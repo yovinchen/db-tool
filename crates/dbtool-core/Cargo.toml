@@ -1,0 +1,29 @@
+[package]
+name        = "dbtool-core"
+description = "Domain model, ports (capability traits), application services, and registry mechanism for dbtool"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+
+[dependencies]
+async-trait   = { workspace = true }
+tokio         = { workspace = true }
+futures       = { workspace = true }
+thiserror     = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+toml          = { workspace = true }
+tracing       = { workspace = true }
+bytes         = { workspace = true }
+url           = { workspace = true }
+chrono        = { workspace = true }
+sha2          = { workspace = true }
+hex           = { workspace = true }
+sqlparser     = { workspace = true }
+governor      = { workspace = true }
+tokio-util    = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

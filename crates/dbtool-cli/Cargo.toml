@@ -1,0 +1,27 @@
+[package]
+name        = "dbtool-cli"
+description = "dbtool CLI binary — usable standalone and as a Claude Code Skill"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "dbtool"
+path = "src/main.rs"
+
+[features]
+default = ["dbtool-registry/default"]
+full    = ["dbtool-registry/full"]
+
+[dependencies]
+dbtool-core     = { path = "../dbtool-core" }
+dbtool-registry = { path = "../dbtool-registry" }
+tokio           = { workspace = true }
+clap            = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+tracing         = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow          = { workspace = true }

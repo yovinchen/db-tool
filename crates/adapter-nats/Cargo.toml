@@ -1,0 +1,18 @@
+[package]
+name        = "adapter-nats"
+description = "NATS/JetStream adapter for dbtool"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+dbtool-core  = { path = "../dbtool-core" }
+async-trait  = { workspace = true }
+tokio        = { workspace = true }
+thiserror    = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+async-nats   = { workspace = true }
+bytes        = { workspace = true }

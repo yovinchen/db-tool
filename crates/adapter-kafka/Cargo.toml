@@ -1,0 +1,27 @@
+[package]
+name        = "adapter-kafka"
+description = "Kafka/AutoMQ/Redpanda/WarpStream adapter for dbtool (default: rskafka; opt-in: rdkafka/librdkafka)"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default      = ["backend-pure"]
+# Pure-Rust backend (self-contained, feature-limited)
+backend-pure = ["dep:rskafka"]
+# librdkafka backend (full features, requires C runtime dep — opt-in only)
+backend-native = ["dep:rdkafka"]
+
+[dependencies]
+dbtool-core  = { path = "../dbtool-core" }
+async-trait  = { workspace = true }
+tokio        = { workspace = true }
+thiserror    = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+bytes        = { workspace = true }
+rskafka      = { workspace = true, optional = true }
+rdkafka      = { workspace = true, optional = true }

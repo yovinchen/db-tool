@@ -1,0 +1,39 @@
+[package]
+name        = "dbtool-registry"
+description = "Composition root: assembles adapters into a Registry via Cargo features"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default = ["sql", "redis", "mongodb"]
+
+# ── Capability features ────────────────────────────────────────────────────────
+mysql    = ["sql"]
+postgres = ["sql"]
+sqlite   = ["sql"]
+sql      = ["dep:adapter-sql"]
+redis    = ["dep:adapter-redis"]
+mongodb  = ["dep:adapter-mongo"]
+amqp     = ["dep:adapter-amqp"]
+nats     = ["dep:adapter-nats"]
+mq       = ["nats", "amqp", "redis"]
+
+# Single kafka feature; backend chosen inside adapter-kafka via mutually exclusive features
+kafka         = ["dep:adapter-kafka", "adapter-kafka/backend-pure"]
+kafka-native  = ["dep:adapter-kafka", "adapter-kafka/backend-native"]
+
+# ── Preset bundles ─────────────────────────────────────────────────────────────
+full        = ["sql", "redis", "mongodb", "mq", "kafka"]
+full-native = ["full", "kafka-native"]
+
+[dependencies]
+dbtool-core   = { path = "../dbtool-core" }
+adapter-sql   = { path = "../adapter-sql",   optional = true }
+adapter-redis = { path = "../adapter-redis", optional = true }
+adapter-mongo = { path = "../adapter-mongo", optional = true }
+adapter-kafka = { path = "../adapter-kafka", optional = true, default-features = false }
+adapter-amqp  = { path = "../adapter-amqp",  optional = true }
+adapter-nats  = { path = "../adapter-nats",  optional = true }

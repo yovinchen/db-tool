@@ -1,0 +1,11 @@
+[connections.local-sqlite]
+dsn = "sqlite::memory:"
+readonly = true
+
+[connections.redis-local]
+dsn = "redis://127.0.0.1:6379/0"
+readonly = false
+
+[connections.prod-postgres]
+dsn = "postgres://app:${DB_PASSWORD}@db.example.com/app"
+readonly = true

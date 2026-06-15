@@ -1,0 +1,27 @@
+[package]
+name        = "dbtool-tui"
+description = "dbtool TUI — interactive multi-panel terminal UI built on ratatui"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "dbtool-tui"
+path = "src/main.rs"
+
+[features]
+default = ["dbtool-registry/default"]
+full    = ["dbtool-registry/full"]
+
+[dependencies]
+dbtool-core     = { path = "../dbtool-core" }
+dbtool-registry = { path = "../dbtool-registry" }
+tokio           = { workspace = true }
+ratatui         = { workspace = true }
+crossterm       = { workspace = true }
+serde_json      = { workspace = true }
+tracing         = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow          = { workspace = true }

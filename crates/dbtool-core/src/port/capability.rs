@@ -1,0 +1,100 @@
+use crate::{
+    model::{
+        ConsumeOptions, Document, ExecOutcome, FindOptions, InsertOutcome, LagInfo, Message, Point,
+        ProduceOutcome, ResultSet, SeriesSet, TableInfo, TableSchema, TimeRange, TopicDetail,
+        TopicInfo, UpdateOutcome, Value,
+    },
+    Result,
+};
+use async_trait::async_trait;
+
+pub use crate::port::connector::Connector;
+
+#[async_trait]
+pub trait SqlEngine: Connector {
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet>;
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome>;
+    async fn list_schemas(&self) -> Result<Vec<String>>;
+    async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>>;
+    async fn describe_table(&self, table: &str) -> Result<TableSchema>;
+}
+
+#[async_trait]
+pub trait KeyValueStore: Connector {
+    async fn get(&self, key: &str) -> Result<Option<bytes::Bytes>>;
+    async fn set(&self, key: &str, value: &[u8], options: SetOptions) -> Result<()>;
+    async fn delete(&self, keys: &[String]) -> Result<u64>;
+    async fn scan(&self, pattern: &str, limit: usize) -> Result<Vec<String>>;
+    /// Escape hatch for raw protocol commands (e.g. `XLEN mystream`).
+    async fn raw_command(&self, args: &[String]) -> Result<Value>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SetOptions {
+    /// TTL in seconds; None = no expiry.
+    pub ttl_secs: Option<u64>,
+    /// Set only if key does not exist.
+    pub nx: bool,
+}
+
+#[async_trait]
+pub trait DocumentStore: Connector {
+    async fn list_collections(&self) -> Result<Vec<String>>;
+    async fn find(
+        &self,
+        collection: &str,
+        filter: Value,
+        options: FindOptions,
+    ) -> Result<Vec<Document>>;
+    async fn insert(&self, collection: &str, docs: Vec<Document>) -> Result<InsertOutcome>;
+    async fn update(&self, collection: &str, filter: Value, update: Value)
+        -> Result<UpdateOutcome>;
+    async fn delete(&self, collection: &str, filter: Value) -> Result<u64>;
+    async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>>;
+}
+
+#[async_trait]
+pub trait TimeSeriesStore: Connector {
+    async fn list_measurements(&self) -> Result<Vec<String>>;
+    async fn write_points(&self, points: Vec<Point>) -> Result<()>;
+    async fn query_range(&self, query: &str, range: TimeRange) -> Result<SeriesSet>;
+}
+
+#[async_trait]
+pub trait SearchEngine: Connector {
+    async fn list_indices(&self) -> Result<Vec<crate::model::IndexInfo>>;
+    async fn search(&self, index: &str, query: Value, options: SearchOptions)
+        -> Result<SearchHits>;
+    async fn index_doc(&self, index: &str, doc: Value) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchOptions {
+    pub size: Option<usize>,
+    pub from: Option<usize>,
+    pub source: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SearchHits {
+    pub total: u64,
+    pub hits: Vec<serde_json::Value>,
+}
+
+#[async_trait]
+pub trait MessageProducer: Connector {
+    async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome>;
+}
+
+#[async_trait]
+pub trait MessageConsumer: Connector {
+    /// Always bounded — `options.max` and `options.timeout` are enforced by the adapter.
+    async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>>;
+}
+
+#[async_trait]
+pub trait AdminInspect: Connector {
+    async fn list_topics(&self) -> Result<Vec<TopicInfo>>;
+    async fn topic_detail(&self, name: &str) -> Result<TopicDetail>;
+    async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>>;
+}
