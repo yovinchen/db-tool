@@ -124,10 +124,10 @@ Goal: replace safe shells with real bounded functionality.
 
 Goal: make verification repeatable locally and in CI without forcing Docker on every run.
 
-- [ ] CI profile for service-free `./scripts/verify.sh`.
-- [ ] Optional CI/manual profile for `./scripts/integration-test.sh`.
-- [ ] Compose config validation in CI.
-- [ ] Document required Docker resources and failure recovery.
+- [x] CI profile for service-free `./scripts/verify.sh`.
+- [x] Optional CI/manual profile for `./scripts/integration-test.sh`.
+- [x] Compose config validation in CI.
+- [x] Document required Docker resources and failure recovery.
 
 ### T3: Packaging
 

@@ -58,6 +58,23 @@ Set `DBTOOL_IT_KEEP_SERVICES=1` to leave containers running for manual inspectio
 ./scripts/integration-down.sh
 ```
 
+For a custom project name, pass the same value used to start the services:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-run ./scripts/integration-down.sh
+```
+
+## CI Profiles
+
+Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate both base and messaging Docker Compose configs without starting containers.
+
+Live integration jobs are opt-in from the GitHub Actions **Run workflow** button:
+
+- `run_live_services` runs `./scripts/integration-test.sh` for Postgres, MySQL, Redis, and MongoDB.
+- `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
+
+The CI jobs use separate Compose project names and host ports so the database and messaging suites can run in parallel.
+
 ## Resource Limits
 
 The compose file applies conservative defaults:
@@ -71,6 +88,8 @@ The compose file applies conservative defaults:
 - NATS: `0.25` CPU, `256m` memory
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
+
+The base service suite is capped at roughly 2 GiB of container memory, and the messaging suite is capped at roughly 2 GiB. If both suites are kept running at the same time, reserve at least 4 GiB of Docker memory and 2 CPUs. Redpanda is the largest single service; increase `DBTOOL_IT_KAFKA_MEMORY` and `DBTOOL_IT_KAFKA_BROKER_MEMORY` together if it fails to become healthy under local load.
 
 ## Live Test Scope
 

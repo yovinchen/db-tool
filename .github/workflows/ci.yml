@@ -4,12 +4,37 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_live_services:
+        description: "Run Docker-backed SQL/KV/document integration tests"
+        required: false
+        type: boolean
+        default: false
+      run_live_messaging:
+        description: "Run Docker-backed messaging integration tests"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  verify:
+    name: Service-free verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify
+        run: ./scripts/verify.sh
+
   check:
     name: Check & Lint
     runs-on: ubuntu-latest
@@ -28,6 +53,18 @@ jobs:
 
       - name: Clippy (full)
         run: cargo clippy --workspace --features dbtool-registry/full -- -D warnings
+
+  compose-config:
+    name: Compose config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate base integration compose config
+        run: docker compose -f docker-compose.integration.yml config
+
+      - name: Validate messaging integration compose config
+        run: docker compose -f docker-compose.integration.yml --profile messaging config
 
   test:
     name: Tests
@@ -85,3 +122,41 @@ jobs:
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --release --target ${{ matrix.target }} -p dbtool-cli
+
+  integration-services:
+    name: Live services integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_services
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-data
+      DBTOOL_IT_POSTGRES_PORT: 25432
+      DBTOOL_IT_MYSQL_PORT: 23306
+      DBTOOL_IT_REDIS_PORT: 26379
+      DBTOOL_IT_MONGO_PORT: 27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run SQL/KV/document integration tests
+        run: ./scripts/integration-test.sh
+
+  integration-messaging:
+    name: Live messaging integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_messaging
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-mq
+      DBTOOL_IT_REDIS_PORT: 36379
+      DBTOOL_IT_KAFKA_PORT: 29092
+      DBTOOL_IT_KAFKA_ADMIN_PORT: 29644
+      DBTOOL_IT_AMQP_PORT: 25672
+      DBTOOL_IT_NATS_PORT: 24222
+      DBTOOL_IT_NATS_MONITOR_PORT: 28222
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run messaging integration tests
+        run: ./scripts/integration-mq-test.sh
