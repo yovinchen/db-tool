@@ -33,6 +33,15 @@ pub enum SqlAction {
 
 pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
     let dsn = ctx.resolve_dsn()?;
+    let target = ctx.safety_target(&dsn);
+
+    match &cmd.action {
+        SqlAction::Query { sql, .. } | SqlAction::Exec { sql } => {
+            SafetyGuard::check_with_target(sql, &target, ctx.allow_write, ctx.confirm.as_deref())?;
+        }
+        SqlAction::Tables { .. } | SqlAction::Schema { .. } => {}
+    }
+
     let conn = ctx.registry.connect(&dsn).await?;
     let sql_engine = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
         kind: conn.kind().0.clone(),
@@ -43,7 +52,6 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
 
     let output = match cmd.action {
         SqlAction::Query { sql, .. } => {
-            SafetyGuard::check(&sql, ctx.allow_write, ctx.confirm.as_deref())?;
             let rs = sql_engine.query(&sql, &[]).await?;
             let rs = ResultLimiter::new(ctx.limit).apply(rs);
             let truncated = rs.truncated;
@@ -55,7 +63,6 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Exec { sql } => {
-            SafetyGuard::check(&sql, ctx.allow_write, ctx.confirm.as_deref())?;
             let outcome = sql_engine.execute(&sql, &[]).await?;
             Formatter::success(
                 conn.kind().0.as_str(),

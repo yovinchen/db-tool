@@ -36,6 +36,14 @@ impl Formatter {
     }
 
     pub fn error(err: &Error) -> String {
+        if let Error::ConfirmRequired {
+            confirm_token,
+            impact,
+        } = err
+        {
+            return Self::confirm_required(confirm_token, impact);
+        }
+
         let envelope = json!({
             "ok":    false,
             "error": {
@@ -57,5 +65,24 @@ impl Formatter {
             }
         });
         serde_json::to_string(&envelope).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_required_error_exposes_token_and_impact() {
+        let rendered = Formatter::error(&Error::ConfirmRequired {
+            confirm_token: "abc123".to_owned(),
+            impact: json!({ "op": "DROP", "target": "conn:prod" }),
+        });
+
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "CONFIRM_REQUIRED");
+        assert_eq!(value["error"]["confirm_token"], "abc123");
+        assert_eq!(value["error"]["impact"]["target"], "conn:prod");
     }
 }

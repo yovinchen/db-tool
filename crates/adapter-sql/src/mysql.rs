@@ -8,7 +8,7 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
-use sqlx::{Column, MySqlPool, Row, TypeInfo};
+use sqlx::{Column, MySqlPool, Row};
 
 pub struct MySqlAdapter {
     pool: MySqlPool,

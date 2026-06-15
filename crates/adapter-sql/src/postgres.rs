@@ -8,7 +8,7 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
-use sqlx::{Column, PgPool, Row, TypeInfo};
+use sqlx::{Column, PgPool, Row};
 
 pub struct PostgresAdapter {
     pool: PgPool,

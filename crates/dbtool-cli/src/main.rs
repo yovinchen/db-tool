@@ -85,7 +85,7 @@ async fn main() {
         registry,
         conn: cli.conn,
         dsn: cli.dsn,
-        format: cli.format.parse().unwrap_or(Format::Json),
+        _format: cli.format.parse().unwrap_or(Format::Json),
         limit: cli.limit,
         allow_write: cli.allow_write,
         confirm: cli.confirm,

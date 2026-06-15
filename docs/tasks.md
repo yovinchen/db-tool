@@ -12,8 +12,8 @@ Goal: `dbtool-core` compiles and exposes stable contracts.
 - [x] Registry and owned `Dsn` factory contract.
 - [x] Protocol alias table and family registration.
 - [ ] Mock adapter and contract tests.
-- [ ] `cargo check -p dbtool-core` passes.
-- [ ] `cargo test -p dbtool-core` passes.
+- [x] `cargo check -p dbtool-core` passes.
+- [x] `cargo test -p dbtool-core` passes.
 
 ## P0b: Shared Core Services
 
@@ -24,9 +24,9 @@ Goal: frontends and adapters share one behavior layer.
 - [x] Result limiter.
 - [x] SQL safety guard and two-step token confirmation.
 - [x] Flow-control service with bounded retry budget.
-- [ ] Replace keyword SQL classifier with `sqlparser`-backed classification.
-- [ ] Bind confirm token to target connection and impact summary.
-- [ ] Unit tests for resolver, formatter, flow control, and safety edge cases.
+- [x] Replace keyword SQL classifier with `sqlparser`-backed classification.
+- [x] Bind confirm token to target connection and impact summary.
+- [x] Unit tests for resolver, formatter, flow control, and safety edge cases.
 
 ## P1: SQL Family
 

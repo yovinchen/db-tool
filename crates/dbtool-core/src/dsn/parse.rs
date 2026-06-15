@@ -63,6 +63,24 @@ impl Dsn {
     }
 }
 
+fn expand_env(s: &str) -> String {
+    // Replace ${VAR} with environment variable value, leaving unknown vars as-is.
+    let mut result = s.to_owned();
+    while let Some(start) = result.find("${") {
+        let end = match result[start..].find('}') {
+            Some(i) => start + i,
+            None => break,
+        };
+        let var_name = &result[start + 2..end];
+        if let Ok(val) = std::env::var(var_name) {
+            result.replace_range(start..=end, &val);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,22 +111,4 @@ mod tests {
         assert_eq!(dsn.password.as_deref(), Some("secret-pass"));
         assert!(!dsn.redacted().contains("secret-pass"));
     }
-}
-
-fn expand_env(s: &str) -> String {
-    // Replace ${VAR} with environment variable value, leaving unknown vars as-is.
-    let mut result = s.to_owned();
-    while let Some(start) = result.find("${") {
-        let end = match result[start..].find('}') {
-            Some(i) => start + i,
-            None => break,
-        };
-        let var_name = &result[start + 2..end];
-        if let Ok(val) = std::env::var(var_name) {
-            result.replace_range(start..=end, &val);
-        } else {
-            break;
-        }
-    }
-    result
 }

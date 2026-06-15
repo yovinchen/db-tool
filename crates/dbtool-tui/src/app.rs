@@ -10,7 +10,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::sync::Arc;
 
 pub struct App {
-    manager: Arc<ConnectionManager>,
+    _manager: Arc<ConnectionManager>,
     state: AppState,
 }
 
@@ -18,7 +18,7 @@ impl App {
     pub fn new(registry: Arc<Registry>) -> Self {
         let manager = Arc::new(ConnectionManager::new(registry));
         Self {
-            manager,
+            _manager: manager,
             state: AppState::default(),
         }
     }

@@ -8,7 +8,7 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
-use sqlx::{Column, Row, SqlitePool, TypeInfo};
+use sqlx::{Column, Row, SqlitePool};
 
 pub struct SqliteAdapter {
     pool: SqlitePool,

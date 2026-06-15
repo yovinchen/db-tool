@@ -52,6 +52,12 @@ impl Registry {
     }
 }
 
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,11 +100,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(conn.kind().0, "dummy");
-    }
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self::new()
     }
 }
