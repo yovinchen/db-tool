@@ -11,7 +11,7 @@ Goal: `dbtool-core` compiles and exposes stable contracts.
 - [x] L2 ports: `Connector` plus capability traits.
 - [x] Registry and owned `Dsn` factory contract.
 - [x] Protocol alias table and family registration.
-- [ ] Mock adapter and contract tests.
+- [x] Mock adapter and contract tests.
 - [x] `cargo check -p dbtool-core` passes.
 - [x] `cargo test -p dbtool-core` passes.
 
