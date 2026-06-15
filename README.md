@@ -9,7 +9,7 @@ The project is being completed core-first.
 - `dbtool-core` is the stable foundation: domain models, ports, DSN parsing, registry, config loading, safety, limiting, and formatting.
 - `dbtool-cli` is the first frontend that exercises the core.
 - `dbtool-tui` is intentionally a lightweight shell for now.
-- Message adapters are staged. Kafka pure/native feature selection is wired, but native Kafka returns a clear not-implemented error until that backend is built.
+- Message adapters are staged. Kafka pure/native feature selection is wired, with pure Rust as the default and native librdkafka available through `full-native`.
 
 ## Workspace Layout
 
@@ -144,6 +144,12 @@ Live messaging integration tests start Redis, Redpanda, RabbitMQ, and NATS:
 ./scripts/integration-mq-test.sh
 ```
 
+Kafka native/librdkafka can be tested against the same Docker services:
+
+```bash
+./scripts/integration-mq-native-test.sh
+```
+
 See [docs/integration-testing.md](docs/integration-testing.md) for custom project names, database names, ports, credentials, resource limits, and cleanup.
 
 Messaging metadata has protocol-specific boundaries. See [docs/messaging-boundaries.md](docs/messaging-boundaries.md) for why AMQP queue listing needs RabbitMQ's management API, why NATS admin is JetStream-scoped, and why Redis Pub/Sub is live-only.
@@ -161,7 +167,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including MySQL and Redis-compatible protocol aliases.
-- Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`.
+- Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.
 - TUI: intentionally minimal while core stabilizes.
 - Release packaging: GitHub Release archive, npm, pip/uv, and mise/ubi metadata are wired; signing/notarization is still future work.

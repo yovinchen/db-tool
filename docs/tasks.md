@@ -92,7 +92,7 @@ Goal: release-quality packages and optional advanced backends.
 - [x] CI/release workflow scaffold.
 - [x] Make workflows reuse build artifacts and avoid duplicate builds.
 - [x] npm/pip/uv/mise packaging.
-- [ ] Optional native Kafka implementation.
+- [x] Optional native Kafka implementation.
 - [ ] Future adapters: search, time-series HTTP, SQL Server, Cassandra.
 
 ## P7: Live Integration Automation
@@ -133,6 +133,7 @@ Goal: make verification repeatable locally and in CI without forcing Docker on e
 - [x] Optional CI/manual profile for `./scripts/integration-test.sh`.
 - [x] Compose config validation in CI.
 - [x] Document required Docker resources and failure recovery.
+- [x] Optional native Kafka integration script using the messaging Docker profile.
 
 ### T3: Packaging
 

@@ -22,6 +22,14 @@ Messaging integration tests use a separate profile so day-to-day database checks
 
 The messaging script starts Redis, Redpanda (Kafka API), RabbitMQ, and NATS, waits for health checks, runs the live CLI tests with `--features full`, and removes the containers and volumes.
 
+Run the same suite with the optional native Kafka backend:
+
+```bash
+./scripts/integration-mq-native-test.sh
+```
+
+That script uses `--no-default-features --features full-native`, so Kafka commands go through librdkafka while the other message backends remain unchanged.
+
 ## Custom Names And Ports
 
 Every service name, database name, and host port can be overridden with environment variables:
@@ -73,6 +81,7 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 
 - `run_live_services` runs `./scripts/integration-test.sh` for Postgres, MySQL, Redis, and MongoDB.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
+- `run_live_messaging_native` can run `./scripts/integration-mq-native-test.sh` when native Kafka coverage is desired.
 
 The CI jobs use separate Compose project names and host ports so the database and messaging suites can run in parallel.
 
@@ -103,6 +112,7 @@ The live tests cover:
 - MongoDB ping, insert/find/update/aggregate/delete.
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.
 - Kafka ping through metadata, produce, topics, detail/watermarks, and consume.
+- Optional native Kafka/librdkafka coverage through the same Redpanda test data.
 - RabbitMQ queue publish, passive detail/message count, acked consume, write guard, and HTTP management queue listing/detail/lag.
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
 
