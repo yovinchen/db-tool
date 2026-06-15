@@ -101,4 +101,7 @@ dbtool --dsn kafka://127.0.0.1:19092 mq detail events
 dbtool --dsn redis://127.0.0.1:16379/0 --allow-write mq produce stream:events '{"hello":"redis-stream"}'
 dbtool --dsn redis://127.0.0.1:16379/0 mq consume stream:events --max 10 --timeout 5
 dbtool --dsn redis://127.0.0.1:16379/0 mq detail pubsub:events
+dbtool --dsn nats://127.0.0.1:14222 mq topics
+dbtool --dsn nats://127.0.0.1:14222 mq detail EVENTS
+dbtool --dsn nats://127.0.0.1:14222 mq lag DURABLE_CONSUMER
 ```

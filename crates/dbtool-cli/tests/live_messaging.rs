@@ -339,3 +339,77 @@ fn nats_live_publish_and_subscribe_round_trip() {
     let consumed = stdout_json(output);
     assert_eq!(payload_text(&consumed["data"][0]), "nats-payload");
 }
+
+#[test]
+fn nats_live_jetstream_admin_lists_detail_and_lag() {
+    if !integration_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_NATS_DSN") else {
+        return;
+    };
+    let stream = unique_name("DBTOOLNATSSTREAM").to_ascii_uppercase();
+    let subject = format!("{}.events", stream.to_ascii_lowercase());
+    let consumer = "DBTOOLCONSUMER";
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime should start");
+    rt.block_on(async {
+        let client = async_nats::connect(dsn.clone())
+            .await
+            .expect("NATS client should connect");
+        let jetstream = async_nats::jetstream::new(client);
+        let stream_handle = jetstream
+            .get_or_create_stream(async_nats::jetstream::stream::Config {
+                name: stream.clone(),
+                subjects: vec![subject.clone()],
+                max_messages: 100,
+                ..Default::default()
+            })
+            .await
+            .expect("JetStream stream should be created");
+        jetstream
+            .publish(subject.clone(), "nats-jetstream-payload".into())
+            .await
+            .expect("JetStream publish should start")
+            .await
+            .expect("JetStream publish should be acknowledged");
+        stream_handle
+            .get_or_create_consumer(
+                consumer,
+                async_nats::jetstream::consumer::pull::Config {
+                    durable_name: Some(consumer.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("JetStream consumer should be created");
+    });
+
+    let topics = stdout_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
+    assert!(topics["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == stream));
+
+    let detail = stdout_json(dbtool(&["--dsn", &dsn, "mq", "detail", &stream]));
+    assert_eq!(detail["data"]["info"]["name"], stream);
+    assert_eq!(detail["data"]["config"]["kind"], "jetstream");
+    assert_eq!(detail["data"]["config"]["messages"], "1");
+    assert_eq!(detail["data"]["config"]["consumer_count"], "1");
+
+    let lag = stdout_json(dbtool(&["--dsn", &dsn, "mq", "lag", consumer]));
+    assert!(lag["data"]
+        .as_array()
+        .expect("lag should be an array")
+        .iter()
+        .any(|item| item["topic"] == stream && item["group"] == consumer && item["lag"] == 1));
+
+    rt.block_on(async {
+        let client = async_nats::connect(dsn)
+            .await
+            .expect("NATS client should reconnect for cleanup");
+        let jetstream = async_nats::jetstream::new(client);
+        let _ = jetstream.delete_stream(stream).await;
+    });
+}

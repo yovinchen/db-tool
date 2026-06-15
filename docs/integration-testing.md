@@ -101,6 +101,6 @@ The live tests cover:
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.
 - Kafka ping through metadata, produce, topics, detail/watermarks, and consume.
 - RabbitMQ queue publish, passive detail/message count, acked consume, and write guard.
-- NATS live subscribe/publish round trip and write guard.
+- NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
 
 Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; those broader admin paths remain future work.

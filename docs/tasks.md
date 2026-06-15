@@ -80,7 +80,7 @@ Goal: bounded message operations with no external runtime dependencies.
 - [x] NATS core real producer/consumer.
 - [x] Redis Streams/PubSub support in Redis adapter.
 - [ ] AMQP queue listing through RabbitMQ management API or documented plugin boundary.
-- [ ] NATS JetStream admin/list/detail support.
+- [x] NATS JetStream admin/list/detail support.
 
 ## P6: Distribution And Extended Backends
 
@@ -116,9 +116,10 @@ Goal: replace safe shells with real bounded functionality.
 - [x] Kafka pure backend ping/list/detail/produce/consume with bounded reads.
 - [x] AMQP producer/consumer/detail with explicit ack and timeout behavior.
 - [x] NATS core producer/consumer with subject validation.
+- [x] NATS JetStream admin topics/detail/lag support.
 - [x] Redis Streams/PubSub support behind explicit capabilities.
 - [x] Live messaging tests with self-starting Redis/Redpanda/RabbitMQ/NATS and resource limits.
-- [ ] AMQP queue listing and NATS JetStream admin once protocol boundary is chosen.
+- [ ] AMQP queue listing through RabbitMQ management API or documented plugin boundary.
 
 ### T2: CI And Integration Profiles
 

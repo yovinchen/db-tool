@@ -1019,6 +1019,7 @@ name = "dbtool-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "clap",
  "dbtool-core",
  "dbtool-registry",
