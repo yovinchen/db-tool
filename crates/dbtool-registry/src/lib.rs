@@ -30,6 +30,7 @@ pub fn build_registry() -> Registry {
     #[cfg(feature = "amqp")]
     {
         r.register_family("amqp", adapter_amqp::factory);
+        r.register("rabbitmq+http", adapter_amqp::management_factory);
     }
 
     #[cfg(feature = "nats")]

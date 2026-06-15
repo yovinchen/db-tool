@@ -82,7 +82,7 @@ Goal: bounded message operations with no external runtime dependencies.
 - [x] AMQP real producer/consumer and queue detail.
 - [x] NATS core real producer/consumer.
 - [x] Redis Streams/PubSub support in Redis adapter.
-- [x] AMQP queue listing through documented RabbitMQ management plugin boundary.
+- [x] RabbitMQ HTTP management queue listing/detail/lag through explicit `rabbitmq+http` boundary.
 - [x] NATS JetStream admin/list/detail support.
 
 ## P6: Distribution And Extended Backends
@@ -123,7 +123,7 @@ Goal: replace safe shells with real bounded functionality.
 - [x] NATS JetStream admin topics/detail/lag support.
 - [x] Redis Streams/PubSub support behind explicit capabilities.
 - [x] Live messaging tests with self-starting Redis/Redpanda/RabbitMQ/NATS and resource limits.
-- [x] AMQP queue listing through documented RabbitMQ management plugin boundary.
+- [x] RabbitMQ HTTP management queue listing/detail/lag through explicit `rabbitmq+http` boundary.
 
 ### T2: CI And Integration Profiles
 
@@ -154,6 +154,16 @@ Goal: prove canonical and compatible database protocols against live services.
 - [x] Redis-compatible aliases `valkey://`, `keydb://`, and `dragonfly://` verified against live Redis.
 - [x] Redis raw mutating commands blocked without `--allow-write`.
 - [x] Redis live coverage for TTL, typed raw output, scan truncation, and multi-key delete.
+
+### T7: RabbitMQ Management Admin
+
+Goal: expose RabbitMQ queue discovery without blurring AMQP protocol boundaries.
+
+- [x] Add an admin-only `rabbitmq+http` management connector.
+- [x] Keep pure `amqp://` queue listing behavior protocol-native.
+- [x] Map RabbitMQ management queues to `TopicInfo`, `TopicDetail`, and queue-level lag.
+- [x] Build RabbitMQ management Docker service port into the messaging profile.
+- [x] Live-test queue creation through AMQP and queue listing/detail/lag through HTTP management.
 
 ### T4: TUI After Core Stability
 

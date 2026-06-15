@@ -42,6 +42,20 @@ fn stdout_json_retry(args: &[&str]) -> Value {
     stdout_json(last_output.expect("command should have been attempted"))
 }
 
+fn stdout_json_retry_until(args: &[&str], matches: impl Fn(&Value) -> bool) -> Value {
+    let mut last_value = None;
+    for _ in 0..10 {
+        let value = stdout_json_retry(args);
+        if matches(&value) {
+            return value;
+        }
+        last_value = Some(value);
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    last_value.expect("command should have produced JSON")
+}
+
 fn stderr_json(output: Output) -> Value {
     assert!(
         !output.status.success(),
@@ -287,6 +301,88 @@ fn amqp_live_queue_produce_detail_and_consume() {
         "5",
     ]);
     assert_eq!(payload_text(&consumed["data"][0]), "amqp-payload");
+}
+
+#[test]
+fn rabbitmq_management_live_lists_detail_and_queue_lag() {
+    if !integration_enabled() {
+        return;
+    }
+    let Some(amqp_dsn) = dsn("DBTOOL_IT_AMQP_DSN") else {
+        return;
+    };
+    let Some(management_dsn) = dsn("DBTOOL_IT_RABBITMQ_MANAGEMENT_DSN") else {
+        return;
+    };
+    let queue = unique_name("dbtool_rabbitmq_mgmt_queue");
+
+    let produced = stdout_json_retry(&[
+        "--dsn",
+        &amqp_dsn,
+        "--allow-write",
+        "mq",
+        "produce",
+        &queue,
+        "rabbitmq-management-payload",
+    ]);
+    assert_eq!(produced["data"]["produced"], 1);
+
+    let ping = stdout_json_retry(&["--dsn", &management_dsn, "ping"]);
+    assert_eq!(ping["kind"], "rabbitmq+http");
+    assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json_retry(&["--dsn", &management_dsn, "caps"]);
+    assert_eq!(caps["data"]["admin"], true);
+    assert_eq!(caps["data"]["producer"], false);
+
+    let topics = stdout_json_retry(&["--dsn", &management_dsn, "mq", "topics"]);
+    assert!(topics["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == queue));
+
+    let detail = stdout_json_retry_until(
+        &["--dsn", &management_dsn, "mq", "detail", &queue],
+        |value| value["data"]["config"]["message_count"] == "1",
+    );
+    assert_eq!(detail["data"]["info"]["name"], queue);
+    assert_eq!(detail["data"]["config"]["message_count"], "1");
+    assert_eq!(detail["data"]["watermarks"][0]["high"], 1);
+
+    let lag = stdout_json_retry_until(&["--dsn", &management_dsn, "mq", "lag", &queue], |value| {
+        value["data"][0]["latest"] == 1 && value["data"][0]["lag"] == 1
+    });
+    assert_eq!(lag["data"][0]["topic"], queue);
+    assert_eq!(lag["data"][0]["latest"], 1);
+    assert_eq!(lag["data"][0]["lag"], 1);
+
+    let unsupported = stderr_json(dbtool(&[
+        "--dsn",
+        &management_dsn,
+        "--allow-write",
+        "mq",
+        "produce",
+        &queue,
+        "unsupported",
+    ]));
+    assert_eq!(unsupported["error"]["code"], "UNSUPPORTED_CAPABILITY");
+
+    let consumed = stdout_json_retry(&[
+        "--dsn",
+        &amqp_dsn,
+        "mq",
+        "consume",
+        &queue,
+        "--max",
+        "1",
+        "--timeout",
+        "5",
+    ]);
+    assert_eq!(
+        payload_text(&consumed["data"][0]),
+        "rabbitmq-management-payload"
+    );
 }
 
 #[test]

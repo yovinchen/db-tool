@@ -27,7 +27,7 @@ The project is being completed core-first.
 │   ├── adapter-redis     # Redis-compatible key-value adapter
 │   ├── adapter-mongo     # MongoDB document adapter
 │   ├── adapter-kafka     # Kafka-compatible message adapter shell
-│   ├── adapter-amqp      # AMQP adapter shell
+│   ├── adapter-amqp      # AMQP plus RabbitMQ management adapter
 │   └── adapter-nats      # NATS adapter shell
 ├── docs
 ├── tests
@@ -162,6 +162,6 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including MySQL and Redis-compatible protocol aliases.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`.
-- Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin is implemented; RabbitMQ management-backed listing remains future work.
+- Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.
 - TUI: intentionally minimal while core stabilizes.
 - Release packaging: GitHub Release archive, npm, pip/uv, and mise/ubi metadata are wired; signing/notarization is still future work.

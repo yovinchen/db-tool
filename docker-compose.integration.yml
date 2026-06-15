@@ -134,7 +134,7 @@ services:
 
   rabbitmq:
     profiles: ["messaging"]
-    image: rabbitmq:3.13-alpine
+    image: rabbitmq:3.13-management-alpine
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: ${DBTOOL_IT_AMQP_USER:-dbtool}
@@ -142,6 +142,7 @@ services:
       RABBITMQ_DEFAULT_VHOST: ${DBTOOL_IT_AMQP_VHOST:-dbtool_it}
     ports:
       - "${DBTOOL_IT_AMQP_PORT:-15672}:5672"
+      - "${DBTOOL_IT_AMQP_MANAGEMENT_PORT:-15673}:15672"
     healthcheck:
       test:
         [

@@ -17,3 +17,4 @@ serde_json   = { workspace = true }
 tracing      = { workspace = true }
 lapin        = { workspace = true }
 bytes        = { workspace = true }
+url          = { workspace = true }

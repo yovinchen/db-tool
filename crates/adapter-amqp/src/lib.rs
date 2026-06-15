@@ -17,6 +17,10 @@ use lapin::{
 use std::collections::HashMap;
 use tokio::time::{sleep, Instant};
 
+mod management;
+
+pub use management::management_factory;
+
 pub struct AmqpAdapter {
     conn: Connection,
     kind: ConnectorKind,
@@ -232,7 +236,7 @@ async fn declare_queue(
         .map_err(|e| Error::Query(e.to_string()))
 }
 
-fn validate_queue(queue: &str) -> Result<()> {
+pub(crate) fn validate_queue(queue: &str) -> Result<()> {
     if queue.is_empty() || queue.len() > 255 || queue.bytes().any(|b| b.is_ascii_control()) {
         return Err(Error::Query(format!("invalid AMQP queue name: {queue:?}")));
     }

@@ -47,6 +47,7 @@ DBTOOL_IT_AMQP_USER=my_user \
 DBTOOL_IT_AMQP_PASSWORD=my_pass \
 DBTOOL_IT_AMQP_VHOST=my_vhost \
 DBTOOL_IT_AMQP_PORT=25672 \
+DBTOOL_IT_AMQP_MANAGEMENT_PORT=25673 \
 DBTOOL_IT_REDIS_PORT=26379 \
 DBTOOL_IT_NATS_PORT=24222 \
 ./scripts/integration-mq-test.sh
@@ -102,7 +103,7 @@ The live tests cover:
 - MongoDB ping, insert/find/update/aggregate/delete.
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.
 - Kafka ping through metadata, produce, topics, detail/watermarks, and consume.
-- RabbitMQ queue publish, passive detail/message count, acked consume, and write guard.
+- RabbitMQ queue publish, passive detail/message count, acked consume, write guard, and HTTP management queue listing/detail/lag.
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
 
-Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; those broader admin paths remain future work.
+Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; use an explicit `rabbitmq+http://` management DSN for RabbitMQ queue discovery.

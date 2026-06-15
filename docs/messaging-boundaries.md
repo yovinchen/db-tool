@@ -13,11 +13,11 @@ Current core behavior:
 - `mq detail <queue>` uses passive queue declare and returns `message_count` and `consumer_count`.
 - `mq topics` returns an empty list for pure AMQP because queue discovery requires RabbitMQ's HTTP management plugin.
 
-RabbitMQ queue listing should be added behind a separate management boundary, not hidden inside the pure AMQP protocol path. Acceptable future shapes:
+RabbitMQ queue listing is exposed through an explicit management boundary, not hidden inside the pure AMQP protocol path:
 
-- An explicit management DSN, for example `rabbitmq+http://host:15672/vhost`, registered as an optional admin adapter.
-- A feature-gated RabbitMQ management client that is only enabled when HTTP management support is requested.
-- A CLI option that clearly identifies the management endpoint and credentials instead of deriving them silently from the AMQP DSN.
+- `rabbitmq+http://user:pass@host:15672/vhost` registers an admin-only connector.
+- `mq topics` lists queues through `/api/queues/{vhost}`.
+- `mq detail <queue>` and `mq lag <queue>` use `/api/queues/{vhost}/{queue}`.
 
 Do not infer the management API port from the AMQP port in core code; local deployments commonly remap one without the other.
 
