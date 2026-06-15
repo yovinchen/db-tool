@@ -75,3 +75,13 @@ Use `--dsn` for an explicit one-off target. Use `--conn <name>` for configured t
 2. `connections.toml`
 
 DSNs may reference environment variables as `${VAR}`. Never print raw DSNs with credentials; use redacted output from `conn list`.
+
+## Local Integration Runs
+
+For end-to-end verification with real services, use:
+
+```bash
+./scripts/integration-test.sh
+```
+
+Override names and ports with `DBTOOL_IT_PROJECT`, `DBTOOL_IT_POSTGRES_DB`, `DBTOOL_IT_MYSQL_DB`, `DBTOOL_IT_MONGO_DB`, and the `DBTOOL_IT_*_PORT` variables documented in `docs/integration-testing.md`.

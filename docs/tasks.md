@@ -89,3 +89,65 @@ Goal: release-quality packages and optional advanced backends.
 - [ ] npm/pip/uv/mise packaging.
 - [ ] Optional native Kafka implementation.
 - [ ] Future adapters: search, time-series HTTP, SQL Server, Cassandra.
+
+## P7: Live Integration Automation
+
+Goal: self-start local databases with bounded resources and verify real CLI workflows.
+
+- [x] Docker Compose integration environment for Postgres, MySQL, Redis, and MongoDB.
+- [x] Custom project name, database names, credentials, and host ports through environment variables.
+- [x] CPU/memory/resource limits for integration services.
+- [x] Integration scripts for up/down/test lifecycle.
+- [x] Live CLI tests for SQL, KV, and document workflows.
+- [x] Documented integration workflow and cleanup.
+
+## Next Execution Queue
+
+Use this as the next implementation order now that the core/CLI/live database loop is stable.
+
+### T1: Messaging Adapters
+
+Goal: replace safe shells with real bounded functionality.
+
+- [ ] Kafka pure backend ping/list/produce/consume with bounded reads.
+- [ ] AMQP producer/consumer/admin with explicit ack and timeout behavior.
+- [ ] NATS producer/consumer/admin with subject validation.
+- [ ] Redis Streams/PubSub support behind explicit capabilities.
+- [ ] Live messaging tests with self-starting services and resource limits.
+
+### T2: CI And Integration Profiles
+
+Goal: make verification repeatable locally and in CI without forcing Docker on every run.
+
+- [ ] CI profile for service-free `./scripts/verify.sh`.
+- [ ] Optional CI/manual profile for `./scripts/integration-test.sh`.
+- [ ] Compose config validation in CI.
+- [ ] Document required Docker resources and failure recovery.
+
+### T3: Packaging
+
+Goal: ship installable artifacts without duplicating build work.
+
+- [ ] Reuse release workflow build artifacts.
+- [ ] npm package wrapper.
+- [ ] pip/uv package wrapper.
+- [ ] mise install metadata.
+- [ ] Release smoke tests against packaged binaries.
+
+### T4: TUI After Core Stability
+
+Goal: build a TUI that consumes the same verified core/CLI behavior.
+
+- [ ] Connection picker backed by core config resolution.
+- [ ] Capability-aware SQL/KV/Document views.
+- [ ] Read limits and write-confirmation prompts.
+- [ ] TUI smoke tests for navigation and command dispatch.
+
+### T5: Extended Backends
+
+Goal: add new families only after the core behavior remains stable under integration tests.
+
+- [ ] Search backend adapter.
+- [ ] Time-series HTTP adapter.
+- [ ] SQL Server adapter.
+- [ ] Cassandra adapter.

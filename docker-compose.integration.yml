@@ -1,0 +1,98 @@
+name: ${DBTOOL_IT_PROJECT:-dbtool-it}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-postgres
+    environment:
+      POSTGRES_DB: ${DBTOOL_IT_POSTGRES_DB:-dbtool_it_pg}
+      POSTGRES_USER: ${DBTOOL_IT_POSTGRES_USER:-dbtool}
+      POSTGRES_PASSWORD: ${DBTOOL_IT_POSTGRES_PASSWORD:-dbtool}
+    ports:
+      - "${DBTOOL_IT_POSTGRES_PORT:-15432}:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DBTOOL_IT_POSTGRES_USER:-dbtool} -d ${DBTOOL_IT_POSTGRES_DB:-dbtool_it_pg}",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cpus: ${DBTOOL_IT_POSTGRES_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_POSTGRES_MEMORY:-512m}
+
+  mysql:
+    image: mysql:8.4
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mysql
+    environment:
+      MYSQL_DATABASE: ${DBTOOL_IT_MYSQL_DB:-dbtool_it_mysql}
+      MYSQL_USER: ${DBTOOL_IT_MYSQL_USER:-dbtool}
+      MYSQL_PASSWORD: ${DBTOOL_IT_MYSQL_PASSWORD:-dbtool}
+      MYSQL_ROOT_PASSWORD: ${DBTOOL_IT_MYSQL_ROOT_PASSWORD:-dbtool_root}
+    command:
+      [
+        "mysqld",
+        "--mysql-native-password=ON",
+        "--max-connections=40",
+        "--performance-schema=OFF",
+      ]
+    ports:
+      - "${DBTOOL_IT_MYSQL_PORT:-13306}:3306"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -u${DBTOOL_IT_MYSQL_USER:-dbtool} -p${DBTOOL_IT_MYSQL_PASSWORD:-dbtool} --silent",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    cpus: ${DBTOOL_IT_MYSQL_CPUS:-0.75}
+    mem_limit: ${DBTOOL_IT_MYSQL_MEMORY:-768m}
+
+  redis:
+    image: redis:7-alpine
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-redis
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "no",
+        "--save",
+        "",
+        "--maxmemory",
+        "${DBTOOL_IT_REDIS_MAXMEMORY:-128mb}",
+        "--maxmemory-policy",
+        "allkeys-lru",
+      ]
+    ports:
+      - "${DBTOOL_IT_REDIS_PORT:-16379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cpus: ${DBTOOL_IT_REDIS_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_REDIS_MEMORY:-256m}
+
+  mongo:
+    image: mongo:7
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${DBTOOL_IT_MONGO_USER:-dbtool}
+      MONGO_INITDB_ROOT_PASSWORD: ${DBTOOL_IT_MONGO_PASSWORD:-dbtool}
+      MONGO_INITDB_DATABASE: ${DBTOOL_IT_MONGO_DB:-dbtool_it_mongo}
+    ports:
+      - "${DBTOOL_IT_MONGO_PORT:-17017}:27017"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --username ${DBTOOL_IT_MONGO_USER:-dbtool} --password ${DBTOOL_IT_MONGO_PASSWORD:-dbtool} --authenticationDatabase admin --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    cpus: ${DBTOOL_IT_MONGO_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_MONGO_MEMORY:-512m}

@@ -1,6 +1,11 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{error::Error, model::FindOptions, service::formatter::Formatter, Result};
+use dbtool_core::{
+    error::Error,
+    model::{Document, FindOptions, Value},
+    service::formatter::Formatter,
+    Result,
+};
 
 #[derive(Args)]
 pub struct DocCmd {
@@ -19,6 +24,22 @@ pub enum DocAction {
     Insert {
         collection: String,
         doc: String,
+    },
+    Update {
+        collection: String,
+        #[arg(long)]
+        filter: String,
+        #[arg(long)]
+        update: String,
+    },
+    Delete {
+        collection: String,
+        #[arg(long)]
+        filter: String,
+    },
+    Aggregate {
+        collection: String,
+        pipeline: String,
     },
 }
 
@@ -54,17 +75,75 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             collection,
             doc: raw_doc,
         } => {
-            let v: serde_json::Value =
-                serde_json::from_str(&raw_doc).map_err(|e| Error::Serialization(e.to_string()))?;
-            let d: dbtool_core::model::Document = if let serde_json::Value::Object(m) = v {
-                m.into_iter()
-                    .map(|(k, v)| (k, dbtool_core::model::Value::Json(v)))
-                    .collect()
-            } else {
-                return Err(Error::Serialization("expected JSON object".into()));
-            };
+            ensure_write_allowed(ctx)?;
+            let d = parse_document(&raw_doc)?;
             let outcome = doc.insert(&collection, vec![d]).await?;
             Formatter::success(&kind, outcome, elapsed(), false)
         }
+        DocAction::Update {
+            collection,
+            filter,
+            update,
+        } => {
+            ensure_write_allowed(ctx)?;
+            let filter = parse_json_value(&filter)?;
+            let update = parse_json_value(&update)?;
+            let outcome = doc.update(&collection, filter, update).await?;
+            Formatter::success(&kind, outcome, elapsed(), false)
+        }
+        DocAction::Delete { collection, filter } => {
+            ensure_write_allowed(ctx)?;
+            let filter = parse_json_value(&filter)?;
+            let deleted = doc.delete(&collection, filter).await?;
+            Formatter::success(
+                &kind,
+                serde_json::json!({ "deleted": deleted }),
+                elapsed(),
+                false,
+            )
+        }
+        DocAction::Aggregate {
+            collection,
+            pipeline,
+        } => {
+            let pipeline = parse_pipeline(&pipeline)?;
+            let docs = doc.aggregate(&collection, pipeline).await?;
+            let truncated = docs.len() >= ctx.limit;
+            Formatter::success(&kind, docs, elapsed(), truncated)
+        }
     })
+}
+
+fn ensure_write_allowed(ctx: &Context) -> Result<()> {
+    if ctx.allow_write {
+        Ok(())
+    } else {
+        Err(Error::WriteNotAllowed)
+    }
+}
+
+fn parse_json_value(raw: &str) -> Result<Value> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .map(Value::Json)
+        .map_err(|e| Error::Serialization(e.to_string()))
+}
+
+fn parse_document(raw: &str) -> Result<Document> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| Error::Serialization(e.to_string()))?;
+    match value {
+        serde_json::Value::Object(map) => {
+            Ok(map.into_iter().map(|(k, v)| (k, Value::Json(v))).collect())
+        }
+        _ => Err(Error::Serialization("expected JSON object".into())),
+    }
+}
+
+fn parse_pipeline(raw: &str) -> Result<Vec<Value>> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| Error::Serialization(e.to_string()))?;
+    match value {
+        serde_json::Value::Array(items) => Ok(items.into_iter().map(Value::Json).collect()),
+        _ => Err(Error::Serialization("expected JSON array pipeline".into())),
+    }
 }

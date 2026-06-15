@@ -8,6 +8,7 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
+use sqlx::mysql::MySqlRow;
 use sqlx::{Column, MySqlPool, Row};
 
 use crate::{
@@ -113,7 +114,7 @@ impl SqlEngine for MySqlAdapter {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
+        rows.iter().map(|r| mysql_text(r, 0)).collect()
     }
 
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
@@ -136,16 +137,20 @@ impl SqlEngine for MySqlAdapter {
 
         Ok(rows
             .iter()
-            .map(|r| TableInfo {
-                schema: schema.map(str::to_owned),
-                name: r.get(0),
-                kind: if r.get::<String, _>(1).contains("VIEW") {
-                    TableKind::View
-                } else {
-                    TableKind::Table
-                },
+            .map(|r| {
+                let name = mysql_text(r, 0)?;
+                let table_type = mysql_text(r, 1)?;
+                Ok(TableInfo {
+                    schema: schema.map(str::to_owned),
+                    name,
+                    kind: if table_type.contains("VIEW") {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()?)
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -173,12 +178,14 @@ impl SqlEngine for MySqlAdapter {
 
         let columns = rows
             .iter()
-            .map(|r| ColumnMeta {
-                name: r.get(0),
-                type_name: r.get(1),
-                nullable: r.get::<String, _>(2) == "YES",
+            .map(|r| {
+                Ok(ColumnMeta {
+                    name: mysql_text(r, 0)?,
+                    type_name: mysql_text(r, 1)?,
+                    nullable: mysql_text(r, 2)? == "YES",
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(TableSchema {
             name: table_ref.name,
@@ -186,4 +193,15 @@ impl SqlEngine for MySqlAdapter {
             indexes: vec![],
         })
     }
+}
+
+fn mysql_text(row: &MySqlRow, index: usize) -> Result<String> {
+    if let Ok(value) = row.try_get::<String, _>(index) {
+        return Ok(value);
+    }
+
+    let bytes = row
+        .try_get::<Vec<u8>, _>(index)
+        .map_err(|e| Error::Query(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|e| Error::Serialization(e.to_string()))
 }

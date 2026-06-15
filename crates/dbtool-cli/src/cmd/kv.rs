@@ -58,6 +58,7 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             )
         }
         KvAction::Set { key, value, ttl } => {
+            ensure_write_allowed(ctx)?;
             kv.set(
                 &key,
                 value.as_bytes(),
@@ -75,6 +76,7 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             Formatter::success(&kind, keys, elapsed(), truncated)
         }
         KvAction::Del { keys } => {
+            ensure_write_allowed(ctx)?;
             let n = kv.delete(&keys).await?;
             Formatter::success(&kind, serde_json::json!({"deleted": n}), elapsed(), false)
         }
@@ -88,4 +90,12 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             Formatter::success(&kind, val, elapsed(), false)
         }
     })
+}
+
+fn ensure_write_allowed(ctx: &Context) -> Result<()> {
+    if ctx.allow_write {
+        Ok(())
+    } else {
+        Err(Error::WriteNotAllowed)
+    }
 }
