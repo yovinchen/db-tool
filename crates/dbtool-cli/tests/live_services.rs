@@ -10,6 +10,11 @@ fn integration_enabled() -> bool {
     env::var("DBTOOL_RUN_INTEGRATION").as_deref() == Ok("1")
 }
 
+fn compat_enabled(flag: &str) -> bool {
+    env::var("DBTOOL_RUN_COMPAT_INTEGRATION").as_deref() == Ok("1")
+        && env::var(flag).as_deref() == Ok("1")
+}
+
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args(args)
@@ -107,6 +112,117 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
     confirmed_sql_exec(dsn, &drop_sql);
 }
 
+fn mysql_family_typed_probe(dsn: &str, expected_kind: &str) {
+    let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
+    assert_eq!(ping["kind"], expected_kind);
+    assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
+    assert_eq!(caps["kind"], expected_kind);
+    assert_eq!(caps["data"]["sql"], true);
+
+    let typed = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        "select cast(42 as signed) as int_value, cast(3.5 as double) as float_value, cast(X'6869' as binary) as bytes_value, cast(null as char) as null_value",
+    ]));
+    let row = &typed["data"]["rows"][0];
+    assert_eq!(row[0], 42);
+    assert_eq!(row[1].as_f64().expect("float should decode"), 3.5);
+    assert_eq!(row[2], serde_json::json!([104, 105]));
+    assert_eq!(row[3], Value::Null);
+
+    let limited = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--limit",
+        "2",
+        "sql",
+        "query",
+        "select 1 as n union all select 2 union all select 3",
+    ]));
+    assert_eq!(limited["data"]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(limited["meta"]["truncated"], true);
+}
+
+fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
+    let key = unique_name(&format!("dbtool_{prefix}_key"));
+    let ttl_key = unique_name(&format!("dbtool_{prefix}_ttl"));
+    let raw_key = unique_name(&format!("dbtool_{prefix}_raw"));
+
+    let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
+    assert_eq!(ping["kind"], expected_kind);
+    assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
+    assert_eq!(caps["kind"], expected_kind);
+    assert_eq!(caps["data"]["key_value"], true);
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &key,
+        expected_kind,
+    ]));
+    let value = stdout_json(dbtool(&["--dsn", dsn, "kv", "get", &key]));
+    assert_eq!(value["data"]["value"], expected_kind);
+
+    let blocked_raw_set = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "kv",
+        "raw",
+        "SET",
+        &raw_key,
+        "raw-value",
+    ]));
+    assert_eq!(blocked_raw_set["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let raw_set = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "kv",
+        "raw",
+        "SET",
+        &raw_key,
+        "raw-value",
+    ]));
+    assert_eq!(raw_set["data"], "OK");
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &ttl_key,
+        "short-lived",
+        "--ttl",
+        "30",
+    ]));
+    let ttl = stdout_json(dbtool(&["--dsn", dsn, "kv", "raw", "TTL", &ttl_key]));
+    let ttl = ttl["data"].as_i64().expect("TTL should be numeric");
+    assert!((1..=30).contains(&ttl), "unexpected TTL value: {ttl}");
+
+    let deleted = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "kv",
+        "del",
+        &key,
+        &ttl_key,
+        &raw_key,
+    ]));
+    assert_eq!(deleted["data"]["deleted"], 3);
+}
+
 #[test]
 fn postgres_live_sql_lifecycle() {
     if !integration_enabled() {
@@ -155,39 +271,27 @@ fn mysql_live_protocol_aliases_and_typed_values() {
     for alias in ["mariadb", "tidb"] {
         let alias_dsn = dsn_with_scheme(&dsn, alias);
 
-        let ping = stdout_json(dbtool(&["--dsn", &alias_dsn, "ping"]));
-        assert_eq!(ping["kind"], alias);
-        assert_eq!(ping["ok"], true);
-
-        let caps = stdout_json(dbtool(&["--dsn", &alias_dsn, "caps"]));
-        assert_eq!(caps["kind"], alias);
-        assert_eq!(caps["data"]["sql"], true);
-
-        let typed = stdout_json(dbtool(&[
-            "--dsn",
-            &alias_dsn,
-            "sql",
-            "query",
-            "select cast(42 as signed) as int_value, cast(3.5 as double) as float_value, cast(X'6869' as binary) as bytes_value, cast(null as char) as null_value",
-        ]));
-        let row = &typed["data"]["rows"][0];
-        assert_eq!(row[0], 42);
-        assert_eq!(row[1].as_f64().expect("float should decode"), 3.5);
-        assert_eq!(row[2], serde_json::json!([104, 105]));
-        assert_eq!(row[3], Value::Null);
-
-        let limited = stdout_json(dbtool(&[
-            "--dsn",
-            &alias_dsn,
-            "--limit",
-            "2",
-            "sql",
-            "query",
-            "select 1 as n union all select 2 union all select 3",
-        ]));
-        assert_eq!(limited["data"]["rows"].as_array().unwrap().len(), 2);
-        assert_eq!(limited["meta"]["truncated"], true);
+        mysql_family_typed_probe(&alias_dsn, alias);
     }
+}
+
+#[test]
+fn mariadb_compat_live_sql_lifecycle_and_typed_values() {
+    if !compat_enabled("DBTOOL_RUN_MARIADB_COMPAT") {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_MARIADB_DSN") else {
+        return;
+    };
+    let table = unique_name("dbtool_mariadb_users");
+
+    mysql_family_typed_probe(&dsn, "mariadb");
+    sql_lifecycle(
+        &dsn,
+        &table,
+        format!("create table {table} (id integer primary key, name varchar(64) not null)"),
+        format!("drop table {table}"),
+    );
 }
 
 #[test]
@@ -371,6 +475,42 @@ fn redis_live_protocol_aliases_resolve_to_same_adapter() {
             &key,
         ]));
     }
+}
+
+#[test]
+fn valkey_compat_live_kv_lifecycle_and_raw_safety() {
+    if !compat_enabled("DBTOOL_RUN_VALKEY_COMPAT") {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_VALKEY_DSN") else {
+        return;
+    };
+
+    redis_family_kv_probe(&dsn, "valkey", "valkey");
+}
+
+#[test]
+fn keydb_compat_live_kv_lifecycle_and_raw_safety() {
+    if !compat_enabled("DBTOOL_RUN_KEYDB_COMPAT") {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_KEYDB_DSN") else {
+        return;
+    };
+
+    redis_family_kv_probe(&dsn, "keydb", "keydb");
+}
+
+#[test]
+fn dragonfly_compat_live_kv_lifecycle_and_raw_safety() {
+    if !compat_enabled("DBTOOL_RUN_DRAGONFLY_COMPAT") {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_DRAGONFLY_DSN") else {
+        return;
+    };
+
+    redis_family_kv_probe(&dsn, "dragonfly", "dragonfly");
 }
 
 #[test]

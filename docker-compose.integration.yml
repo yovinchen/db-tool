@@ -51,6 +51,35 @@ services:
     cpus: ${DBTOOL_IT_MYSQL_CPUS:-0.75}
     mem_limit: ${DBTOOL_IT_MYSQL_MEMORY:-768m}
 
+  mariadb:
+    profiles: ["compat"]
+    image: mariadb:11.4
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mariadb
+    environment:
+      MARIADB_DATABASE: ${DBTOOL_IT_MARIADB_DB:-dbtool_it_mariadb}
+      MARIADB_USER: ${DBTOOL_IT_MARIADB_USER:-dbtool}
+      MARIADB_PASSWORD: ${DBTOOL_IT_MARIADB_PASSWORD:-dbtool}
+      MARIADB_ROOT_PASSWORD: ${DBTOOL_IT_MARIADB_ROOT_PASSWORD:-dbtool_root}
+    command:
+      [
+        "mariadbd",
+        "--max-connections=40",
+        "--performance-schema=OFF",
+      ]
+    ports:
+      - "${DBTOOL_IT_MARIADB_PORT:-23306}:3306"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mariadb-admin ping -h 127.0.0.1 -u${DBTOOL_IT_MARIADB_USER:-dbtool} -p${DBTOOL_IT_MARIADB_PASSWORD:-dbtool} --silent",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    cpus: ${DBTOOL_IT_MARIADB_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_MARIADB_MEMORY:-512m}
+
   redis:
     image: redis:7-alpine
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-redis
@@ -75,6 +104,72 @@ services:
       retries: 30
     cpus: ${DBTOOL_IT_REDIS_CPUS:-0.25}
     mem_limit: ${DBTOOL_IT_REDIS_MEMORY:-256m}
+
+  valkey:
+    profiles: ["compat"]
+    image: valkey/valkey:8-alpine
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-valkey
+    command:
+      [
+        "valkey-server",
+        "--appendonly",
+        "no",
+        "--save",
+        "",
+        "--maxmemory",
+        "${DBTOOL_IT_VALKEY_MAXMEMORY:-128mb}",
+        "--maxmemory-policy",
+        "allkeys-lru",
+      ]
+    ports:
+      - "${DBTOOL_IT_VALKEY_PORT:-26379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cpus: ${DBTOOL_IT_VALKEY_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_VALKEY_MEMORY:-256m}
+
+  keydb:
+    profiles: ["compat-extra"]
+    image: eqalpha/keydb:alpine
+    platform: ${DBTOOL_IT_KEYDB_PLATFORM:-linux/amd64}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-keydb
+    command:
+      [
+        "keydb-server",
+        "--appendonly",
+        "no",
+        "--save",
+        "",
+        "--maxmemory",
+        "${DBTOOL_IT_KEYDB_MAXMEMORY:-128mb}",
+        "--maxmemory-policy",
+        "allkeys-lru",
+      ]
+    ports:
+      - "${DBTOOL_IT_KEYDB_PORT:-26380}:6379"
+    healthcheck:
+      test: ["CMD", "keydb-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cpus: ${DBTOOL_IT_KEYDB_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_KEYDB_MEMORY:-256m}
+
+  dragonfly:
+    profiles: ["compat-extra"]
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-dragonfly
+    command:
+      [
+        "--maxmemory=${DBTOOL_IT_DRAGONFLY_MAXMEMORY:-256mb}",
+      ]
+    ports:
+      - "${DBTOOL_IT_DRAGONFLY_PORT:-26381}:6379"
+    cpus: ${DBTOOL_IT_DRAGONFLY_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_DRAGONFLY_MEMORY:-384m}
 
   mongo:
     image: mongo:7

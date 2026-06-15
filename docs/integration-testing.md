@@ -14,6 +14,20 @@ Live integration tests can start local databases with Docker Compose:
 
 The script starts Postgres, MySQL, Redis, and MongoDB, waits for health checks, runs the live CLI tests, and then removes the containers and volumes.
 
+Compatible database integration tests use a separate profile:
+
+```bash
+./scripts/integration-compat-test.sh
+```
+
+The compatibility script starts MariaDB and Valkey by default, waits for health checks, runs the compatibility live tests, and removes the containers and volumes. Run the optional Redis-compatible matrix as well:
+
+```bash
+DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh
+```
+
+That extra mode adds KeyDB and Dragonfly. KeyDB is pinned to `linux/amd64` by default because its published Alpine image is amd64-only on Apple Silicon.
+
 Messaging integration tests use a separate profile so day-to-day database checks stay lighter:
 
 ```bash
@@ -44,6 +58,19 @@ DBTOOL_IT_MYSQL_PORT=23306 \
 DBTOOL_IT_REDIS_PORT=26379 \
 DBTOOL_IT_MONGO_PORT=27018 \
 ./scripts/integration-test.sh
+```
+
+Compatible service settings follow the same pattern:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-compat-run \
+DBTOOL_IT_MARIADB_DB=my_mariadb \
+DBTOOL_IT_MARIADB_PORT=33306 \
+DBTOOL_IT_VALKEY_PORT=36379 \
+DBTOOL_IT_KEYDB_PORT=36380 \
+DBTOOL_IT_DRAGONFLY_PORT=36381 \
+DBTOOL_IT_COMPAT_EXTRA=1 \
+./scripts/integration-compat-test.sh
 ```
 
 Messaging service settings follow the same pattern:
@@ -80,6 +107,7 @@ Daily push and pull request CI run service-free verification through `./scripts/
 Live integration jobs are opt-in from the GitHub Actions **Run workflow** button:
 
 - `run_live_services` runs `./scripts/integration-test.sh` for Postgres, MySQL, Redis, and MongoDB.
+- `run_live_compat` can run `./scripts/integration-compat-test.sh` for MariaDB and Valkey, with `DBTOOL_IT_COMPAT_EXTRA=1` for KeyDB and Dragonfly.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
 - `run_live_messaging_native` can run `./scripts/integration-mq-native-test.sh` when native Kafka coverage is desired.
 
@@ -93,6 +121,10 @@ The compose file applies conservative defaults:
 - MySQL: `0.75` CPU, `768m` memory
 - Redis: `0.25` CPU, `256m` memory plus `128mb` Redis maxmemory
 - MongoDB: `0.50` CPU, `512m` memory
+- MariaDB compat: `0.50` CPU, `512m` memory
+- Valkey compat: `0.25` CPU, `256m` memory plus `128mb` maxmemory
+- KeyDB compat-extra: `0.25` CPU, `256m` memory plus `128mb` maxmemory
+- Dragonfly compat-extra: `0.25` CPU, `384m` memory plus `256mb` maxmemory
 - Redpanda/Kafka API: `0.75` CPU, `1g` memory, broker memory `512M`
 - RabbitMQ/AMQP: `0.50` CPU, `512m` memory
 - NATS: `0.25` CPU, `256m` memory
@@ -109,6 +141,8 @@ The live tests cover:
 - MariaDB/TiDB alias DSNs against the MySQL protocol adapter, typed MySQL values, and result limiting.
 - Redis ping, set/get/scan/raw typed output, TTL, scan truncation, multi-key delete, blocked destructive raw command, and blocked mutating raw command without `--allow-write`.
 - Valkey/KeyDB/Dragonfly alias DSNs against the Redis protocol adapter.
+- Real MariaDB compatibility through `mariadb://` against a MariaDB container.
+- Real Valkey compatibility through `valkey://`; optional KeyDB and Dragonfly compatibility through `DBTOOL_IT_COMPAT_EXTRA=1`.
 - MongoDB ping, insert/find/update/aggregate/delete.
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.
 - Kafka ping through metadata, produce, topics, detail/watermarks, and consume.

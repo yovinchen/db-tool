@@ -138,6 +138,18 @@ Live database integration tests can start local Docker services with resource li
 ./scripts/integration-test.sh
 ```
 
+Compatible database integration tests start real MariaDB and Valkey services by default:
+
+```bash
+./scripts/integration-compat-test.sh
+```
+
+Run the optional Redis-compatible matrix with KeyDB and Dragonfly as well:
+
+```bash
+DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh
+```
+
 Live messaging integration tests start Redis, Redpanda, RabbitMQ, and NATS:
 
 ```bash
@@ -166,7 +178,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 ## Implementation Status
 
 - Core contracts and services: implemented as the main foundation.
-- SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including MySQL and Redis-compatible protocol aliases.
+- SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, Valkey, KeyDB, and Dragonfly compatibility profiles.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.
 - TUI: intentionally minimal while core stabilizes.

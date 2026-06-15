@@ -8,4 +8,6 @@ docker compose \
   -f "$ROOT/docker-compose.integration.yml" \
   -p "$DBTOOL_IT_PROJECT" \
   --profile messaging \
+  --profile compat \
+  --profile compat-extra \
   down -v --remove-orphans
