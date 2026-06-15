@@ -35,6 +35,7 @@ Goal: MySQL/Postgres/SQLite adapters and SQL CLI commands.
 - [x] SQL adapter crate scaffold.
 - [x] MySQL/Postgres/SQLite factories.
 - [x] Protocol aliases for MariaDB/TiDB/Cockroach/Timescale/Redshift.
+- [x] Live protocol alias verification for MariaDB/TiDB through the MySQL adapter.
 - [x] Correct typed value extraction from SQL rows.
 - [x] Safe identifier handling for schema/table commands.
 - [x] SQLite smoke tests with in-memory database.
@@ -57,6 +58,8 @@ Goal: Redis-compatible and MongoDB adapters.
 - [x] Redis adapter scaffold and basic KV commands.
 - [x] MongoDB adapter scaffold.
 - [x] Redis raw command validation and typed result conversion.
+- [x] Redis raw write commands require `--allow-write`.
+- [x] Live protocol alias verification for Valkey/KeyDB/Dragonfly through the Redis adapter.
 - [x] Redis Streams/PubSub capability split.
 - [x] MongoDB filter/update/aggregate implementation.
 - [x] Remove adapter-side `unwrap`.
@@ -102,6 +105,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] CPU/memory/resource limits for integration services.
 - [x] Integration scripts for up/down/test lifecycle.
 - [x] Live CLI tests for SQL, KV, and document workflows.
+- [x] Live CLI tests for MySQL protocol aliases and Redis-compatible protocol aliases.
 - [x] Live CLI tests for Redis Streams/PubSub, Kafka, AMQP, and NATS messaging workflows.
 - [x] Documented integration workflow and cleanup.
 
@@ -139,6 +143,17 @@ Goal: ship installable artifacts without duplicating build work.
 - [x] pip/uv package wrapper.
 - [x] mise install metadata.
 - [x] Release smoke tests against packaged binaries.
+
+### T6: Database Protocol Hardening
+
+Goal: prove canonical and compatible database protocols against live services.
+
+- [x] Normalize adapter driver URLs while preserving caller-facing alias kind.
+- [x] MySQL protocol aliases `mariadb://` and `tidb://` verified against live MySQL.
+- [x] MySQL live typed-value coverage for int, float, bytes, null, and result limiting.
+- [x] Redis-compatible aliases `valkey://`, `keydb://`, and `dragonfly://` verified against live Redis.
+- [x] Redis raw mutating commands blocked without `--allow-write`.
+- [x] Redis live coverage for TTL, typed raw output, scan truncation, and multi-key delete.
 
 ### T4: TUI After Core Stability
 

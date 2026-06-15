@@ -96,7 +96,9 @@ The base service suite is capped at roughly 2 GiB of container memory, and the m
 The live tests cover:
 
 - Postgres and MySQL ping, destructive SQL confirmation, insert/query/schema/drop.
-- Redis ping, set/get/scan/raw typed output, and blocked destructive raw command.
+- MariaDB/TiDB alias DSNs against the MySQL protocol adapter, typed MySQL values, and result limiting.
+- Redis ping, set/get/scan/raw typed output, TTL, scan truncation, multi-key delete, blocked destructive raw command, and blocked mutating raw command without `--allow-write`.
+- Valkey/KeyDB/Dragonfly alias DSNs against the Redis protocol adapter.
 - MongoDB ping, insert/find/update/aggregate/delete.
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.
 - Kafka ping through metadata, produce, topics, detail/watermarks, and consume.

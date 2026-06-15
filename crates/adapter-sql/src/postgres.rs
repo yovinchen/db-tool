@@ -22,7 +22,8 @@ pub struct PostgresAdapter {
 
 pub fn postgres_factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
-        let pool = PgPool::connect(&dsn.raw)
+        let driver_url = dsn.raw_with_scheme("postgres")?;
+        let pool = PgPool::connect(&driver_url)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
         Ok(Box::new(PostgresAdapter {

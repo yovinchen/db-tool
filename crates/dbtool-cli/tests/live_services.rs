@@ -49,6 +49,13 @@ fn dsn(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+fn dsn_with_scheme(dsn: &str, scheme: &str) -> String {
+    let (_, rest) = dsn
+        .split_once("://")
+        .expect("integration DSN should include a URL scheme");
+    format!("{scheme}://{rest}")
+}
+
 fn confirmed_sql_exec(dsn: &str, sql: &str) -> Value {
     let first = stderr_json(dbtool(&["--dsn", dsn, "--allow-write", "sql", "exec", sql]));
     assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
@@ -137,6 +144,53 @@ fn mysql_live_sql_lifecycle() {
 }
 
 #[test]
+fn mysql_live_protocol_aliases_and_typed_values() {
+    if !integration_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_MYSQL_DSN") else {
+        return;
+    };
+
+    for alias in ["mariadb", "tidb"] {
+        let alias_dsn = dsn_with_scheme(&dsn, alias);
+
+        let ping = stdout_json(dbtool(&["--dsn", &alias_dsn, "ping"]));
+        assert_eq!(ping["kind"], alias);
+        assert_eq!(ping["ok"], true);
+
+        let caps = stdout_json(dbtool(&["--dsn", &alias_dsn, "caps"]));
+        assert_eq!(caps["kind"], alias);
+        assert_eq!(caps["data"]["sql"], true);
+
+        let typed = stdout_json(dbtool(&[
+            "--dsn",
+            &alias_dsn,
+            "sql",
+            "query",
+            "select cast(42 as signed) as int_value, cast(3.5 as double) as float_value, cast(X'6869' as binary) as bytes_value, cast(null as char) as null_value",
+        ]));
+        let row = &typed["data"]["rows"][0];
+        assert_eq!(row[0], 42);
+        assert_eq!(row[1].as_f64().expect("float should decode"), 3.5);
+        assert_eq!(row[2], serde_json::json!([104, 105]));
+        assert_eq!(row[3], Value::Null);
+
+        let limited = stdout_json(dbtool(&[
+            "--dsn",
+            &alias_dsn,
+            "--limit",
+            "2",
+            "sql",
+            "query",
+            "select 1 as n union all select 2 union all select 3",
+        ]));
+        assert_eq!(limited["data"]["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(limited["meta"]["truncated"], true);
+    }
+}
+
+#[test]
 fn redis_live_kv_lifecycle_and_raw_safety() {
     if !integration_enabled() {
         return;
@@ -145,6 +199,15 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
         return;
     };
     let key = unique_name("dbtool_redis_key");
+    let ttl_key = unique_name("dbtool_redis_ttl");
+    let raw_key = unique_name("dbtool_redis_raw");
+    let counter_key = unique_name("dbtool_redis_counter");
+    let scan_prefix = unique_name("dbtool_redis_scan");
+    let scan_keys = [
+        format!("{scan_prefix}:1"),
+        format!("{scan_prefix}:2"),
+        format!("{scan_prefix}:3"),
+    ];
 
     let blocked_set = stderr_json(dbtool(&["--dsn", &dsn, "kv", "set", &key, "alice"]));
     assert_eq!(blocked_set["error"]["code"], "WRITE_NOT_ALLOWED");
@@ -168,10 +231,146 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let pong = stdout_json(dbtool(&["--dsn", &dsn, "kv", "raw", "PING"]));
     assert_eq!(pong["data"], "PONG");
 
+    let blocked_raw_set = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "kv",
+        "raw",
+        "SET",
+        &raw_key,
+        "raw-value",
+    ]));
+    assert_eq!(blocked_raw_set["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let raw_set = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "raw",
+        "SET",
+        &raw_key,
+        "raw-value",
+    ]));
+    assert_eq!(raw_set["data"], "OK");
+
+    let incr = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "raw",
+        "INCR",
+        &counter_key,
+    ]));
+    assert_eq!(incr["data"], 1);
+
+    let multi_get = stdout_json(dbtool(&[
+        "--dsn", &dsn, "kv", "raw", "MGET", &key, &raw_key,
+    ]));
+    assert_eq!(multi_get["data"][0], "alice");
+    assert_eq!(multi_get["data"][1], "raw-value");
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &ttl_key,
+        "short-lived",
+        "--ttl",
+        "30",
+    ]));
+    let ttl = stdout_json(dbtool(&["--dsn", &dsn, "kv", "raw", "TTL", &ttl_key]));
+    let ttl = ttl["data"].as_i64().expect("TTL should be numeric");
+    assert!((1..=30).contains(&ttl), "unexpected TTL value: {ttl}");
+
+    for scan_key in &scan_keys {
+        stdout_json(dbtool(&[
+            "--dsn",
+            &dsn,
+            "--allow-write",
+            "kv",
+            "set",
+            scan_key,
+            "scan-value",
+        ]));
+    }
+    let scan = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--limit",
+        "2",
+        "kv",
+        "scan",
+        &format!("{scan_prefix}:*"),
+    ]));
+    assert_eq!(scan["data"].as_array().unwrap().len(), 2);
+    assert_eq!(scan["meta"]["truncated"], true);
+
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "kv", "raw", "FLUSHALL"]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
 
-    stdout_json(dbtool(&["--dsn", &dsn, "--allow-write", "kv", "del", &key]));
+    let mut delete_args = vec![
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "del",
+        &key,
+        &ttl_key,
+        &raw_key,
+        &counter_key,
+    ];
+    for scan_key in &scan_keys {
+        delete_args.push(scan_key);
+    }
+    let deleted = stdout_json(dbtool(&delete_args));
+    assert_eq!(deleted["data"]["deleted"], 7);
+}
+
+#[test]
+fn redis_live_protocol_aliases_resolve_to_same_adapter() {
+    if !integration_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_REDIS_DSN") else {
+        return;
+    };
+
+    for alias in ["valkey", "keydb", "dragonfly"] {
+        let alias_dsn = dsn_with_scheme(&dsn, alias);
+        let key = unique_name(&format!("dbtool_{alias}_key"));
+
+        let ping = stdout_json(dbtool(&["--dsn", &alias_dsn, "ping"]));
+        assert_eq!(ping["kind"], alias);
+        assert_eq!(ping["ok"], true);
+
+        let caps = stdout_json(dbtool(&["--dsn", &alias_dsn, "caps"]));
+        assert_eq!(caps["kind"], alias);
+        assert_eq!(caps["data"]["key_value"], true);
+
+        stdout_json(dbtool(&[
+            "--dsn",
+            &alias_dsn,
+            "--allow-write",
+            "kv",
+            "set",
+            &key,
+            alias,
+        ]));
+        let value = stdout_json(dbtool(&["--dsn", &alias_dsn, "kv", "get", &key]));
+        assert_eq!(value["data"]["value"], alias);
+        stdout_json(dbtool(&[
+            "--dsn",
+            &alias_dsn,
+            "--allow-write",
+            "kv",
+            "del",
+            &key,
+        ]));
+    }
 }
 
 #[test]

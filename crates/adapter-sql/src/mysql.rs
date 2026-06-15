@@ -23,7 +23,8 @@ pub struct MySqlAdapter {
 
 pub fn mysql_factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
-        let pool = MySqlPool::connect(&dsn.raw)
+        let driver_url = dsn.raw_with_scheme("mysql")?;
+        let pool = MySqlPool::connect(&driver_url)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
         Ok(Box::new(MySqlAdapter {

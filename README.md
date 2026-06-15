@@ -160,7 +160,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 ## Implementation Status
 
 - Core contracts and services: implemented as the main foundation.
-- SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths.
+- SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including MySQL and Redis-compatible protocol aliases.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin is implemented; RabbitMQ management-backed listing remains future work.
 - TUI: intentionally minimal while core stabilizes.

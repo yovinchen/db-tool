@@ -79,6 +79,7 @@ services:
   mongo:
     image: mongo:7
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mongo
+    command: ["mongod", "--bind_ip", "0.0.0.0"]
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${DBTOOL_IT_MONGO_USER:-dbtool}
       MONGO_INITDB_ROOT_PASSWORD: ${DBTOOL_IT_MONGO_PASSWORD:-dbtool}

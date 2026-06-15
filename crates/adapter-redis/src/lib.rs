@@ -27,8 +27,9 @@ pub struct RedisAdapter {
 
 pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
+        let driver_url = dsn.raw_with_scheme("redis")?;
         let client =
-            Client::open(dsn.raw.as_str()).map_err(|e| Error::Connection(e.to_string()))?;
+            Client::open(driver_url.as_str()).map_err(|e| Error::Connection(e.to_string()))?;
         let conn = client
             .get_multiplexed_async_connection()
             .await

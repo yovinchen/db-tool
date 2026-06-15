@@ -28,6 +28,7 @@ Use dbtool when you need to inspect SQL databases, key-value stores, document st
 
    ```bash
    dbtool --conn redis-local kv raw XLEN mystream
+   dbtool --conn redis-local --allow-write kv raw SET key value
    ```
 
 ## Output Contract

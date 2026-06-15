@@ -61,6 +61,13 @@ impl Dsn {
     pub fn redacted(&self) -> String {
         super::redact::redact_dsn(&self.raw)
     }
+
+    pub fn raw_with_scheme(&self, scheme: &str) -> Result<String> {
+        let mut url = Url::parse(&self.raw).map_err(|e| Error::Dsn(format!("invalid URL: {e}")))?;
+        url.set_scheme(scheme)
+            .map_err(|_| Error::Dsn(format!("invalid URL scheme: {scheme}")))?;
+        Ok(url.to_string())
+    }
 }
 
 fn expand_env(s: &str) -> String {
@@ -110,5 +117,15 @@ mod tests {
         assert!(!dsn.raw.contains("${DBTOOL_PARSE_TEST_PASSWORD}"));
         assert_eq!(dsn.password.as_deref(), Some("secret-pass"));
         assert!(!dsn.redacted().contains("secret-pass"));
+    }
+
+    #[test]
+    fn can_rewrite_alias_scheme_for_driver_urls() {
+        let dsn = Dsn::parse("mariadb://user:pass@localhost:3306/app?ssl-mode=disabled").unwrap();
+
+        assert_eq!(
+            dsn.raw_with_scheme("mysql").unwrap(),
+            "mysql://user:pass@localhost:3306/app?ssl-mode=disabled"
+        );
     }
 }

@@ -86,6 +86,9 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
                     "raw command requires at least one argument".into(),
                 ));
             }
+            if !is_readonly_raw_command(&args[0]) {
+                ensure_write_allowed(ctx)?;
+            }
             let val = kv.raw_command(&args).await?;
             Formatter::success(&kind, val, elapsed(), false)
         }
@@ -97,5 +100,66 @@ fn ensure_write_allowed(ctx: &Context) -> Result<()> {
         Ok(())
     } else {
         Err(Error::WriteNotAllowed)
+    }
+}
+
+fn is_readonly_raw_command(command: &str) -> bool {
+    matches!(
+        command.to_ascii_uppercase().as_str(),
+        "PING"
+            | "ECHO"
+            | "GET"
+            | "MGET"
+            | "EXISTS"
+            | "TTL"
+            | "PTTL"
+            | "TYPE"
+            | "STRLEN"
+            | "DBSIZE"
+            | "SCAN"
+            | "KEYS"
+            | "HGET"
+            | "HMGET"
+            | "HGETALL"
+            | "HEXISTS"
+            | "HLEN"
+            | "HKEYS"
+            | "HVALS"
+            | "LLEN"
+            | "LRANGE"
+            | "LINDEX"
+            | "SCARD"
+            | "SISMEMBER"
+            | "SMEMBERS"
+            | "SRANDMEMBER"
+            | "ZCARD"
+            | "ZRANGE"
+            | "ZREVRANGE"
+            | "ZSCORE"
+            | "XLEN"
+            | "XRANGE"
+            | "XREVRANGE"
+            | "XINFO"
+            | "XREAD"
+            | "PUBSUB"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readonly_raw_commands_do_not_need_write_flag() {
+        assert!(is_readonly_raw_command("ping"));
+        assert!(is_readonly_raw_command("GET"));
+        assert!(is_readonly_raw_command("xinfo"));
+    }
+
+    #[test]
+    fn mutating_raw_commands_need_write_flag() {
+        assert!(!is_readonly_raw_command("set"));
+        assert!(!is_readonly_raw_command("incr"));
+        assert!(!is_readonly_raw_command("xadd"));
     }
 }
