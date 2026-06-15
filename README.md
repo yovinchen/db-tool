@@ -26,6 +26,7 @@ The project is being completed core-first.
 │   ├── adapter-sql       # MySQL/Postgres/SQLite protocol-family adapter
 │   ├── adapter-redis     # Redis-compatible key-value adapter
 │   ├── adapter-mongo     # MongoDB document adapter
+│   ├── adapter-search    # OpenSearch/Elasticsearch HTTP search adapter
 │   ├── adapter-kafka     # Kafka-compatible message adapter shell
 │   ├── adapter-amqp      # AMQP plus RabbitMQ management adapter
 │   └── adapter-nats      # NATS adapter shell
@@ -39,7 +40,7 @@ The project is being completed core-first.
 `dbtool-core` owns the stable contracts:
 
 - `model`: shared result, value, document, message, metadata, and time-series structs.
-- `port`: capability traits such as `SqlEngine`, `KeyValueStore`, `DocumentStore`, `MessageProducer`, and `AdminInspect`.
+- `port`: capability traits such as `SqlEngine`, `KeyValueStore`, `DocumentStore`, `SearchEngine`, `MessageProducer`, and `AdminInspect`.
 - `dsn`: DSN parsing, environment expansion, and safe redaction.
 - `registry`: scheme-to-factory lookup plus protocol-family alias handling.
 - `config`: named connection loading from `connections.toml` and `DBTOOL_CONN_*` environment variables.
@@ -72,6 +73,9 @@ cargo run -p dbtool-cli -- --dsn sqlite::memory: sql query "select 1"
 cargo run -p dbtool-cli -- --dsn sqlite::memory: --format table sql query "select 1 as id"
 cargo run -p dbtool-cli -- --dsn sqlite::memory: --format ndjson sql query "select 1 as id"
 cargo run -p dbtool-cli -- --conn redis-local kv get my-key
+cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 search indices
+cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 --limit 10 search search users --q '{"match_all":{}}'
+cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 --allow-write search index users '{"name":"alice"}'
 ```
 
 Named connections resolve in this order:
@@ -193,6 +197,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, Valkey, KeyDB, and Dragonfly compatibility profiles.
+- OpenSearch/Elasticsearch HTTP search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP mapping tests.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.
 - TUI: intentionally minimal while core stabilizes.

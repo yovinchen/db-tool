@@ -5,6 +5,7 @@ members = [
     "crates/adapter-sql",
     "crates/adapter-redis",
     "crates/adapter-mongo",
+    "crates/adapter-search",
     "crates/adapter-kafka",
     "crates/adapter-amqp",
     "crates/adapter-nats",

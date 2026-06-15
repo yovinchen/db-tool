@@ -1,6 +1,6 @@
 # dbtool Claude Skill
 
-Use dbtool when you need to inspect SQL databases, key-value stores, document stores, or message systems through a machine-readable CLI. Prefer this tool for workflows that need stable JSON, safety checks, and named connection resolution.
+Use dbtool when you need to inspect SQL databases, key-value stores, document stores, search indexes, or message systems through a machine-readable CLI. Prefer this tool for workflows that need stable JSON, safety checks, and named connection resolution.
 
 ## Operating Flow
 
@@ -16,12 +16,14 @@ Use dbtool when you need to inspect SQL databases, key-value stores, document st
    ```bash
    dbtool --conn <name> sql tables
    dbtool --conn <name> sql schema users
+   dbtool --conn search-local search indices
    ```
 
 3. Query with explicit limits:
 
    ```bash
    dbtool --conn <name> --limit 50 sql query "select id, name from users"
+   dbtool --conn search-local --limit 10 search search users --q '{"match_all":{}}'
    ```
 
 4. Use protocol-specific escape hatches only when the typed command is not enough:
@@ -73,6 +75,7 @@ Example:
 ```bash
 dbtool --dsn sqlite::memory: --allow-write sql exec "create table users (id integer)"
 dbtool --dsn sqlite::memory: --allow-write --confirm <token> sql exec "create table users (id integer)"
+dbtool --dsn opensearch://127.0.0.1:9200 --allow-write search index users '{"name":"alice"}'
 ```
 
 ## Connection Resolution

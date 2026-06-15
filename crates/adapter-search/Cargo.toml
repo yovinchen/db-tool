@@ -1,0 +1,16 @@
+[package]
+name        = "adapter-search"
+description = "OpenSearch/Elasticsearch search adapter for dbtool"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+dbtool-core = { path = "../dbtool-core" }
+async-trait = { workspace = true }
+tokio       = { workspace = true }
+futures     = { workspace = true }
+serde_json  = { workspace = true }
+url         = { workspace = true }

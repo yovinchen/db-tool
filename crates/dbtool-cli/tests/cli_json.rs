@@ -159,3 +159,17 @@ fn errors_stay_json_when_table_format_is_requested() {
     assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
     assert!(first["error"]["confirm_token"].as_str().is_some());
 }
+
+#[test]
+fn search_index_requires_write_flag_before_connecting() {
+    let err = stderr_json(&dbtool(&[
+        "--dsn",
+        "opensearch://127.0.0.1:1",
+        "search",
+        "index",
+        "users",
+        r#"{"name":"alice"}"#,
+    ]));
+
+    assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");
+}

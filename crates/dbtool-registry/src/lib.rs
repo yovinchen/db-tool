@@ -22,6 +22,11 @@ pub fn build_registry() -> Registry {
         r.register("mongodb", adapter_mongo::factory);
     }
 
+    #[cfg(feature = "search")]
+    {
+        r.register_family("opensearch", adapter_search::factory);
+    }
+
     #[cfg(feature = "kafka")]
     {
         r.register_family("kafka", adapter_kafka::factory);

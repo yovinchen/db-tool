@@ -12,7 +12,7 @@ usable.
 | Area | Status | Notes |
 | --- | --- | --- |
 | Core contracts | Implemented | `Connector`, capability traits, shared models, registry, DSN parsing, redaction, and protocol aliases are in place. |
-| CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `kv`, `doc`, `mq`, `ts`, and `search` command shells exist. |
+| CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `kv`, `doc`, `mq`, `search`, and `ts` command families exist. |
 | Output formats | Implemented | JSON is the default. `--format table` and `--format ndjson` are implemented for successful command output; errors always stay JSON so `error.code` and confirmation tokens remain machine-readable. |
 | SQL safety | Implemented | Read statements are allowed, writes need `--allow-write`, destructive SQL needs a confirm token bound to the target. |
 | Docker integration | Implemented | Base databases, compatibility databases, TiDB, TiDB secure HA, and messaging profiles are available. |
@@ -47,6 +47,8 @@ usable.
 | AMQP/RabbitMQ | `amqp://`, `amqps://` | AMQP | produce, consume, queue detail | RabbitMQ live test; `amqps://` routing is registered but TLS is not live-tested |
 | RabbitMQ management | `rabbitmq+http://` | RabbitMQ HTTP admin | queue list, detail, lag | RabbitMQ management live test |
 | NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS live test; `nats+tls://` routing is registered but TLS is not live-tested |
+| OpenSearch | `opensearch://` | Search HTTP | index list, search, single-document index | Service-free fake HTTP adapter tests and CLI write-guard test; no live Docker service yet |
+| Elasticsearch | `elasticsearch://` | Search HTTP | Routed to OpenSearch-compatible HTTP adapter | Service-free fake HTTP adapter tests; no live Docker service yet |
 
 ## Docker Service Profiles
 
@@ -69,14 +71,15 @@ usable.
 | KV | `kv get`, `kv set`, `kv scan`, `kv del`, `kv raw` | `set`, `del`, and mutating raw commands require `--allow-write` |
 | Document | `doc collections`, `doc find`, `doc insert`, `doc update`, `doc delete`, `doc aggregate` | insert/update/delete require `--allow-write`; delete refuses empty filters adapter-side |
 | Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write` |
-| Search | `search indices`, `search search` | CLI shell exists, but no backend is registered |
+| Search | `search indices`, `search search`, `search index` | `index` requires `--allow-write` |
 | Time series | `ts measurements`, `ts query` | CLI shell exists, but no backend is registered |
 
 ## Not Implemented Or Not Yet Fully Usable
 
 | Item | Status | Why it is not fully usable | Recommended next task |
 | --- | --- | --- | --- |
-| Search backend | Not implemented | The `SearchEngine` trait and CLI shell exist, but no Elasticsearch/OpenSearch adapter is registered. | Add an OpenSearch/Elasticsearch HTTP adapter with local Docker tests. |
+| Search live Docker profile | Partial | OpenSearch/Elasticsearch HTTP support is implemented with service-free tests, but a resource-bounded real service profile has not been added. | Add OpenSearch container lifecycle and live CLI tests if search compatibility needs real-server coverage. |
+| Search HTTPS/TLS | Not implemented | The current search adapter uses a small plain HTTP client over Tokio TCP. | Add a TLS-capable HTTP path before advertising `https` support. |
 | Time-series backend | Not implemented | The `TimeSeriesStore` trait and CLI shell exist, but no Prometheus/Influx adapter is registered. | Add a Prometheus HTTP read adapter first, then decide whether writes belong in scope. |
 | SQL Server | Not implemented | No TDS adapter, DSN scheme, Docker profile, or tests exist. | Add `sqlserver://` adapter and a SQL Server container profile if image cost is acceptable. |
 | Cassandra | Not implemented | No CQL adapter, DSN scheme, Docker profile, or tests exist. | Add only after SQL/KV/search/time-series scope stabilizes. |
@@ -89,8 +92,8 @@ usable.
 
 ## Next Implementation Queue
 
-1. Add Search backend, starting with OpenSearch/Elasticsearch HTTP because the CLI shell and trait already exist.
-2. Add Time-series backend, starting with Prometheus HTTP read operations.
+1. Add Time-series backend, starting with Prometheus HTTP read operations.
+2. Add OpenSearch/Elasticsearch live Docker coverage if real-server search verification becomes important.
 3. Harden PostgreSQL-family compatibility with live CockroachDB and TimescaleDB profiles.
-4. Add TLS live coverage for `amqps://` and `nats+tls://` aliases if secure messaging compatibility matters.
+4. Add TLS live coverage for `amqps://`, `nats+tls://`, and search HTTPS if secure protocol compatibility matters.
 5. Expand TUI only after the above core and CLI behavior remains stable.

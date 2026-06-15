@@ -93,7 +93,8 @@ Goal: release-quality packages and optional advanced backends.
 - [x] Make workflows reuse build artifacts and avoid duplicate builds.
 - [x] npm/pip/uv/mise packaging.
 - [x] Optional native Kafka implementation.
-- [ ] Future adapters: search, time-series HTTP, SQL Server, Cassandra.
+- [x] OpenSearch/Elasticsearch HTTP search adapter.
+- [ ] Future adapters: time-series HTTP, SQL Server, Cassandra.
 
 ## P7: Live Integration Automation
 
@@ -203,7 +204,9 @@ Goal: build a TUI that consumes the same verified core/CLI behavior.
 
 Goal: add new families only after the core behavior remains stable under integration tests.
 
-- [ ] Search backend adapter.
+- [x] Search backend adapter with OpenSearch/Elasticsearch HTTP index list/search/index operations.
+- [ ] OpenSearch/Elasticsearch resource-bounded Docker profile and live CLI tests.
+- [ ] Search HTTPS/TLS support.
 - [ ] Time-series HTTP adapter.
 - [ ] SQL Server adapter.
 - [ ] Cassandra adapter.

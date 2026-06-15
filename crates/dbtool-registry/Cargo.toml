@@ -8,7 +8,7 @@ license.workspace    = true
 repository.workspace = true
 
 [features]
-default = ["sql", "redis", "mongodb"]
+default = ["sql", "redis", "mongodb", "search"]
 
 # ── Capability features ────────────────────────────────────────────────────────
 mysql    = ["sql"]
@@ -17,6 +17,7 @@ sqlite   = ["sql"]
 sql      = ["dep:adapter-sql"]
 redis    = ["dep:adapter-redis"]
 mongodb  = ["dep:adapter-mongo"]
+search   = ["dep:adapter-search"]
 amqp     = ["dep:adapter-amqp"]
 nats     = ["dep:adapter-nats"]
 mq       = ["nats", "amqp", "redis"]
@@ -26,7 +27,7 @@ kafka         = ["dep:adapter-kafka", "adapter-kafka/backend-pure"]
 kafka-native  = ["dep:adapter-kafka", "adapter-kafka/backend-native"]
 
 # ── Preset bundles ─────────────────────────────────────────────────────────────
-full        = ["sql", "redis", "mongodb", "mq", "kafka"]
+full        = ["sql", "redis", "mongodb", "search", "mq", "kafka"]
 full-native = ["full", "kafka-native"]
 
 [dependencies]
@@ -34,6 +35,7 @@ dbtool-core   = { path = "../dbtool-core" }
 adapter-sql   = { path = "../adapter-sql",   optional = true }
 adapter-redis = { path = "../adapter-redis", optional = true }
 adapter-mongo = { path = "../adapter-mongo", optional = true }
+adapter-search = { path = "../adapter-search", optional = true }
 adapter-kafka = { path = "../adapter-kafka", optional = true, default-features = false }
 adapter-amqp  = { path = "../adapter-amqp",  optional = true }
 adapter-nats  = { path = "../adapter-nats",  optional = true }
