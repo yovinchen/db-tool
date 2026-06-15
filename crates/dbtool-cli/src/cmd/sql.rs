@@ -2,7 +2,7 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    service::{formatter::Formatter, limiter::ResultLimiter, safety::SafetyGuard},
+    service::{limiter::ResultLimiter, safety::SafetyGuard},
     Result,
 };
 
@@ -55,7 +55,7 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             let rs = sql_engine.query(&sql, &[]).await?;
             let rs = ResultLimiter::new(ctx.limit).apply(rs);
             let truncated = rs.truncated;
-            Formatter::success(
+            ctx.render_success(
                 conn.kind().0.as_str(),
                 rs,
                 start.elapsed().as_millis() as u64,
@@ -64,7 +64,7 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
         }
         SqlAction::Exec { sql } => {
             let outcome = sql_engine.execute(&sql, &[]).await?;
-            Formatter::success(
+            ctx.render_success(
                 conn.kind().0.as_str(),
                 outcome,
                 start.elapsed().as_millis() as u64,
@@ -73,7 +73,7 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
         }
         SqlAction::Tables { schema } => {
             let tables = sql_engine.list_tables(schema.as_deref()).await?;
-            Formatter::success(
+            ctx.render_success(
                 conn.kind().0.as_str(),
                 tables,
                 start.elapsed().as_millis() as u64,
@@ -82,7 +82,7 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
         }
         SqlAction::Schema { table } => {
             let schema = sql_engine.describe_table(&table).await?;
-            Formatter::success(
+            ctx.render_success(
                 conn.kind().0.as_str(),
                 schema,
                 start.elapsed().as_millis() as u64,

@@ -1,6 +1,6 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{error::Error, model::TimeRange, service::formatter::Formatter, Result};
+use dbtool_core::{error::Error, model::TimeRange, Result};
 
 #[derive(Args)]
 pub struct TsCmd {
@@ -31,7 +31,7 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
     let kind = conn.kind().0.clone();
 
     Ok(match cmd.action {
-        TsAction::Measurements => Formatter::success(
+        TsAction::Measurements => ctx.render_success(
             &kind,
             ts.list_measurements().await?,
             start.elapsed().as_millis() as u64,
@@ -44,7 +44,7 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
             let range = TimeRange::last_n_minutes(last_minutes);
             let result = ts.query_range(&query, range).await?;
             let truncated = result.truncated;
-            Formatter::success(&kind, result, start.elapsed().as_millis() as u64, truncated)
+            ctx.render_success(&kind, result, start.elapsed().as_millis() as u64, truncated)
         }
     })
 }

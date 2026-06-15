@@ -47,7 +47,7 @@ Goal: machine-readable CLI suitable for Claude Code skill calls.
 
 - [x] `ping`, `caps`, `conn list`, `sql`, `kv`, `doc`, `mq`, `ts`, `search` command shell.
 - [x] Named connection resolution via core.
-- [x] Table/NDJSON format support or documented JSON-only scope.
+- [x] Table/NDJSON format support.
 - [x] `SKILL.md` with command examples and safety workflow.
 - [x] CLI integration tests for JSON envelopes and error codes.
 

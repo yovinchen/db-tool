@@ -3,7 +3,6 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     config::{env::discover_env_connections, ConnectionConfig},
     dsn::redact_dsn,
-    service::formatter::Formatter,
     Result,
 };
 
@@ -41,7 +40,7 @@ pub async fn run(ctx: &Context, cmd: ConnCmd) -> Result<String> {
                 .collect();
             file_connections.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
 
-            Formatter::success(
+            ctx.render_success(
                 "registry",
                 serde_json::json!({
                     "supported_schemes": schemes,

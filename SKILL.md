@@ -33,7 +33,7 @@ Use dbtool when you need to inspect SQL databases, key-value stores, document st
 
 ## Output Contract
 
-Current CLI output is JSON-only. The envelope is stable:
+Default CLI output is JSON. The envelope is stable:
 
 ```json
 {
@@ -48,6 +48,13 @@ Current CLI output is JSON-only. The envelope is stable:
 ```
 
 On failure, read `error.code` before interpreting the message. Useful codes include `UNSUPPORTED_CAPABILITY`, `WRITE_NOT_ALLOWED`, and `CONFIRM_REQUIRED`.
+
+For human inspection or pipelines, request an alternate successful-output format:
+
+```bash
+dbtool --conn <name> --format table sql query "select id, name from users"
+dbtool --conn <name> --format ndjson sql query "select id, name from users"
+```
 
 ## Safety Workflow
 

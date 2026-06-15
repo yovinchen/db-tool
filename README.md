@@ -69,6 +69,8 @@ Examples:
 cargo run -p dbtool-cli -- --dsn sqlite::memory: ping
 cargo run -p dbtool-cli -- conn list
 cargo run -p dbtool-cli -- --dsn sqlite::memory: sql query "select 1"
+cargo run -p dbtool-cli -- --dsn sqlite::memory: --format table sql query "select 1 as id"
+cargo run -p dbtool-cli -- --dsn sqlite::memory: --format ndjson sql query "select 1 as id"
 cargo run -p dbtool-cli -- --conn redis-local kv get my-key
 ```
 
@@ -107,7 +109,7 @@ This keeps the CLI non-interactive and machine-readable, which is important for 
 
 ## Claude Skill Usage
 
-The project-level [SKILL.md](SKILL.md) documents the automation contract for Claude-style callers. The current CLI scope is JSON-only even though the global `--format` flag is reserved for future table and NDJSON renderers.
+The project-level [SKILL.md](SKILL.md) documents the automation contract for Claude-style callers. JSON remains the default machine-readable output, and `--format table` / `--format ndjson` are available for human inspection or pipeline use.
 
 ## Verification
 

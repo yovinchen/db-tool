@@ -1,7 +1,7 @@
 mod cmd;
 
 use clap::{Parser, Subcommand};
-use dbtool_core::service::formatter::{Format, Formatter};
+use dbtool_core::service::formatter::Format;
 use dbtool_registry::build_registry;
 use tracing_subscriber::EnvFilter;
 
@@ -85,7 +85,7 @@ async fn main() {
         registry,
         conn: cli.conn,
         dsn: cli.dsn,
-        _format: cli.format.parse().unwrap_or(Format::Json),
+        format: cli.format.parse().unwrap_or(Format::Json),
         limit: cli.limit,
         allow_write: cli.allow_write,
         confirm: cli.confirm,
@@ -106,7 +106,7 @@ async fn main() {
     match result {
         Ok(output) => println!("{output}"),
         Err(e) => {
-            let output = Formatter::error(&e);
+            let output = ctx.render_error(&e);
             eprintln!("{output}");
             std::process::exit(1);
         }

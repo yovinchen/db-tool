@@ -1,8 +1,6 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{
-    error::Error, port::capability::SearchOptions, service::formatter::Formatter, Result,
-};
+use dbtool_core::{error::Error, port::capability::SearchOptions, Result};
 
 #[derive(Args)]
 pub struct SearchCmd {
@@ -33,7 +31,7 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
     let kind = conn.kind().0.clone();
 
     Ok(match cmd.action {
-        SearchAction::Indices => Formatter::success(
+        SearchAction::Indices => ctx.render_success(
             &kind,
             se.list_indices().await?,
             start.elapsed().as_millis() as u64,
@@ -47,7 +45,7 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
                 ..Default::default()
             };
             let hits = se.search(&index, query.into(), opts).await?;
-            Formatter::success(&kind, hits, start.elapsed().as_millis() as u64, false)
+            ctx.render_success(&kind, hits, start.elapsed().as_millis() as u64, false)
         }
     })
 }

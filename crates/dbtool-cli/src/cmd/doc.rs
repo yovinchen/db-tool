@@ -3,7 +3,6 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     model::{Document, FindOptions, Value},
-    service::formatter::Formatter,
     Result,
 };
 
@@ -58,7 +57,7 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
 
     Ok(match cmd.action {
         DocAction::Collections => {
-            Formatter::success(&kind, doc.list_collections().await?, elapsed(), false)
+            ctx.render_success(&kind, doc.list_collections().await?, elapsed(), false)
         }
         DocAction::Find { collection, filter } => {
             let f: serde_json::Value =
@@ -69,7 +68,7 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             };
             let docs = doc.find(&collection, f.into(), opts).await?;
             let truncated = docs.len() >= ctx.limit;
-            Formatter::success(&kind, docs, elapsed(), truncated)
+            ctx.render_success(&kind, docs, elapsed(), truncated)
         }
         DocAction::Insert {
             collection,
@@ -78,7 +77,7 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             ensure_write_allowed(ctx)?;
             let d = parse_document(&raw_doc)?;
             let outcome = doc.insert(&collection, vec![d]).await?;
-            Formatter::success(&kind, outcome, elapsed(), false)
+            ctx.render_success(&kind, outcome, elapsed(), false)
         }
         DocAction::Update {
             collection,
@@ -89,13 +88,13 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             let filter = parse_json_value(&filter)?;
             let update = parse_json_value(&update)?;
             let outcome = doc.update(&collection, filter, update).await?;
-            Formatter::success(&kind, outcome, elapsed(), false)
+            ctx.render_success(&kind, outcome, elapsed(), false)
         }
         DocAction::Delete { collection, filter } => {
             ensure_write_allowed(ctx)?;
             let filter = parse_json_value(&filter)?;
             let deleted = doc.delete(&collection, filter).await?;
-            Formatter::success(
+            ctx.render_success(
                 &kind,
                 serde_json::json!({ "deleted": deleted }),
                 elapsed(),
@@ -109,7 +108,7 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             let pipeline = parse_pipeline(&pipeline)?;
             let docs = doc.aggregate(&collection, pipeline).await?;
             let truncated = docs.len() >= ctx.limit;
-            Formatter::success(&kind, docs, elapsed(), truncated)
+            ctx.render_success(&kind, docs, elapsed(), truncated)
         }
     })
 }

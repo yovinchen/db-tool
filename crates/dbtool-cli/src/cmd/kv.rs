@@ -1,8 +1,6 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{
-    error::Error, port::capability::SetOptions, service::formatter::Formatter, Result,
-};
+use dbtool_core::{error::Error, port::capability::SetOptions, Result};
 
 #[derive(Args)]
 pub struct KvCmd {
@@ -50,7 +48,7 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
         KvAction::Get { key } => {
             let val = kv.get(&key).await?;
             let s = val.map(|b| String::from_utf8_lossy(&b).into_owned());
-            Formatter::success(
+            ctx.render_success(
                 &kind,
                 serde_json::json!({"key": key, "value": s}),
                 elapsed(),
@@ -68,17 +66,17 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
                 },
             )
             .await?;
-            Formatter::success(&kind, serde_json::json!({"ok": true}), elapsed(), false)
+            ctx.render_success(&kind, serde_json::json!({"ok": true}), elapsed(), false)
         }
         KvAction::Scan { pattern } => {
             let keys = kv.scan(&pattern, ctx.limit).await?;
             let truncated = keys.len() >= ctx.limit;
-            Formatter::success(&kind, keys, elapsed(), truncated)
+            ctx.render_success(&kind, keys, elapsed(), truncated)
         }
         KvAction::Del { keys } => {
             ensure_write_allowed(ctx)?;
             let n = kv.delete(&keys).await?;
-            Formatter::success(&kind, serde_json::json!({"deleted": n}), elapsed(), false)
+            ctx.render_success(&kind, serde_json::json!({"deleted": n}), elapsed(), false)
         }
         KvAction::Raw { args } => {
             if args.is_empty() {
@@ -90,7 +88,7 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
                 ensure_write_allowed(ctx)?;
             }
             let val = kv.raw_command(&args).await?;
-            Formatter::success(&kind, val, elapsed(), false)
+            ctx.render_success(&kind, val, elapsed(), false)
         }
     })
 }

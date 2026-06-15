@@ -3,7 +3,6 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     model::{ConsumeOptions, Message},
-    service::formatter::Formatter,
     Result,
 };
 use std::time::Duration;
@@ -66,7 +65,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                 timestamp: None,
             };
             let outcome = producer.produce(&topic, vec![msg]).await?;
-            Formatter::success(&kind, outcome, elapsed(), false)
+            ctx.render_success(&kind, outcome, elapsed(), false)
         }
         MqAction::Consume {
             topic,
@@ -86,7 +85,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             };
             let msgs = consumer.consume(&topic, opts).await?;
             let truncated = msgs.len() >= max;
-            Formatter::success(&kind, msgs, elapsed(), truncated)
+            ctx.render_success(&kind, msgs, elapsed(), truncated)
         }
         MqAction::Topics => {
             let admin = conn
@@ -96,7 +95,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                     needed: "AdminInspect",
                 })?;
             let topics = admin.list_topics().await?;
-            Formatter::success(&kind, topics, elapsed(), false)
+            ctx.render_success(&kind, topics, elapsed(), false)
         }
         MqAction::Detail { topic } => {
             let admin = conn
@@ -106,7 +105,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                     needed: "AdminInspect",
                 })?;
             let detail = admin.topic_detail(&topic).await?;
-            Formatter::success(&kind, detail, elapsed(), false)
+            ctx.render_success(&kind, detail, elapsed(), false)
         }
         MqAction::Lag { group } => {
             let admin = conn
@@ -116,7 +115,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                     needed: "AdminInspect",
                 })?;
             let lag = admin.consumer_lag(&group).await?;
-            Formatter::success(&kind, lag, elapsed(), false)
+            ctx.render_success(&kind, lag, elapsed(), false)
         }
     })
 }
