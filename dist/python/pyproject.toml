@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbtool-bin"
+version = "0.0.0-development"
+description = "dbtool command-line binary wrapper"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "YoVinchen", email = "gzh298255@gmail.com" }]
+
+[project.scripts]
+dbtool = "dbtool_bin.cli:main"

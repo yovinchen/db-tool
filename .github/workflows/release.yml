@@ -54,32 +54,102 @@ jobs:
           ${{ matrix.use_cross && 'cross' || 'cargo' }} build --release \
             --target ${{ matrix.target }} -p dbtool-cli
 
-      - name: Package
+      - name: Prepare binary artifact
         shell: bash
         run: |
           BIN=target/${{ matrix.target }}/release/dbtool${{ matrix.suffix }}
-          ARCHIVE=dbtool-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-          tar czf "$ARCHIVE" -C "$(dirname $BIN)" "$(basename $BIN)"
-          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+          mkdir -p dist-bin/${{ matrix.target }}
+          cp "$BIN" dist-bin/${{ matrix.target }}/dbtool${{ matrix.suffix }}
+          chmod +x dist-bin/${{ matrix.target }}/dbtool${{ matrix.suffix }}
+
+      - name: Smoke binary artifact
+        shell: bash
+        run: scripts/smoke-binary.sh ${{ matrix.target }} dist-bin/${{ matrix.target }}/dbtool${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dbtool-${{ matrix.target }}
-          path: ${{ env.ARCHIVE }}
+          name: dbtool-bin-${{ matrix.target }}
+          path: dist-bin/${{ matrix.target }}/dbtool${{ matrix.suffix }}
+
+  package-release:
+    name: Package release archives
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package archives
+        run: scripts/package-release.sh artifacts release-dist ${{ github.ref_name }}
+
+      - name: Smoke packaged archives
+        run: scripts/smoke-release-artifacts.sh release-dist
+
+      - name: Upload release archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbtool-release-archives
+          path: release-dist/*.tar.gz
+
+  package-npm:
+    name: Package npm wrappers
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package npm tarballs
+        run: node scripts/package-npm.mjs artifacts npm-dist ${{ github.ref_name }}
+
+      - name: Upload npm packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbtool-npm-packages
+          path: npm-dist/*.tgz
+
+  package-python:
+    name: Package pip/uv wheels
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package wheels
+        run: python3 scripts/package-python-wheel.py artifacts python-dist ${{ github.ref_name }}
+
+      - name: Upload Python wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbtool-python-wheels
+          path: python-dist/*.whl
 
   release:
     name: Create GitHub Release
-    needs: build-matrix
+    needs:
+      - package-release
+      - package-npm
+      - package-python
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
+          name: dbtool-release-archives
+          path: release-dist
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: release-dist/*.tar.gz
           generate_release_notes: true

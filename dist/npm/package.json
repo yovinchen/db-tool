@@ -1,0 +1,20 @@
+{
+  "name": "@yovinchen/dbtool",
+  "version": "0.0.0-development",
+  "description": "Unified data and message connection CLI",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YoVinchen/db-tool.git"
+  },
+  "bin": {
+    "dbtool": "bin/dbtool.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -87,8 +87,8 @@ Goal: bounded message operations with no external runtime dependencies.
 Goal: release-quality packages and optional advanced backends.
 
 - [x] CI/release workflow scaffold.
-- [ ] Make workflows reuse build artifacts and avoid duplicate builds.
-- [ ] npm/pip/uv/mise packaging.
+- [x] Make workflows reuse build artifacts and avoid duplicate builds.
+- [x] npm/pip/uv/mise packaging.
 - [ ] Optional native Kafka implementation.
 - [ ] Future adapters: search, time-series HTTP, SQL Server, Cassandra.
 
@@ -133,11 +133,11 @@ Goal: make verification repeatable locally and in CI without forcing Docker on e
 
 Goal: ship installable artifacts without duplicating build work.
 
-- [ ] Reuse release workflow build artifacts.
-- [ ] npm package wrapper.
-- [ ] pip/uv package wrapper.
-- [ ] mise install metadata.
-- [ ] Release smoke tests against packaged binaries.
+- [x] Reuse release workflow build artifacts.
+- [x] npm package wrapper.
+- [x] pip/uv package wrapper.
+- [x] mise install metadata.
+- [x] Release smoke tests against packaged binaries.
 
 ### T4: TUI After Core Stability
 

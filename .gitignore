@@ -8,4 +8,8 @@ connections.toml
 dist/npm/node_modules/
 dist/python/dist/
 dist/python/__pycache__/
+__pycache__/
+release-dist/
+npm-dist/
+python-dist/
 .DS_Store

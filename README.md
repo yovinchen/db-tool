@@ -146,6 +146,15 @@ Live messaging integration tests start Redis, Redpanda, RabbitMQ, and NATS:
 
 See [docs/integration-testing.md](docs/integration-testing.md) for custom project names, database names, ports, credentials, resource limits, and cleanup.
 
+## Distribution
+
+Release builds compile each target once, upload raw binary artifacts, and reuse those artifacts for GitHub Release archives plus npm and pip/uv wrappers.
+
+- GitHub Release assets: `dbtool-<tag>-<target>.tar.gz`
+- npm wrapper: `@yovinchen/dbtool`
+- pip/uv wrapper: `dbtool-bin`
+- mise/ubi: consumes the GitHub Release asset names documented in [dist/mise/README.md](dist/mise/README.md)
+
 ## Implementation Status
 
 - Core contracts and services: implemented as the main foundation.
@@ -153,4 +162,4 @@ See [docs/integration-testing.md](docs/integration-testing.md) for custom projec
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; protocol-limited admin remains future work.
 - TUI: intentionally minimal while core stabilizes.
-- Release packaging: workflow scaffold exists; signing/notarization is still future work.
+- Release packaging: GitHub Release archive, npm, pip/uv, and mise/ubi metadata are wired; signing/notarization is still future work.
