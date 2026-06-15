@@ -15,6 +15,10 @@ fn compat_enabled(flag: &str) -> bool {
         && env::var(flag).as_deref() == Ok("1")
 }
 
+fn tidb_enabled() -> bool {
+    env::var("DBTOOL_RUN_TIDB_INTEGRATION").as_deref() == Ok("1")
+}
+
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args(args)
@@ -107,7 +111,8 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
 
     let schema = stdout_json(dbtool(&["--dsn", dsn, "sql", "schema", table]));
     assert_eq!(schema["ok"], true);
-    assert_eq!(schema["data"]["name"], table);
+    let expected_schema_name = table.rsplit('.').next().unwrap_or(table);
+    assert_eq!(schema["data"]["name"], expected_schema_name);
 
     confirmed_sql_exec(dsn, &drop_sql);
 }
@@ -291,6 +296,30 @@ fn mariadb_compat_live_sql_lifecycle_and_typed_values() {
         &table,
         format!("create table {table} (id integer primary key, name varchar(64) not null)"),
         format!("drop table {table}"),
+    );
+}
+
+#[test]
+fn tidb_compat_live_sql_lifecycle_and_typed_values() {
+    if !tidb_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_TIDB_DSN") else {
+        return;
+    };
+    let database = env::var("DBTOOL_IT_TIDB_DB").unwrap_or_else(|_| "dbtool_it_tidb".to_owned());
+    let table = unique_name("dbtool_tidb_users");
+    let qualified_table = format!("{database}.{table}");
+
+    mysql_family_typed_probe(&dsn, "tidb");
+    confirmed_sql_exec(&dsn, &format!("create database if not exists {database}"));
+    sql_lifecycle(
+        &dsn,
+        &qualified_table,
+        format!(
+            "create table {qualified_table} (id integer primary key, name varchar(64) not null)"
+        ),
+        format!("drop table {qualified_table}"),
     );
 }
 

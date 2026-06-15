@@ -10,4 +10,5 @@ docker compose \
   --profile messaging \
   --profile compat \
   --profile compat-extra \
+  --profile tidb \
   down -v --remove-orphans

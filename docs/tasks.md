@@ -102,6 +102,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Docker Compose integration environment for Postgres, MySQL, Redis, and MongoDB.
 - [x] Docker Compose compatibility profile for MariaDB and Valkey.
 - [x] Docker Compose compatibility-extra profile for KeyDB and Dragonfly.
+- [x] Docker Compose TiDB profile for PD, TiKV, and TiDB SQL server.
 - [x] Docker Compose messaging profile for Redis, Redpanda, RabbitMQ, and NATS.
 - [x] Custom project name, database names, credentials, and host ports through environment variables.
 - [x] CPU/memory/resource limits for integration services.
@@ -109,6 +110,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Live CLI tests for SQL, KV, and document workflows.
 - [x] Live CLI tests for MySQL protocol aliases and Redis-compatible protocol aliases.
 - [x] Live CLI tests for real MariaDB, Valkey, KeyDB, and Dragonfly compatibility services.
+- [x] Live CLI tests for real TiDB compatibility service.
 - [x] Live CLI tests for Redis Streams/PubSub, Kafka, AMQP, and NATS messaging workflows.
 - [x] Documented integration workflow and cleanup.
 
@@ -135,6 +137,7 @@ Goal: make verification repeatable locally and in CI without forcing Docker on e
 - [x] CI profile for service-free `./scripts/verify.sh`.
 - [x] Optional CI/manual profile for `./scripts/integration-test.sh`.
 - [x] Compose config validation in CI.
+- [x] Optional CI/manual profiles for compatible database and TiDB integration scripts.
 - [x] Document required Docker resources and failure recovery.
 - [x] Optional native Kafka integration script using the messaging Docker profile.
 
@@ -176,9 +179,11 @@ Goal: prove compatible database protocols against real compatible services.
 - [x] Add a lightweight `compat` Docker profile for MariaDB and Valkey.
 - [x] Add a `compat-extra` Docker profile for KeyDB and Dragonfly.
 - [x] Add `integration-compat-up.sh` and `integration-compat-test.sh`.
+- [x] Add a resource-bounded TiDB profile with PD, TiKV, and TiDB SQL server.
+- [x] Add `integration-tidb-up.sh` and `integration-tidb-test.sh`.
 - [x] Live-test `mariadb://` SQL lifecycle, typed values, and limiting against MariaDB.
+- [x] Live-test `tidb://` SQL lifecycle, typed values, limiting, safety confirmation, and schema-qualified table names against TiDB.
 - [x] Live-test `valkey://`, `keydb://`, and `dragonfly://` KV lifecycle, raw write guard, and TTL against their real services.
-- [ ] Add a resource-bounded TiDB profile; TiDB requires a heavier PD/TiKV/TiDB topology or a validated standalone mode.
 
 ### T4: TUI After Core Stability
 

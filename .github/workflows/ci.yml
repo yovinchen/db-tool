@@ -11,8 +11,23 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_compat:
+        description: "Run Docker-backed compatible database integration tests"
+        required: false
+        type: boolean
+        default: false
+      run_live_tidb:
+        description: "Run Docker-backed TiDB compatibility integration tests"
+        required: false
+        type: boolean
+        default: false
       run_live_messaging:
         description: "Run Docker-backed messaging integration tests"
+        required: false
+        type: boolean
+        default: false
+      run_live_messaging_native:
+        description: "Run Docker-backed messaging integration tests with native Kafka"
         required: false
         type: boolean
         default: false
@@ -62,6 +77,12 @@ jobs:
 
       - name: Validate base integration compose config
         run: docker compose -f docker-compose.integration.yml config
+
+      - name: Validate compatibility integration compose config
+        run: docker compose -f docker-compose.integration.yml --profile compat --profile compat-extra config
+
+      - name: Validate TiDB integration compose config
+        run: docker compose -f docker-compose.integration.yml --profile tidb config
 
       - name: Validate messaging integration compose config
         run: docker compose -f docker-compose.integration.yml --profile messaging config
@@ -141,6 +162,41 @@ jobs:
       - name: Run SQL/KV/document integration tests
         run: ./scripts/integration-test.sh
 
+  integration-compat:
+    name: Live compatibility integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_compat
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-compat
+      DBTOOL_IT_MARIADB_PORT: 33306
+      DBTOOL_IT_VALKEY_PORT: 36379
+      DBTOOL_IT_KEYDB_PORT: 36380
+      DBTOOL_IT_DRAGONFLY_PORT: 36381
+      DBTOOL_IT_COMPAT_EXTRA: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run compatible database integration tests
+        run: ./scripts/integration-compat-test.sh
+
+  integration-tidb:
+    name: Live TiDB compatibility integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_tidb
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-tidb
+      DBTOOL_IT_TIDB_PORT: 34000
+      DBTOOL_IT_TIDB_STATUS_PORT: 31080
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run TiDB compatibility integration tests
+        run: ./scripts/integration-tidb-test.sh
+
   integration-messaging:
     name: Live messaging integration
     if: github.event_name == 'workflow_dispatch' && inputs.run_live_messaging
@@ -160,3 +216,23 @@ jobs:
 
       - name: Run messaging integration tests
         run: ./scripts/integration-mq-test.sh
+
+  integration-messaging-native:
+    name: Live messaging native Kafka integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_messaging_native
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-mq-native
+      DBTOOL_IT_REDIS_PORT: 46379
+      DBTOOL_IT_KAFKA_PORT: 39092
+      DBTOOL_IT_KAFKA_ADMIN_PORT: 39644
+      DBTOOL_IT_AMQP_PORT: 35672
+      DBTOOL_IT_NATS_PORT: 34222
+      DBTOOL_IT_NATS_MONITOR_PORT: 38222
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run native Kafka messaging integration tests
+        run: ./scripts/integration-mq-native-test.sh
