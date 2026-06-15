@@ -49,10 +49,12 @@ sqlx          = { version = "0.8", default-features = false, features = [
 sqlparser     = "0.51"
 
 # ── KV ────────────────────────────────────────────────────────────────────────
-redis         = { version = "0.27", features = ["tokio-comp", "tls-rustls-insecure"] }
+redis         = { version = "0.27", features = ["tokio-rustls-comp", "tls-rustls-insecure"] }
 
 # ── Document ──────────────────────────────────────────────────────────────────
-mongodb       = { version = "3", default-features = false, features = ["rustls-tls"] }
+mongodb       = { version = "3", default-features = false, features = [
+                    "compat-3-3-0", "bson-2", "rustls-tls",
+                ] }
 
 # ── Messaging ─────────────────────────────────────────────────────────────────
 rskafka       = "0.5"

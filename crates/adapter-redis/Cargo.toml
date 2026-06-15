@@ -11,6 +11,7 @@ repository.workspace = true
 dbtool-core  = { path = "../dbtool-core" }
 async-trait  = { workspace = true }
 tokio        = { workspace = true }
+futures      = { workspace = true }
 thiserror    = { workspace = true }
 serde_json   = { workspace = true }
 tracing      = { workspace = true }
