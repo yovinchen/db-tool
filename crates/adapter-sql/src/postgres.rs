@@ -10,6 +10,11 @@ use dbtool_core::{
 use futures::future::BoxFuture;
 use sqlx::{Column, PgPool, Row};
 
+use crate::{
+    identifier::{parse_table_ref, validate_optional_schema},
+    value::{column_type_name, postgres_value},
+};
+
 pub struct PostgresAdapter {
     pool: PgPool,
     kind: ConnectorKind,
@@ -73,22 +78,14 @@ impl SqlEngine for PostgresAdapter {
             .iter()
             .map(|c| ColumnMeta {
                 name: c.name().to_owned(),
-                type_name: c.type_info().to_string(),
+                type_name: column_type_name(c),
                 nullable: true,
             })
             .collect();
 
         let result_rows = rows
             .iter()
-            .map(|row| {
-                (0..columns.len())
-                    .map(|i| {
-                        row.try_get::<String, _>(i)
-                            .map(Value::Text)
-                            .unwrap_or(Value::Null)
-                    })
-                    .collect()
-            })
+            .map(|row| (0..columns.len()).map(|i| postgres_value(row, i)).collect())
             .collect();
 
         Ok(ResultSet {
@@ -119,7 +116,7 @@ impl SqlEngine for PostgresAdapter {
     }
 
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
-        let s = schema.unwrap_or("public");
+        let s = validate_optional_schema(schema)?.unwrap_or("public");
         let rows = sqlx::query(
             "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = $1",
         )
@@ -142,11 +139,14 @@ impl SqlEngine for PostgresAdapter {
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
+        let table_ref = parse_table_ref(table)?;
+        let schema = table_ref.schema.as_deref().unwrap_or("public");
         let rows = sqlx::query(
             "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
-             WHERE table_name = $1 ORDER BY ordinal_position",
+             WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
         )
-        .bind(table)
+        .bind(schema)
+        .bind(&table_ref.name)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| Error::Query(e.to_string()))?;
@@ -160,7 +160,7 @@ impl SqlEngine for PostgresAdapter {
             })
             .collect();
         Ok(TableSchema {
-            name: table.to_owned(),
+            name: table_ref.name,
             columns,
             indexes: vec![],
         })

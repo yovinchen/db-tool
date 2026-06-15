@@ -66,10 +66,10 @@ All CLI responses are JSON envelopes by default:
 Examples:
 
 ```bash
-cargo run -p dbtool-cli -- ping --dsn sqlite::memory:
+cargo run -p dbtool-cli -- --dsn sqlite::memory: ping
 cargo run -p dbtool-cli -- conn list
-cargo run -p dbtool-cli -- sql query "select 1" --dsn sqlite::memory:
-cargo run -p dbtool-cli -- kv get my-key --conn redis-local
+cargo run -p dbtool-cli -- --dsn sqlite::memory: sql query "select 1"
+cargo run -p dbtool-cli -- --conn redis-local kv get my-key
 ```
 
 Named connections resolve in this order:
@@ -105,6 +105,10 @@ SQL execution is guarded before it reaches adapters:
 
 This keeps the CLI non-interactive and machine-readable, which is important for Claude Code skill usage.
 
+## Claude Skill Usage
+
+The project-level [SKILL.md](SKILL.md) documents the automation contract for Claude-style callers. The current CLI scope is JSON-only even though the global `--format` flag is reserved for future table and NDJSON renderers.
+
 ## Verification
 
 Manifest-level validation that does not need dependency downloads:
@@ -116,9 +120,16 @@ cargo metadata --no-deps --format-version 1
 Full checks require crates.io access the first time dependencies are downloaded:
 
 ```bash
+./scripts/verify.sh
+```
+
+The script runs:
+
+```bash
 cargo fmt --all -- --check
-cargo test -p dbtool-core
 cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 ## Implementation Status

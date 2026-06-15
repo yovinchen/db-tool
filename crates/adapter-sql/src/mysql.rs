@@ -10,6 +10,11 @@ use dbtool_core::{
 use futures::future::BoxFuture;
 use sqlx::{Column, MySqlPool, Row};
 
+use crate::{
+    identifier::{parse_table_ref, validate_optional_schema},
+    value::{column_type_name, mysql_value},
+};
+
 pub struct MySqlAdapter {
     pool: MySqlPool,
     kind: ConnectorKind,
@@ -75,22 +80,14 @@ impl SqlEngine for MySqlAdapter {
             .iter()
             .map(|c| ColumnMeta {
                 name: c.name().to_owned(),
-                type_name: c.type_info().to_string(),
+                type_name: column_type_name(c),
                 nullable: true,
             })
             .collect();
 
         let result_rows: Vec<Vec<Value>> = rows
             .iter()
-            .map(|row| {
-                (0..columns.len())
-                    .map(|i| {
-                        row.try_get::<String, _>(i)
-                            .map(Value::Text)
-                            .unwrap_or(Value::Null)
-                    })
-                    .collect()
-            })
+            .map(|row| (0..columns.len()).map(|i| mysql_value(row, i)).collect())
             .collect();
 
         Ok(ResultSet {
@@ -120,6 +117,7 @@ impl SqlEngine for MySqlAdapter {
     }
 
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
+        let schema = validate_optional_schema(schema)?;
         let rows = if let Some(schema) = schema {
             sqlx::query(
                 "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
@@ -151,10 +149,27 @@ impl SqlEngine for MySqlAdapter {
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
-        let rows = sqlx::query(&format!("DESCRIBE `{table}`"))
+        let table_ref = parse_table_ref(table)?;
+        let schema = table_ref.schema.as_deref();
+        let rows = if let Some(schema) = schema {
+            sqlx::query(
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            )
+            .bind(schema)
+            .bind(&table_ref.name)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
+        } else {
+            sqlx::query(
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+            )
+            .bind(&table_ref.name)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| Error::Query(e.to_string()))?;
 
         let columns = rows
             .iter()
@@ -166,7 +181,7 @@ impl SqlEngine for MySqlAdapter {
             .collect();
 
         Ok(TableSchema {
-            name: table.to_owned(),
+            name: table_ref.name,
             columns,
             indexes: vec![],
         })

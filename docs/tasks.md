@@ -35,10 +35,10 @@ Goal: MySQL/Postgres/SQLite adapters and SQL CLI commands.
 - [x] SQL adapter crate scaffold.
 - [x] MySQL/Postgres/SQLite factories.
 - [x] Protocol aliases for MariaDB/TiDB/Cockroach/Timescale/Redshift.
-- [ ] Correct typed value extraction from SQL rows.
-- [ ] Safe identifier handling for schema/table commands.
-- [ ] SQLite smoke tests with in-memory database.
-- [ ] SQL CLI query/exec/tables/schema verified.
+- [x] Correct typed value extraction from SQL rows.
+- [x] Safe identifier handling for schema/table commands.
+- [x] SQLite smoke tests with in-memory database.
+- [x] SQL CLI query/exec/tables/schema verified.
 
 ## P2: CLI And Claude Skill Surface
 
@@ -46,9 +46,9 @@ Goal: machine-readable CLI suitable for Claude Code skill calls.
 
 - [x] `ping`, `caps`, `conn list`, `sql`, `kv`, `doc`, `mq`, `ts`, `search` command shell.
 - [x] Named connection resolution via core.
-- [ ] Table/NDJSON format support or documented JSON-only scope.
-- [ ] `SKILL.md` with command examples and safety workflow.
-- [ ] CLI integration tests for JSON envelopes and error codes.
+- [x] Table/NDJSON format support or documented JSON-only scope.
+- [x] `SKILL.md` with command examples and safety workflow.
+- [x] CLI integration tests for JSON envelopes and error codes.
 
 ## P3: KV And Document Stores
 
