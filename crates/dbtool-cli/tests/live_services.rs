@@ -19,6 +19,10 @@ fn tidb_enabled() -> bool {
     env::var("DBTOOL_RUN_TIDB_INTEGRATION").as_deref() == Ok("1")
 }
 
+fn tidb_secure_enabled() -> bool {
+    env::var("DBTOOL_RUN_TIDB_SECURE_INTEGRATION").as_deref() == Ok("1")
+}
+
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args(args)
@@ -58,6 +62,10 @@ fn dsn(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+fn required_env(name: &str) -> String {
+    env::var(name).unwrap_or_else(|_| panic!("{name} should be set for this integration test"))
+}
+
 fn dsn_with_scheme(dsn: &str, scheme: &str) -> String {
     let (_, rest) = dsn
         .split_once("://")
@@ -67,6 +75,30 @@ fn dsn_with_scheme(dsn: &str, scheme: &str) -> String {
 
 fn confirmed_sql_exec(dsn: &str, sql: &str) -> Value {
     let first = stderr_json(dbtool(&["--dsn", dsn, "--allow-write", "sql", "exec", sql]));
+    assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
+    let token = first["error"]["confirm_token"]
+        .as_str()
+        .expect("confirm token should be a string");
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "--confirm",
+        token,
+        "sql",
+        "exec",
+        sql,
+    ]))
+}
+
+fn setup_sql_exec(dsn: &str, sql: &str) -> Value {
+    let first = dbtool(&["--dsn", dsn, "--allow-write", "sql", "exec", sql]);
+    if first.status.success() {
+        return stdout_json(first);
+    }
+
+    let first = stderr_json(first);
     assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
     let token = first["error"]["confirm_token"]
         .as_str()
@@ -167,6 +199,61 @@ fn mysql_family_typed_probe(dsn: &str, expected_kind: &str) {
     ]));
     assert_eq!(limited["data"]["rows"].as_array().unwrap().len(), 2);
     assert_eq!(limited["meta"]["truncated"], true);
+}
+
+fn assert_mysql_tls_connection(dsn: &str) {
+    let status = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        "show status like 'Ssl_cipher'",
+    ]));
+    let rows = status["data"]["rows"]
+        .as_array()
+        .expect("TLS status should return rows");
+    let cipher = rows
+        .first()
+        .and_then(|row| row.as_array())
+        .and_then(|row| row.get(1))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !cipher.is_empty(),
+        "expected TLS connection with non-empty Ssl_cipher; output: {status}"
+    );
+}
+
+fn assert_connection_rejected(dsn: &str) {
+    let rejected = stderr_json(dbtool(&["--dsn", dsn, "ping"]));
+    let code = rejected["error"]["code"].as_str().unwrap_or_default();
+    assert!(
+        matches!(code, "CONNECTION_ERROR" | "AUTH_ERROR"),
+        "expected connection/auth rejection, got: {rejected}"
+    );
+}
+
+fn assert_mysql_identifier(value: &str, label: &str) {
+    assert!(
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "{label} must be a simple MySQL identifier for integration SQL, got {value:?}"
+    );
+}
+
+fn mysql_account(user: &str) -> String {
+    assert_mysql_identifier(user, "user");
+    format!("'{user}'@'%'")
+}
+
+fn mysql_password(password: &str) -> String {
+    assert!(
+        !password.contains('\'') && !password.contains('\\'),
+        "password must not need escaping in integration SQL"
+    );
+    format!("'{password}'")
 }
 
 fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
@@ -329,7 +416,7 @@ fn tidb_compat_live_sql_lifecycle_and_typed_values() {
     let qualified_table = format!("{database}.{table}");
 
     mysql_family_typed_probe(&dsn, "tidb");
-    confirmed_sql_exec(&dsn, &format!("create database if not exists {database}"));
+    setup_sql_exec(&dsn, &format!("create database if not exists {database}"));
     sql_lifecycle(
         &dsn,
         &qualified_table,
@@ -337,6 +424,108 @@ fn tidb_compat_live_sql_lifecycle_and_typed_values() {
             "create table {qualified_table} (id integer primary key, name varchar(64) not null)"
         ),
         format!("drop table {qualified_table}"),
+    );
+}
+
+#[test]
+fn tidb_secure_auth_tls_and_ha_live_sql_lifecycle() {
+    if !tidb_secure_enabled() {
+        return;
+    }
+
+    let root_dsn_1 = required_env("DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1");
+    let root_dsn_2 = required_env("DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2");
+    let secure_dsn_1 = required_env("DBTOOL_IT_TIDB_SECURE_DSN_1");
+    let secure_dsn_2 = required_env("DBTOOL_IT_TIDB_SECURE_DSN_2");
+    let disabled_dsn = required_env("DBTOOL_IT_TIDB_SECURE_DISABLED_DSN");
+    let x509_dsn = required_env("DBTOOL_IT_TIDB_SECURE_X509_DSN");
+    let x509_no_cert_dsn = required_env("DBTOOL_IT_TIDB_SECURE_X509_NO_CERT_DSN");
+    let database = required_env("DBTOOL_IT_TIDB_SECURE_DB");
+    let ssl_user = required_env("DBTOOL_IT_TIDB_SECURE_USER");
+    let ssl_password = required_env("DBTOOL_IT_TIDB_SECURE_PASSWORD");
+    let x509_user = required_env("DBTOOL_IT_TIDB_SECURE_X509_USER");
+    let x509_password = required_env("DBTOOL_IT_TIDB_SECURE_X509_PASSWORD");
+
+    assert_mysql_identifier(&database, "database");
+
+    mysql_family_typed_probe(&root_dsn_1, "tidb");
+    assert_mysql_tls_connection(&root_dsn_1);
+    assert_mysql_tls_connection(&root_dsn_2);
+
+    setup_sql_exec(
+        &root_dsn_1,
+        &format!("create database if not exists {database}"),
+    );
+    setup_sql_exec(
+        &root_dsn_1,
+        &format!("drop user if exists {}", mysql_account(&ssl_user)),
+    );
+    setup_sql_exec(
+        &root_dsn_1,
+        &format!("drop user if exists {}", mysql_account(&x509_user)),
+    );
+    setup_sql_exec(
+        &root_dsn_1,
+        &format!(
+            "create user {} identified by {} require ssl",
+            mysql_account(&ssl_user),
+            mysql_password(&ssl_password)
+        ),
+    );
+    setup_sql_exec(
+        &root_dsn_1,
+        &format!(
+            "create user {} identified by {} require x509",
+            mysql_account(&x509_user),
+            mysql_password(&x509_password)
+        ),
+    );
+    setup_sql_exec(
+        &root_dsn_1,
+        &format!(
+            "grant all privileges on {database}.* to {}",
+            mysql_account(&ssl_user)
+        ),
+    );
+    setup_sql_exec(
+        &root_dsn_1,
+        &format!(
+            "grant all privileges on {database}.* to {}",
+            mysql_account(&x509_user)
+        ),
+    );
+
+    assert_connection_rejected(&disabled_dsn);
+    assert_connection_rejected(&x509_no_cert_dsn);
+
+    mysql_family_typed_probe(&secure_dsn_1, "tidb");
+    assert_mysql_tls_connection(&secure_dsn_1);
+    let table_1 = format!("{}.{}", database, unique_name("dbtool_tidb_secure_node1"));
+    sql_lifecycle(
+        &secure_dsn_1,
+        &table_1,
+        format!("create table {table_1} (id integer primary key, name varchar(64) not null)"),
+        format!("drop table {table_1}"),
+    );
+
+    mysql_family_typed_probe(&secure_dsn_2, "tidb");
+    assert_mysql_tls_connection(&secure_dsn_2);
+    let table_2 = format!("{}.{}", database, unique_name("dbtool_tidb_secure_node2"));
+    sql_lifecycle(
+        &secure_dsn_2,
+        &table_2,
+        format!("create table {table_2} (id integer primary key, name varchar(64) not null)"),
+        format!("drop table {table_2}"),
+    );
+
+    mysql_family_typed_probe(&x509_dsn, "tidb");
+    assert_mysql_tls_connection(&x509_dsn);
+    let table_x509 = format!("{}.{}", database, unique_name("dbtool_tidb_x509"));
+    sql_lifecycle(
+        &x509_dsn,
+        &table_x509,
+        format!("create table {table_x509} (id integer primary key, name varchar(64) not null)"),
+        format!("drop table {table_x509}"),
     );
 }
 

@@ -145,6 +145,172 @@ services:
     cpus: ${DBTOOL_IT_TIDB_CPUS:-0.50}
     mem_limit: ${DBTOOL_IT_TIDB_MEMORY:-512m}
 
+  tidb-secure-pd-1:
+    profiles: ["tidb-secure"]
+    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-pd-1
+    command:
+      [
+        "--name=pd-1",
+        "--data-dir=/tmp/pd",
+        "--client-urls=https://0.0.0.0:2379",
+        "--peer-urls=https://0.0.0.0:2380",
+        "--advertise-client-urls=https://tidb-secure-pd-1:2379",
+        "--advertise-peer-urls=https://tidb-secure-pd-1:2380",
+        "--initial-cluster=pd-1=https://tidb-secure-pd-1:2380,pd-2=https://tidb-secure-pd-2:2380,pd-3=https://tidb-secure-pd-3:2380",
+        "--cacert=/tidb-secure/certs/ca.pem",
+        "--cert=/tidb-secure/certs/server.pem",
+        "--key=/tidb-secure/certs/server-key.pem",
+      ]
+    volumes:
+      - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    cpus: ${DBTOOL_IT_TIDB_SECURE_PD_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_TIDB_SECURE_PD_MEMORY:-256m}
+
+  tidb-secure-pd-2:
+    profiles: ["tidb-secure"]
+    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-pd-2
+    command:
+      [
+        "--name=pd-2",
+        "--data-dir=/tmp/pd",
+        "--client-urls=https://0.0.0.0:2379",
+        "--peer-urls=https://0.0.0.0:2380",
+        "--advertise-client-urls=https://tidb-secure-pd-2:2379",
+        "--advertise-peer-urls=https://tidb-secure-pd-2:2380",
+        "--initial-cluster=pd-1=https://tidb-secure-pd-1:2380,pd-2=https://tidb-secure-pd-2:2380,pd-3=https://tidb-secure-pd-3:2380",
+        "--cacert=/tidb-secure/certs/ca.pem",
+        "--cert=/tidb-secure/certs/server.pem",
+        "--key=/tidb-secure/certs/server-key.pem",
+      ]
+    volumes:
+      - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    cpus: ${DBTOOL_IT_TIDB_SECURE_PD_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_TIDB_SECURE_PD_MEMORY:-256m}
+
+  tidb-secure-pd-3:
+    profiles: ["tidb-secure"]
+    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-pd-3
+    command:
+      [
+        "--name=pd-3",
+        "--data-dir=/tmp/pd",
+        "--client-urls=https://0.0.0.0:2379",
+        "--peer-urls=https://0.0.0.0:2380",
+        "--advertise-client-urls=https://tidb-secure-pd-3:2379",
+        "--advertise-peer-urls=https://tidb-secure-pd-3:2380",
+        "--initial-cluster=pd-1=https://tidb-secure-pd-1:2380,pd-2=https://tidb-secure-pd-2:2380,pd-3=https://tidb-secure-pd-3:2380",
+        "--cacert=/tidb-secure/certs/ca.pem",
+        "--cert=/tidb-secure/certs/server.pem",
+        "--key=/tidb-secure/certs/server-key.pem",
+      ]
+    volumes:
+      - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    cpus: ${DBTOOL_IT_TIDB_SECURE_PD_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_TIDB_SECURE_PD_MEMORY:-256m}
+
+  tidb-secure-tikv-1:
+    profiles: ["tidb-secure"]
+    image: pingcap/tikv:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-tikv-1
+    command:
+      [
+        "--config=/tidb-secure/tikv.toml",
+        "--addr=0.0.0.0:20160",
+        "--advertise-addr=tidb-secure-tikv-1:20160",
+        "--status-addr=0.0.0.0:20180",
+        "--pd-endpoints=https://tidb-secure-pd-1:2379,https://tidb-secure-pd-2:2379,https://tidb-secure-pd-3:2379",
+        "--data-dir=/tmp/tikv",
+      ]
+    depends_on:
+      - tidb-secure-pd-1
+      - tidb-secure-pd-2
+      - tidb-secure-pd-3
+    volumes:
+      - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    cpus: ${DBTOOL_IT_TIDB_SECURE_TIKV_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY:-1g}
+
+  tidb-secure-tikv-2:
+    profiles: ["tidb-secure"]
+    image: pingcap/tikv:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-tikv-2
+    command:
+      [
+        "--config=/tidb-secure/tikv.toml",
+        "--addr=0.0.0.0:20160",
+        "--advertise-addr=tidb-secure-tikv-2:20160",
+        "--status-addr=0.0.0.0:20180",
+        "--pd-endpoints=https://tidb-secure-pd-1:2379,https://tidb-secure-pd-2:2379,https://tidb-secure-pd-3:2379",
+        "--data-dir=/tmp/tikv",
+      ]
+    depends_on:
+      - tidb-secure-pd-1
+      - tidb-secure-pd-2
+      - tidb-secure-pd-3
+    volumes:
+      - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    cpus: ${DBTOOL_IT_TIDB_SECURE_TIKV_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY:-1g}
+
+  tidb-secure-1:
+    profiles: ["tidb-secure"]
+    image: pingcap/tidb:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-1
+    command:
+      [
+        "--config=/tidb-secure/tidb.toml",
+        "--store=tikv",
+        "--path=tidb-secure-pd-1:2379,tidb-secure-pd-2:2379,tidb-secure-pd-3:2379",
+        "--host=0.0.0.0",
+        "--advertise-address=tidb-secure-1",
+        "-P=4000",
+        "--status=10080",
+      ]
+    depends_on:
+      - tidb-secure-pd-1
+      - tidb-secure-pd-2
+      - tidb-secure-pd-3
+      - tidb-secure-tikv-1
+      - tidb-secure-tikv-2
+    ports:
+      - "${DBTOOL_IT_TIDB_SECURE_PORT_1:-14100}:4000"
+      - "${DBTOOL_IT_TIDB_SECURE_STATUS_PORT_1:-11100}:10080"
+    volumes:
+      - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    cpus: ${DBTOOL_IT_TIDB_SECURE_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_TIDB_SECURE_MEMORY:-512m}
+
+  tidb-secure-2:
+    profiles: ["tidb-secure"]
+    image: pingcap/tidb:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-2
+    command:
+      [
+        "--config=/tidb-secure/tidb.toml",
+        "--store=tikv",
+        "--path=tidb-secure-pd-1:2379,tidb-secure-pd-2:2379,tidb-secure-pd-3:2379",
+        "--host=0.0.0.0",
+        "--advertise-address=tidb-secure-2",
+        "-P=4000",
+        "--status=10080",
+      ]
+    depends_on:
+      - tidb-secure-pd-1
+      - tidb-secure-pd-2
+      - tidb-secure-pd-3
+      - tidb-secure-tikv-1
+      - tidb-secure-tikv-2
+    ports:
+      - "${DBTOOL_IT_TIDB_SECURE_PORT_2:-14101}:4000"
+      - "${DBTOOL_IT_TIDB_SECURE_STATUS_PORT_2:-11101}:10080"
+    volumes:
+      - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    cpus: ${DBTOOL_IT_TIDB_SECURE_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_TIDB_SECURE_MEMORY:-512m}
+
   redis:
     image: redis:7-alpine
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-redis

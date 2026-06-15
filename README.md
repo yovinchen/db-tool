@@ -156,6 +156,12 @@ TiDB compatibility uses a heavier PD/TiKV/TiDB profile:
 ./scripts/integration-tidb-test.sh
 ```
 
+TiDB secure HA integration starts 3 PD, 2 TiKV, and 2 TiDB SQL nodes with component TLS, SQL TLS, `REQUIRE SSL`, and `REQUIRE X509` checks:
+
+```bash
+./scripts/integration-tidb-secure-test.sh
+```
+
 Live messaging integration tests start Redis, Redpanda, RabbitMQ, and NATS:
 
 ```bash
@@ -184,7 +190,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 ## Implementation Status
 
 - Core contracts and services: implemented as the main foundation.
-- SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, Valkey, KeyDB, and Dragonfly compatibility profiles.
+- SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, Valkey, KeyDB, and Dragonfly compatibility profiles.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.
 - TUI: intentionally minimal while core stabilizes.

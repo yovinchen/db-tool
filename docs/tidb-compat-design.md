@@ -1,4 +1,4 @@
-# TiDB Compatibility Design
+# TiDB Compatibility And Secure HA Design
 
 ## Goal
 
@@ -64,7 +64,36 @@ Normal CI validates the TiDB Compose profile with:
 docker compose -f docker-compose.integration.yml --profile tidb config
 ```
 
-The live TiDB run is opt-in through the `run_live_tidb` workflow_dispatch input. This keeps PR feedback fast while preserving an automated path for compatibility verification.
+Normal CI also validates the secure HA profile without starting containers:
+
+```bash
+docker compose -f docker-compose.integration.yml --profile tidb-secure config
+```
+
+The live TiDB runs are opt-in through the `run_live_tidb` and `run_live_tidb_secure` workflow_dispatch inputs. This keeps PR feedback fast while preserving an automated path for compatibility and security verification.
+
+## Secure HA Profile
+
+`./scripts/integration-tidb-secure-test.sh` adds a heavier local topology:
+
+- 3 PD nodes: `tidb-secure-pd-1`, `tidb-secure-pd-2`, and `tidb-secure-pd-3`.
+- 2 TiKV nodes: `tidb-secure-tikv-1` and `tidb-secure-tikv-2`.
+- 2 TiDB SQL nodes exposed on `${DBTOOL_IT_TIDB_SECURE_PORT_1:-14100}` and `${DBTOOL_IT_TIDB_SECURE_PORT_2:-14101}`.
+
+The script sources `scripts/integration-tidb-secure-prepare.sh`, which generates a short-lived CA, a local server certificate with SANs for all TiDB component DNS names plus `127.0.0.1`, a client certificate, and the TiDB/TiKV config files under `${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}`.
+
+The secure profile uses TLS in two layers:
+
+- Component mTLS between TiDB, PD, and TiKV through the TiDB `cluster-ssl-*`, PD `--cacert/--cert/--key`, and TiKV `[security]` settings.
+- SQL client TLS through TiDB `ssl-ca`, `ssl-cert`, and `ssl-key`, with host-side DSNs using `ssl-mode=VERIFY_CA`.
+
+The secure live test verifies:
+
+- Both TiDB SQL nodes accept TLS root connections.
+- A `REQUIRE SSL` user can connect over TLS and is rejected when `ssl-mode=DISABLED`.
+- A `REQUIRE X509` user is rejected without a client certificate and succeeds with `ssl-cert` plus `ssl-key`.
+- SQL lifecycle coverage runs through both SQL nodes against the same secure database.
+- The X509 user can run the same SQL lifecycle with a client certificate.
 
 ## Failure Recovery
 
@@ -84,11 +113,20 @@ docker logs dbtool-it-tidb-pd
 docker logs dbtool-it-tidb-tikv
 ```
 
+For secure HA runs, inspect the secure service names:
+
+```bash
+docker logs dbtool-it-tidb-secure-1
+docker logs dbtool-it-tidb-secure-pd-1
+docker logs dbtool-it-tidb-secure-tikv-1
+```
+
 The most likely local causes are a TiDB flag/version mismatch, not enough Docker memory for TiKV, or a stale container from a previous failed run.
 
 ## Known Boundaries
 
-- The topology is a single-node compatibility harness, not an HA TiDB cluster.
-- TLS, password rotation, user management, placement rules, and upgrade scenarios are outside this test.
-- The profile uses the local insecure bootstrap user only for disposable integration tests.
+- The default `tidb` profile is a single-node compatibility harness; use `tidb-secure` for local HA/security coverage.
+- The secure HA topology is still a local integration harness, not a production deployment model.
+- Password rotation, placement rules, failover drills, TiProxy, and upgrade scenarios are outside this test.
+- The profile uses the local bootstrap root user only for disposable integration tests.
 - TiDB remains implemented through the MySQL-family adapter; the alias kind is preserved for user-facing metadata and test assertions.

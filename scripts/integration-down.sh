@@ -11,4 +11,5 @@ docker compose \
   --profile compat \
   --profile compat-extra \
   --profile tidb \
+  --profile tidb-secure \
   down -v --remove-orphans

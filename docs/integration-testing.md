@@ -38,6 +38,14 @@ The TiDB script waits for the three containers, runs the `tidb://` live SQL comp
 
 See [TiDB compatibility design](tidb-compat-design.md) for the topology, DSN strategy, validation flow, and known boundaries.
 
+TiDB secure HA integration starts a larger local topology with component TLS and SQL TLS:
+
+```bash
+./scripts/integration-tidb-secure-test.sh
+```
+
+The secure script generates a short-lived local CA plus server/client certificates under `.tmp/`, starts 3 PD nodes, 2 TiKV nodes, and 2 TiDB SQL nodes, verifies `REQUIRE SSL` and `REQUIRE X509` users, and removes the containers and network by default.
+
 Messaging integration tests use a separate profile so day-to-day database checks stay lighter:
 
 ```bash
@@ -93,6 +101,18 @@ DBTOOL_IT_TIDB_STATUS_PORT=31080 \
 ./scripts/integration-tidb-test.sh
 ```
 
+TiDB secure HA service settings can be overridden independently:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-tidb-secure-run \
+DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
+DBTOOL_IT_TIDB_SECURE_PORT_1=34100 \
+DBTOOL_IT_TIDB_SECURE_PORT_2=34101 \
+DBTOOL_IT_TIDB_SECURE_STATUS_PORT_1=31100 \
+DBTOOL_IT_TIDB_SECURE_STATUS_PORT_2=31101 \
+./scripts/integration-tidb-secure-test.sh
+```
+
 Messaging service settings follow the same pattern:
 
 ```bash
@@ -129,6 +149,7 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_services` runs `./scripts/integration-test.sh` for Postgres, MySQL, Redis, and MongoDB.
 - `run_live_compat` can run `./scripts/integration-compat-test.sh` for MariaDB and Valkey, with `DBTOOL_IT_COMPAT_EXTRA=1` for KeyDB and Dragonfly.
 - `run_live_tidb` runs `./scripts/integration-tidb-test.sh` for TiDB through a local PD/TiKV/TiDB topology.
+- `run_live_tidb_secure` runs `./scripts/integration-tidb-secure-test.sh` for TiDB auth/TLS/HA coverage.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
 - `run_live_messaging_native` can run `./scripts/integration-mq-native-test.sh` when native Kafka coverage is desired.
 
@@ -149,13 +170,16 @@ The compose file applies conservative defaults:
 - TiDB PD: `0.25` CPU, `256m` memory
 - TiDB TiKV: `0.75` CPU, `1g` memory
 - TiDB SQL server: `0.50` CPU, `512m` memory
+- TiDB secure HA PD nodes: `0.25` CPU, `256m` memory each
+- TiDB secure HA TiKV nodes: `0.50` CPU, `1g` memory each
+- TiDB secure HA SQL nodes: `0.50` CPU, `512m` memory each
 - Redpanda/Kafka API: `0.75` CPU, `1g` memory, broker memory `512M`
 - RabbitMQ/AMQP: `0.50` CPU, `512m` memory
 - NATS: `0.25` CPU, `256m` memory
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the messaging suite is capped at roughly 2 GiB, and the TiDB suite is capped at roughly 1.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, or `DBTOOL_IT_TIDB_TIKV_MEMORY`, if either fails to become healthy under local load.
+The base service suite is capped at roughly 2 GiB of container memory, the messaging suite is capped at roughly 2 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if either fails to become healthy under local load.
 
 ## Live Test Scope
 
@@ -167,6 +191,7 @@ The live tests cover:
 - Valkey/KeyDB/Dragonfly alias DSNs against the Redis protocol adapter.
 - Real MariaDB compatibility through `mariadb://` against a MariaDB container.
 - Real TiDB compatibility through `tidb://` against a PD/TiKV/TiDB topology, including database creation, typed values, result limiting, destructive confirmation, table listing, insert/query/schema/drop, and schema-qualified table names.
+- TiDB secure HA through `tidb://` with 3 PD nodes, 2 TiKV nodes, 2 TiDB SQL nodes, component TLS, SQL TLS, TLS-required users, client-certificate-required users, insecure-login rejection, and SQL lifecycle coverage through both SQL nodes.
 - Real Valkey compatibility through `valkey://`; optional KeyDB and Dragonfly compatibility through `DBTOOL_IT_COMPAT_EXTRA=1`.
 - MongoDB ping, insert/find/update/aggregate/delete.
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.

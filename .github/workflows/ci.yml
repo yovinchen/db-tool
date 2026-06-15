@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_tidb_secure:
+        description: "Run Docker-backed TiDB auth/TLS/HA integration tests"
+        required: false
+        type: boolean
+        default: false
       run_live_messaging:
         description: "Run Docker-backed messaging integration tests"
         required: false
@@ -83,6 +88,9 @@ jobs:
 
       - name: Validate TiDB integration compose config
         run: docker compose -f docker-compose.integration.yml --profile tidb config
+
+      - name: Validate TiDB secure HA integration compose config
+        run: docker compose -f docker-compose.integration.yml --profile tidb-secure config
 
       - name: Validate messaging integration compose config
         run: docker compose -f docker-compose.integration.yml --profile messaging config
@@ -196,6 +204,24 @@ jobs:
 
       - name: Run TiDB compatibility integration tests
         run: ./scripts/integration-tidb-test.sh
+
+  integration-tidb-secure:
+    name: Live TiDB auth/TLS/HA integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_tidb_secure
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-tidb-secure
+      DBTOOL_IT_TIDB_SECURE_PORT_1: 34100
+      DBTOOL_IT_TIDB_SECURE_PORT_2: 34101
+      DBTOOL_IT_TIDB_SECURE_STATUS_PORT_1: 31100
+      DBTOOL_IT_TIDB_SECURE_STATUS_PORT_2: 31101
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run TiDB auth/TLS/HA integration tests
+        run: ./scripts/integration-tidb-secure-test.sh
 
   integration-messaging:
     name: Live messaging integration

@@ -97,6 +97,12 @@ For the heavier TiDB compatibility profile, use:
 ./scripts/integration-tidb-test.sh
 ```
 
+For TiDB auth/TLS/HA coverage, use:
+
+```bash
+./scripts/integration-tidb-secure-test.sh
+```
+
 Override names and ports with `DBTOOL_IT_PROJECT`, `DBTOOL_IT_POSTGRES_DB`, `DBTOOL_IT_MYSQL_DB`, `DBTOOL_IT_TIDB_DB`, `DBTOOL_IT_MONGO_DB`, and the `DBTOOL_IT_*_PORT` variables documented in `docs/integration-testing.md`.
 
 Message writes use the same safety flag as other write paths:
