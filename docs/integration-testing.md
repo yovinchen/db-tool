@@ -20,7 +20,7 @@ Messaging integration tests use a separate profile so day-to-day database checks
 ./scripts/integration-mq-test.sh
 ```
 
-The messaging script starts Redpanda (Kafka API), RabbitMQ, and NATS, waits for health checks, runs the live CLI tests with `--features full`, and removes the containers and volumes.
+The messaging script starts Redis, Redpanda (Kafka API), RabbitMQ, and NATS, waits for health checks, runs the live CLI tests with `--features full`, and removes the containers and volumes.
 
 ## Custom Names And Ports
 
@@ -47,6 +47,7 @@ DBTOOL_IT_AMQP_USER=my_user \
 DBTOOL_IT_AMQP_PASSWORD=my_pass \
 DBTOOL_IT_AMQP_VHOST=my_vhost \
 DBTOOL_IT_AMQP_PORT=25672 \
+DBTOOL_IT_REDIS_PORT=26379 \
 DBTOOL_IT_NATS_PORT=24222 \
 ./scripts/integration-mq-test.sh
 ```
@@ -78,8 +79,9 @@ The live tests cover:
 - Postgres and MySQL ping, destructive SQL confirmation, insert/query/schema/drop.
 - Redis ping, set/get/scan/raw typed output, and blocked destructive raw command.
 - MongoDB ping, insert/find/update/aggregate/delete.
+- Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.
 - Kafka ping through metadata, produce, topics, detail/watermarks, and consume.
 - RabbitMQ queue publish, passive detail/message count, acked consume, and write guard.
 - NATS live subscribe/publish round trip and write guard.
 
-Core NATS does not expose subject listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; those broader admin paths remain future work.
+Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; those broader admin paths remain future work.

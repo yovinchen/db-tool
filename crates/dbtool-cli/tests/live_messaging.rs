@@ -83,6 +83,121 @@ fn payload_text(message: &Value) -> String {
 }
 
 #[test]
+fn redis_live_stream_produce_detail_and_consume() {
+    if !integration_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_REDIS_DSN") else {
+        return;
+    };
+    let stream = unique_name("dbtool_redis_stream");
+
+    let blocked = stderr_json(dbtool(&[
+        "--dsn", &dsn, "mq", "produce", &stream, "blocked",
+    ]));
+    assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let produced = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "mq",
+        "produce",
+        &stream,
+        "redis-stream-payload",
+    ]));
+    assert_eq!(produced["data"]["produced"], 1);
+
+    let topics = stdout_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
+    assert!(topics["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == stream));
+
+    let detail = stdout_json(dbtool(&["--dsn", &dsn, "mq", "detail", &stream]));
+    assert_eq!(detail["data"]["info"]["name"], stream);
+    assert_eq!(detail["data"]["config"]["kind"], "stream");
+    assert_eq!(detail["data"]["config"]["length"], "1");
+
+    let consumed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "mq",
+        "consume",
+        &stream,
+        "--max",
+        "1",
+        "--timeout",
+        "5",
+    ]));
+    assert_eq!(payload_text(&consumed["data"][0]), "redis-stream-payload");
+    assert!(consumed["data"][0]["headers"]["redis_stream_id"]
+        .as_str()
+        .expect("stream id header should be present")
+        .contains('-'));
+}
+
+#[test]
+fn redis_live_pubsub_publish_and_subscribe_round_trip() {
+    if !integration_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_REDIS_DSN") else {
+        return;
+    };
+    let channel = format!("pubsub:{}", unique_name("dbtool_redis_channel"));
+
+    let consumer = Command::new(env!("CARGO_BIN_EXE_dbtool"))
+        .args([
+            "--dsn",
+            &dsn,
+            "mq",
+            "consume",
+            &channel,
+            "--max",
+            "1",
+            "--timeout",
+            "5",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Redis PubSub consume command should start");
+
+    let mut subscriber_seen = false;
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(250));
+        let detail = stdout_json(dbtool(&["--dsn", &dsn, "mq", "detail", &channel]));
+        if detail["data"]["config"]["subscribers"] == "1" {
+            subscriber_seen = true;
+            break;
+        }
+    }
+    assert!(
+        subscriber_seen,
+        "Redis PubSub subscriber should be registered"
+    );
+
+    let produced = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "mq",
+        "produce",
+        &channel,
+        "redis-pubsub-payload",
+    ]));
+    assert_eq!(produced["data"]["produced"], 1);
+
+    let output = consumer
+        .wait_with_output()
+        .expect("Redis PubSub consume command should finish");
+    let consumed = stdout_json(output);
+    assert_eq!(payload_text(&consumed["data"][0]), "redis-pubsub-payload");
+}
+
+#[test]
 fn kafka_live_topic_produce_detail_and_consume() {
     if !integration_enabled() {
         return;

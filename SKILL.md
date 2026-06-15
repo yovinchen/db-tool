@@ -98,4 +98,7 @@ Message writes use the same safety flag as other write paths:
 dbtool --dsn kafka://127.0.0.1:19092 --allow-write mq produce events '{"hello":"world"}'
 dbtool --dsn kafka://127.0.0.1:19092 mq consume events --max 10 --timeout 5
 dbtool --dsn kafka://127.0.0.1:19092 mq detail events
+dbtool --dsn redis://127.0.0.1:16379/0 --allow-write mq produce stream:events '{"hello":"redis-stream"}'
+dbtool --dsn redis://127.0.0.1:16379/0 mq consume stream:events --max 10 --timeout 5
+dbtool --dsn redis://127.0.0.1:16379/0 mq detail pubsub:events
 ```

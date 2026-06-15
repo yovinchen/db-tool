@@ -9,10 +9,10 @@ docker compose \
   -p "$DBTOOL_IT_PROJECT" \
   --profile messaging \
   up -d --wait --wait-timeout "${DBTOOL_IT_WAIT_TIMEOUT:-240}" \
-  kafka rabbitmq nats
+  redis kafka rabbitmq nats
 
 docker compose \
   -f "$ROOT/docker-compose.integration.yml" \
   -p "$DBTOOL_IT_PROJECT" \
   --profile messaging \
-  ps kafka rabbitmq nats
+  ps redis kafka rabbitmq nats

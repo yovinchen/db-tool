@@ -78,9 +78,9 @@ Goal: bounded message operations with no external runtime dependencies.
 - [x] Kafka pure backend real ping/list/detail/produce/consume.
 - [x] AMQP real producer/consumer and queue detail.
 - [x] NATS core real producer/consumer.
+- [x] Redis Streams/PubSub support in Redis adapter.
 - [ ] AMQP queue listing through RabbitMQ management API or documented plugin boundary.
 - [ ] NATS JetStream admin/list/detail support.
-- [ ] Redis Streams/PubSub support in Redis adapter.
 
 ## P6: Distribution And Extended Backends
 
@@ -97,12 +97,12 @@ Goal: release-quality packages and optional advanced backends.
 Goal: self-start local services with bounded resources and verify real CLI workflows.
 
 - [x] Docker Compose integration environment for Postgres, MySQL, Redis, and MongoDB.
-- [x] Docker Compose messaging profile for Redpanda, RabbitMQ, and NATS.
+- [x] Docker Compose messaging profile for Redis, Redpanda, RabbitMQ, and NATS.
 - [x] Custom project name, database names, credentials, and host ports through environment variables.
 - [x] CPU/memory/resource limits for integration services.
 - [x] Integration scripts for up/down/test lifecycle.
 - [x] Live CLI tests for SQL, KV, and document workflows.
-- [x] Live CLI tests for Kafka, AMQP, and NATS messaging workflows.
+- [x] Live CLI tests for Redis Streams/PubSub, Kafka, AMQP, and NATS messaging workflows.
 - [x] Documented integration workflow and cleanup.
 
 ## Next Execution Queue
@@ -116,8 +116,8 @@ Goal: replace safe shells with real bounded functionality.
 - [x] Kafka pure backend ping/list/detail/produce/consume with bounded reads.
 - [x] AMQP producer/consumer/detail with explicit ack and timeout behavior.
 - [x] NATS core producer/consumer with subject validation.
-- [ ] Redis Streams/PubSub support behind explicit capabilities.
-- [x] Live messaging tests with self-starting Redpanda/RabbitMQ/NATS and resource limits.
+- [x] Redis Streams/PubSub support behind explicit capabilities.
+- [x] Live messaging tests with self-starting Redis/Redpanda/RabbitMQ/NATS and resource limits.
 - [ ] AMQP queue listing and NATS JetStream admin once protocol boundary is chosen.
 
 ### T2: CI And Integration Profiles
