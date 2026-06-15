@@ -6,6 +6,7 @@ members = [
     "crates/adapter-redis",
     "crates/adapter-mongo",
     "crates/adapter-search",
+    "crates/adapter-timeseries",
     "crates/adapter-kafka",
     "crates/adapter-amqp",
     "crates/adapter-nats",

@@ -69,7 +69,8 @@ Goal: Redis-compatible and MongoDB adapters.
 Goal: ratatui frontend built on core `ConnectionManager`.
 
 - [x] Minimal TUI shell.
-- [ ] Defer detailed TUI until core/CLI are stable.
+- [x] Defer detailed TUI until core/CLI are stable.
+- [x] Add basic connection picker, capability-aware command dispatch, and write confirmation.
 
 ## P5: Self-Contained Messaging
 
@@ -94,7 +95,8 @@ Goal: release-quality packages and optional advanced backends.
 - [x] npm/pip/uv/mise packaging.
 - [x] Optional native Kafka implementation.
 - [x] OpenSearch/Elasticsearch HTTP search adapter.
-- [ ] Future adapters: time-series HTTP, SQL Server, Cassandra.
+- [x] Prometheus HTTP time-series adapter.
+- [ ] Future adapters: SQL Server, Cassandra; implementation gate is documented in [extended-backends.md](extended-backends.md).
 
 ## P7: Live Integration Automation
 
@@ -115,6 +117,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Live CLI tests for real TiDB compatibility service.
 - [x] Live CLI tests for TiDB auth, SQL TLS, component TLS, X509, and local HA topology.
 - [x] Live CLI tests for Redis Streams/PubSub, Kafka, AMQP, and NATS messaging workflows.
+- [x] Live CLI tests for OpenSearch search and Prometheus time-series workflows.
 - [x] Documented integration workflow and cleanup.
 
 ## Next Execution Queue
@@ -195,18 +198,20 @@ Goal: prove compatible database protocols against real compatible services.
 
 Goal: build a TUI that consumes the same verified core/CLI behavior.
 
-- [ ] Connection picker backed by core config resolution.
-- [ ] Capability-aware SQL/KV/Document views.
-- [ ] Read limits and write-confirmation prompts.
-- [ ] TUI smoke tests for navigation and command dispatch.
+- [x] Connection picker backed by core config resolution.
+- [x] Capability-aware SQL/KV/Document/Search/Time-series command dispatch.
+- [x] Read limits and write-confirmation prompts.
+- [x] TUI smoke tests for navigation and command dispatch.
+- [ ] Full-screen polish, command history, and richer per-capability forms.
 
 ### T5: Extended Backends
 
 Goal: add new families only after the core behavior remains stable under integration tests.
 
 - [x] Search backend adapter with OpenSearch/Elasticsearch HTTP index list/search/index operations.
-- [ ] OpenSearch/Elasticsearch resource-bounded Docker profile and live CLI tests.
+- [x] OpenSearch/Elasticsearch resource-bounded Docker profile and live CLI tests.
 - [ ] Search HTTPS/TLS support.
-- [ ] Time-series HTTP adapter.
+- [x] Time-series HTTP adapter with Prometheus measurement list/query operations.
+- [x] Prometheus resource-bounded Docker profile and live CLI tests.
 - [ ] SQL Server adapter.
 - [ ] Cassandra adapter.

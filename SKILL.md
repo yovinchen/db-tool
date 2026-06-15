@@ -17,6 +17,7 @@ Use dbtool when you need to inspect SQL databases, key-value stores, document st
    dbtool --conn <name> sql tables
    dbtool --conn <name> sql schema users
    dbtool --conn search-local search indices
+   dbtool --conn prometheus-local ts measurements
    ```
 
 3. Query with explicit limits:
@@ -24,6 +25,7 @@ Use dbtool when you need to inspect SQL databases, key-value stores, document st
    ```bash
    dbtool --conn <name> --limit 50 sql query "select id, name from users"
    dbtool --conn search-local --limit 10 search search users --q '{"match_all":{}}'
+   dbtool --conn prometheus-local ts query up --last-minutes 10
    ```
 
 4. Use protocol-specific escape hatches only when the typed command is not enough:
@@ -99,6 +101,12 @@ For real messaging backends, use:
 
 ```bash
 ./scripts/integration-mq-test.sh
+```
+
+For real search and time-series backends, use:
+
+```bash
+./scripts/integration-observability-test.sh
 ```
 
 For the heavier TiDB compatibility profile, use:

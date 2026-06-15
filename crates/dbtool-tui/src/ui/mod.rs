@@ -25,7 +25,8 @@ pub fn render(f: &mut Frame, state: &AppState) {
             } else {
                 Style::default()
             };
-            ListItem::new(c.clone()).style(style)
+            let mode = if c.readonly { "ro" } else { "rw" };
+            ListItem::new(format!("{} ({mode})", c.name)).style(style)
         })
         .collect();
 
@@ -43,9 +44,14 @@ pub fn render(f: &mut Frame, state: &AppState) {
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(chunks[1]);
 
+    let input_title = if state.pending_write.is_some() {
+        "Query [y confirm / n cancel]"
+    } else {
+        "Query [Enter]"
+    };
     let input = Paragraph::new(state.query_input.as_str()).block(
         Block::default()
-            .title("Query [Tab]")
+            .title(input_title)
             .borders(Borders::ALL)
             .border_style(panel_style(&state.active_panel, Panel::QueryInput)),
     );

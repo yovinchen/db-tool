@@ -10,7 +10,9 @@ pub struct TsCmd {
 
 #[derive(Subcommand)]
 pub enum TsAction {
+    /// List metric names from a Prometheus-compatible backend.
     Measurements,
+    /// Run a range query over the last N minutes.
     Query {
         query: String,
         #[arg(long, default_value = "60")]

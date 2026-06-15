@@ -27,6 +27,7 @@ The project is being completed core-first.
 │   ├── adapter-redis     # Redis-compatible key-value adapter
 │   ├── adapter-mongo     # MongoDB document adapter
 │   ├── adapter-search    # OpenSearch/Elasticsearch HTTP search adapter
+│   ├── adapter-timeseries # Prometheus HTTP time-series adapter
 │   ├── adapter-kafka     # Kafka-compatible message adapter shell
 │   ├── adapter-amqp      # AMQP plus RabbitMQ management adapter
 │   └── adapter-nats      # NATS adapter shell
@@ -76,6 +77,8 @@ cargo run -p dbtool-cli -- --conn redis-local kv get my-key
 cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 search indices
 cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 --limit 10 search search users --q '{"match_all":{}}'
 cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 --allow-write search index users '{"name":"alice"}'
+cargo run -p dbtool-cli -- --dsn prometheus://127.0.0.1:9090 ts measurements
+cargo run -p dbtool-cli -- --dsn prometheus://127.0.0.1:9090 ts query up --last-minutes 10
 ```
 
 Named connections resolve in this order:
@@ -180,9 +183,17 @@ Kafka native/librdkafka can be tested against the same Docker services:
 ./scripts/integration-mq-native-test.sh
 ```
 
+Search and time-series integration tests start OpenSearch and Prometheus:
+
+```bash
+./scripts/integration-observability-test.sh
+```
+
 See [docs/integration-testing.md](docs/integration-testing.md) for custom project names, database names, ports, credentials, resource limits, and cleanup.
 
 Messaging metadata has protocol-specific boundaries. See [docs/messaging-boundaries.md](docs/messaging-boundaries.md) for why AMQP queue listing needs RabbitMQ's management API, why NATS admin is JetStream-scoped, and why Redis Pub/Sub is live-only.
+
+Heavyweight future adapters such as SQL Server and Cassandra are tracked in [docs/extended-backends.md](docs/extended-backends.md); they intentionally remain unregistered until their protocol dependencies and Docker resource costs are accepted.
 
 ## Distribution
 
@@ -198,7 +209,8 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, Valkey, KeyDB, and Dragonfly compatibility profiles.
 - OpenSearch/Elasticsearch HTTP search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP mapping tests.
+- Prometheus HTTP time-series adapter: implemented for metric listing and range queries, with read-only semantics.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.
-- TUI: intentionally minimal while core stabilizes.
+- TUI: basic connection picker, capability-aware command dispatch, read limits, and write confirmation are implemented; richer forms remain future work.
 - Release packaging: GitHub Release archive, npm, pip/uv, and mise/ubi metadata are wired; signing/notarization is still future work.

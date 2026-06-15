@@ -62,6 +62,14 @@ Run the same suite with the optional native Kafka backend:
 
 That script uses `--no-default-features --features full-native`, so Kafka commands go through librdkafka while the other message backends remain unchanged.
 
+Search and time-series integration tests use the observability profile:
+
+```bash
+./scripts/integration-observability-test.sh
+```
+
+The observability script starts OpenSearch and Prometheus, waits for health checks, runs live CLI tests for `search` and `ts`, and removes the containers and volumes.
+
 ## Custom Names And Ports
 
 Every service name, database name, and host port can be overridden with environment variables:
@@ -128,6 +136,15 @@ DBTOOL_IT_NATS_PORT=24222 \
 ./scripts/integration-mq-test.sh
 ```
 
+Observability service settings follow the same pattern:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-observability-run \
+DBTOOL_IT_OPENSEARCH_PORT=29200 \
+DBTOOL_IT_PROMETHEUS_PORT=29090 \
+./scripts/integration-observability-test.sh
+```
+
 Set `DBTOOL_IT_KEEP_SERVICES=1` to leave containers running for manual inspection, then clean up with:
 
 ```bash
@@ -142,7 +159,7 @@ DBTOOL_IT_PROJECT=my-dbtool-run ./scripts/integration-down.sh
 
 ## CI Profiles
 
-Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, TiDB, and messaging Docker Compose configs without starting containers.
+Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, TiDB, messaging, and observability Docker Compose configs without starting containers.
 
 Live integration jobs are opt-in from the GitHub Actions **Run workflow** button:
 
@@ -152,8 +169,9 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_tidb_secure` runs `./scripts/integration-tidb-secure-test.sh` for TiDB auth/TLS/HA coverage.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
 - `run_live_messaging_native` can run `./scripts/integration-mq-native-test.sh` when native Kafka coverage is desired.
+- `run_live_observability` runs `./scripts/integration-observability-test.sh` for OpenSearch and Prometheus.
 
-The CI jobs use separate Compose project names and host ports so the database, compatibility, TiDB, and messaging suites can run in parallel.
+The CI jobs use separate Compose project names and host ports so the database, compatibility, TiDB, messaging, and observability suites can run in parallel.
 
 ## Resource Limits
 
@@ -176,10 +194,12 @@ The compose file applies conservative defaults:
 - Redpanda/Kafka API: `0.75` CPU, `1g` memory, broker memory `512M`
 - RabbitMQ/AMQP: `0.50` CPU, `512m` memory
 - NATS: `0.25` CPU, `256m` memory
+- OpenSearch: `1.00` CPU, `1g` memory, JVM heap `256m`
+- Prometheus: `0.25` CPU, `256m` memory
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the messaging suite is capped at roughly 2 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if either fails to become healthy under local load.
+The base service suite is capped at roughly 2 GiB of container memory, the messaging suite is capped at roughly 2 GiB, the observability suite is capped at roughly 1.25 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
 
 ## Live Test Scope
 
@@ -199,5 +219,7 @@ The live tests cover:
 - Optional native Kafka/librdkafka coverage through the same Redpanda test data.
 - RabbitMQ queue publish, passive detail/message count, acked consume, write guard, and HTTP management queue listing/detail/lag.
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
+- OpenSearch ping, write guard, single-document indexing, search, and index listing.
+- Prometheus ping, metric listing, and range query through `ts`.
 
 Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; use an explicit `rabbitmq+http://` management DSN for RabbitMQ queue discovery.

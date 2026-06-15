@@ -36,6 +36,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_observability:
+        description: "Run Docker-backed OpenSearch and Prometheus integration tests"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -94,6 +99,9 @@ jobs:
 
       - name: Validate messaging integration compose config
         run: docker compose -f docker-compose.integration.yml --profile messaging config
+
+      - name: Validate observability integration compose config
+        run: docker compose -f docker-compose.integration.yml --profile observability config
 
   test:
     name: Tests
@@ -262,3 +270,19 @@ jobs:
 
       - name: Run native Kafka messaging integration tests
         run: ./scripts/integration-mq-native-test.sh
+
+  integration-observability:
+    name: Live observability integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_observability
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-observability
+      DBTOOL_IT_OPENSEARCH_PORT: 29200
+      DBTOOL_IT_PROMETHEUS_PORT: 29090
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run observability integration tests
+        run: ./scripts/integration-observability-test.sh

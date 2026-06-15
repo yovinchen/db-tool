@@ -27,6 +27,11 @@ pub fn build_registry() -> Registry {
         r.register_family("opensearch", adapter_search::factory);
     }
 
+    #[cfg(feature = "timeseries")]
+    {
+        r.register_family("prometheus", adapter_timeseries::factory);
+    }
+
     #[cfg(feature = "kafka")]
     {
         r.register_family("kafka", adapter_kafka::factory);

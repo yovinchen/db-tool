@@ -111,6 +111,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adapter-timeseries"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dbtool-core",
+ "futures",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1076,6 +1088,7 @@ dependencies = [
  "adapter-redis",
  "adapter-search",
  "adapter-sql",
+ "adapter-timeseries",
  "dbtool-core",
 ]
 
@@ -1088,6 +1101,7 @@ dependencies = [
  "dbtool-core",
  "dbtool-registry",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
