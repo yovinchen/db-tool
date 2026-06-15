@@ -8,7 +8,11 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
-use mongodb::{Client, Database};
+use mongodb::{
+    bson::{self, Bson},
+    Client, Database,
+};
+use std::collections::BTreeMap;
 
 pub struct MongoAdapter {
     db: Database,
@@ -65,28 +69,27 @@ impl DocumentStore for MongoAdapter {
     async fn find(
         &self,
         collection: &str,
-        _filter: Value,
+        filter: Value,
         opts: FindOptions,
     ) -> Result<Vec<Document>> {
         use futures::StreamExt;
         let col = self.db.collection::<mongodb::bson::Document>(collection);
+        let filter = value_to_document(filter)?;
         let find_opts = mongodb::options::FindOptions::builder()
             .limit(opts.limit.map(|n| n as i64))
             .skip(opts.skip.map(|n| n as u64))
+            .sort(optional_document(opts.sort)?)
+            .projection(optional_document(opts.projection)?)
             .build();
         let mut cursor = col
-            .find(mongodb::bson::doc! {})
+            .find(filter)
             .with_options(find_opts)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
         let mut docs = Vec::new();
         while let Some(doc) = cursor.next().await {
             let bson_doc = doc.map_err(|e| Error::Query(e.to_string()))?;
-            let json_val: serde_json::Value = mongodb::bson::from_document(bson_doc)
-                .map_err(|e| Error::Serialization(e.to_string()))?;
-            if let serde_json::Value::Object(map) = json_val {
-                docs.push(map.into_iter().map(|(k, v)| (k, Value::Json(v))).collect());
-            }
+            docs.push(bson_document_to_core(bson_doc));
         }
         Ok(docs)
     }
@@ -95,47 +98,216 @@ impl DocumentStore for MongoAdapter {
         let col = self.db.collection::<mongodb::bson::Document>(collection);
         let bson_docs: Vec<_> = docs
             .into_iter()
-            .map(|d| {
-                let json = serde_json::Value::Object(
-                    d.into_iter()
-                        .map(|(k, v)| (k, serde_json::to_value(v).unwrap()))
-                        .collect(),
-                );
-                mongodb::bson::to_document(&json).unwrap()
-            })
-            .collect();
+            .map(core_document_to_bson)
+            .collect::<Result<Vec<_>>>()?;
         let count = bson_docs.len() as u64;
-        col.insert_many(bson_docs)
+        let result = col
+            .insert_many(bson_docs)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
         Ok(InsertOutcome {
             inserted: count,
-            ids: vec![],
+            ids: result
+                .inserted_ids
+                .into_values()
+                .map(|id| id.to_string())
+                .collect(),
         })
     }
 
     async fn update(
         &self,
-        _collection: &str,
-        _filter: Value,
-        _update: Value,
+        collection: &str,
+        filter: Value,
+        update: Value,
     ) -> Result<UpdateOutcome> {
+        let col = self.db.collection::<mongodb::bson::Document>(collection);
+        let filter = value_to_document(filter)?;
+        let update = update_document(update)?;
+        let result = col
+            .update_many(filter, update)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
         Ok(UpdateOutcome {
-            matched: 0,
-            modified: 0,
+            matched: result.matched_count,
+            modified: result.modified_count,
         })
     }
 
-    async fn delete(&self, collection: &str, _filter: Value) -> Result<u64> {
+    async fn delete(&self, collection: &str, filter: Value) -> Result<u64> {
         let col = self.db.collection::<mongodb::bson::Document>(collection);
+        let filter = value_to_document(filter)?;
+        if filter.is_empty() {
+            return Err(Error::Query(
+                "refusing to delete documents without a filter".into(),
+            ));
+        }
         let r = col
-            .delete_many(mongodb::bson::doc! {})
+            .delete_many(filter)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
         Ok(r.deleted_count)
     }
 
-    async fn aggregate(&self, _collection: &str, _pipeline: Vec<Value>) -> Result<Vec<Document>> {
-        Ok(vec![])
+    async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>> {
+        use futures::StreamExt;
+        let col = self.db.collection::<mongodb::bson::Document>(collection);
+        let pipeline = pipeline
+            .into_iter()
+            .map(value_to_document)
+            .collect::<Result<Vec<_>>>()?;
+        let mut cursor = col
+            .aggregate(pipeline)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut docs = Vec::new();
+        while let Some(doc) = cursor.next().await {
+            docs.push(bson_document_to_core(
+                doc.map_err(|e| Error::Query(e.to_string()))?,
+            ));
+        }
+        Ok(docs)
+    }
+}
+
+fn optional_document(value: Option<Value>) -> Result<Option<bson::Document>> {
+    value.map(value_to_document).transpose()
+}
+
+fn value_to_document(value: Value) -> Result<bson::Document> {
+    match value {
+        Value::Null => Ok(bson::Document::new()),
+        Value::Json(serde_json::Value::Object(map)) => {
+            let mut doc = bson::Document::new();
+            for (key, value) in map {
+                doc.insert(key, json_to_bson(value)?);
+            }
+            Ok(doc)
+        }
+        Value::Map(map) => {
+            let mut doc = bson::Document::new();
+            for (key, value) in map {
+                doc.insert(key, value_to_bson(value)?);
+            }
+            Ok(doc)
+        }
+        other => Err(Error::Serialization(format!(
+            "expected JSON object/document, got {other:?}"
+        ))),
+    }
+}
+
+fn update_document(value: Value) -> Result<bson::Document> {
+    let doc = value_to_document(value)?;
+    if doc.keys().any(|key| key.starts_with('$')) {
+        return Ok(doc);
+    }
+
+    Ok(bson::doc! { "$set": doc })
+}
+
+fn core_document_to_bson(document: Document) -> Result<bson::Document> {
+    let mut bson_doc = bson::Document::new();
+    for (key, value) in document {
+        bson_doc.insert(key, value_to_bson(value)?);
+    }
+    Ok(bson_doc)
+}
+
+fn value_to_bson(value: Value) -> Result<Bson> {
+    Ok(match value {
+        Value::Null => Bson::Null,
+        Value::Bool(value) => Bson::Boolean(value),
+        Value::Int(value) => Bson::Int64(value),
+        Value::Float(value) => Bson::Double(value),
+        Value::Text(value) => Bson::String(value),
+        Value::Bytes(value) => Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: value,
+        }),
+        Value::Timestamp(ms) => Bson::DateTime(bson::DateTime::from_millis(ms)),
+        Value::Json(value) => json_to_bson(value)?,
+        Value::Array(values) => Bson::Array(
+            values
+                .into_iter()
+                .map(value_to_bson)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Value::Map(map) => {
+            let mut doc = bson::Document::new();
+            for (key, value) in map {
+                doc.insert(key, value_to_bson(value)?);
+            }
+            Bson::Document(doc)
+        }
+    })
+}
+
+fn json_to_bson(value: serde_json::Value) -> Result<Bson> {
+    bson::to_bson(&value).map_err(|err| Error::Serialization(err.to_string()))
+}
+
+fn bson_document_to_core(document: bson::Document) -> Document {
+    document
+        .into_iter()
+        .map(|(key, value)| (key, bson_to_value(value)))
+        .collect()
+}
+
+fn bson_to_value(value: Bson) -> Value {
+    match value {
+        Bson::Double(value) => Value::Float(value),
+        Bson::String(value) => Value::Text(value),
+        Bson::Array(values) => Value::Array(values.into_iter().map(bson_to_value).collect()),
+        Bson::Document(document) => {
+            let map: BTreeMap<_, _> = document
+                .into_iter()
+                .map(|(key, value)| (key, bson_to_value(value)))
+                .collect();
+            Value::Map(map)
+        }
+        Bson::Boolean(value) => Value::Bool(value),
+        Bson::Null => Value::Null,
+        Bson::Int32(value) => Value::Int(value.into()),
+        Bson::Int64(value) => Value::Int(value),
+        Bson::Binary(binary) => Value::Bytes(binary.bytes),
+        Bson::DateTime(value) => Value::Timestamp(value.timestamp_millis()),
+        other => Value::Text(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_document_wraps_plain_document_in_set() {
+        let update = update_document(Value::Json(serde_json::json!({ "name": "alice" }))).unwrap();
+
+        assert!(update.contains_key("$set"));
+    }
+
+    #[test]
+    fn update_document_preserves_operator_document() {
+        let update =
+            update_document(Value::Json(serde_json::json!({ "$inc": { "visits": 1 } }))).unwrap();
+
+        assert!(update.contains_key("$inc"));
+        assert!(!update.contains_key("$set"));
+    }
+
+    #[test]
+    fn bson_round_trip_preserves_core_value_shapes() {
+        let mut doc = Document::new();
+        doc.insert("name".to_owned(), Value::Text("alice".to_owned()));
+        doc.insert("active".to_owned(), Value::Bool(true));
+        doc.insert("count".to_owned(), Value::Int(3));
+
+        let bson = core_document_to_bson(doc).unwrap();
+        let core = bson_document_to_core(bson);
+
+        assert_eq!(core.get("name"), Some(&Value::Text("alice".to_owned())));
+        assert_eq!(core.get("active"), Some(&Value::Bool(true)));
+        assert_eq!(core.get("count"), Some(&Value::Int(3)));
     }
 }

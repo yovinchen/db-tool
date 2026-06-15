@@ -56,10 +56,10 @@ Goal: Redis-compatible and MongoDB adapters.
 
 - [x] Redis adapter scaffold and basic KV commands.
 - [x] MongoDB adapter scaffold.
-- [ ] Redis raw command validation and typed result conversion.
-- [ ] Redis Streams/PubSub capability split.
-- [ ] MongoDB filter/update/aggregate implementation.
-- [ ] Remove adapter-side `unwrap`.
+- [x] Redis raw command validation and typed result conversion.
+- [x] Redis Streams/PubSub capability split.
+- [x] MongoDB filter/update/aggregate implementation.
+- [x] Remove adapter-side `unwrap`.
 
 ## P4: TUI
 
