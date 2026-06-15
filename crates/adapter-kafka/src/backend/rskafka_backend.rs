@@ -3,11 +3,7 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{ConsumeOptions, LagInfo, Message, ProduceOutcome, TopicDetail, TopicInfo},
-    port::{
-        capability::{AdminInspect, MessageConsumer, MessageProducer},
-        connector::{Capabilities, Connector, ConnectorKind},
-    },
+    port::connector::{Capabilities, Connector, ConnectorKind},
 };
 use futures::future::BoxFuture;
 
@@ -35,68 +31,40 @@ impl Connector for RskafkaAdapter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            producer: true,
-            consumer: true,
-            admin: true,
-            ..Default::default()
-        }
+        Capabilities::default()
     }
 
     async fn ping(&self) -> Result<()> {
         if self.brokers.is_empty() {
             return Err(Error::Connection("no Kafka brokers configured".into()));
         }
-        Ok(())
+        Err(Error::UnsupportedCapability {
+            kind: self.kind.0.clone(),
+            needed: "Kafka pure backend implementation",
+        })
     }
 
     async fn close(self: Box<Self>) -> Result<()> {
         Ok(())
     }
-
-    fn as_producer(&self) -> Option<&dyn MessageProducer> {
-        Some(self)
-    }
-    fn as_consumer(&self) -> Option<&dyn MessageConsumer> {
-        Some(self)
-    }
-    fn as_admin(&self) -> Option<&dyn AdminInspect> {
-        Some(self)
-    }
 }
 
-#[async_trait::async_trait]
-impl MessageProducer for RskafkaAdapter {
-    async fn produce(&self, _target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
-        let n = messages.len() as u64;
-        Ok(ProduceOutcome {
-            produced: n,
-            placements: vec![],
-        })
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[async_trait::async_trait]
-impl MessageConsumer for RskafkaAdapter {
-    async fn consume(&self, _source: &str, opts: ConsumeOptions) -> Result<Vec<Message>> {
-        let _ = (opts.max, opts.timeout);
-        Ok(vec![])
-    }
-}
+    #[tokio::test]
+    async fn kafka_shell_does_not_advertise_unimplemented_capabilities() {
+        let connector = connect(Dsn::parse("kafka://localhost:9092").unwrap())
+            .await
+            .unwrap();
+        let caps = connector.capabilities();
 
-#[async_trait::async_trait]
-impl AdminInspect for RskafkaAdapter {
-    async fn list_topics(&self) -> Result<Vec<TopicInfo>> {
-        Ok(vec![])
-    }
-
-    async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
-        Err(Error::Internal(format!(
-            "topic_detail for '{name}' not yet implemented"
-        )))
-    }
-
-    async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
-        Ok(vec![])
+        assert!(!caps.producer);
+        assert!(!caps.consumer);
+        assert!(!caps.admin);
+        assert!(connector.as_producer().is_none());
+        assert!(connector.as_consumer().is_none());
+        assert!(connector.as_admin().is_none());
     }
 }

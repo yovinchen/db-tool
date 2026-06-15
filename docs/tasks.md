@@ -74,6 +74,7 @@ Goal: bounded message operations with no external runtime dependencies.
 
 - [x] Kafka pure/native feature boundary scaffold.
 - [x] AMQP/NATS adapter shells.
+- [x] Messaging shells do not advertise unimplemented producer/consumer/admin capabilities.
 - [ ] Kafka pure backend real ping/list/produce/consume.
 - [ ] AMQP real producer/consumer/admin.
 - [ ] NATS real producer/consumer/admin.
