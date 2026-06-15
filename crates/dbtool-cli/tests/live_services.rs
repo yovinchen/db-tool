@@ -90,6 +90,24 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
 
     confirmed_sql_exec(dsn, &create_sql);
 
+    let (schema, expected_table_name) = table
+        .split_once('.')
+        .map_or((None, table), |(schema, name)| (Some(schema), name));
+    let tables = if let Some(schema) = schema {
+        stdout_json(dbtool(&["--dsn", dsn, "sql", "tables", "--schema", schema]))
+    } else {
+        stdout_json(dbtool(&["--dsn", dsn, "sql", "tables"]))
+    };
+    let table_found = tables["data"]
+        .as_array()
+        .expect("tables output should be an array")
+        .iter()
+        .any(|entry| entry["name"].as_str() == Some(expected_table_name));
+    assert!(
+        table_found,
+        "expected sql tables to include {expected_table_name}; output: {tables}"
+    );
+
     stdout_json(dbtool(&[
         "--dsn",
         dsn,
@@ -111,8 +129,7 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
 
     let schema = stdout_json(dbtool(&["--dsn", dsn, "sql", "schema", table]));
     assert_eq!(schema["ok"], true);
-    let expected_schema_name = table.rsplit('.').next().unwrap_or(table);
-    assert_eq!(schema["data"]["name"], expected_schema_name);
+    assert_eq!(schema["data"]["name"], expected_table_name);
 
     confirmed_sql_exec(dsn, &drop_sql);
 }

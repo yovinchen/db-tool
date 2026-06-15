@@ -9,3 +9,7 @@ readonly = false
 [connections.prod-postgres]
 dsn = "postgres://app:${DB_PASSWORD}@db.example.com/app"
 readonly = true
+
+[connections.local-tidb]
+dsn = "tidb://root@127.0.0.1:14000"
+readonly = false

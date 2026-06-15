@@ -182,7 +182,7 @@ Goal: prove compatible database protocols against real compatible services.
 - [x] Add a resource-bounded TiDB profile with PD, TiKV, and TiDB SQL server.
 - [x] Add `integration-tidb-up.sh` and `integration-tidb-test.sh`.
 - [x] Live-test `mariadb://` SQL lifecycle, typed values, and limiting against MariaDB.
-- [x] Live-test `tidb://` SQL lifecycle, typed values, limiting, safety confirmation, and schema-qualified table names against TiDB.
+- [x] Live-test `tidb://` SQL lifecycle, typed values, limiting, safety confirmation, table listing, and schema-qualified table names against TiDB.
 - [x] Live-test `valkey://`, `keydb://`, and `dragonfly://` KV lifecycle, raw write guard, and TTL against their real services.
 
 ### T4: TUI After Core Stability

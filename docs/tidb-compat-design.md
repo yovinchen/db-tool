@@ -53,6 +53,7 @@ The live test verifies:
 - Result limiting marks truncated output.
 - Destructive SQL still requires confirmation.
 - Database creation works through a root no-database DSN.
+- Table listing works with an explicit TiDB database schema.
 - Create, insert, query, schema, and drop work against a schema-qualified TiDB table.
 
 ## CI Policy
