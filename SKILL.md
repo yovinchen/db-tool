@@ -84,4 +84,18 @@ For end-to-end verification with real services, use:
 ./scripts/integration-test.sh
 ```
 
+For real messaging backends, use:
+
+```bash
+./scripts/integration-mq-test.sh
+```
+
 Override names and ports with `DBTOOL_IT_PROJECT`, `DBTOOL_IT_POSTGRES_DB`, `DBTOOL_IT_MYSQL_DB`, `DBTOOL_IT_MONGO_DB`, and the `DBTOOL_IT_*_PORT` variables documented in `docs/integration-testing.md`.
+
+Message writes use the same safety flag as other write paths:
+
+```bash
+dbtool --dsn kafka://127.0.0.1:19092 --allow-write mq produce events '{"hello":"world"}'
+dbtool --dsn kafka://127.0.0.1:19092 mq consume events --max 10 --timeout 5
+dbtool --dsn kafka://127.0.0.1:19092 mq detail events
+```

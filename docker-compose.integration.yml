@@ -96,3 +96,75 @@ services:
       retries: 40
     cpus: ${DBTOOL_IT_MONGO_CPUS:-0.50}
     mem_limit: ${DBTOOL_IT_MONGO_MEMORY:-512m}
+
+  kafka:
+    profiles: ["messaging"]
+    image: redpandadata/redpanda:v24.3.6
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-kafka
+    command:
+      [
+        "redpanda",
+        "start",
+        "--overprovisioned",
+        "--smp",
+        "1",
+        "--memory",
+        "${DBTOOL_IT_KAFKA_BROKER_MEMORY:-512M}",
+        "--reserve-memory",
+        "0M",
+        "--node-id",
+        "0",
+        "--check=false",
+        "--kafka-addr",
+        "PLAINTEXT://0.0.0.0:9092",
+        "--advertise-kafka-addr",
+        "PLAINTEXT://127.0.0.1:${DBTOOL_IT_KAFKA_PORT:-19092}",
+      ]
+    ports:
+      - "${DBTOOL_IT_KAFKA_PORT:-19092}:9092"
+      - "${DBTOOL_IT_KAFKA_ADMIN_PORT:-19644}:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --exit-when-healthy --watch=false"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+    cpus: ${DBTOOL_IT_KAFKA_CPUS:-0.75}
+    mem_limit: ${DBTOOL_IT_KAFKA_MEMORY:-1g}
+
+  rabbitmq:
+    profiles: ["messaging"]
+    image: rabbitmq:3.13-alpine
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${DBTOOL_IT_AMQP_USER:-dbtool}
+      RABBITMQ_DEFAULT_PASS: ${DBTOOL_IT_AMQP_PASSWORD:-dbtool}
+      RABBITMQ_DEFAULT_VHOST: ${DBTOOL_IT_AMQP_VHOST:-dbtool_it}
+    ports:
+      - "${DBTOOL_IT_AMQP_PORT:-15672}:5672"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "rabbitmq-diagnostics -q ping && rabbitmq-diagnostics -q check_port_connectivity",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+    cpus: ${DBTOOL_IT_AMQP_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_AMQP_MEMORY:-512m}
+
+  nats:
+    profiles: ["messaging"]
+    image: nats:2.10-alpine
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-nats
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "${DBTOOL_IT_NATS_PORT:-14222}:4222"
+      - "${DBTOOL_IT_NATS_MONITOR_PORT:-18222}:8222"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    cpus: ${DBTOOL_IT_NATS_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_NATS_MEMORY:-256m}

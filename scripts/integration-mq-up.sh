@@ -8,4 +8,11 @@ docker compose \
   -f "$ROOT/docker-compose.integration.yml" \
   -p "$DBTOOL_IT_PROJECT" \
   --profile messaging \
-  down -v --remove-orphans
+  up -d --wait --wait-timeout "${DBTOOL_IT_WAIT_TIMEOUT:-240}" \
+  kafka rabbitmq nats
+
+docker compose \
+  -f "$ROOT/docker-compose.integration.yml" \
+  -p "$DBTOOL_IT_PROJECT" \
+  --profile messaging \
+  ps kafka rabbitmq nats

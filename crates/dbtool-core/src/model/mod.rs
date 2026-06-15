@@ -6,7 +6,7 @@ pub mod series;
 pub mod value;
 
 pub use document::{Document, FindOptions, InsertOutcome, UpdateOutcome};
-pub use message::{ConsumeOptions, Message, ProduceOutcome};
+pub use message::{ConsumeOptions, Message, MessagePlacement, ProduceOutcome};
 pub use meta::{
     ColumnMeta, IndexInfo, LagInfo, PartitionWatermark, TableInfo, TableKind, TableSchema,
     TopicDetail, TopicInfo,

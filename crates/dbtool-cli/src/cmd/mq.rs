@@ -32,11 +32,17 @@ pub enum MqAction {
     },
     /// List topics
     Topics,
+    /// Show topic/queue detail when the backend exposes admin metadata
+    Detail { topic: String },
     /// Show consumer group lag
     Lag { group: String },
 }
 
 pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
+    if matches!(cmd.action, MqAction::Produce { .. }) {
+        ensure_write_allowed(ctx)?;
+    }
+
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
     let start = std::time::Instant::now();
@@ -92,6 +98,16 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             let topics = admin.list_topics().await?;
             Formatter::success(&kind, topics, elapsed(), false)
         }
+        MqAction::Detail { topic } => {
+            let admin = conn
+                .as_admin()
+                .ok_or_else(|| Error::UnsupportedCapability {
+                    kind: kind.clone(),
+                    needed: "AdminInspect",
+                })?;
+            let detail = admin.topic_detail(&topic).await?;
+            Formatter::success(&kind, detail, elapsed(), false)
+        }
         MqAction::Lag { group } => {
             let admin = conn
                 .as_admin()
@@ -103,4 +119,12 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             Formatter::success(&kind, lag, elapsed(), false)
         }
     })
+}
+
+fn ensure_write_allowed(ctx: &Context) -> Result<()> {
+    if ctx.allow_write {
+        Ok(())
+    } else {
+        Err(Error::WriteNotAllowed)
+    }
 }

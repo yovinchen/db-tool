@@ -138,12 +138,19 @@ Live database integration tests can start local Docker services with resource li
 ./scripts/integration-test.sh
 ```
 
+Live messaging integration tests start Redpanda, RabbitMQ, and NATS:
+
+```bash
+./scripts/integration-mq-test.sh
+```
+
 See [docs/integration-testing.md](docs/integration-testing.md) for custom project names, database names, ports, credentials, resource limits, and cleanup.
 
 ## Implementation Status
 
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths.
-- Kafka/AMQP/NATS adapters: staged shells, not complete production adapters yet.
+- Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`.
+- AMQP/NATS adapters: real bounded producer/consumer paths implemented behind `full`; protocol-limited admin remains future work.
 - TUI: intentionally minimal while core stabilizes.
 - Release packaging: workflow scaffold exists; signing/notarization is still future work.

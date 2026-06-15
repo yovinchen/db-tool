@@ -75,9 +75,11 @@ Goal: bounded message operations with no external runtime dependencies.
 - [x] Kafka pure/native feature boundary scaffold.
 - [x] AMQP/NATS adapter shells.
 - [x] Messaging shells do not advertise unimplemented producer/consumer/admin capabilities.
-- [ ] Kafka pure backend real ping/list/produce/consume.
-- [ ] AMQP real producer/consumer/admin.
-- [ ] NATS real producer/consumer/admin.
+- [x] Kafka pure backend real ping/list/detail/produce/consume.
+- [x] AMQP real producer/consumer and queue detail.
+- [x] NATS core real producer/consumer.
+- [ ] AMQP queue listing through RabbitMQ management API or documented plugin boundary.
+- [ ] NATS JetStream admin/list/detail support.
 - [ ] Redis Streams/PubSub support in Redis adapter.
 
 ## P6: Distribution And Extended Backends
@@ -92,13 +94,15 @@ Goal: release-quality packages and optional advanced backends.
 
 ## P7: Live Integration Automation
 
-Goal: self-start local databases with bounded resources and verify real CLI workflows.
+Goal: self-start local services with bounded resources and verify real CLI workflows.
 
 - [x] Docker Compose integration environment for Postgres, MySQL, Redis, and MongoDB.
+- [x] Docker Compose messaging profile for Redpanda, RabbitMQ, and NATS.
 - [x] Custom project name, database names, credentials, and host ports through environment variables.
 - [x] CPU/memory/resource limits for integration services.
 - [x] Integration scripts for up/down/test lifecycle.
 - [x] Live CLI tests for SQL, KV, and document workflows.
+- [x] Live CLI tests for Kafka, AMQP, and NATS messaging workflows.
 - [x] Documented integration workflow and cleanup.
 
 ## Next Execution Queue
@@ -109,11 +113,12 @@ Use this as the next implementation order now that the core/CLI/live database lo
 
 Goal: replace safe shells with real bounded functionality.
 
-- [ ] Kafka pure backend ping/list/produce/consume with bounded reads.
-- [ ] AMQP producer/consumer/admin with explicit ack and timeout behavior.
-- [ ] NATS producer/consumer/admin with subject validation.
+- [x] Kafka pure backend ping/list/detail/produce/consume with bounded reads.
+- [x] AMQP producer/consumer/detail with explicit ack and timeout behavior.
+- [x] NATS core producer/consumer with subject validation.
 - [ ] Redis Streams/PubSub support behind explicit capabilities.
-- [ ] Live messaging tests with self-starting services and resource limits.
+- [x] Live messaging tests with self-starting Redpanda/RabbitMQ/NATS and resource limits.
+- [ ] AMQP queue listing and NATS JetStream admin once protocol boundary is chosen.
 
 ### T2: CI And Integration Profiles
 
