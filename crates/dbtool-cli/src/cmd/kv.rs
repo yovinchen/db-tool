@@ -10,24 +10,35 @@ pub struct KvCmd {
 
 #[derive(Subcommand)]
 pub enum KvAction {
+    /// Read one key and return its UTF-8 value when present.
     Get {
+        /// Key name to read.
         key: String,
     },
+    /// Write one string value, optionally with a TTL in seconds.
     Set {
+        /// Key name to write.
         key: String,
+        /// String value to store.
         value: String,
+        /// Expiration time in seconds.
         #[arg(long)]
         ttl: Option<u64>,
     },
+    /// Scan keys matching a pattern, bounded by the global --limit.
     Scan {
+        /// Redis glob-style pattern.
         #[arg(default_value = "*")]
         pattern: String,
     },
+    /// Delete one or more keys.
     Del {
+        /// Key names to delete.
         keys: Vec<String>,
     },
     /// Send a raw command, e.g.: dbtool kv raw XLEN mystream
     Raw {
+        /// Raw command name followed by its arguments.
         args: Vec<String>,
     },
 }

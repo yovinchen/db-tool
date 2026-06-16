@@ -70,6 +70,31 @@ fn stderr_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stderr).expect("stderr should be JSON")
 }
 
+fn stdout_text(output: &Output) -> String {
+    assert!(
+        output.status.success(),
+        "expected success\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone()).expect("stdout should be valid UTF-8")
+}
+
+#[test]
+fn cli_help_documents_kv_and_doc_subcommands() {
+    let kv_help = stdout_text(&dbtool(&["kv", "--help"]));
+    assert!(kv_help.contains("Read one key"));
+    assert!(kv_help.contains("Write one string value"));
+    assert!(kv_help.contains("Scan keys matching a pattern"));
+    assert!(kv_help.contains("Delete one or more keys"));
+
+    let doc_help = stdout_text(&dbtool(&["doc", "--help"]));
+    assert!(doc_help.contains("List document collections"));
+    assert!(doc_help.contains("Find documents with a JSON filter"));
+    assert!(doc_help.contains("Insert one JSON document"));
+    assert!(doc_help.contains("Run a JSON aggregation pipeline"));
+}
+
 #[test]
 fn ping_and_caps_emit_success_envelopes() {
     let ping = stdout_json(&dbtool(&["--dsn", "sqlite::memory:", "ping"]));

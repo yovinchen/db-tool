@@ -14,30 +14,47 @@ pub struct DocCmd {
 
 #[derive(Subcommand)]
 pub enum DocAction {
+    /// List document collections.
     Collections,
+    /// Find documents with a JSON filter.
     Find {
+        /// Collection name.
         collection: String,
+        /// JSON filter object.
         #[arg(long, default_value = "{}")]
         filter: String,
     },
+    /// Insert one JSON document.
     Insert {
+        /// Collection name.
         collection: String,
+        /// JSON document object.
         doc: String,
     },
+    /// Update documents matching a JSON filter.
     Update {
+        /// Collection name.
         collection: String,
+        /// JSON filter object.
         #[arg(long)]
         filter: String,
+        /// JSON update document; plain objects are wrapped in `$set` by MongoDB adapter.
         #[arg(long)]
         update: String,
     },
+    /// Delete documents matching a non-empty JSON filter.
     Delete {
+        /// Collection name.
         collection: String,
+        /// JSON filter object.
         #[arg(long)]
         filter: String,
     },
+    /// Run a JSON aggregation pipeline.
     Aggregate {
+        /// Collection name.
         collection: String,
+        /// JSON array pipeline.
         pipeline: String,
     },
 }

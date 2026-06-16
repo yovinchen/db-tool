@@ -120,6 +120,22 @@ the stated dbtool objective.
 | Redis Pub/Sub durable listing | Not a durable catalog | Pub/Sub channels are live subscriptions, not durable topics; durable list/detail semantics stay on Redis Streams. |
 | NATS core subject listing | Not a durable catalog | Core NATS subjects are ephemeral routing names; durable list/detail/lag semantics stay on JetStream. |
 
+## Recommended Enhancement Candidates
+
+The project objective is complete, but these productization candidates would make
+the tool easier to operate in wider environments. They should stay separate from
+the completed core objective and be implemented one feature branch at a time.
+
+| Candidate | Why it helps | Concrete implementation path | Verification gate |
+| --- | --- | --- | --- |
+| CLI discoverability polish | Keeps the tool self-explanatory for humans and Claude Skill callers. | Add clap help text and examples to command variants and arguments without changing command behavior. | Targeted `--help` assertions plus `cargo test -p dbtool-cli --test cli_json`. |
+| Shell completions and manpage artifacts | Makes local installation via npm/pip/mise feel complete. | Add a packaging script that emits bash/zsh/fish completions and a manpage from clap metadata, then include them in release archives and wrapper packages. | Archive smoke checks verify completion/manpage files for every target. |
+| Dedicated CQL command surface | Cassandra works today through constrained SQL commands, but CQL has protocol-specific concepts such as keyspaces, paging, consistency, and prepared statements. | Add a `CqlEngine` trait, expose `dbtool cql query/exec/keyspaces/tables/schema`, and let `adapter-cassandra` implement it while keeping the existing SQL-compatible path. | Adapter unit tests plus Cassandra Docker lifecycle, keyspace/table/schema, paging, and write-safety coverage. |
+| Product-native Elasticsearch profile | The shared OpenSearch/Elasticsearch HTTP surface is covered, but a real Elasticsearch container would catch product-specific response drift. | Add an opt-in Elasticsearch Docker profile and an `integration-elasticsearch-test.sh` that exercises `elasticsearch://` and `elasticsearch+https://` aliases. | Compose config validation plus live index/search/index lifecycle against Elasticsearch. |
+| OpenSearch security-plugin TLS profile | Current HTTPS validation uses a compatible TLS harness; the full OpenSearch security plugin remains a heavier product setup. | Add a separate security-enabled OpenSearch profile with generated certs, credentials, and role setup, keeping it opt-in. | `search indices`, `search search`, and `search index` through authenticated TLS DSNs. |
+| Vendor Kafka-compatible smoke profiles | AutoMQ, WarpStream, and Confluent routes reuse the Kafka adapter but are not all live-tested against vendor deployments. | Add env-gated scripts that consume externally supplied broker URLs/credentials, without committing secrets or forcing CI usage. | Opt-in smoke proves ping/topics/produce/consume for each supplied vendor endpoint. |
+| Generic export/import CLI | Integration scripts prove logical roundtrips, but users do not yet have first-class `export`/`import` commands. | Add read-only export commands and write-gated import commands for SQL rows, Redis keys, MongoDB documents, and possibly search documents. | Service-free SQLite tests plus Docker-backed base DB roundtrip tests using only public CLI commands. |
+
 ## Completion Evidence
 
 `docs/final-goal-audit.md` maps the final objective to concrete evidence, and
