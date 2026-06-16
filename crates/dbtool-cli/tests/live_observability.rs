@@ -81,7 +81,35 @@ fn opensearch_tls_live_index_search_and_list() {
     }
 
     let dsn = required_env("DBTOOL_IT_OPENSEARCH_TLS_DSN");
+    assert_tls_seed_fixture(&dsn);
     run_search_lifecycle(&dsn, "opensearch+https", "dbtool_search_tls");
+}
+
+fn assert_tls_seed_fixture(dsn: &str) {
+    let indices = stdout_json_retry(&["--dsn", dsn, "search", "indices"], |value| {
+        value["data"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["name"] == "dbtool_seed"))
+    });
+    assert!(indices["data"].as_array().is_some());
+
+    let hits = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--limit",
+        "10",
+        "search",
+        "search",
+        "dbtool_seed",
+        "--q",
+        r#"{"match_all":{}}"#,
+    ]));
+    assert_eq!(hits["data"]["total"], 2);
+    assert!(hits["data"]["hits"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["_source"]["source"] == "dockerfile-fixture")
+    }));
 }
 
 fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str) {

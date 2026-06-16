@@ -9,6 +9,24 @@ from urllib.parse import parse_qs, unquote, urlparse
 STORE = {}
 
 
+def load_seed(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"invalid seed JSON at {path}:{line_number}: {exc}") from exc
+
+            index = item.get("index")
+            doc = item.get("doc")
+            if not isinstance(index, str) or not isinstance(doc, dict):
+                raise SystemExit(f"seed row must contain string index and object doc at {path}:{line_number}")
+            STORE.setdefault(index, []).append(doc)
+
+
 class SearchTlsHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -74,7 +92,11 @@ def main():
     parser.add_argument("--port", type=int, default=9200)
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
+    parser.add_argument("--seed")
     args = parser.parse_args()
+
+    if args.seed:
+        load_seed(args.seed)
 
     server = ThreadingHTTPServer((args.host, args.port), SearchTlsHandler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

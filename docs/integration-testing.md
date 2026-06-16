@@ -121,8 +121,11 @@ Search and time-series integration tests use the observability profile:
 The observability script starts OpenSearch, an OpenSearch-compatible HTTPS
 harness, and Prometheus, waits for health checks, runs live CLI tests for
 `search` and `ts`, and removes the containers and volumes. The HTTPS harness
-uses a short-lived local CA under `.tmp/` and validates the `opensearch+https://`
-path with the `tls-ca` DSN parameter.
+is built from [docker/search-tls/Dockerfile](../docker/search-tls/Dockerfile),
+loads seed documents from
+[testdata/search-tls-seed.ndjson](../testdata/search-tls-seed.ndjson), uses a
+short-lived local CA under `.tmp/`, and validates the `opensearch+https://` path
+with the `tls-ca` DSN parameter.
 
 ## Custom Names And Ports
 
@@ -331,6 +334,7 @@ The live tests cover:
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
 - AMQPS queue publish/detail/consume and NATS TLS publish/subscribe plus JetStream topics/detail/lag through local CA-backed TLS services.
 - OpenSearch ping, write guard, single-document indexing, search, and index listing over plain HTTP plus TLS transport through `opensearch+https://`.
+- OpenSearch TLS harness fixture loading by searching the seeded `dbtool_seed` index from the Dockerfile-built image.
 - Prometheus ping, metric listing, and range query through `ts`.
 
 Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; use an explicit `rabbitmq+http://` management DSN for RabbitMQ queue discovery.

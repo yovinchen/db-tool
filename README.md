@@ -219,6 +219,9 @@ OpenSearch-compatible HTTPS harness, and Prometheus:
 ./scripts/integration-observability-test.sh
 ```
 
+The HTTPS harness is built from [docker/search-tls/Dockerfile](docker/search-tls/Dockerfile)
+and seeds fixture documents from [testdata/search-tls-seed.ndjson](testdata/search-tls-seed.ndjson).
+
 See [docs/integration-testing.md](docs/integration-testing.md) for custom project names, database names, ports, credentials, resource limits, and cleanup.
 
 Messaging metadata has protocol-specific boundaries. See [docs/messaging-boundaries.md](docs/messaging-boundaries.md) for why AMQP queue listing needs RabbitMQ's management API, why NATS admin is JetStream-scoped, and why Redis Pub/Sub is live-only.

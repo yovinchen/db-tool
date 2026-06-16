@@ -9,6 +9,12 @@ docker compose \
   -f "$ROOT/docker-compose.integration.yml" \
   -p "$DBTOOL_IT_PROJECT" \
   --profile observability \
+  build opensearch-tls
+
+docker compose \
+  -f "$ROOT/docker-compose.integration.yml" \
+  -p "$DBTOOL_IT_PROJECT" \
+  --profile observability \
   up -d --wait --wait-timeout "${DBTOOL_IT_WAIT_TIMEOUT:-300}" \
   opensearch opensearch-tls prometheus
 

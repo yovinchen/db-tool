@@ -68,7 +68,7 @@ usable.
 | `./scripts/integration-mq-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Streams/PubSub, Kafka, AMQP, NATS | Roughly 2 GiB container memory |
 | `./scripts/integration-mq-tls-test.sh` | RabbitMQ TLS, NATS TLS | AMQPS and NATS TLS aliases | Roughly 768 MiB container memory |
 | `./scripts/integration-mq-native-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Native Kafka backend plus messaging regression | Requires `full-native` build |
-| `./scripts/integration-observability-test.sh` | OpenSearch, OpenSearch-compatible HTTPS harness, Prometheus | Search, search TLS transport, and time-series workflows | Roughly 1.4 GiB container memory |
+| `./scripts/integration-observability-test.sh` | OpenSearch, Dockerfile-built OpenSearch-compatible HTTPS harness, Prometheus | Search, seeded search TLS transport, and time-series workflows | Roughly 1.4 GiB container memory |
 
 ## Implemented CLI Operations
 

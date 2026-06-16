@@ -1,0 +1,2 @@
+{"index":"dbtool_seed","doc":{"name":"seed-alice","role":"search","source":"dockerfile-fixture"}}
+{"index":"dbtool_seed","doc":{"name":"seed-bob","role":"observability","source":"dockerfile-fixture"}}

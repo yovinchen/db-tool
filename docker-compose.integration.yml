@@ -550,12 +550,15 @@ services:
 
   opensearch-tls:
     profiles: ["observability"]
-    image: python:${DBTOOL_IT_SEARCH_TLS_PYTHON_VERSION:-3.12-alpine}
+    image: ${DBTOOL_IT_SEARCH_TLS_IMAGE:-dbtool-search-tls:local}
+    build:
+      context: .
+      dockerfile: docker/search-tls/Dockerfile
+      args:
+        PYTHON_VERSION: ${DBTOOL_IT_SEARCH_TLS_PYTHON_VERSION:-3.12-alpine}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-opensearch-tls
     command:
       [
-        "python",
-        "/search-tls/server.py",
         "--host",
         "0.0.0.0",
         "--port",
@@ -564,9 +567,10 @@ services:
         "/search-tls/certs/server.pem",
         "--key",
         "/search-tls/certs/server-key.pem",
+        "--seed",
+        "/search-tls/seed.ndjson",
       ]
     volumes:
-      - ./scripts/search-tls-harness.py:/search-tls/server.py:ro
       - ${DBTOOL_IT_SEARCH_TLS_DIR:-.tmp/dbtool-it-search-tls}/certs:/search-tls/certs:ro
     ports:
       - "${DBTOOL_IT_OPENSEARCH_TLS_PORT:-19201}:9200"
