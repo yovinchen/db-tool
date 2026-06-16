@@ -1,4 +1,4 @@
-use crate::state::{AppState, Panel};
+use crate::state::{AppState, CommandFormState, Panel};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -55,11 +55,25 @@ pub fn render(f: &mut Frame, state: &AppState) {
     );
     f.render_widget(list, chunks[0]);
 
-    // Right: query + results
+    // Right: command form + query + results
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
         .split(chunks[1]);
+
+    let form = Paragraph::new(form_text(&state.form))
+        .block(
+            Block::default()
+                .title("Form [F2/F3/F4]")
+                .borders(Borders::ALL)
+                .border_style(panel_style(&state.active_panel, Panel::CommandForm)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(form, right[0]);
 
     let input_title = if state.pending_write.is_some() {
         "Query [y confirm / n cancel]"
@@ -74,7 +88,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
                 .border_style(panel_style(&state.active_panel, Panel::QueryInput)),
         )
         .wrap(Wrap { trim: false });
-    f.render_widget(input, right[0]);
+    f.render_widget(input, right[1]);
 
     let results = Paragraph::new(state.result_text.as_str())
         .block(
@@ -84,7 +98,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
                 .border_style(panel_style(&state.active_panel, Panel::Results)),
         )
         .wrap(Wrap { trim: false });
-    f.render_widget(results, right[1]);
+    f.render_widget(results, right[2]);
 
     let footer = Paragraph::new(footer_text(state)).style(Style::default().fg(Color::DarkGray));
     f.render_widget(footer, screen[2]);
@@ -104,10 +118,41 @@ fn status_text(state: &AppState) -> String {
         .unwrap_or(("none", "unknown"));
 
     format!(
-        "connection: {connection} | mode: {mode} | limit: {} | history: {} | panel: {:?}",
+        "connection: {connection} | mode: {mode} | limit: {} | history: {} | form: {} | panel: {:?}",
         state.limit,
         state.command_history.len(),
+        state.form.kind.label(),
         state.active_panel
+    )
+}
+
+fn form_text(form: &CommandFormState) -> String {
+    let labels = form.kind.field_labels();
+    if labels.is_empty() {
+        return format!("{} -> {}", form.kind.label(), form.command());
+    }
+
+    let active = form.active_label().unwrap_or("none");
+    let fields = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let marker = if index == form.active_field { ">" } else { " " };
+            let value = form
+                .fields
+                .get(index)
+                .map(|field| field.as_str())
+                .filter(|field| !field.is_empty())
+                .unwrap_or("<default>");
+            format!("{marker} {label}: {value}")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    format!(
+        "{} -> {}\nactive: {active} | {fields}",
+        form.kind.label(),
+        form.command()
     )
 }
 
@@ -152,6 +197,7 @@ mod tests {
         assert!(status.contains("mode: readonly"));
         assert!(status.contains("limit: 42"));
         assert!(status.contains("history: 1"));
+        assert!(status.contains("form: SQL query"));
         assert!(status.contains("panel: Results"));
     }
 
@@ -171,11 +217,32 @@ mod tests {
 
         let rendered = buffer_text(terminal.backend().buffer());
         assert!(rendered.contains("dbtool TUI"));
+        assert!(rendered.contains("Form"));
         assert!(rendered.contains("connection: primary"));
         assert!(rendered.contains("mode: read-write"));
         assert!(rendered.contains("history: 1"));
+        assert!(rendered.contains("SQL query"));
         assert!(rendered.contains("pending write: none"));
         assert!(rendered.contains("result bytes: 19"));
+    }
+
+    #[test]
+    fn form_text_renders_active_field_and_generated_command() {
+        let mut form = CommandFormState::new(crate::state::CapabilityForm::SearchQuery);
+        for c in "users".chars() {
+            form.push_char(c);
+        }
+        form.next_field();
+        for c in "{\"query\":{\"match_all\":{}}}".chars() {
+            form.push_char(c);
+        }
+
+        let rendered = form_text(&form);
+
+        assert!(rendered.contains("Search query"));
+        assert!(rendered.contains("search users {\"query\":{\"match_all\":{}}}"));
+        assert!(rendered.contains("active: query"));
+        assert!(rendered.contains("> query: {\"query\":{\"match_all\":{}}}"));
     }
 
     fn buffer_text(buffer: &Buffer) -> String {

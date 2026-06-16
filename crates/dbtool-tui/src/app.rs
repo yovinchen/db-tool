@@ -35,7 +35,7 @@ impl App {
     }
 
     pub fn help_text() -> &'static str {
-        "dbtool-tui\n\nUsage: dbtool-tui [--smoke]\n\nKeys: Tab changes panel, Enter runs a query command, Up/Down recall command history in the query panel, y confirms a pending write, n cancels it, q quits.\nCommands: ping, caps, sql <query>, sql exec <statement>, tables, schema <table>, kv get/scan/set/del, doc collections/find, search indices/index/query, ts measurements/query."
+        "dbtool-tui\n\nUsage: dbtool-tui [--smoke]\n\nKeys: Tab changes panel, Enter runs a query command, Up/Down recall command history in the query panel, F2 changes the capability form, F3 changes form field, F4 applies the form, y confirms a pending write, n cancels it, q quits.\nCommands: ping, caps, sql <query>, sql exec <statement>, tables, schema <table>, kv get/scan/set/del, doc collections/find, search indices/index/query, ts measurements/query."
     }
 
     pub fn smoke_summary(&self) -> String {
@@ -471,6 +471,7 @@ mod tests {
 
         assert!(App::help_text().contains("Usage: dbtool-tui"));
         assert!(App::help_text().contains("Up/Down recall command history"));
+        assert!(App::help_text().contains("F2 changes the capability form"));
         assert!(app.smoke_summary().contains("loaded"));
     }
 
