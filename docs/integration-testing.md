@@ -27,6 +27,7 @@ The default suite runs:
 - `./scripts/validate-compose-configs.sh`
 - `./scripts/integration-test.sh`
 - `./scripts/integration-flow-control-test.sh`
+- `./scripts/integration-connection-config-test.sh`
 - `./scripts/integration-fixture-data-test.sh`
 - `./scripts/integration-fixture-images-test.sh`
 - `./scripts/integration-data-roundtrip-test.sh`
@@ -48,6 +49,19 @@ base database and flow-control live checks. `heavy` adds opt-in phases such as
 the dbtool Docker image smoke, SQL Server, Cassandra, TiDB secure HA drills,
 TiDB TiProxy, and observability. `DBTOOL_IT_DB_SUITE_CONTINUE=1` keeps running
 after a failed phase and reports all failed phase names at the end.
+
+Run the live connection-config smoke when you need to verify
+`connections.toml` named connections against real Docker services:
+
+```bash
+./scripts/integration-connection-config-test.sh
+```
+
+The config smoke writes a temporary `connections.toml`, starts Postgres, MySQL,
+Redis, and MongoDB, then uses only `--conn` names to run pings and SQL/KV/doc
+commands. It also adds a PostgreSQL named connection with short
+`request_timeout` and `overall_deadline` values and verifies a live
+`pg_sleep(1)` returns `TIMEOUT`.
 
 Run a narrower flow-control smoke when you need to validate throttling-facing
 CLI flags against real services without running the whole live test binary:

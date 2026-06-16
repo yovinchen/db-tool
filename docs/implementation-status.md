@@ -64,9 +64,10 @@ usable.
 
 | Script | Services | Main coverage | Resource note |
 | --- | --- | --- | --- |
-| `./scripts/integration-db-suite.sh` | Selectable local DB suite | Orchestrates Compose config validation, service-free checks, base DB workflows, flow-control, fixture data/images, logical roundtrip, compatibility profiles, TiDB, and opt-in heavy DB phases | Default excludes heavy phases; `DBTOOL_IT_DB_SUITE_PHASES=all` includes the dbtool image smoke plus every DB/observability phase |
+| `./scripts/integration-db-suite.sh` | Selectable local DB suite | Orchestrates Compose config validation, service-free checks, base DB workflows, flow-control, live connection config, fixture data/images, logical roundtrip, compatibility profiles, TiDB, and opt-in heavy DB phases | Default excludes heavy phases; `DBTOOL_IT_DB_SUITE_PHASES=all` includes the dbtool image smoke plus every DB/observability phase |
 | `./scripts/integration-test.sh` | Postgres, MySQL, Redis, MongoDB | Canonical SQL, KV, and document workflows | Roughly 2 GiB container memory |
 | `./scripts/integration-flow-control-test.sh` | Postgres, MySQL, Redis, MongoDB | Live request timeout, rate/admission flags, SQL/KV/document result limiting, and disposable fixture cleanup | Roughly 2 GiB container memory; local-only while CI budget is frozen |
+| `./scripts/integration-connection-config-test.sh` | Postgres, MySQL, Redis, MongoDB | Temporary `connections.toml` named connections for SQL/KV/document workflows plus connection-level request timeout | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-fixture-data-test.sh` | Postgres, MySQL, Redis, MongoDB | File-backed reusable fixture loading for SQL rows, Redis keys, and MongoDB documents | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-fixture-images-test.sh` | Dockerfile-built Postgres, MySQL, Redis, MongoDB | Fixture data baked into database images and verified through dbtool readback | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-data-roundtrip-test.sh` | Postgres, MySQL, Redis, MongoDB | dbtool-mediated logical export and restore of fixture rows, keys, and documents into independent target resources | Roughly 2 GiB container memory; local-only while CI budget is frozen |
