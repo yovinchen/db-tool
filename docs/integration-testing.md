@@ -38,6 +38,23 @@ Tune the smoke with `DBTOOL_IT_FLOW_CONTROL_TIMEOUT_REQUEST`,
 `DBTOOL_IT_FLOW_CONTROL_REQUEST_TIMEOUT`, and
 `DBTOOL_IT_FLOW_CONTROL_DEADLINE`.
 
+Run the reusable fixture-data smoke when you need file-backed test data for the
+base database suite:
+
+```bash
+./scripts/integration-fixture-data-test.sh
+```
+
+The fixture smoke starts the same Postgres, MySQL, Redis, and MongoDB
+containers, loads backend-specific seed files from `testdata/`, then verifies
+that dbtool can query the seeded rows, keys, and documents back through the
+normal CLI surfaces:
+
+- [base-postgres-seed.sql](../testdata/base-postgres-seed.sql) for PostgreSQL.
+- [base-mysql-seed.sql](../testdata/base-mysql-seed.sql) for MySQL.
+- [base-redis-seed.commands](../testdata/base-redis-seed.commands) for Redis.
+- [base-mongo-seed.ndjson](../testdata/base-mongo-seed.ndjson) for MongoDB.
+
 Compatible database integration tests use a separate profile:
 
 ```bash
@@ -417,6 +434,8 @@ The live tests cover:
 - Docker-backed flow-control smoke for Postgres slow-query timeout, MySQL
   rate/admission flags, SQL result limits, Redis scan limits, MongoDB find
   limits, and disposable fixture cleanup.
+- Reusable base fixture loading for PostgreSQL, MySQL, Redis, and MongoDB from
+  SQL, command, and NDJSON files under `testdata/`.
 - MariaDB/TiDB alias DSNs against the MySQL protocol adapter, typed MySQL values, and result limiting.
 - CockroachDB/TimescaleDB alias DSNs against the PostgreSQL protocol adapter, typed Postgres-family values, result limiting, table listing, schema inspection, and SQL lifecycle.
 - Redis ping, set/get/scan/raw typed output, TTL, scan truncation, multi-key delete, blocked destructive raw command, and blocked mutating raw command without `--allow-write`.

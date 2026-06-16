@@ -213,6 +213,14 @@ and fixture cleanup:
 ./scripts/integration-flow-control-test.sh
 ```
 
+Run the reusable fixture-data smoke when you need to prove that file-backed
+seed data can be loaded through dbtool and queried back from the base SQL, KV,
+and document services:
+
+```bash
+./scripts/integration-fixture-data-test.sh
+```
+
 Compatible database integration tests start real MariaDB and Valkey services by default:
 
 ```bash
