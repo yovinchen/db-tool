@@ -8,6 +8,7 @@ DEFAULT_PHASES=(
   service-free
   base
   flow-control
+  server-timeout
   connection-config
   custom-env
   fixture-data
@@ -52,8 +53,8 @@ Environment:
                                   failed phases at the end.
 
 Default phases:
-  compose-config service-free base flow-control connection-config fixture-data
-  custom-env fixture-images data-roundtrip compat pg-compat tidb
+  compose-config service-free base flow-control server-timeout connection-config
+  custom-env fixture-data fixture-images data-roundtrip compat pg-compat tidb
 
 Heavy phases:
   dbtool-image compat-extra sqlserver cassandra tidb-secure tidb-ha tidb-pd
@@ -73,6 +74,7 @@ phase_description() {
     dbtool-image) echo "containerized dbtool CLI image smoke" ;;
     base) echo "Postgres/MySQL/Redis/MongoDB live CLI workflows" ;;
     flow-control) echo "live timeout, rate/admission, and result-limit checks" ;;
+    server-timeout) echo "live database-side SQL execution timeout checks" ;;
     connection-config) echo "live connections.toml named-connection workflows and limits" ;;
     custom-env) echo "custom database names, credentials, and host ports smoke" ;;
     fixture-data) echo "file-backed base database fixture data" ;;
@@ -144,6 +146,7 @@ run_phase() {
     dbtool-image) "$ROOT/scripts/smoke-docker-image.sh" ;;
     base) "$ROOT/scripts/integration-test.sh" ;;
     flow-control) "$ROOT/scripts/integration-flow-control-test.sh" ;;
+    server-timeout) "$ROOT/scripts/integration-server-timeout-test.sh" ;;
     connection-config) "$ROOT/scripts/integration-connection-config-test.sh" ;;
     custom-env) "$ROOT/scripts/integration-custom-env-test.sh" ;;
     fixture-data) "$ROOT/scripts/integration-fixture-data-test.sh" ;;

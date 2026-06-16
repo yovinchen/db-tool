@@ -27,6 +27,7 @@ The default suite runs:
 - `./scripts/validate-compose-configs.sh`
 - `./scripts/integration-test.sh`
 - `./scripts/integration-flow-control-test.sh`
+- `./scripts/integration-server-timeout-test.sh`
 - `./scripts/integration-connection-config-test.sh`
 - `./scripts/integration-custom-env-test.sh`
 - `./scripts/integration-fixture-data-test.sh`
@@ -101,6 +102,30 @@ Tune the smoke with `DBTOOL_IT_FLOW_CONTROL_TIMEOUT_REQUEST`,
 `DBTOOL_IT_FLOW_CONTROL_ACQUIRE_TIMEOUT`,
 `DBTOOL_IT_FLOW_CONTROL_REQUEST_TIMEOUT`, and
 `DBTOOL_IT_FLOW_CONTROL_DEADLINE`.
+
+Run the server-timeout smoke when you need to validate database-side execution
+timeouts separately from dbtool's client-side request timeout:
+
+```bash
+./scripts/integration-server-timeout-test.sh
+```
+
+The server-timeout smoke starts the base PostgreSQL and MySQL services, then
+verifies PostgreSQL `statement_timeout` cancels a slow `pg_sleep` query for new
+sessions and MySQL `innodb_lock_wait_timeout` cancels a dbtool `UPDATE`
+blocked behind a row lock held by the container-local MySQL client. The
+client-side `--request-timeout` and `--deadline` values are kept larger than
+the database-side budgets so the observed failures prove the database layer is
+enforcing the limit.
+
+Tune the smoke with `DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_STATEMENT_TIMEOUT`,
+`DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_SLEEP_SECONDS`,
+`DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_WAIT_SECONDS`,
+`DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_HOLD_SECONDS`,
+`DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_READY_SLEEP`,
+`DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_WAIT_RESET_SECONDS`,
+`DBTOOL_IT_SERVER_TIMEOUT_CLIENT_REQUEST_TIMEOUT`, and
+`DBTOOL_IT_SERVER_TIMEOUT_CLIENT_DEADLINE`.
 
 Run the reusable fixture-data smoke when you need file-backed test data for the
 base database suite:
