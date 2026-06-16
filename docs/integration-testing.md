@@ -68,7 +68,11 @@ Search and time-series integration tests use the observability profile:
 ./scripts/integration-observability-test.sh
 ```
 
-The observability script starts OpenSearch and Prometheus, waits for health checks, runs live CLI tests for `search` and `ts`, and removes the containers and volumes.
+The observability script starts OpenSearch, an OpenSearch-compatible HTTPS
+harness, and Prometheus, waits for health checks, runs live CLI tests for
+`search` and `ts`, and removes the containers and volumes. The HTTPS harness
+uses a short-lived local CA under `.tmp/` and validates the `opensearch+https://`
+path with the `tls-ca` DSN parameter.
 
 ## Custom Names And Ports
 
@@ -141,6 +145,7 @@ Observability service settings follow the same pattern:
 ```bash
 DBTOOL_IT_PROJECT=my-dbtool-observability-run \
 DBTOOL_IT_OPENSEARCH_PORT=29200 \
+DBTOOL_IT_OPENSEARCH_TLS_PORT=29201 \
 DBTOOL_IT_PROMETHEUS_PORT=29090 \
 ./scripts/integration-observability-test.sh
 ```
@@ -195,11 +200,12 @@ The compose file applies conservative defaults:
 - RabbitMQ/AMQP: `0.50` CPU, `512m` memory
 - NATS: `0.25` CPU, `256m` memory
 - OpenSearch: `1.00` CPU, `1g` memory, JVM heap `256m`
+- OpenSearch-compatible HTTPS harness: `0.25` CPU, `128m` memory
 - Prometheus: `0.25` CPU, `256m` memory
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the messaging suite is capped at roughly 2 GiB, the observability suite is capped at roughly 1.25 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
+The base service suite is capped at roughly 2 GiB of container memory, the messaging suite is capped at roughly 2 GiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
 
 ## Live Test Scope
 
@@ -219,7 +225,7 @@ The live tests cover:
 - Optional native Kafka/librdkafka coverage through the same Redpanda test data.
 - RabbitMQ queue publish, passive detail/message count, acked consume, write guard, and HTTP management queue listing/detail/lag.
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
-- OpenSearch ping, write guard, single-document indexing, search, and index listing.
+- OpenSearch ping, write guard, single-document indexing, search, and index listing over plain HTTP plus TLS transport through `opensearch+https://`.
 - Prometheus ping, metric listing, and range query through `ts`.
 
 Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; use an explicit `rabbitmq+http://` management DSN for RabbitMQ queue discovery.

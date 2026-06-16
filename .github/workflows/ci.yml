@@ -278,6 +278,7 @@ jobs:
     env:
       DBTOOL_IT_PROJECT: dbtool-it-ci-observability
       DBTOOL_IT_OPENSEARCH_PORT: 29200
+      DBTOOL_IT_OPENSEARCH_TLS_PORT: 29201
       DBTOOL_IT_PROMETHEUS_PORT: 29090
     steps:
       - uses: actions/checkout@v4

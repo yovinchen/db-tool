@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::ServerName;
 use serde_json::{json, Map, Value as JsonValue};
-use std::sync::Arc;
+use std::{fs::File, io::BufReader, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -108,6 +108,7 @@ struct SearchHttpClient {
     base_path: String,
     authorization: Option<String>,
     transport: SearchTransport,
+    tls_ca: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +138,7 @@ impl SearchHttpClient {
             validate_tls_server_name(&host)?;
         }
         let port = url.port().unwrap_or(9200);
+        let tls_ca = search_tls_ca(&url);
         let username = percent_decode(url.username())?;
         let password = url
             .password()
@@ -156,6 +158,7 @@ impl SearchHttpClient {
             base_path,
             authorization,
             transport,
+            tls_ca,
         })
     }
 
@@ -172,7 +175,8 @@ impl SearchHttpClient {
             .map_err(|e| Error::Connection(e.to_string()))?;
 
         if self.transport == SearchTransport::Tls {
-            let connector = TlsConnector::from(Arc::new(tls_client_config()?));
+            let connector =
+                TlsConnector::from(Arc::new(tls_client_config(self.tls_ca.as_deref())?));
             let server_name = ServerName::try_from(self.host.clone())
                 .map_err(|e| Error::Dsn(format!("invalid TLS server name: {e}")))?;
             let stream = connector
@@ -238,11 +242,18 @@ where
     }
 
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .map_err(|e| Error::Connection(e.to_string()))?;
+    if let Err(e) = stream.read_to_end(&mut response).await {
+        if response.is_empty() || !is_tls_close_notify_eof(&e) {
+            return Err(Error::Connection(e.to_string()));
+        }
+    }
     parse_http_json(&response)
+}
+
+fn is_tls_close_notify_eof(error: &std::io::Error) -> bool {
+    error
+        .to_string()
+        .contains("peer closed connection without sending TLS close_notify")
 }
 
 fn validate_tls_server_name(host: &str) -> Result<()> {
@@ -251,7 +262,7 @@ fn validate_tls_server_name(host: &str) -> Result<()> {
         .map_err(|e| Error::Dsn(format!("invalid TLS server name: {e}")))
 }
 
-fn tls_client_config() -> Result<ClientConfig> {
+fn tls_client_config(tls_ca: Option<&str>) -> Result<ClientConfig> {
     let cert_result = rustls_native_certs::load_native_certs();
     let load_errors = cert_result
         .errors
@@ -261,8 +272,13 @@ fn tls_client_config() -> Result<ClientConfig> {
         .join("; ");
     let mut roots = RootCertStore::empty();
     let (valid, invalid) = roots.add_parsable_certificates(cert_result.certs);
+    let custom_valid = if let Some(path) = tls_ca {
+        add_custom_ca_file(&mut roots, path)?
+    } else {
+        0
+    };
 
-    if valid == 0 {
+    if valid + custom_valid == 0 {
         let mut reason = format!("no usable native root certificates found; ignored {invalid}");
         if !load_errors.is_empty() {
             reason.push_str(&format!("; load errors: {load_errors}"));
@@ -273,6 +289,35 @@ fn tls_client_config() -> Result<ClientConfig> {
     Ok(ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth())
+}
+
+fn search_tls_ca(url: &Url) -> Option<String> {
+    url.query_pairs().find_map(|(key, value)| {
+        matches!(key.as_ref(), "tls-ca" | "ssl-ca").then(|| value.into_owned())
+    })
+}
+
+fn add_custom_ca_file(roots: &mut RootCertStore, path: &str) -> Result<usize> {
+    let file = File::open(path)
+        .map_err(|e| Error::Config(format!("failed to open TLS CA file {path}: {e}")))?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::Config(format!("failed to read TLS CA file {path}: {e}")))?;
+    if certs.is_empty() {
+        return Err(Error::Config(format!(
+            "TLS CA file {path} does not contain PEM certificates"
+        )));
+    }
+
+    let (valid, invalid) = roots.add_parsable_certificates(certs);
+    if valid == 0 {
+        return Err(Error::Config(format!(
+            "TLS CA file {path} did not contain usable certificates; ignored {invalid}"
+        )));
+    }
+
+    Ok(valid)
 }
 
 fn normalize_base_path(path: &str) -> String {
@@ -603,6 +648,18 @@ mod tests {
 
         assert_eq!(client.transport, SearchTransport::Tls);
         assert_eq!(client.port, 9200);
+    }
+
+    #[test]
+    fn accepts_custom_tls_ca_query_params() {
+        let dsn = Dsn::parse("opensearch+https://search.local?tls-ca=/tmp/search-ca.pem").unwrap();
+        let client = SearchHttpClient::from_dsn(&dsn).unwrap();
+        assert_eq!(client.tls_ca.as_deref(), Some("/tmp/search-ca.pem"));
+
+        let dsn =
+            Dsn::parse("elasticsearch+https://search.local?ssl-ca=/tmp/search-ca.pem").unwrap();
+        let client = SearchHttpClient::from_dsn(&dsn).unwrap();
+        assert_eq!(client.tls_ca.as_deref(), Some("/tmp/search-ca.pem"));
     }
 
     #[test]

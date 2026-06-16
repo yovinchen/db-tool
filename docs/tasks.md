@@ -211,7 +211,7 @@ Goal: add new families only after the core behavior remains stable under integra
 - [x] Search backend adapter with OpenSearch/Elasticsearch HTTP index list/search/index operations.
 - [x] OpenSearch/Elasticsearch resource-bounded Docker profile and live CLI tests.
 - [x] Search HTTPS/TLS transport support for `opensearch+https://` and `elasticsearch+https://`.
-- [ ] Search HTTPS/TLS live Docker profile and CLI test coverage.
+- [x] Search HTTPS/TLS live Docker profile and CLI test coverage through a local compatible harness.
 - [x] Time-series HTTP adapter with Prometheus measurement list/query operations.
 - [x] Prometheus resource-bounded Docker profile and live CLI tests.
 - [ ] SQL Server adapter.
@@ -224,7 +224,7 @@ major database compatibility loop became stable.
 
 | Task | Priority | Status | Scope | Verification gate |
 | --- | --- | --- | --- | --- |
-| T9 Search TLS live validation | P1 | Pending | Add a TLS-enabled OpenSearch/Elasticsearch local profile or scripted cert harness, then exercise `opensearch+https://` through `search indices`, `search search`, and `search index`. | New integration script plus service-free TLS parsing tests. |
+| T9 Search TLS live validation | P1 | Done | Added a TLS-enabled OpenSearch-compatible harness with generated local CA, then exercised `opensearch+https://` through `search indices`, `search search`, and `search index`. | `cargo test -p adapter-search`; `cargo test -p dbtool-cli --test live_observability`; observability compose config validation; optional `./scripts/integration-observability-test.sh`. |
 | T10 PostgreSQL-family live compatibility | P1 | Pending | Add resource-bounded CockroachDB and TimescaleDB profiles for the existing Postgres adapter aliases. | Live SQL lifecycle, typed values, limiting, tables, and schema tests for `cockroach://` and `timescale://`. |
 | T11 Messaging TLS live validation | P2 | Pending | Add TLS-enabled RabbitMQ and NATS profiles for already-registered `amqps://` and `nats+tls://` aliases. | Live produce/consume/detail for AMQPS and publish/subscribe/JetStream checks for NATS TLS. |
 | T12 TUI workflow depth | P2 | Pending | Add command history, richer per-capability forms, and polished full-screen navigation while reusing core confirmation and limit behavior. | TUI smoke tests for history, forms, write confirmation, and error rendering. |

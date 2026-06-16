@@ -71,14 +71,28 @@ fn opensearch_live_index_search_and_list() {
     }
 
     let dsn = required_env("DBTOOL_IT_OPENSEARCH_DSN");
-    let index = unique_name("dbtool_search");
+    run_search_lifecycle(&dsn, "opensearch", "dbtool_search");
+}
 
-    let ping = stdout_json(dbtool(&["--dsn", &dsn, "ping"]));
-    assert_eq!(ping["kind"], "opensearch");
+#[test]
+fn opensearch_tls_live_index_search_and_list() {
+    if !integration_enabled() {
+        return;
+    }
+
+    let dsn = required_env("DBTOOL_IT_OPENSEARCH_TLS_DSN");
+    run_search_lifecycle(&dsn, "opensearch+https", "dbtool_search_tls");
+}
+
+fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str) {
+    let index = unique_name(prefix);
+
+    let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
+    assert_eq!(ping["kind"], expected_kind);
 
     let blocked = stderr_json(dbtool(&[
         "--dsn",
-        &dsn,
+        dsn,
         "search",
         "index",
         &index,
@@ -88,7 +102,7 @@ fn opensearch_live_index_search_and_list() {
 
     let indexed = stdout_json(dbtool(&[
         "--dsn",
-        &dsn,
+        dsn,
         "--allow-write",
         "search",
         "index",
@@ -100,7 +114,7 @@ fn opensearch_live_index_search_and_list() {
     let hits = stdout_json_retry(
         &[
             "--dsn",
-            &dsn,
+            dsn,
             "--limit",
             "10",
             "search",
@@ -115,7 +129,7 @@ fn opensearch_live_index_search_and_list() {
         .as_str()
         .is_some());
 
-    let indices = stdout_json_retry(&["--dsn", &dsn, "search", "indices"], |value| {
+    let indices = stdout_json_retry(&["--dsn", dsn, "search", "indices"], |value| {
         value["data"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item["name"] == index))

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/integration-env.sh"
+source "$ROOT/scripts/integration-observability-tls-prepare.sh"
 
 "$ROOT/scripts/integration-observability-up.sh"
 

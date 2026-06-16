@@ -183,7 +183,8 @@ Kafka native/librdkafka can be tested against the same Docker services:
 ./scripts/integration-mq-native-test.sh
 ```
 
-Search and time-series integration tests start OpenSearch and Prometheus:
+Search and time-series integration tests start OpenSearch, an
+OpenSearch-compatible HTTPS harness, and Prometheus:
 
 ```bash
 ./scripts/integration-observability-test.sh
@@ -216,7 +217,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, Valkey, KeyDB, and Dragonfly compatibility profiles.
-- OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP/TLS mapping tests and plain HTTP OpenSearch live tests.
+- OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP/TLS mapping tests, plain HTTP OpenSearch live tests, and HTTPS live transport tests.
 - Prometheus HTTP time-series adapter: implemented for metric listing and range queries, with read-only semantics.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.
