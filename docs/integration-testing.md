@@ -14,6 +14,30 @@ Live integration tests can start local databases with Docker Compose:
 
 The script starts Postgres, MySQL, Redis, and MongoDB, waits for health checks, runs the live CLI tests, and then removes the containers and volumes.
 
+Run a narrower flow-control smoke when you need to validate throttling-facing
+CLI flags against real services without running the whole live test binary:
+
+```bash
+./scripts/integration-flow-control-test.sh
+```
+
+The flow-control smoke starts the same Postgres, MySQL, Redis, and MongoDB
+containers, creates disposable fixture data, and verifies:
+
+- PostgreSQL `--request-timeout` and `--deadline` abort a slow `pg_sleep`
+  query with `TIMEOUT`.
+- PostgreSQL and MySQL SQL result limits mark output as truncated.
+- Redis `kv scan --limit` truncates fixture keys.
+- MongoDB `doc find --limit` truncates fixture documents.
+- SQL rate/admission flags such as `--rate` and `--acquire-timeout` are
+  accepted on a real MySQL query.
+
+Tune the smoke with `DBTOOL_IT_FLOW_CONTROL_TIMEOUT_REQUEST`,
+`DBTOOL_IT_FLOW_CONTROL_TIMEOUT_DEADLINE`, `DBTOOL_IT_FLOW_CONTROL_RATE`,
+`DBTOOL_IT_FLOW_CONTROL_ACQUIRE_TIMEOUT`,
+`DBTOOL_IT_FLOW_CONTROL_REQUEST_TIMEOUT`, and
+`DBTOOL_IT_FLOW_CONTROL_DEADLINE`.
+
 Compatible database integration tests use a separate profile:
 
 ```bash
@@ -390,6 +414,9 @@ The base service suite is capped at roughly 2 GiB of container memory, the Postg
 The live tests cover:
 
 - Postgres and MySQL ping, destructive SQL confirmation, insert/query/schema/drop.
+- Docker-backed flow-control smoke for Postgres slow-query timeout, MySQL
+  rate/admission flags, SQL result limits, Redis scan limits, MongoDB find
+  limits, and disposable fixture cleanup.
 - MariaDB/TiDB alias DSNs against the MySQL protocol adapter, typed MySQL values, and result limiting.
 - CockroachDB/TimescaleDB alias DSNs against the PostgreSQL protocol adapter, typed Postgres-family values, result limiting, table listing, schema inspection, and SQL lifecycle.
 - Redis ping, set/get/scan/raw typed output, TTL, scan truncation, multi-key delete, blocked destructive raw command, and blocked mutating raw command without `--allow-write`.

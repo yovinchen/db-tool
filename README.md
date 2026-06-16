@@ -205,6 +205,14 @@ Live database integration tests can start local Docker services with resource li
 ./scripts/integration-test.sh
 ```
 
+Run a focused Docker-backed flow-control smoke against the base services when
+you need to validate live request timeouts, rate/admission flags, result limits,
+and fixture cleanup:
+
+```bash
+./scripts/integration-flow-control-test.sh
+```
+
 Compatible database integration tests start real MariaDB and Valkey services by default:
 
 ```bash

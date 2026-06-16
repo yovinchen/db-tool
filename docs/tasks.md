@@ -142,6 +142,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] CPU/memory/resource limits for integration services.
 - [x] Integration scripts for up/down/test lifecycle.
 - [x] Service-free smoke script for core SQLite CRUD, safety, result limiting, and configured timeout behavior.
+- [x] Docker-backed flow-control smoke script for live request timeout, rate/admission flags, SQL/KV/document limits, and disposable test data cleanup.
 - [x] Docker image smoke script that runs the same core SQLite flow inside the containerized dbtool CLI.
 - [x] Live CLI tests for SQL, KV, and document workflows.
 - [x] Live CLI tests for MySQL protocol aliases and Redis-compatible protocol aliases.
