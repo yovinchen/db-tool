@@ -235,6 +235,12 @@ TiDB secure HA integration starts 3 PD, 2 TiKV, and 2 TiDB SQL nodes with compon
 ./scripts/integration-tidb-secure-test.sh
 ```
 
+Run the same secure HA topology as a SQL-node failover drill:
+
+```bash
+./scripts/integration-tidb-ha-drill.sh
+```
+
 Live messaging integration tests start Redis, Redpanda, RabbitMQ, and NATS:
 
 ```bash

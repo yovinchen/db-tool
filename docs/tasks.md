@@ -125,6 +125,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Live CLI tests for real MariaDB, Valkey, KeyDB, and Dragonfly compatibility services.
 - [x] Live CLI tests for real TiDB compatibility service.
 - [x] Live CLI tests for TiDB auth, SQL TLS, component TLS, X509, and local HA topology.
+- [x] TiDB secure HA SQL-node failover drill script with CI manual entry and documented pass/fail criteria.
 - [x] Live CLI test entry for SQL Server SQL lifecycle, typed values, limiting, tables, and schema.
 - [x] Live CLI tests for Redis Streams/PubSub, Kafka, AMQP, and NATS messaging workflows.
 - [x] Live CLI tests for AMQPS and NATS TLS messaging workflows.
@@ -243,4 +244,4 @@ major database compatibility loop became stable.
 | T13 SQL Server adapter gate | P3 | In progress | Added `adapter-sqlserver`, `sqlserver://` and `mssql://` registration, Docker profile, integration scripts, and CLI live lifecycle coverage. Remaining gate is running the heavyweight Docker profile in an x86_64-capable environment. | `cargo test -p adapter-sqlserver`; `docker compose -f docker-compose.integration.yml --profile sqlserver config`; optional `./scripts/integration-sqlserver-test.sh`. |
 | T14 Cassandra/CQL adapter gate | P3 | Done | Accepted a constrained CQL-over-`SqlEngine` surface, added `adapter-cassandra`, `cassandra://` and `scylla://` registration, Docker profile, integration scripts, and CLI live lifecycle coverage. The local Docker profile passed with address translation enabled for host-port mapping. | `cargo test -p adapter-cassandra`; `docker compose -f docker-compose.integration.yml --profile cassandra config`; `./scripts/integration-cassandra-test.sh`. |
 | T15 Prometheus remote write | P3 | Deferred | Add protobuf/snappy remote-write support only if write-heavy time-series workflows become required. | Service-free encoding tests plus Prometheus-compatible remote-write receiver test. |
-| T16 Production TiDB HA drills | P3 | Deferred | Keep local secure HA documented as compatibility validation; add TiProxy/failover/cert-rotation drills only when production-readiness is in scope. | Explicit failover drill script and documented pass/fail criteria. |
+| T16 Production TiDB HA drills | P3 | In progress | Added a secure HA SQL-node failover drill that stops each TiDB SQL node in turn, proves the surviving TLS SQL node can keep writing/reading shared data, and confirms restarted nodes can read outage-time writes. TiProxy, PD/TiKV failover, certificate rotation, and production-readiness drills remain deferred. | `./scripts/integration-tidb-ha-drill.sh`; `run_live_tidb_ha_drill` workflow input; documented pass/fail criteria in `docs/tidb-compat-design.md`. |

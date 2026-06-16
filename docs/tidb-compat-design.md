@@ -95,6 +95,40 @@ The secure live test verifies:
 - SQL lifecycle coverage runs through both SQL nodes against the same secure database.
 - The X509 user can run the same SQL lifecycle with a client certificate.
 
+## Secure HA Failover Drill
+
+`./scripts/integration-tidb-ha-drill.sh` reuses the secure HA topology for an
+explicit SQL-node failover exercise. It is separate from
+`integration-tidb-secure-test.sh` so auth/TLS checks and disruptive container
+operations can be run independently.
+
+The drill performs this flow:
+
+1. Start the secure HA topology through `integration-tidb-secure-up.sh`.
+2. Create a fixture table through `tidb-secure-1`.
+3. Read that row through `tidb-secure-2` to prove both SQL nodes see the same
+   TiKV-backed state.
+4. Stop `tidb-secure-1`, require its DSN to reject `ping`, then write and read
+   through `tidb-secure-2`.
+5. Restart `tidb-secure-1` and require it to read the row written while it was
+   stopped.
+6. Stop `tidb-secure-2`, repeat the surviving-node write/read check through
+   `tidb-secure-1`, then restart `tidb-secure-2`.
+7. Require `tidb-secure-2` to read the row written while it was stopped.
+
+Pass/fail criteria:
+
+- Both secure SQL DSNs must become reachable before the drill starts.
+- A stopped SQL node must become unreachable from dbtool's `ping` command.
+- The surviving SQL node must continue accepting TLS SQL writes and reads.
+- A restarted SQL node must read rows written during its outage.
+- The script removes the topology on exit unless `DBTOOL_IT_KEEP_SERVICES=1`;
+  if services are kept, it attempts to restart any SQL node it stopped.
+
+This drill proves local TiDB SQL frontend failover through dbtool's MySQL-family
+adapter. It does not replace production TiProxy, placement, PD leadership, TiKV
+failure, backup/restore, upgrade, or certificate-rotation drills.
+
 ## Failure Recovery
 
 Use the shared cleanup script if a run is interrupted:
@@ -127,6 +161,6 @@ The most likely local causes are a TiDB flag/version mismatch, not enough Docker
 
 - The default `tidb` profile is a single-node compatibility harness; use `tidb-secure` for local HA/security coverage.
 - The secure HA topology is still a local integration harness, not a production deployment model.
-- Password rotation, placement rules, failover drills, TiProxy, and upgrade scenarios are outside this test.
+- Password rotation, placement rules, TiProxy, PD/TiKV failover, certificate rotation, and upgrade scenarios are outside these tests.
 - The profile uses the local bootstrap root user only for disposable integration tests.
 - TiDB remains implemented through the MySQL-family adapter; the alias kind is preserved for user-facing metadata and test assertions.

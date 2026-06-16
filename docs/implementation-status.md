@@ -65,6 +65,7 @@ usable.
 | `./scripts/integration-cassandra-test.sh` | Cassandra | CQL lifecycle, keyspace-qualified tables, schema inspection, typed scalar and collection values | Roughly 2 GiB container memory; startup can be slow |
 | `./scripts/integration-tidb-test.sh` | PD, TiKV, TiDB | Real TiDB compatibility | Roughly 1.75 GiB container memory |
 | `./scripts/integration-tidb-secure-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB auth/TLS/local HA | Roughly 3.75 GiB container memory |
+| `./scripts/integration-tidb-ha-drill.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB secure HA SQL-node failover with one SQL node stopped at a time | Roughly 3.75 GiB container memory |
 | `./scripts/integration-mq-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Streams/PubSub, Kafka, AMQP, NATS | Roughly 2 GiB container memory |
 | `./scripts/integration-mq-tls-test.sh` | RabbitMQ TLS, NATS TLS | AMQPS and NATS TLS aliases | Roughly 768 MiB container memory |
 | `./scripts/integration-mq-native-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Native Kafka backend plus messaging regression | Requires `full-native` build |
@@ -92,7 +93,7 @@ usable.
 | SQL Server heavyweight live run | Partially verified | Adapter, DSN schemes, Docker profile, scripts, and live test entry exist; the live container should be run on an amd64-capable Docker host because Microsoft documents SQL Server Linux containers as x86-64 supported. | Run `./scripts/integration-sqlserver-test.sh` in the target Docker environment. |
 | Cassandra trait split | Deferred | Cassandra is currently usable through a constrained CQL-over-`SqlEngine` surface so the existing CLI safety/limit/output paths work; a dedicated `CqlEngine` is not yet modeled. | Add `CqlEngine` only if CQL needs protocol-specific commands, prepared values, paging, or TUI forms. |
 | TUI rich workflows | Partial | Basic command dispatch exists, but command history, form controls, and richer per-capability screens are not implemented. | Expand after core protocol coverage remains stable. |
-| Production TiDB HA | Partial | Local secure HA topology is verified, but TiProxy/failover drills/cert rotation are not covered. | Add explicit failover tests or document that this is compatibility validation only. |
+| Production TiDB HA | Partial | Local secure HA topology and SQL-node failover drill are available, but TiProxy, PD/TiKV failure, certificate rotation, backup/restore, and upgrade drills are not covered. | Add product-specific production drills only when production-readiness is in scope. |
 | AMQP queue listing over pure AMQP | Not supported | AMQP 0.9.1 does not expose queue listing as a portable protocol operation. | Keep using `rabbitmq+http://` for RabbitMQ admin discovery. |
 | Redis Pub/Sub durable listing | Not supported | Pub/Sub channels are live subscriptions, not durable topics. | Keep durable list/detail semantics on Redis Streams only. |
 | NATS core subject listing | Not supported | Core NATS subjects are not durable catalog entries. | Keep list/detail/lag semantics on JetStream only. |
@@ -101,4 +102,5 @@ usable.
 
 1. Run SQL Server live validation in an amd64-capable Docker environment and mark T13 done when it passes.
 2. Expand TUI command history and richer per-capability forms.
-3. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.
+3. Run the TiDB secure HA failover drill in the target Docker environment when production-readiness evidence is needed.
+4. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.

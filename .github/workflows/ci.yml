@@ -41,6 +41,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_tidb_ha_drill:
+        description: "Run Docker-backed TiDB secure HA failover drill"
+        required: false
+        type: boolean
+        default: false
       run_live_messaging:
         description: "Run Docker-backed messaging integration tests"
         required: false
@@ -282,6 +287,24 @@ jobs:
 
       - name: Run TiDB auth/TLS/HA integration tests
         run: ./scripts/integration-tidb-secure-test.sh
+
+  integration-tidb-ha-drill:
+    name: Live TiDB secure HA failover drill
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_tidb_ha_drill
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-tidb-ha-drill
+      DBTOOL_IT_TIDB_SECURE_PORT_1: 44100
+      DBTOOL_IT_TIDB_SECURE_PORT_2: 44101
+      DBTOOL_IT_TIDB_SECURE_STATUS_PORT_1: 41100
+      DBTOOL_IT_TIDB_SECURE_STATUS_PORT_2: 41101
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run TiDB secure HA failover drill
+        run: ./scripts/integration-tidb-ha-drill.sh
 
   integration-messaging:
     name: Live messaging integration
