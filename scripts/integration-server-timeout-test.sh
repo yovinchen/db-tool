@@ -15,6 +15,7 @@ compose \
 compose ps
 
 pg_timeout_set=0
+pg_idle_timeout_set=0
 pg_lock_timeout_set=0
 pg_lock_pid=""
 pg_lock_table=""
@@ -130,6 +131,17 @@ postgres_user_exec() {
     -c "$1"
 }
 
+postgres_user_stdin() {
+  compose exec -T \
+    -e PGPASSWORD="$DBTOOL_IT_POSTGRES_PASSWORD" \
+    postgres \
+    psql \
+    -h 127.0.0.1 \
+    -U "$DBTOOL_IT_POSTGRES_USER" \
+    -d "$DBTOOL_IT_POSTGRES_DB" \
+    -v ON_ERROR_STOP=1
+}
+
 mysql_admin_exec() {
   compose exec -T mysql \
     mysql \
@@ -159,6 +171,9 @@ cleanup() {
   if [[ "$pg_lock_timeout_set" == "1" ]]; then
     sql_exec "$DBTOOL_IT_POSTGRES_DSN" "alter role current_user reset lock_timeout" >/dev/null 2>&1
   fi
+  if [[ "$pg_idle_timeout_set" == "1" ]]; then
+    sql_exec "$DBTOOL_IT_POSTGRES_DSN" "alter role current_user reset idle_in_transaction_session_timeout" >/dev/null 2>&1
+  fi
   if [[ -n "$pg_lock_table" ]]; then
     sql_exec "$DBTOOL_IT_POSTGRES_DSN" "drop table if exists $pg_lock_table" >/dev/null 2>&1
   fi
@@ -182,6 +197,8 @@ run_dbtool --dsn "$DBTOOL_IT_MYSQL_DSN" ping >/dev/null
 
 pg_statement_timeout="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_STATEMENT_TIMEOUT:-100ms}"
 pg_sleep_seconds="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_SLEEP_SECONDS:-1}"
+pg_idle_timeout="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_IDLE_TIMEOUT:-100ms}"
+pg_idle_hold_seconds="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_IDLE_HOLD_SECONDS:-1}"
 pg_lock_timeout="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_TIMEOUT:-100ms}"
 pg_lock_hold_seconds="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_HOLD_SECONDS:-5}"
 pg_lock_ready_sleep="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_READY_SLEEP:-1}"
@@ -210,6 +227,37 @@ assert_contains "$pg_timeout_error" "statement timeout"
 
 sql_exec "$DBTOOL_IT_POSTGRES_DSN" "alter role current_user reset statement_timeout"
 pg_timeout_set=0
+assert_json_field \
+  "$(run_dbtool --dsn "$DBTOOL_IT_POSTGRES_DSN" sql query "select 1")" \
+  "data.rows.0.0" \
+  "1"
+
+echo "dbtool server timeout smoke: verifying PostgreSQL idle_in_transaction_session_timeout"
+sql_exec \
+  "$DBTOOL_IT_POSTGRES_DSN" \
+  "alter role current_user set idle_in_transaction_session_timeout = '$pg_idle_timeout'"
+pg_idle_timeout_set=1
+
+set +e
+pg_idle_error="$(
+  {
+    printf 'begin;\n'
+    sleep "$pg_idle_hold_seconds"
+    printf 'commit;\n'
+  } | postgres_user_stdin 2>&1
+)"
+pg_idle_status=$?
+set -e
+
+if [[ "$pg_idle_status" -eq 0 ]]; then
+  echo "expected PostgreSQL idle transaction session to be terminated" >&2
+  echo "$pg_idle_error" >&2
+  exit 1
+fi
+assert_contains "$pg_idle_error" "idle-in-transaction timeout"
+
+sql_exec "$DBTOOL_IT_POSTGRES_DSN" "alter role current_user reset idle_in_transaction_session_timeout"
+pg_idle_timeout_set=0
 assert_json_field \
   "$(run_dbtool --dsn "$DBTOOL_IT_POSTGRES_DSN" sql query "select 1")" \
   "data.rows.0.0" \
