@@ -32,6 +32,10 @@ fn sqlserver_enabled() -> bool {
     env::var("DBTOOL_RUN_SQLSERVER_INTEGRATION").as_deref() == Ok("1")
 }
 
+fn cassandra_enabled() -> bool {
+    env::var("DBTOOL_RUN_CASSANDRA_INTEGRATION").as_deref() == Ok("1")
+}
+
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args(args)
@@ -280,6 +284,25 @@ fn sqlserver_typed_probe(dsn: &str, expected_kind: &str) {
     ]));
     assert_eq!(limited["data"]["rows"].as_array().unwrap().len(), 2);
     assert_eq!(limited["meta"]["truncated"], true);
+}
+
+fn cassandra_cql_probe(dsn: &str, expected_kind: &str) {
+    let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
+    assert_eq!(ping["kind"], expected_kind);
+    assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
+    assert_eq!(caps["kind"], expected_kind);
+    assert_eq!(caps["data"]["sql"], true);
+
+    let local = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        "select release_version from system.local",
+    ]));
+    assert!(local["data"]["rows"][0][0].as_str().is_some());
 }
 
 fn assert_mysql_tls_connection(dsn: &str) {
@@ -666,6 +689,73 @@ fn sqlserver_live_sql_lifecycle_and_typed_values() {
         format!("create table {qualified_table} (id int primary key, name nvarchar(64) not null)"),
         format!("drop table {qualified_table}"),
     );
+}
+
+#[test]
+fn cassandra_live_cql_lifecycle_and_typed_values() {
+    if !cassandra_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_CASSANDRA_DSN") else {
+        return;
+    };
+    let keyspace = env::var("DBTOOL_IT_CASSANDRA_KEYSPACE")
+        .unwrap_or_else(|_| "dbtool_it_cassandra".to_owned());
+    let table = unique_name("dbtool_cassandra_users");
+    let qualified_table = format!("{keyspace}.{table}");
+
+    cassandra_cql_probe(&dsn, "cassandra");
+    cassandra_cql_probe(&dsn_with_scheme(&dsn, "scylla"), "scylla");
+
+    setup_sql_exec(
+        &dsn,
+        &format!(
+            "create keyspace if not exists {keyspace} \
+             with replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ),
+    );
+    sql_lifecycle(
+        &dsn,
+        &qualified_table,
+        format!("create table {qualified_table} (id int primary key, name text)"),
+        format!("drop table {qualified_table}"),
+    );
+
+    let typed_table = format!("{}.{}", keyspace, unique_name("dbtool_cassandra_typed"));
+    confirmed_sql_exec(
+        &dsn,
+        &format!(
+            "create table {typed_table} \
+             (id int primary key, name text, score double, active boolean, tags list<text>)"
+        ),
+    );
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &format!(
+            "insert into {typed_table} (id, name, score, active, tags) \
+             values (1, 'alice', 3.5, true, ['core', 'cql'])"
+        ),
+    ]));
+
+    let typed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "sql",
+        "query",
+        &format!("select id, name, score, active, tags from {typed_table} where id = 1"),
+    ]));
+    let row = &typed["data"]["rows"][0];
+    assert_eq!(row[0], 1);
+    assert_eq!(row[1], "alice");
+    assert_eq!(row[2].as_f64().expect("score should decode"), 3.5);
+    assert_eq!(row[3], true);
+    assert_eq!(row[4], serde_json::json!(["core", "cql"]));
+
+    confirmed_sql_exec(&dsn, &format!("drop table {typed_table}"));
 }
 
 #[test]

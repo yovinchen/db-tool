@@ -16,6 +16,7 @@ default = ["dbtool-registry/default"]
 full    = ["dbtool-registry/full"]
 full-native = ["dbtool-registry/full-native"]
 sqlserver = ["dbtool-registry/sqlserver"]
+cassandra = ["dbtool-registry/cassandra"]
 
 [dependencies]
 dbtool-core     = { path = "../dbtool-core" }

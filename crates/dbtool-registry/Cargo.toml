@@ -16,6 +16,7 @@ postgres = ["sql"]
 sqlite   = ["sql"]
 sql      = ["dep:adapter-sql"]
 sqlserver = ["dep:adapter-sqlserver"]
+cassandra = ["dep:adapter-cassandra"]
 redis    = ["dep:adapter-redis"]
 mongodb  = ["dep:adapter-mongo"]
 search   = ["dep:adapter-search"]
@@ -29,13 +30,14 @@ kafka         = ["dep:adapter-kafka", "adapter-kafka/backend-pure"]
 kafka-native  = ["dep:adapter-kafka", "adapter-kafka/backend-native"]
 
 # ── Preset bundles ─────────────────────────────────────────────────────────────
-full        = ["sql", "sqlserver", "redis", "mongodb", "search", "timeseries", "mq", "kafka"]
+full        = ["sql", "sqlserver", "cassandra", "redis", "mongodb", "search", "timeseries", "mq", "kafka"]
 full-native = ["full", "kafka-native"]
 
 [dependencies]
 dbtool-core   = { path = "../dbtool-core" }
 adapter-sql   = { path = "../adapter-sql",   optional = true }
 adapter-sqlserver = { path = "../adapter-sqlserver", optional = true }
+adapter-cassandra = { path = "../adapter-cassandra", optional = true }
 adapter-redis = { path = "../adapter-redis", optional = true }
 adapter-mongo = { path = "../adapter-mongo", optional = true }
 adapter-search = { path = "../adapter-search", optional = true }

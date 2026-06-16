@@ -219,7 +219,7 @@ Goal: add new families only after the core behavior remains stable under integra
 - [x] Time-series HTTP adapter with Prometheus measurement list/query operations.
 - [x] Prometheus resource-bounded Docker profile and live CLI tests.
 - [x] SQL Server adapter.
-- [ ] Cassandra adapter.
+- [x] Cassandra adapter.
 
 ## Remaining Task Board
 
@@ -233,6 +233,6 @@ major database compatibility loop became stable.
 | T11 Messaging TLS live validation | P2 | Done | Added TLS-enabled RabbitMQ and NATS profiles for already-registered `amqps://` and `nats+tls://` aliases, with generated local CA support through `tls-ca`/`ssl-ca` DSN params. | `./scripts/integration-mq-tls-test.sh` covers AMQPS produce/consume/detail and NATS TLS publish/subscribe plus JetStream topics/detail/lag. |
 | T12 TUI workflow depth | P2 | Pending | Add command history, richer per-capability forms, and polished full-screen navigation while reusing core confirmation and limit behavior. | TUI smoke tests for history, forms, write confirmation, and error rendering. |
 | T13 SQL Server adapter gate | P3 | In progress | Added `adapter-sqlserver`, `sqlserver://` and `mssql://` registration, Docker profile, integration scripts, and CLI live lifecycle coverage. Remaining gate is running the heavyweight Docker profile in an x86_64-capable environment. | `cargo test -p adapter-sqlserver`; `docker compose -f docker-compose.integration.yml --profile sqlserver config`; optional `./scripts/integration-sqlserver-test.sh`. |
-| T14 Cassandra/CQL adapter gate | P3 | Pending | Decide whether CQL belongs behind a new trait or limited SQL-like interface, then add adapter and Docker profile. | CQL trait contract tests plus Cassandra/Scylla live smoke tests if accepted. |
+| T14 Cassandra/CQL adapter gate | P3 | Done | Accepted a constrained CQL-over-`SqlEngine` surface, added `adapter-cassandra`, `cassandra://` and `scylla://` registration, Docker profile, integration scripts, and CLI live lifecycle coverage. The local Docker profile passed with address translation enabled for host-port mapping. | `cargo test -p adapter-cassandra`; `docker compose -f docker-compose.integration.yml --profile cassandra config`; `./scripts/integration-cassandra-test.sh`. |
 | T15 Prometheus remote write | P3 | Deferred | Add protobuf/snappy remote-write support only if write-heavy time-series workflows become required. | Service-free encoding tests plus Prometheus-compatible remote-write receiver test. |
 | T16 Production TiDB HA drills | P3 | Deferred | Keep local secure HA documented as compatibility validation; add TiProxy/failover/cert-rotation drills only when production-readiness is in scope. | Explicit failover drill script and documented pass/fail criteria. |

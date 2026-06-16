@@ -15,7 +15,7 @@ usable.
 | CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `kv`, `doc`, `mq`, `search`, and `ts` command families exist with default backends for core read paths. |
 | Output formats | Implemented | JSON is the default. `--format table` and `--format ndjson` are implemented for successful command output; errors always stay JSON so `error.code` and confirmation tokens remain machine-readable. |
 | SQL safety | Implemented | Read statements are allowed, writes need `--allow-write`, destructive SQL needs a confirm token bound to the target. |
-| Docker integration | Implemented | Base databases, compatibility databases, SQL Server, TiDB, TiDB secure HA, messaging, messaging TLS, and observability profiles are available. |
+| Docker integration | Implemented | Base databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, and observability profiles are available. |
 | CI | Implemented | Service-free verification runs by default; live Docker jobs are manual workflow inputs. |
 | TUI | Partial | Connection picker, read command dispatch, read limits, write confirmation, and smoke tests exist; richer per-capability forms remain future work. |
 
@@ -30,6 +30,7 @@ usable.
 | TimescaleDB | `timescale://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real TimescaleDB compatibility live test |
 | Redshift | `redshift://` | SQL | Routed to Postgres adapter | Not live-tested against Redshift |
 | SQL Server | `sqlserver://`, `mssql://` | SQL Server/TDS | SQL query/exec/tables/schema, typed scalar values, result limiting | Service-free adapter tests plus opt-in SQL Server Docker live profile |
+| Cassandra/ScyllaDB | `cassandra://`, `scylla://` | CQL over constrained SQL surface | `ping`, CQL query/exec through `sql` commands, keyspace table listing, schema inspection, primitive/collection typed values | Adapter tests plus real Cassandra Docker live test |
 | MySQL | `mysql://` | SQL | SQL query/exec/tables/schema, typed values, result limiting | Base Docker live test |
 | MariaDB | `mariadb://` | SQL | MySQL-family SQL lifecycle, typed values, result limiting | Real MariaDB compatibility live test |
 | TiDB | `tidb://` | SQL | MySQL-family SQL lifecycle, typed values, table listing, schema-qualified tables | Real PD/TiKV/TiDB live test |
@@ -60,6 +61,7 @@ usable.
 | `./scripts/integration-compat-test.sh` | MariaDB, Valkey | MySQL and Redis compatible databases | Extra KeyDB/Dragonfly via `DBTOOL_IT_COMPAT_EXTRA=1` |
 | `./scripts/integration-pg-compat-test.sh` | CockroachDB, TimescaleDB | PostgreSQL-family compatible databases | Roughly 1 GiB container memory |
 | `./scripts/integration-sqlserver-test.sh` | SQL Server | TDS SQL lifecycle, typed values, limiting, tables, and schema | Requires amd64-capable Docker; roughly 2 GiB container memory |
+| `./scripts/integration-cassandra-test.sh` | Cassandra | CQL lifecycle, keyspace-qualified tables, schema inspection, typed scalar and collection values | Roughly 2 GiB container memory; startup can be slow |
 | `./scripts/integration-tidb-test.sh` | PD, TiKV, TiDB | Real TiDB compatibility | Roughly 1.75 GiB container memory |
 | `./scripts/integration-tidb-secure-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB auth/TLS/local HA | Roughly 3.75 GiB container memory |
 | `./scripts/integration-mq-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Streams/PubSub, Kafka, AMQP, NATS | Roughly 2 GiB container memory |
@@ -87,7 +89,7 @@ usable.
 | Real OpenSearch security-plugin TLS profile | Partial | TLS transport is live-tested against a compatible HTTPS harness; the heavier OpenSearch security plugin TLS configuration is not part of the default profile. | Add only if security-plugin-specific OpenSearch behavior must be validated. |
 | Prometheus remote write | Not supported | The implemented Prometheus adapter intentionally covers read APIs only; remote write is a separate protobuf/snappy protocol. | Add only if write-heavy time-series workflows become a requirement. |
 | SQL Server heavyweight live run | Partially verified | Adapter, DSN schemes, Docker profile, scripts, and live test entry exist; the live container should be run on an amd64-capable Docker host because Microsoft documents SQL Server Linux containers as x86-64 supported. | Run `./scripts/integration-sqlserver-test.sh` in the target Docker environment. |
-| Cassandra | Not implemented | No CQL adapter, DSN scheme, Docker profile, or tests exist; trait decision is still needed. | Add only after accepting the CQL trait/dependency plan in `docs/extended-backends.md`. |
+| Cassandra trait split | Deferred | Cassandra is currently usable through a constrained CQL-over-`SqlEngine` surface so the existing CLI safety/limit/output paths work; a dedicated `CqlEngine` is not yet modeled. | Add `CqlEngine` only if CQL needs protocol-specific commands, prepared values, paging, or TUI forms. |
 | TUI rich workflows | Partial | Basic command dispatch exists, but command history, form controls, and richer per-capability screens are not implemented. | Expand after core protocol coverage remains stable. |
 | Production TiDB HA | Partial | Local secure HA topology is verified, but TiProxy/failover drills/cert rotation are not covered. | Add explicit failover tests or document that this is compatibility validation only. |
 | AMQP queue listing over pure AMQP | Not supported | AMQP 0.9.1 does not expose queue listing as a portable protocol operation. | Keep using `rabbitmq+http://` for RabbitMQ admin discovery. |
@@ -97,6 +99,5 @@ usable.
 ## Next Implementation Queue
 
 1. Run SQL Server live validation in an amd64-capable Docker environment and mark T13 done when it passes.
-2. Decide Cassandra/CQL trait shape before adding the Cassandra adapter.
-3. Expand TUI command history and richer per-capability forms.
-4. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.
+2. Expand TUI command history and richer per-capability forms.
+3. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.

@@ -26,6 +26,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_cassandra:
+        description: "Run Docker-backed Cassandra/CQL integration tests"
+        required: false
+        type: boolean
+        default: false
       run_live_tidb:
         description: "Run Docker-backed TiDB compatibility integration tests"
         required: false
@@ -111,6 +116,9 @@ jobs:
 
       - name: Validate SQL Server integration compose config
         run: docker compose -f docker-compose.integration.yml --profile sqlserver config
+
+      - name: Validate Cassandra integration compose config
+        run: docker compose -f docker-compose.integration.yml --profile cassandra config
 
       - name: Validate TiDB integration compose config
         run: docker compose -f docker-compose.integration.yml --profile tidb config
@@ -252,6 +260,21 @@ jobs:
 
       - name: Run SQL Server integration tests
         run: ./scripts/integration-sqlserver-test.sh
+
+  integration-cassandra:
+    name: Live Cassandra/CQL integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_cassandra
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-cassandra
+      DBTOOL_IT_CASSANDRA_PORT: 39042
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Cassandra/CQL integration tests
+        run: ./scripts/integration-cassandra-test.sh
 
   integration-tidb:
     name: Live TiDB compatibility integration

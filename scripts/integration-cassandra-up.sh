@@ -7,14 +7,12 @@ source "$ROOT/scripts/integration-env.sh"
 docker compose \
   -f "$ROOT/docker-compose.integration.yml" \
   -p "$DBTOOL_IT_PROJECT" \
-  --profile messaging \
-  --profile messaging-tls \
-  --profile compat \
-  --profile compat-extra \
-  --profile pg-compat \
-  --profile sqlserver \
   --profile cassandra \
-  --profile tidb \
-  --profile tidb-secure \
-  --profile observability \
-  down -v --remove-orphans
+  up -d --wait --wait-timeout "${DBTOOL_IT_CASSANDRA_WAIT_TIMEOUT:-600}" \
+  cassandra
+
+docker compose \
+  -f "$ROOT/docker-compose.integration.yml" \
+  -p "$DBTOOL_IT_PROJECT" \
+  --profile cassandra \
+  ps

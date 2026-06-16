@@ -17,6 +17,11 @@ pub fn build_registry() -> Registry {
         r.register_family("sqlserver", adapter_sqlserver::factory);
     }
 
+    #[cfg(feature = "cassandra")]
+    {
+        r.register_family("cassandra", adapter_cassandra::factory);
+    }
+
     #[cfg(feature = "redis")]
     {
         r.register_family("redis", adapter_redis::factory);

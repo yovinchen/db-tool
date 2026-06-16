@@ -52,6 +52,21 @@ removes the container by default. The default DSN uses
 `x86_64` hosts the up script exits before pulling the image unless
 `DBTOOL_IT_SQLSERVER_ALLOW_UNSUPPORTED_ARCH=1` is set.
 
+Cassandra/CQL uses a separate opt-in profile because the JVM image needs more
+memory and can take longer to become healthy:
+
+```bash
+./scripts/integration-cassandra-test.sh
+```
+
+The Cassandra script starts the official `cassandra` image, waits for `cqlsh`
+health checks, creates the test keyspace from the live test, runs
+`cassandra://` and `scylla://` CQL lifecycle coverage through the existing
+`sql` command family, and removes the container by default. The default DSN does
+not include a keyspace so the first connection can create it safely. It also
+uses `address-translator=contact-point` so the Rust CQL driver translates
+Docker-internal broadcast addresses back to the published host port.
+
 TiDB compatibility uses its own profile because it starts a small PD/TiKV/TiDB topology:
 
 ```bash
@@ -158,6 +173,15 @@ DBTOOL_IT_SQLSERVER_PASSWORD='My_Strong_SQLServer_123!' \
 ./scripts/integration-sqlserver-test.sh
 ```
 
+Cassandra settings can be overridden independently:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-cassandra-run \
+DBTOOL_IT_CASSANDRA_KEYSPACE=my_cassandra_ks \
+DBTOOL_IT_CASSANDRA_PORT=39042 \
+./scripts/integration-cassandra-test.sh
+```
+
 TiDB service settings follow the same pattern:
 
 ```bash
@@ -233,7 +257,7 @@ DBTOOL_IT_PROJECT=my-dbtool-run ./scripts/integration-down.sh
 
 ## CI Profiles
 
-Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, PostgreSQL-family compatibility, TiDB, messaging, messaging TLS, and observability Docker Compose configs without starting containers.
+Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, PostgreSQL-family compatibility, SQL Server, Cassandra, TiDB, messaging, messaging TLS, and observability Docker Compose configs without starting containers.
 
 Live integration jobs are opt-in from the GitHub Actions **Run workflow** button:
 
@@ -241,6 +265,7 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_compat` can run `./scripts/integration-compat-test.sh` for MariaDB and Valkey, with `DBTOOL_IT_COMPAT_EXTRA=1` for KeyDB and Dragonfly.
 - `run_live_pg_compat` runs `./scripts/integration-pg-compat-test.sh` for CockroachDB and TimescaleDB.
 - `run_live_sqlserver` runs `./scripts/integration-sqlserver-test.sh` for SQL Server/TDS coverage.
+- `run_live_cassandra` runs `./scripts/integration-cassandra-test.sh` for Cassandra/CQL coverage.
 - `run_live_tidb` runs `./scripts/integration-tidb-test.sh` for TiDB through a local PD/TiKV/TiDB topology.
 - `run_live_tidb_secure` runs `./scripts/integration-tidb-secure-test.sh` for TiDB auth/TLS/HA coverage.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
@@ -262,6 +287,7 @@ The compose file applies conservative defaults:
 - CockroachDB pg-compat: `0.50` CPU, `512m` memory
 - TimescaleDB pg-compat: `0.50` CPU, `512m` memory
 - SQL Server: `1.00` CPU, `2g` memory
+- Cassandra: `1.00` CPU, `2g` memory, JVM heap `512M`
 - Valkey compat: `0.25` CPU, `256m` memory plus `128mb` maxmemory
 - KeyDB compat-extra: `0.25` CPU, `256m` memory plus `128mb` maxmemory
 - Dragonfly compat-extra: `0.25` CPU, `384m` memory plus `256mb` maxmemory

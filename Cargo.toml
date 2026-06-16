@@ -11,6 +11,7 @@ members = [
     "crates/adapter-amqp",
     "crates/adapter-nats",
     "crates/adapter-sqlserver",
+    "crates/adapter-cassandra",
     "crates/dbtool-registry",
     "crates/dbtool-cli",
     "crates/dbtool-tui",
@@ -50,6 +51,7 @@ sqlx          = { version = "0.8", default-features = false, features = [
 tiberius      = { version = "0.12", default-features = false, features = [
                     "tds73", "tokio", "tokio-util", "rustls",
                 ] }
+scylla        = { version = "1.7", default-features = false }
 
 # ── SQL safety parser ─────────────────────────────────────────────────────────
 sqlparser     = "0.51"
