@@ -1203,6 +1203,7 @@ dependencies = [
  "adapter-sqlserver",
  "adapter-timeseries",
  "dbtool-core",
+ "tokio",
 ]
 
 [[package]]

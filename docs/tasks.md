@@ -52,6 +52,7 @@ Goal: frontends and adapters share one behavior layer.
 - [x] Replace keyword SQL classifier with `sqlparser`-backed classification.
 - [x] Bind confirm token to target connection and impact summary.
 - [x] Unit tests for resolver, formatter, flow control, and safety edge cases.
+- [x] Service-free embedded/library smoke for registry composition, `ConnectionManager`, `SafetyGuard`, and `FlowControl` without spawning the CLI.
 
 ## P1: SQL Family
 
@@ -289,3 +290,4 @@ major database compatibility loop became stable.
 | T22 Custom DB environment smoke | P2 | Done | Added Docker-backed custom env smoke for PostgreSQL, MySQL, Redis, and MongoDB. The script starts the base services with custom project name, database names, credentials, and host ports, then verifies generated DSNs plus dbtool read/write behavior. | `./scripts/integration-custom-env-test.sh`; included in the default `./scripts/integration-db-suite.sh`; local-only while CI budget is frozen. |
 | T23 Server-side SQL timeout smoke | P2 | Done | Added Docker-backed database-side timeout coverage for PostgreSQL and MySQL. The script keeps dbtool client deadlines larger than DB-side timeout budgets, then proves PostgreSQL `statement_timeout` cancels slow statements, `idle_in_transaction_session_timeout` terminates idle transactions, `lock_timeout` cancels blocked writes, and MySQL `innodb_lock_wait_timeout` cancels blocked dbtool writes at the server layer. | `./scripts/integration-server-timeout-test.sh`; included in the default `./scripts/integration-db-suite.sh`; local-only while CI budget is frozen. |
 | T24 Cassandra fixture data smoke | P2 | Done | Added reusable CQL fixture data and a Docker-backed Cassandra smoke. The script loads `testdata/base-cassandra-seed.cql` through dbtool, verifies seeded row readback, table listing, and schema inspection, and keeps the slower JVM-backed check in the heavy suite. | `./scripts/integration-cassandra-fixture-data-test.sh`; `DBTOOL_IT_DB_SUITE_PHASES=cassandra-fixture ./scripts/integration-db-suite.sh`; local-only while CI budget is frozen. |
+| T25 Embedded library smoke | P1 | Done | Added a service-free Rust integration test proving consumers can use `dbtool-core` and `dbtool-registry` directly: build the registry, reuse a SQLite connector through `ConnectionManager`, apply `SafetyGuard`, and run SQL under `FlowControl` without spawning the CLI. | `cargo test -p dbtool-registry --test embedded_library`; covered by `./scripts/verify.sh`. |

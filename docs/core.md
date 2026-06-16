@@ -26,3 +26,9 @@ Use `ConnectionResolver` instead of duplicating lookup logic. The resolver accep
 `SafetyGuard` classifies SQL before execution. `ResultLimiter` applies output-size constraints after adapter execution when pushdown is unavailable.
 
 These services are intentionally adapter-agnostic so the CLI, TUI, and embedded library paths can share the same behavior.
+
+The service-free embedded smoke lives in
+`crates/dbtool-registry/tests/embedded_library.rs`. It builds the adapter
+registry directly, reuses a SQLite connector through `ConnectionManager`,
+checks `SafetyGuard` confirmation behavior, and runs a query under
+`FlowControl` without spawning the CLI binary.

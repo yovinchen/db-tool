@@ -168,6 +168,12 @@ cargo test --workspace
 ./scripts/smoke-core-flow.sh
 ```
 
+The embedded library path is covered without spawning the CLI:
+
+```bash
+cargo test -p dbtool-registry --test embedded_library
+```
+
 Service-free executable smoke coverage uses a temporary SQLite database,
 `connections.toml`, and [testdata/sqlite-core-flow.sql](testdata/sqlite-core-flow.sql)
 to verify ping, write confirmation, insert/query, result limiting,

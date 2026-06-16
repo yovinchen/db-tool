@@ -45,3 +45,6 @@ adapter-timeseries = { path = "../adapter-timeseries", optional = true }
 adapter-kafka = { path = "../adapter-kafka", optional = true, default-features = false }
 adapter-amqp  = { path = "../adapter-amqp",  optional = true }
 adapter-nats  = { path = "../adapter-nats",  optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
