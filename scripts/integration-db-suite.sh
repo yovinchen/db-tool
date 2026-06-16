@@ -24,6 +24,7 @@ HEAVY_PHASES=(
   compat-extra
   sqlserver
   cassandra
+  cassandra-fixture
   tidb-secure
   tidb-ha
   tidb-pd
@@ -57,9 +58,9 @@ Default phases:
   custom-env fixture-data fixture-images data-roundtrip compat pg-compat tidb
 
 Heavy phases:
-  dbtool-image compat-extra sqlserver cassandra tidb-secure tidb-ha tidb-pd
-  tidb-pd-leader tidb-tikv-boundary tidb-cert tidb-logical-roundtrip
-  tidb-tiproxy observability
+  dbtool-image compat-extra sqlserver cassandra cassandra-fixture tidb-secure
+  tidb-ha tidb-pd tidb-pd-leader tidb-tikv-boundary tidb-cert
+  tidb-logical-roundtrip tidb-tiproxy observability
 EOF
 }
 
@@ -94,6 +95,7 @@ phase_description() {
     tidb-tiproxy) echo "TiDB secure HA TiProxy routing drill" ;;
     sqlserver) echo "SQL Server live SQL lifecycle" ;;
     cassandra) echo "Cassandra CQL live lifecycle" ;;
+    cassandra-fixture) echo "Cassandra CQL file-backed fixture data" ;;
     observability) echo "OpenSearch/TLS search and Prometheus workflows" ;;
     *) return 1 ;;
   esac
@@ -171,6 +173,7 @@ run_phase() {
     tidb-tiproxy) "$ROOT/scripts/integration-tidb-tiproxy-test.sh" ;;
     sqlserver) "$ROOT/scripts/integration-sqlserver-test.sh" ;;
     cassandra) "$ROOT/scripts/integration-cassandra-test.sh" ;;
+    cassandra-fixture) "$ROOT/scripts/integration-cassandra-fixture-data-test.sh" ;;
     observability) "$ROOT/scripts/integration-observability-test.sh" ;;
     *)
       echo "unknown db suite phase: $phase" >&2

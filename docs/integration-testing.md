@@ -231,6 +231,19 @@ not include a keyspace so the first connection can create it safely. It also
 uses `address-translator=contact-point` so the Rust CQL driver translates
 Docker-internal broadcast addresses back to the published host port.
 
+Run the Cassandra fixture-data smoke when you need reusable file-backed CQL
+seed data instead of only lifecycle-generated rows:
+
+```bash
+./scripts/integration-cassandra-fixture-data-test.sh
+```
+
+The fixture smoke starts the same Cassandra profile, loads
+[base-cassandra-seed.cql](../testdata/base-cassandra-seed.cql) through dbtool,
+then verifies seeded rows, table listing, and schema inspection through the
+existing `sql` command surface. It is also available from the local suite as
+the heavy `cassandra-fixture` phase.
+
 TiDB compatibility uses its own profile because it starts a small PD/TiKV/TiDB topology:
 
 ```bash
