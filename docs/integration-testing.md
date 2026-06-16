@@ -14,6 +14,40 @@ Live integration tests can start local databases with Docker Compose:
 
 The script starts Postgres, MySQL, Redis, and MongoDB, waits for health checks, runs the live CLI tests, and then removes the containers and volumes.
 
+Use the local DB suite runner when you want the database verification flow
+automated from one entrypoint:
+
+```bash
+./scripts/integration-db-suite.sh
+```
+
+The default suite runs:
+
+- `./scripts/verify.sh`
+- `./scripts/integration-test.sh`
+- `./scripts/integration-flow-control-test.sh`
+- `./scripts/integration-fixture-data-test.sh`
+- `./scripts/integration-fixture-images-test.sh`
+- `./scripts/integration-data-roundtrip-test.sh`
+- `./scripts/integration-compat-test.sh`
+- `./scripts/integration-pg-compat-test.sh`
+- `./scripts/integration-tidb-test.sh`
+
+Useful selectors:
+
+```bash
+DBTOOL_IT_DB_SUITE_PHASES=quick ./scripts/integration-db-suite.sh
+DBTOOL_IT_DB_SUITE_PHASES=heavy ./scripts/integration-db-suite.sh
+DBTOOL_IT_DB_SUITE_PHASES=all ./scripts/integration-db-suite.sh
+DBTOOL_IT_DB_SUITE_DRY_RUN=1 DBTOOL_IT_DB_SUITE_PHASES=all ./scripts/integration-db-suite.sh
+```
+
+`quick` means service-free verification plus the base database and
+flow-control live checks. `heavy` adds opt-in resource-heavy phases such as
+SQL Server, Cassandra, TiDB secure HA drills, TiDB TiProxy, and observability.
+`DBTOOL_IT_DB_SUITE_CONTINUE=1` keeps running after a failed phase and reports
+all failed phase names at the end.
+
 Run a narrower flow-control smoke when you need to validate throttling-facing
 CLI flags against real services without running the whole live test binary:
 

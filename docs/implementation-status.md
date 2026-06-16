@@ -64,6 +64,7 @@ usable.
 
 | Script | Services | Main coverage | Resource note |
 | --- | --- | --- | --- |
+| `./scripts/integration-db-suite.sh` | Selectable local DB suite | Orchestrates service-free checks, base DB workflows, flow-control, fixture data/images, logical roundtrip, compatibility profiles, TiDB, and opt-in heavy DB phases | Default excludes heavy phases; `DBTOOL_IT_DB_SUITE_PHASES=all` includes every DB/observability phase |
 | `./scripts/integration-test.sh` | Postgres, MySQL, Redis, MongoDB | Canonical SQL, KV, and document workflows | Roughly 2 GiB container memory |
 | `./scripts/integration-flow-control-test.sh` | Postgres, MySQL, Redis, MongoDB | Live request timeout, rate/admission flags, SQL/KV/document result limiting, and disposable fixture cleanup | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-fixture-data-test.sh` | Postgres, MySQL, Redis, MongoDB | File-backed reusable fixture loading for SQL rows, Redis keys, and MongoDB documents | Roughly 2 GiB container memory; local-only while CI budget is frozen |
