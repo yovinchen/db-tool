@@ -53,6 +53,7 @@ DNS.5 = tidb-secure-tikv-1
 DNS.6 = tidb-secure-tikv-2
 DNS.7 = tidb-secure-1
 DNS.8 = tidb-secure-2
+DNS.9 = tidb-secure-tiproxy
 IP.1 = 127.0.0.1
 EOF
 
@@ -125,6 +126,34 @@ cat >"$DBTOOL_IT_TIDB_SECURE_DIR/tikv.toml" <<'EOF'
 ca-path = "/tidb-secure/certs/ca.pem"
 cert-path = "/tidb-secure/certs/server.pem"
 key-path = "/tidb-secure/certs/server-key.pem"
+EOF
+
+cat >"$DBTOOL_IT_TIDB_SECURE_DIR/tiproxy.toml" <<'EOF'
+[proxy]
+addr = "0.0.0.0:6000"
+advertise-addr = "tidb-secure-tiproxy"
+pd-addrs = "tidb-secure-pd-1:2379,tidb-secure-pd-2:2379,tidb-secure-pd-3:2379"
+max-connections = 100
+
+[api]
+addr = "0.0.0.0:3080"
+
+[security]
+require-backend-tls = true
+
+[security.cluster-tls]
+ca = "/tidb-secure/certs/ca.pem"
+cert = "/tidb-secure/certs/server.pem"
+key = "/tidb-secure/certs/server-key.pem"
+
+[security.sql-tls]
+ca = "/tidb-secure/certs/ca.pem"
+cert = "/tidb-secure/certs/server.pem"
+key = "/tidb-secure/certs/server-key.pem"
+
+[security.server-tls]
+cert = "/tidb-secure/certs/server.pem"
+key = "/tidb-secure/certs/server-key.pem"
 EOF
 
 export DBTOOL_IT_TIDB_SECURE_CA="$CERT_DIR/ca.pem"

@@ -241,6 +241,13 @@ Run the same secure HA topology as a SQL-node failover drill:
 ./scripts/integration-tidb-ha-drill.sh
 ```
 
+Run the secure HA topology through TiProxy to validate the TLS proxy entrypoint
+and new-connection routing while each TiDB SQL node is stopped in turn:
+
+```bash
+./scripts/integration-tidb-tiproxy-test.sh
+```
+
 Live messaging integration tests start Redis, Redpanda, RabbitMQ, and NATS:
 
 ```bash
@@ -298,7 +305,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 ## Implementation Status
 
 - Core contracts and services: implemented as the main foundation.
-- SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, Valkey, KeyDB, and Dragonfly compatibility profiles.
+- SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, TiDB TiProxy, Valkey, KeyDB, and Dragonfly compatibility profiles.
 - OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP/TLS mapping tests, plain HTTP OpenSearch live tests, and HTTPS live transport tests.
 - Prometheus HTTP time-series adapter: implemented for metric listing and range queries, with read-only semantics.
 - SQL Server and Cassandra/ScyllaDB adapters: implemented and registered, with service-free adapter coverage plus opt-in Docker integration profiles; Cassandra has passed local live coverage, and SQL Server has passed live coverage on GitHub Actions x86_64 runners.

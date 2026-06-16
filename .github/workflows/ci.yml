@@ -46,6 +46,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_tidb_tiproxy:
+        description: "Run Docker-backed TiDB TiProxy failover drill"
+        required: false
+        type: boolean
+        default: false
       run_live_messaging:
         description: "Run Docker-backed messaging integration tests"
         required: false
@@ -305,6 +310,26 @@ jobs:
 
       - name: Run TiDB secure HA failover drill
         run: ./scripts/integration-tidb-ha-drill.sh
+
+  integration-tidb-tiproxy:
+    name: Live TiDB TiProxy failover drill
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_tidb_tiproxy
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-tidb-tiproxy
+      DBTOOL_IT_TIDB_SECURE_PORT_1: 54100
+      DBTOOL_IT_TIDB_SECURE_PORT_2: 54101
+      DBTOOL_IT_TIDB_SECURE_STATUS_PORT_1: 51100
+      DBTOOL_IT_TIDB_SECURE_STATUS_PORT_2: 51101
+      DBTOOL_IT_TIDB_TIPROXY_PORT: 54200
+      DBTOOL_IT_TIDB_TIPROXY_STATUS_PORT: 51200
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run TiDB TiProxy failover drill
+        run: ./scripts/integration-tidb-tiproxy-test.sh
 
   integration-messaging:
     name: Live messaging integration

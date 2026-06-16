@@ -2,9 +2,12 @@ use std::{
     fs,
     path::Path,
     process::{Command, Output},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde_json::Value;
+
+static CONFIG_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
@@ -34,11 +37,13 @@ fn dbtool_with_config(args: &[&str], config: &str) -> Output {
     output
 }
 
-fn unique_suffix() -> u128 {
-    std::time::SystemTime::now()
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time should be after epoch")
-        .as_nanos()
+        .as_nanos();
+    let counter = CONFIG_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}-{counter}")
 }
 
 fn cleanup_dir(path: &Path) {

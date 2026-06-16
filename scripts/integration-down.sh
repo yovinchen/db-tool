@@ -16,5 +16,6 @@ docker compose \
   --profile cassandra \
   --profile tidb \
   --profile tidb-secure \
+  --profile tidb-tiproxy \
   --profile observability \
   down -v --remove-orphans

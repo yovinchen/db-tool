@@ -225,6 +225,19 @@ DBTOOL_IT_TIDB_SECURE_PORT_2=44101 \
 ./scripts/integration-tidb-ha-drill.sh
 ```
 
+Add TiProxy-specific host ports when running the secure HA topology through the
+local TiProxy profile:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-tidb-tiproxy \
+DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
+DBTOOL_IT_TIDB_SECURE_PORT_1=54100 \
+DBTOOL_IT_TIDB_SECURE_PORT_2=54101 \
+DBTOOL_IT_TIDB_TIPROXY_PORT=54200 \
+DBTOOL_IT_TIDB_TIPROXY_STATUS_PORT=51200 \
+./scripts/integration-tidb-tiproxy-test.sh
+```
+
 Messaging service settings follow the same pattern:
 
 ```bash
@@ -297,6 +310,7 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_tidb` runs `./scripts/integration-tidb-test.sh` for TiDB through a local PD/TiKV/TiDB topology.
 - `run_live_tidb_secure` runs `./scripts/integration-tidb-secure-test.sh` for TiDB auth/TLS/HA coverage.
 - `run_live_tidb_ha_drill` runs `./scripts/integration-tidb-ha-drill.sh` for SQL-node failover on the secure HA topology.
+- `run_live_tidb_tiproxy` runs `./scripts/integration-tidb-tiproxy-test.sh` for TiProxy TLS entrypoint and new-connection routing coverage on the secure HA topology.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
 - `run_live_messaging_tls` runs `./scripts/integration-mq-tls-test.sh` for RabbitMQ TLS and NATS TLS.
 - `run_live_messaging_native` can run `./scripts/integration-mq-native-test.sh` when native Kafka coverage is desired.
@@ -326,6 +340,7 @@ The compose file applies conservative defaults:
 - TiDB secure HA PD nodes: `0.25` CPU, `256m` memory each
 - TiDB secure HA TiKV nodes: `0.50` CPU, `1g` memory each
 - TiDB secure HA SQL nodes: `0.50` CPU, `512m` memory each
+- TiDB TiProxy: `0.25` CPU, `256m` memory
 - Redpanda/Kafka API: `0.75` CPU, `1g` memory, broker memory `512M`
 - RabbitMQ/AMQP: `0.50` CPU, `512m` memory
 - NATS: `0.25` CPU, `256m` memory
@@ -337,7 +352,7 @@ The compose file applies conservative defaults:
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the SQL Server suite is capped at roughly 2 GiB, the messaging suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly 768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite or failover drill is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, SQL Server, CockroachDB, RabbitMQ, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_SQLSERVER_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
+The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the SQL Server suite is capped at roughly 2 GiB, the messaging suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly 768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, the TiDB secure HA suite or failover drill is capped at roughly 3.75 GiB, and the TiProxy drill is capped at roughly 4 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, SQL Server, CockroachDB, RabbitMQ, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_SQLSERVER_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_TIPROXY_MEMORY` if one fails to become healthy under local load.
 
 ## Live Test Scope
 
@@ -352,6 +367,7 @@ The live tests cover:
 - Real TiDB compatibility through `tidb://` against a PD/TiKV/TiDB topology, including database creation, typed values, result limiting, destructive confirmation, table listing, insert/query/schema/drop, and schema-qualified table names.
 - TiDB secure HA through `tidb://` with 3 PD nodes, 2 TiKV nodes, 2 TiDB SQL nodes, component TLS, SQL TLS, TLS-required users, client-certificate-required users, insecure-login rejection, and SQL lifecycle coverage through both SQL nodes.
 - TiDB secure HA failover drill with one SQL node stopped at a time, writes through the surviving SQL node, and post-restart reads of rows created during each outage.
+- TiDB TiProxy drill with a TLS proxy entrypoint, a `REQUIRE SSL` user, and new proxy connections that keep writing/reading while each TiDB SQL node is stopped in turn.
 - Real Valkey compatibility through `valkey://`; optional KeyDB and Dragonfly compatibility through `DBTOOL_IT_COMPAT_EXTRA=1`.
 - MongoDB ping, insert/find/update/aggregate/delete.
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.

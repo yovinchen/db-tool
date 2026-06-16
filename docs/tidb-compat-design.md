@@ -95,6 +95,53 @@ The secure live test verifies:
 - SQL lifecycle coverage runs through both SQL nodes against the same secure database.
 - The X509 user can run the same SQL lifecycle with a client certificate.
 
+## TiProxy Profile
+
+`./scripts/integration-tidb-tiproxy-test.sh` adds TiProxy to the secure HA
+topology through a separate `tidb-tiproxy` Compose profile. The profile uses
+PingCAP's `pingcap/tiproxy:${DBTOOL_IT_TIDB_TIPROXY_VERSION:-v1.3.2}` image and
+a generated `tiproxy.toml` under the same secure working directory.
+
+The TiProxy config follows PingCAP's documented model:
+
+- `[proxy]` listens on `0.0.0.0:6000`, uses the three TLS-enabled PD addresses
+  for service discovery, and exposes the host port
+  `${DBTOOL_IT_TIDB_TIPROXY_PORT:-14200}`.
+- `[api]` listens on `0.0.0.0:3080` and exposes the host status port
+  `${DBTOOL_IT_TIDB_TIPROXY_STATUS_PORT:-11200}`.
+- `[security.cluster-tls]` lets TiProxy talk to PD over component TLS.
+- `[security.sql-tls]` plus `require-backend-tls = true` require TLS between
+  TiProxy and the TiDB SQL nodes.
+- `[security.server-tls]` enables TLS on the client-facing TiProxy SQL port.
+
+The TiProxy drill performs this flow:
+
+1. Start the secure HA topology through `integration-tidb-secure-up.sh`.
+2. Start `tidb-secure-tiproxy`.
+3. Create a fixture database, table, and `REQUIRE SSL` proxy user through a
+   direct secure SQL node.
+4. Wait for dbtool to `ping` the TLS TiProxy DSN as that proxy user.
+5. Prove the `REQUIRE SSL` user can read through TiProxy.
+6. Stop `tidb-secure-1`, require the direct node DSN to fail, then write/read
+   through TiProxy.
+7. Restart `tidb-secure-1`, then stop `tidb-secure-2` and repeat the TiProxy
+   write/read check.
+
+Pass/fail criteria:
+
+- TiProxy must accept TLS SQL connections from dbtool.
+- TiProxy must route new dbtool SQL connections while either SQL node is
+  stopped.
+- Direct DSNs for stopped SQL nodes must fail `ping`, proving the check is not
+  accidentally using the stopped endpoint.
+- A `REQUIRE SSL` SQL user must be usable through the proxy TLS DSN.
+
+This drill proves dbtool can use a local TiProxy entrypoint for new SQL
+connections. It does not claim existing-session migration or virtual-IP HA:
+PingCAP documents TiProxy's unexpected TiDB downtime and certificate-based
+authentication limitations, so those remain explicit production-readiness
+boundaries.
+
 ## Secure HA Failover Drill
 
 `./scripts/integration-tidb-ha-drill.sh` reuses the secure HA topology for an
@@ -126,8 +173,9 @@ Pass/fail criteria:
   if services are kept, it attempts to restart any SQL node it stopped.
 
 This drill proves local TiDB SQL frontend failover through dbtool's MySQL-family
-adapter. It does not replace production TiProxy, placement, PD leadership, TiKV
-failure, backup/restore, upgrade, or certificate-rotation drills.
+adapter. Together with the TiProxy drill, it still does not replace placement,
+PD leadership, TiKV failure, backup/restore, upgrade, certificate-rotation, or
+existing-session migration drills.
 
 ## Failure Recovery
 

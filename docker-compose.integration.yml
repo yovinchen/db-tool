@@ -412,6 +412,28 @@ services:
     cpus: ${DBTOOL_IT_TIDB_SECURE_CPUS:-0.50}
     mem_limit: ${DBTOOL_IT_TIDB_SECURE_MEMORY:-512m}
 
+  tidb-secure-tiproxy:
+    profiles: ["tidb-tiproxy"]
+    image: pingcap/tiproxy:${DBTOOL_IT_TIDB_TIPROXY_VERSION:-v1.3.2}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-tiproxy
+    entrypoint: ["/bin/tiproxy"]
+    command: ["--config=/tidb-secure/tiproxy.toml"]
+    depends_on:
+      - tidb-secure-pd-1
+      - tidb-secure-pd-2
+      - tidb-secure-pd-3
+      - tidb-secure-tikv-1
+      - tidb-secure-tikv-2
+      - tidb-secure-1
+      - tidb-secure-2
+    ports:
+      - "${DBTOOL_IT_TIDB_TIPROXY_PORT:-14200}:6000"
+      - "${DBTOOL_IT_TIDB_TIPROXY_STATUS_PORT:-11200}:3080"
+    volumes:
+      - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    cpus: ${DBTOOL_IT_TIDB_TIPROXY_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_TIDB_TIPROXY_MEMORY:-256m}
+
   redis:
     image: redis:7-alpine
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-redis

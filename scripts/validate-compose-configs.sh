@@ -18,6 +18,7 @@ run_config "sqlserver" --profile sqlserver
 run_config "cassandra" --profile cassandra
 run_config "tidb" --profile tidb
 run_config "tidb-secure" --profile tidb-secure
+run_config "tidb-tiproxy" --profile tidb-secure --profile tidb-tiproxy
 run_config "messaging" --profile messaging
 run_config "messaging-tls" --profile messaging-tls
 run_config "observability" --profile observability
