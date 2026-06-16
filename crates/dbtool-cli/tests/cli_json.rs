@@ -257,3 +257,35 @@ max_retries = 0
 
     assert_eq!(err["error"]["code"], "TIMEOUT");
 }
+
+#[test]
+fn request_timeout_flag_aborts_slow_data_commands() {
+    let output = dbtool(&[
+        "--dsn",
+        "sqlite::memory:",
+        "--request-timeout",
+        "1ms",
+        "--deadline",
+        "20ms",
+        "sql",
+        "query",
+        "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt LIMIT 100000000) SELECT sum(x) FROM cnt",
+    ]);
+
+    let err = stderr_json(&output);
+
+    assert_eq!(err["error"]["code"], "TIMEOUT");
+}
+
+#[test]
+fn invalid_rate_flag_is_a_json_config_error() {
+    let output = dbtool(&["--dsn", "sqlite::memory:", "--rate", "10/hour", "ping"]);
+
+    let err = stderr_json(&output);
+
+    assert_eq!(err["error"]["code"], "CONFIG_ERROR");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cli.limits.rate"));
+}

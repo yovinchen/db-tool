@@ -9,7 +9,11 @@ pub mod sql;
 pub mod ts;
 
 use dbtool_core::service::{formatter::Format, ThrottleConfig};
-use dbtool_core::{config::ConnectionConfig, error::Error, service::ConnectionResolver};
+use dbtool_core::{
+    config::{ConnectionConfig, LimitsConfig},
+    error::Error,
+    service::ConnectionResolver,
+};
 use serde::Serialize;
 
 pub struct Context {
@@ -18,6 +22,7 @@ pub struct Context {
     pub dsn: Option<String>,
     pub format: Format,
     pub limit: usize,
+    pub throttle_overrides: LimitsConfig,
     pub allow_write: bool,
     pub confirm: Option<String>,
 }
@@ -41,7 +46,10 @@ impl Context {
         let config = ConnectionConfig::load(&ConnectionConfig::default_path())?;
 
         if self.dsn.is_some() {
-            return config.throttle_config_for(None);
+            let mut throttle = config.throttle_config_for(None)?;
+            self.throttle_overrides
+                .apply_to_throttle(&mut throttle, "cli.limits")?;
+            return Ok(throttle);
         }
 
         let connection = self.conn.as_deref().and_then(|name| {
@@ -52,7 +60,10 @@ impl Context {
             }
         });
 
-        config.throttle_config_for(connection)
+        let mut throttle = config.throttle_config_for(connection)?;
+        self.throttle_overrides
+            .apply_to_throttle(&mut throttle, "cli.limits")?;
+        Ok(throttle)
     }
 
     pub fn safety_target(&self, resolved_dsn: &str) -> String {

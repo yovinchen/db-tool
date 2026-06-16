@@ -1,6 +1,7 @@
 mod cmd;
 
 use clap::{Parser, Subcommand};
+use dbtool_core::config::LimitsConfig;
 use dbtool_core::service::{formatter::Format, FlowControl};
 use dbtool_registry::build_registry;
 use tracing_subscriber::EnvFilter;
@@ -27,6 +28,30 @@ struct Cli {
     /// Maximum rows/messages to return
     #[arg(long, global = true, default_value = "100")]
     limit: usize,
+
+    /// Maximum in-process concurrent operations for this command
+    #[arg(long, global = true)]
+    max_concurrency: Option<usize>,
+
+    /// Token-bucket rate limit, e.g. 50/s or 120/min
+    #[arg(long, global = true)]
+    rate: Option<String>,
+
+    /// Maximum time to wait for rate/concurrency admission
+    #[arg(long, global = true)]
+    acquire_timeout: Option<String>,
+
+    /// Per-request timeout, e.g. 500ms, 5s, or 1m
+    #[arg(long, global = true)]
+    request_timeout: Option<String>,
+
+    /// Overall command deadline including admission and execution
+    #[arg(long, global = true)]
+    deadline: Option<String>,
+
+    /// Retry budget for retry-capable embedded/core flows
+    #[arg(long, global = true)]
+    max_retries: Option<u32>,
 
     /// Allow write operations (INSERT / UPDATE / DELETE)
     #[arg(long, global = true)]
@@ -87,6 +112,14 @@ async fn main() {
         dsn: cli.dsn,
         format: cli.format.parse().unwrap_or(Format::Json),
         limit: cli.limit,
+        throttle_overrides: LimitsConfig {
+            max_concurrency: cli.max_concurrency,
+            rate: cli.rate,
+            acquire_timeout: cli.acquire_timeout,
+            request_timeout: cli.request_timeout,
+            overall_deadline: cli.deadline,
+            max_retries: cli.max_retries,
+        },
         allow_write: cli.allow_write,
         confirm: cli.confirm,
     };

@@ -121,6 +121,15 @@ request_timeout = "5s"
 connection; `overall_deadline = "none"` disables the shared per-command
 deadline.
 
+The same flow-control values can be overridden per command:
+
+```bash
+dbtool --conn prod-readonly --rate 10/s --request-timeout 5s --deadline 15s sql query "select 1"
+```
+
+Available overrides are `--max-concurrency`, `--rate`, `--acquire-timeout`,
+`--request-timeout`, `--deadline`, and `--max-retries`.
+
 ## Safety Defaults
 
 SQL execution is guarded before it reaches adapters:
@@ -162,7 +171,8 @@ cargo test --workspace
 Service-free executable smoke coverage uses a temporary SQLite database,
 `connections.toml`, and [testdata/sqlite-core-flow.sql](testdata/sqlite-core-flow.sql)
 to verify ping, write confirmation, insert/query, result limiting,
-table/schema inspection, write guards, and configured request timeout:
+table/schema inspection, write guards, configured request timeout, and CLI
+flow-control flag overrides:
 
 ```bash
 ./scripts/smoke-core-flow.sh

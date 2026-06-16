@@ -160,4 +160,6 @@ expect_error_code WRITE_NOT_ALLOWED --conn smoke-sqlite sql exec "INSERT INTO pe
 
 expect_error_code TIMEOUT --conn timeout-sqlite sql query "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt LIMIT 100000000) SELECT sum(x) FROM cnt" >/dev/null
 
+expect_error_code TIMEOUT --conn smoke-sqlite --request-timeout 1ms --deadline 20ms sql query "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt LIMIT 100000000) SELECT sum(x) FROM cnt" >/dev/null
+
 echo "dbtool core smoke passed"

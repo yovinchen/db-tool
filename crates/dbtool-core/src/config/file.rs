@@ -19,7 +19,7 @@ pub struct Defaults {
     pub limits: Option<LimitsConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LimitsConfig {
     pub max_concurrency: Option<usize>,
     pub rate: Option<String>,
@@ -58,7 +58,7 @@ impl ConnectionConfig {
             .as_ref()
             .and_then(|defaults| defaults.limits.as_ref())
         {
-            limits.apply_to(&mut config, "defaults.limits")?;
+            limits.apply_to_throttle(&mut config, "defaults.limits")?;
         }
 
         if let Some(connection) = connection {
@@ -67,7 +67,8 @@ impl ConnectionConfig {
                 .get(connection)
                 .and_then(|entry| entry.limits.as_ref())
             {
-                limits.apply_to(&mut config, &format!("connections.{connection}.limits"))?;
+                limits
+                    .apply_to_throttle(&mut config, &format!("connections.{connection}.limits"))?;
             }
         }
 
@@ -76,7 +77,7 @@ impl ConnectionConfig {
 }
 
 impl LimitsConfig {
-    fn apply_to(&self, config: &mut ThrottleConfig, scope: &str) -> Result<()> {
+    pub fn apply_to_throttle(&self, config: &mut ThrottleConfig, scope: &str) -> Result<()> {
         if let Some(max_concurrency) = self.max_concurrency {
             if max_concurrency == 0 {
                 return Err(Error::Config(format!(
