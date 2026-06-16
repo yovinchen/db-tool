@@ -324,6 +324,35 @@ This drill proves local generated TLS material can be replaced across a full
 secure HA restart. It does not claim online certificate rotation for an
 already-running TiDB cluster.
 
+## Logical Roundtrip Smoke
+
+`./scripts/integration-tidb-logical-roundtrip-test.sh` reuses the secure HA
+topology for a dbtool-mediated SQL data roundtrip. It is local-only while the CI
+budget freeze is in effect.
+
+The smoke performs this flow:
+
+1. Start the secure HA topology through `integration-tidb-secure-up.sh`.
+2. Create a disposable source table through `tidb-secure-1`.
+3. Export ordered source rows to JSON through dbtool.
+4. Restore the exported rows into an independent table through
+   `tidb-secure-2`.
+5. Read the restored table through `tidb-secure-2`.
+6. Read the restored table again through `tidb-secure-1`, proving both SQL
+   nodes see the same restored TiKV-backed state.
+
+Pass/fail criteria:
+
+- Both secure SQL nodes must accept TLS dbtool commands before the smoke starts.
+- The exported JSON must contain all expected source rows.
+- Restored rows must be readable from both secure SQL nodes.
+- The script drops its disposable source and restore tables on exit unless the
+  topology is already unavailable.
+
+This smoke proves logical dbtool input/output behavior across the local secure
+HA topology. It does not claim product-native TiDB backup/restore coverage such
+as BR, PITR, placement-rule validation, or cluster-level restore semantics.
+
 ## Failure Recovery
 
 Use the shared cleanup script if a run is interrupted:
@@ -356,7 +385,8 @@ The most likely local causes are a TiDB flag/version mismatch, not enough Docker
 
 - The default `tidb` profile is a single-node compatibility harness; use `tidb-secure` for local HA/security coverage.
 - The secure HA topology is still a local integration harness, not a production deployment model.
-- Password rotation, placement rules, production TiKV failover, online certificate
-  rotation, and upgrade scenarios are outside these tests.
+- Password rotation, placement rules, production TiKV failover, product-native
+  backup/restore, online certificate rotation, and upgrade scenarios are
+  outside these tests.
 - The profile uses the local bootstrap root user only for disposable integration tests.
 - TiDB remains implemented through the MySQL-family adapter; the alias kind is preserved for user-facing metadata and test assertions.

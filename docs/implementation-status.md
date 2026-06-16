@@ -40,6 +40,7 @@ usable.
 | TiDB PD leader | `tidb://` with TLS params | SQL | Current PD leader is discovered through the TLS PD API, stopped, replaced, and both SQL nodes continue TLS writes/reads | Local secure HA PD leader drill |
 | TiDB TiKV outage boundary | `tidb://` with TLS params | SQL | One local TiKV service is stopped and dbtool SQL probes must either continue successfully or fail within bounded request/deadline time | Local secure HA TiKV outage boundary drill |
 | TiDB certificate regeneration | `tidb://` with regenerated TLS params | SQL | Cold-restart secure HA after regenerated CA/server/client certificates, with TLS writes/reads through both generations | Local secure HA certificate regeneration drill |
+| TiDB logical roundtrip | `tidb://` with TLS params | SQL | Rows are exported through one secure SQL node, restored through the other node, and read back from both nodes | Local secure HA logical roundtrip smoke |
 | TiDB TiProxy | `tidb://` through TiProxy TLS port | SQL | TLS proxy entrypoint, `REQUIRE SSL` user, SQL lifecycle, new-connection routing while either TiDB SQL node is stopped | Opt-in TiProxy Docker drill |
 | Redis | `redis://` | Redis | KV get/set/delete/scan/raw, TTL, Streams, Pub/Sub | Base and messaging Docker live tests |
 | Valkey | `valkey://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Real Valkey compatibility live test |
@@ -79,6 +80,7 @@ usable.
 | `./scripts/integration-tidb-pd-leader-drill.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB secure HA continuity after stopping the discovered current PD leader | Roughly 3.75 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-tidb-tikv-outage-boundary.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB secure HA behavior boundary after stopping one local TiKV service, with bounded dbtool probes | Roughly 3.75 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-tidb-cert-regeneration-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB secure HA cold restart after regenerated CA/server/client certificates | Roughly 3.75 GiB container memory; local-only while CI budget is frozen |
+| `./scripts/integration-tidb-logical-roundtrip-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB secure HA logical export/restore across the two TLS SQL nodes with cross-node readback | Roughly 3.75 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-tidb-tiproxy-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL, TiProxy | TiProxy TLS entrypoint and new-connection routing while one SQL node is stopped | Roughly 4 GiB container memory |
 | `./scripts/integration-mq-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Streams/PubSub, Kafka, AMQP, NATS | Roughly 2 GiB container memory |
 | `./scripts/integration-mq-tls-test.sh` | RabbitMQ TLS, NATS TLS | AMQPS and NATS TLS aliases | Roughly 768 MiB container memory |
@@ -106,7 +108,7 @@ usable.
 | Prometheus remote write | Not supported | The implemented Prometheus adapter intentionally covers read APIs only; remote write is a separate protobuf/snappy protocol. | Add only if write-heavy time-series workflows become a requirement. |
 | Cassandra trait split | Deferred | Cassandra is currently usable through a constrained CQL-over-`SqlEngine` surface so the existing CLI safety/limit/output paths work; a dedicated `CqlEngine` is not yet modeled. | Add `CqlEngine` only if CQL needs protocol-specific commands, prepared values, paging, or TUI forms. |
 | TUI rich workflows | Partial | Basic command dispatch exists, but command history, form controls, and richer per-capability screens are not implemented. | Expand after core protocol coverage remains stable. |
-| Production TiDB HA | Partial | Local secure HA topology, SQL-node failover drill, PD single-node outage drill, PD leader outage drill, TiKV outage boundary drill, certificate regeneration cold-restart drill, and TiProxy new-connection routing drill are available, but production TiKV failover, online certificate rotation, backup/restore, and upgrade drills are not covered. | Add product-specific production drills only when production-readiness is in scope. |
+| Production TiDB HA | Partial | Local secure HA topology, SQL-node failover drill, PD single-node outage drill, PD leader outage drill, TiKV outage boundary drill, certificate regeneration cold-restart drill, logical data roundtrip smoke, and TiProxy new-connection routing drill are available, but production TiKV failover, online certificate rotation, product-native backup/restore, and upgrade drills are not covered. | Add product-specific production drills only when production-readiness is in scope. |
 | AMQP queue listing over pure AMQP | Not supported | AMQP 0.9.1 does not expose queue listing as a portable protocol operation. | Keep using `rabbitmq+http://` for RabbitMQ admin discovery. |
 | Redis Pub/Sub durable listing | Not supported | Pub/Sub channels are live subscriptions, not durable topics. | Keep durable list/detail semantics on Redis Streams only. |
 | NATS core subject listing | Not supported | Core NATS subjects are not durable catalog entries. | Keep list/detail/lag semantics on JetStream only. |
@@ -114,5 +116,5 @@ usable.
 ## Next Implementation Queue
 
 1. Expand TUI command history and richer per-capability forms.
-2. Run the TiDB secure HA, PD, and TiProxy drills in the target Docker environment when production-readiness evidence is needed.
+2. Run the TiDB secure HA, PD, logical roundtrip, and TiProxy drills in the target Docker environment when production-readiness evidence is needed.
 3. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.

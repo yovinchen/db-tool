@@ -224,6 +224,22 @@ certificate fingerprints changed, then starts the topology again and repeats
 the TLS SQL check. It is a cold-restart certificate lifecycle test, not a claim
 of online production certificate rotation.
 
+Run the TiDB secure HA logical roundtrip smoke when you need to prove dbtool can
+export rows from one TLS SQL node, restore them through another SQL node, and
+read the restored table from both nodes:
+
+```bash
+./scripts/integration-tidb-logical-roundtrip-test.sh
+```
+
+The roundtrip smoke starts the secure HA profile, creates a disposable source
+table, exports rows to JSON under `.tmp/`, restores them into an independent
+target table through the second SQL node, then reads the restored data through
+both SQL nodes. The dbtool calls use bounded defaults through
+`DBTOOL_IT_TIDB_ROUNDTRIP_REQUEST_TIMEOUT` and
+`DBTOOL_IT_TIDB_ROUNDTRIP_DEADLINE`. This is logical SQL roundtrip coverage,
+not a replacement for product-native TiDB backup/restore tooling.
+
 Messaging integration tests use a separate profile so day-to-day database checks stay lighter:
 
 ```bash
@@ -417,6 +433,17 @@ DBTOOL_IT_TIDB_SECURE_PORT_2=46101 \
 ./scripts/integration-tidb-cert-regeneration-test.sh
 ```
 
+Use the same secure HA variables for the TiDB logical roundtrip smoke:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-tidb-roundtrip \
+DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
+DBTOOL_IT_TIDB_SECURE_PORT_1=47100 \
+DBTOOL_IT_TIDB_SECURE_PORT_2=47101 \
+DBTOOL_IT_KEEP_EXPORTS=1 \
+./scripts/integration-tidb-logical-roundtrip-test.sh
+```
+
 Add TiProxy-specific host ports when running the secure HA topology through the
 local TiProxy profile:
 
@@ -602,6 +629,8 @@ The live tests cover:
 - TiDB secure HA certificate regeneration drill with changed CA/server/client
   certificate fingerprints across a cold restart and TLS SQL verification
   through both generations.
+- TiDB secure HA logical data roundtrip with TLS SQL export through one SQL
+  node, restore through the other node, and cross-node readback.
 - TiDB TiProxy drill with a TLS proxy entrypoint, a `REQUIRE SSL` user, and new proxy connections that keep writing/reading while each TiDB SQL node is stopped in turn.
 - Real Valkey compatibility through `valkey://`; optional KeyDB and Dragonfly compatibility through `DBTOOL_IT_COMPAT_EXTRA=1`.
 - MongoDB ping, insert/find/update/aggregate/delete.

@@ -301,6 +301,14 @@ SQL through both generations:
 ./scripts/integration-tidb-cert-regeneration-test.sh
 ```
 
+Run the secure HA topology as a logical data roundtrip smoke, exporting rows
+through one TLS SQL node, restoring them through the other node, and reading
+back from both nodes:
+
+```bash
+./scripts/integration-tidb-logical-roundtrip-test.sh
+```
+
 Run the secure HA topology through TiProxy to validate the TLS proxy entrypoint
 and new-connection routing while each TiDB SQL node is stopped in turn:
 
