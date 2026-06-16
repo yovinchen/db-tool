@@ -1,7 +1,7 @@
 mod cmd;
 
 use clap::{Parser, Subcommand};
-use dbtool_core::service::formatter::Format;
+use dbtool_core::service::{formatter::Format, FlowControl};
 use dbtool_registry::build_registry;
 use tracing_subscriber::EnvFilter;
 
@@ -92,15 +92,15 @@ async fn main() {
     };
 
     let result = match cli.command {
-        Commands::Ping => cmd::ping::run(&ctx).await,
-        Commands::Caps => cmd::caps::run(&ctx).await,
-        Commands::Sql(sub) => cmd::sql::run(&ctx, sub).await,
-        Commands::Kv(sub) => cmd::kv::run(&ctx, sub).await,
-        Commands::Doc(sub) => cmd::doc::run(&ctx, sub).await,
-        Commands::Ts(sub) => cmd::ts::run(&ctx, sub).await,
-        Commands::Search(sub) => cmd::search::run(&ctx, sub).await,
-        Commands::Mq(sub) => cmd::mq::run(&ctx, sub).await,
         Commands::Conn(sub) => cmd::conn::run(&ctx, sub).await,
+        command => match ctx.throttle_config() {
+            Ok(config) => {
+                FlowControl::new(config)
+                    .run_single(run_data_command(&ctx, command))
+                    .await
+            }
+            Err(err) => Err(err),
+        },
     };
 
     match result {
@@ -110,5 +110,21 @@ async fn main() {
             eprintln!("{output}");
             std::process::exit(1);
         }
+    }
+}
+
+async fn run_data_command(ctx: &cmd::Context, command: Commands) -> dbtool_core::Result<String> {
+    match command {
+        Commands::Ping => cmd::ping::run(ctx).await,
+        Commands::Caps => cmd::caps::run(ctx).await,
+        Commands::Sql(sub) => cmd::sql::run(ctx, sub).await,
+        Commands::Kv(sub) => cmd::kv::run(ctx, sub).await,
+        Commands::Doc(sub) => cmd::doc::run(ctx, sub).await,
+        Commands::Ts(sub) => cmd::ts::run(ctx, sub).await,
+        Commands::Search(sub) => cmd::search::run(ctx, sub).await,
+        Commands::Mq(sub) => cmd::mq::run(ctx, sub).await,
+        Commands::Conn(_) => Err(dbtool_core::Error::Internal(
+            "conn command is not a data operation".to_owned(),
+        )),
     }
 }

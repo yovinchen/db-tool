@@ -1,4 +1,8 @@
-use std::process::{Command, Output};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
 
 use serde_json::Value;
 
@@ -7,6 +11,38 @@ fn dbtool(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("dbtool command should run")
+}
+
+fn dbtool_with_config(args: &[&str], config: &str) -> Output {
+    let root = std::env::temp_dir().join(format!(
+        "dbtool-cli-config-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let config_dir = root.join("dbtool");
+    fs::create_dir_all(&config_dir).expect("config directory should be created");
+    fs::write(config_dir.join("connections.toml"), config).expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dbtool"))
+        .env("XDG_CONFIG_HOME", &root)
+        .env_remove("DBTOOL_CONN_LIMIT_TEST")
+        .args(args)
+        .output()
+        .expect("dbtool command should run");
+
+    cleanup_dir(&root);
+    output
+}
+
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_nanos()
+}
+
+fn cleanup_dir(path: &Path) {
+    fs::remove_dir_all(path).ok();
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -172,4 +208,26 @@ fn search_index_requires_write_flag_before_connecting() {
     ]));
 
     assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");
+}
+
+#[test]
+fn named_connection_limits_are_loaded_for_data_commands() {
+    let output = dbtool_with_config(
+        &["--conn", "limit-test", "ping"],
+        r#"
+[connections.limit-test]
+dsn = "sqlite::memory:"
+
+[connections.limit-test.limits]
+request_timeout = "not-a-duration"
+"#,
+    );
+
+    let err = stderr_json(&output);
+
+    assert_eq!(err["error"]["code"], "CONFIG_ERROR");
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("request_timeout"));
 }

@@ -1,3 +1,11 @@
+[defaults.limits]
+max_concurrency = 8
+rate = "50/s"
+acquire_timeout = "2s"
+request_timeout = "10s"
+overall_deadline = "15s"
+max_retries = 3
+
 [connections.local-sqlite]
 dsn = "sqlite::memory:"
 readonly = true
@@ -9,6 +17,10 @@ readonly = false
 [connections.prod-postgres]
 dsn = "postgres://app:${DB_PASSWORD}@db.example.com/app"
 readonly = true
+
+[connections.prod-postgres.limits]
+rate = "10/s"
+request_timeout = "5s"
 
 [connections.local-tidb]
 dsn = "tidb://root@127.0.0.1:14000"

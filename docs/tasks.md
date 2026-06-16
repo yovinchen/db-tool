@@ -24,6 +24,7 @@ Goal: frontends and adapters share one behavior layer.
 - [x] Result limiter.
 - [x] SQL safety guard and two-step token confirmation.
 - [x] Flow-control service with concurrency, rate limiting, timeout, and bounded retry budget.
+- [x] `connections.toml` limits merged into CLI data-command flow control.
 - [x] Replace keyword SQL classifier with `sqlparser`-backed classification.
 - [x] Bind confirm token to target connection and impact summary.
 - [x] Unit tests for resolver, formatter, flow control, and safety edge cases.
@@ -96,7 +97,8 @@ Goal: release-quality packages and optional advanced backends.
 - [x] Optional native Kafka implementation.
 - [x] OpenSearch/Elasticsearch HTTP search adapter.
 - [x] Prometheus HTTP time-series adapter.
-- [ ] Future adapters: SQL Server adapter is implemented behind an opt-in feature/profile; Cassandra remains gated by the CQL trait decision in [extended-backends.md](extended-backends.md).
+- [x] SQL Server adapter behind an opt-in Docker profile with service-free coverage and documented amd64 live gate.
+- [x] Cassandra/ScyllaDB CQL adapter through the constrained SQL command surface with real Cassandra live coverage.
 
 ## P7: Live Integration Automation
 

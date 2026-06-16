@@ -11,6 +11,10 @@ impl ConnectionResolver {
         Self { config }
     }
 
+    pub fn env_key(name: &str) -> String {
+        format!("DBTOOL_CONN_{}", name.to_uppercase().replace('-', "_"))
+    }
+
     pub fn resolve(&self, name_or_dsn: &str) -> Result<Dsn> {
         // 1. Treat as a raw DSN if it contains "://".
         if name_or_dsn.contains("://") {
@@ -18,10 +22,7 @@ impl ConnectionResolver {
         }
 
         // 2. Check env var DBTOOL_CONN_<UPPER_NAME>.
-        let env_key = format!(
-            "DBTOOL_CONN_{}",
-            name_or_dsn.to_uppercase().replace('-', "_")
-        );
+        let env_key = Self::env_key(name_or_dsn);
         if let Ok(dsn_str) = std::env::var(&env_key) {
             return Dsn::parse(&dsn_str);
         }

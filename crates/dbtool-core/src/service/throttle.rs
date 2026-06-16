@@ -99,6 +99,22 @@ impl FlowControl {
         }
     }
 
+    /// Run one operation under the configured rate/concurrency/time budgets.
+    ///
+    /// This intentionally does not retry, so CLI callers can protect one-shot
+    /// operations without replaying writes.
+    pub async fn run_single<F, T>(&self, op: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        let deadline_at = Instant::now()
+            + self
+                .config
+                .overall_deadline
+                .unwrap_or(self.config.request_timeout);
+        self.run_once(deadline_at, op).await
+    }
+
     async fn run_once<F, T>(&self, deadline_at: Instant, op: F) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,

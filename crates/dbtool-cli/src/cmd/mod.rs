@@ -8,7 +8,7 @@ pub mod search;
 pub mod sql;
 pub mod ts;
 
-use dbtool_core::service::formatter::Format;
+use dbtool_core::service::{formatter::Format, ThrottleConfig};
 use dbtool_core::{config::ConnectionConfig, error::Error, service::ConnectionResolver};
 use serde::Serialize;
 
@@ -35,6 +35,24 @@ impl Context {
                 .map(|dsn| dsn.raw);
         }
         Err(dbtool_core::Error::Config("provide --conn or --dsn".into()))
+    }
+
+    pub fn throttle_config(&self) -> dbtool_core::Result<ThrottleConfig> {
+        let config = ConnectionConfig::load(&ConnectionConfig::default_path())?;
+
+        if self.dsn.is_some() {
+            return config.throttle_config_for(None);
+        }
+
+        let connection = self.conn.as_deref().and_then(|name| {
+            if std::env::var_os(ConnectionResolver::env_key(name)).is_some() {
+                None
+            } else {
+                Some(name)
+            }
+        });
+
+        config.throttle_config_for(connection)
     }
 
     pub fn safety_target(&self, resolved_dsn: &str) -> String {

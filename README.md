@@ -95,6 +95,14 @@ The default config path is:
 Example:
 
 ```toml
+[defaults.limits]
+max_concurrency = 8
+rate = "50/s"
+acquire_timeout = "2s"
+request_timeout = "10s"
+overall_deadline = "15s"
+max_retries = 3
+
 [connections.local-sqlite]
 dsn = "sqlite::memory:"
 readonly = true
@@ -102,7 +110,16 @@ readonly = true
 [connections.prod-readonly]
 dsn = "postgres://user:${DB_PASSWORD}@db.example.com/app"
 readonly = true
+
+[connections.prod-readonly.limits]
+rate = "10/s"
+request_timeout = "5s"
 ```
+
+`[defaults.limits]` applies to all CLI data commands. A connection-specific
+`[connections.<name>.limits]` table overrides those defaults for that named
+connection; `overall_deadline = "none"` disables the shared per-command
+deadline.
 
 ## Safety Defaults
 
