@@ -2,6 +2,29 @@
 
 This task plan maps the design document milestones into commit-sized work.
 
+## Execution Guardrails
+
+These rules are active for every future task until explicitly changed by the
+project owner.
+
+- [ ] Start each new feature or fix from a fresh feature branch, normally
+      `codex/<short-scope>`, before editing implementation files.
+- [ ] Do not edit or push directly on `master` for feature work. Finish the
+      feature branch first, verify locally, then merge the completed branch back
+      into `master`.
+- [ ] Use local verification as the default completion gate. Run the smallest
+      meaningful local test set for the changed scope, then record any known
+      gaps in the commit message.
+- [ ] GitHub Actions budget freeze: do not manually dispatch workflows, do not
+      trigger avoidable CI runs, and cancel already-running Actions when the
+      owner declares CI budget exhausted.
+- [ ] While the CI budget freeze is active, do not push branch or `master`
+      updates that would start GitHub CI. Keep completed merges local until the
+      owner explicitly allows remote pushes/CI again.
+- [ ] Each feature cycle must be independent: create branch -> implement ->
+      local test -> commit -> merge to `master` -> start the next feature from a
+      new branch.
+
 ## P0a: Compilable Core Skeleton
 
 Goal: `dbtool-core` compiles and exposes stable contracts.

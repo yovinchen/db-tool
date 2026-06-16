@@ -212,6 +212,10 @@ services:
       ]
     depends_on:
       - tidb-pd
+    ulimits:
+      nofile:
+        soft: ${DBTOOL_IT_TIDB_TIKV_NOFILE_SOFT:-200000}
+        hard: ${DBTOOL_IT_TIDB_TIKV_NOFILE_HARD:-200000}
     cpus: ${DBTOOL_IT_TIDB_TIKV_CPUS:-0.75}
     mem_limit: ${DBTOOL_IT_TIDB_TIKV_MEMORY:-1g}
 
@@ -331,6 +335,10 @@ services:
       - tidb-secure-pd-3
     volumes:
       - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    ulimits:
+      nofile:
+        soft: ${DBTOOL_IT_TIDB_SECURE_TIKV_NOFILE_SOFT:-200000}
+        hard: ${DBTOOL_IT_TIDB_SECURE_TIKV_NOFILE_HARD:-200000}
     cpus: ${DBTOOL_IT_TIDB_SECURE_TIKV_CPUS:-0.50}
     mem_limit: ${DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY:-1g}
 
@@ -353,6 +361,10 @@ services:
       - tidb-secure-pd-3
     volumes:
       - "${DBTOOL_IT_TIDB_SECURE_DIR:-.tmp/dbtool-it-tidb-secure}:/tidb-secure:ro"
+    ulimits:
+      nofile:
+        soft: ${DBTOOL_IT_TIDB_SECURE_TIKV_NOFILE_SOFT:-200000}
+        hard: ${DBTOOL_IT_TIDB_SECURE_TIKV_NOFILE_HARD:-200000}
     cpus: ${DBTOOL_IT_TIDB_SECURE_TIKV_CPUS:-0.50}
     mem_limit: ${DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY:-1g}
 
