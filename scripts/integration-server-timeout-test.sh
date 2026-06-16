@@ -15,6 +15,9 @@ compose \
 compose ps
 
 pg_timeout_set=0
+pg_lock_timeout_set=0
+pg_lock_pid=""
+pg_lock_table=""
 mysql_timeout_set=0
 mysql_lock_pid=""
 mysql_table=""
@@ -115,6 +118,18 @@ sql_exec() {
   return "$status"
 }
 
+postgres_user_exec() {
+  compose exec -T \
+    -e PGPASSWORD="$DBTOOL_IT_POSTGRES_PASSWORD" \
+    postgres \
+    psql \
+    -h 127.0.0.1 \
+    -U "$DBTOOL_IT_POSTGRES_USER" \
+    -d "$DBTOOL_IT_POSTGRES_DB" \
+    -v ON_ERROR_STOP=1 \
+    -c "$1"
+}
+
 mysql_admin_exec() {
   compose exec -T mysql \
     mysql \
@@ -135,8 +150,17 @@ mysql_user_exec() {
 
 cleanup() {
   set +e
+  if [[ -n "$pg_lock_pid" ]]; then
+    wait "$pg_lock_pid" >/dev/null 2>&1
+  fi
   if [[ -n "$mysql_lock_pid" ]]; then
     wait "$mysql_lock_pid" >/dev/null 2>&1
+  fi
+  if [[ "$pg_lock_timeout_set" == "1" ]]; then
+    sql_exec "$DBTOOL_IT_POSTGRES_DSN" "alter role current_user reset lock_timeout" >/dev/null 2>&1
+  fi
+  if [[ -n "$pg_lock_table" ]]; then
+    sql_exec "$DBTOOL_IT_POSTGRES_DSN" "drop table if exists $pg_lock_table" >/dev/null 2>&1
   fi
   if [[ "$mysql_timeout_set" == "1" ]]; then
     mysql_admin_exec "set global innodb_lock_wait_timeout = ${DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_WAIT_RESET_SECONDS:-50}" >/dev/null 2>&1
@@ -158,10 +182,14 @@ run_dbtool --dsn "$DBTOOL_IT_MYSQL_DSN" ping >/dev/null
 
 pg_statement_timeout="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_STATEMENT_TIMEOUT:-100ms}"
 pg_sleep_seconds="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_SLEEP_SECONDS:-1}"
+pg_lock_timeout="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_TIMEOUT:-100ms}"
+pg_lock_hold_seconds="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_HOLD_SECONDS:-5}"
+pg_lock_ready_sleep="${DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_READY_SLEEP:-1}"
 mysql_lock_wait_seconds="${DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_WAIT_SECONDS:-1}"
 mysql_lock_hold_seconds="${DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_HOLD_SECONDS:-5}"
 mysql_lock_ready_sleep="${DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_READY_SLEEP:-1}"
 suffix="$(date +%s)_$$"
+pg_lock_table="dbtool_pg_lock_timeout_${suffix}"
 mysql_table="dbtool_server_timeout_${suffix}"
 
 echo "dbtool server timeout smoke: verifying PostgreSQL statement_timeout"
@@ -186,6 +214,43 @@ assert_json_field \
   "$(run_dbtool --dsn "$DBTOOL_IT_POSTGRES_DSN" sql query "select 1")" \
   "data.rows.0.0" \
   "1"
+
+echo "dbtool server timeout smoke: verifying PostgreSQL lock_timeout"
+sql_exec "$DBTOOL_IT_POSTGRES_DSN" "drop table if exists $pg_lock_table"
+sql_exec "$DBTOOL_IT_POSTGRES_DSN" "create table $pg_lock_table (id integer primary key, note text not null)"
+sql_exec "$DBTOOL_IT_POSTGRES_DSN" "insert into $pg_lock_table (id, note) values (1, 'initial')"
+sql_exec \
+  "$DBTOOL_IT_POSTGRES_DSN" \
+  "alter role current_user set lock_timeout = '$pg_lock_timeout'"
+pg_lock_timeout_set=1
+
+postgres_user_exec \
+  "begin; update $pg_lock_table set note = 'held' where id = 1; select pg_sleep($pg_lock_hold_seconds); commit;" \
+  >/dev/null 2>&1 &
+pg_lock_pid=$!
+sleep "$pg_lock_ready_sleep"
+
+pg_lock_error="$(
+  expect_error_code \
+    QUERY_ERROR \
+    --dsn "$DBTOOL_IT_POSTGRES_DSN" \
+    --request-timeout "${DBTOOL_IT_SERVER_TIMEOUT_CLIENT_REQUEST_TIMEOUT:-5s}" \
+    --deadline "${DBTOOL_IT_SERVER_TIMEOUT_CLIENT_DEADLINE:-10s}" \
+    --allow-write \
+    sql exec "update $pg_lock_table set note = 'dbtool' where id = 1"
+)"
+assert_contains "$pg_lock_error" "lock timeout"
+
+wait "$pg_lock_pid"
+pg_lock_pid=""
+sql_exec "$DBTOOL_IT_POSTGRES_DSN" "alter role current_user reset lock_timeout"
+pg_lock_timeout_set=0
+assert_json_field \
+  "$(run_dbtool --dsn "$DBTOOL_IT_POSTGRES_DSN" sql query "select note from $pg_lock_table where id = 1")" \
+  "data.rows.0.0" \
+  "held"
+sql_exec "$DBTOOL_IT_POSTGRES_DSN" "drop table if exists $pg_lock_table"
+pg_lock_table=""
 
 echo "dbtool server timeout smoke: verifying MySQL innodb_lock_wait_timeout"
 sql_exec "$DBTOOL_IT_MYSQL_DSN" "drop table if exists $mysql_table"

@@ -111,15 +111,19 @@ timeouts separately from dbtool's client-side request timeout:
 ```
 
 The server-timeout smoke starts the base PostgreSQL and MySQL services, then
-verifies PostgreSQL `statement_timeout` cancels a slow `pg_sleep` query for new
-sessions and MySQL `innodb_lock_wait_timeout` cancels a dbtool `UPDATE`
-blocked behind a row lock held by the container-local MySQL client. The
-client-side `--request-timeout` and `--deadline` values are kept larger than
-the database-side budgets so the observed failures prove the database layer is
+verifies PostgreSQL `statement_timeout` cancels a slow `pg_sleep` query,
+PostgreSQL `lock_timeout` cancels a dbtool `UPDATE` blocked behind a row lock,
+and MySQL `innodb_lock_wait_timeout` cancels a dbtool `UPDATE` blocked behind a
+row lock held by the container-local database client. The client-side
+`--request-timeout` and `--deadline` values are kept larger than the
+database-side budgets so the observed failures prove the database layer is
 enforcing the limit.
 
 Tune the smoke with `DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_STATEMENT_TIMEOUT`,
 `DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_SLEEP_SECONDS`,
+`DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_TIMEOUT`,
+`DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_HOLD_SECONDS`,
+`DBTOOL_IT_SERVER_TIMEOUT_POSTGRES_LOCK_READY_SLEEP`,
 `DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_WAIT_SECONDS`,
 `DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_HOLD_SECONDS`,
 `DBTOOL_IT_SERVER_TIMEOUT_MYSQL_LOCK_READY_SLEEP`,
