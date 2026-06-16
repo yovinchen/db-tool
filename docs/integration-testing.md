@@ -99,6 +99,21 @@ Run the secure HA failover drill when you need to prove the two exposed TiDB SQL
 
 The drill reuses the secure HA profile, writes shared fixture rows through both SQL nodes, stops `tidb-secure-1`, verifies `tidb-secure-2`, restarts node 1, then repeats the same check with `tidb-secure-2` stopped. Passing means each surviving SQL node can still write and read the shared TiKV-backed table, and each restarted SQL node can read rows written during its outage.
 
+Run the secure HA PD drill when you need to prove the local 3-PD quorum can lose
+one PD container at a time while both SQL nodes continue serving TLS SQL traffic:
+
+```bash
+./scripts/integration-tidb-pd-drill.sh
+```
+
+The drill reuses the secure HA profile, creates shared fixture rows, stops
+`tidb-secure-pd-1`, `tidb-secure-pd-2`, and `tidb-secure-pd-3` one at a time,
+and requires both SQL nodes to keep writing and reading during each outage.
+Its dbtool calls use bounded defaults through
+`DBTOOL_IT_TIDB_PD_DRILL_REQUEST_TIMEOUT` and
+`DBTOOL_IT_TIDB_PD_DRILL_DEADLINE` so a broken quorum fails fast instead of
+hanging indefinitely.
+
 Messaging integration tests use a separate profile so day-to-day database checks stay lighter:
 
 ```bash
@@ -231,6 +246,16 @@ DBTOOL_IT_TIDB_SECURE_PORT_2=44101 \
 ./scripts/integration-tidb-ha-drill.sh
 ```
 
+Use the same secure HA variables for the PD drill:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-tidb-pd-drill \
+DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
+DBTOOL_IT_TIDB_SECURE_PORT_1=45100 \
+DBTOOL_IT_TIDB_SECURE_PORT_2=45101 \
+./scripts/integration-tidb-pd-drill.sh
+```
+
 Add TiProxy-specific host ports when running the secure HA topology through the
 local TiProxy profile:
 
@@ -358,7 +383,7 @@ The compose file applies conservative defaults:
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the SQL Server suite is capped at roughly 2 GiB, the messaging suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly 768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, the TiDB secure HA suite or failover drill is capped at roughly 3.75 GiB, and the TiProxy drill is capped at roughly 4 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, SQL Server, CockroachDB, RabbitMQ, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_SQLSERVER_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_TIPROXY_MEMORY` if one fails to become healthy under local load.
+The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the SQL Server suite is capped at roughly 2 GiB, the messaging suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly 768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, the TiDB secure HA suite, SQL-node failover drill, or PD drill is capped at roughly 3.75 GiB, and the TiProxy drill is capped at roughly 4 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, SQL Server, CockroachDB, RabbitMQ, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_SQLSERVER_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_TIPROXY_MEMORY` if one fails to become healthy under local load.
 
 ## Live Test Scope
 
@@ -373,6 +398,7 @@ The live tests cover:
 - Real TiDB compatibility through `tidb://` against a PD/TiKV/TiDB topology, including database creation, typed values, result limiting, destructive confirmation, table listing, insert/query/schema/drop, and schema-qualified table names.
 - TiDB secure HA through `tidb://` with 3 PD nodes, 2 TiKV nodes, 2 TiDB SQL nodes, component TLS, SQL TLS, TLS-required users, client-certificate-required users, insecure-login rejection, and SQL lifecycle coverage through both SQL nodes.
 - TiDB secure HA failover drill with one SQL node stopped at a time, writes through the surviving SQL node, and post-restart reads of rows created during each outage.
+- TiDB secure HA PD drill with one PD node stopped at a time, writes through both SQL nodes during each PD outage, and post-restart SQL reachability checks.
 - TiDB TiProxy drill with a TLS proxy entrypoint, a `REQUIRE SSL` user, and new proxy connections that keep writing/reading while each TiDB SQL node is stopped in turn.
 - Real Valkey compatibility through `valkey://`; optional KeyDB and Dragonfly compatibility through `DBTOOL_IT_COMPAT_EXTRA=1`.
 - MongoDB ping, insert/find/update/aggregate/delete.

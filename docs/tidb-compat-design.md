@@ -177,6 +177,43 @@ adapter. Together with the TiProxy drill, it still does not replace placement,
 PD leadership, TiKV failure, backup/restore, upgrade, certificate-rotation, or
 existing-session migration drills.
 
+## PD Quorum Drill
+
+`./scripts/integration-tidb-pd-drill.sh` reuses the secure HA topology for a
+single-PD outage exercise. It is local-only while the CI budget freeze is in
+effect.
+
+The drill performs this flow:
+
+1. Start the secure HA topology through `integration-tidb-secure-up.sh`.
+2. Create a fixture table through `tidb-secure-1`.
+3. Read that row through `tidb-secure-2` to prove both SQL nodes share the same
+   TiKV-backed state.
+4. Stop `tidb-secure-pd-1`, require both SQL nodes to accept TLS `ping`, write
+   one row through each SQL node, and read each row from the opposite SQL node.
+5. Restart `tidb-secure-pd-1` and require both SQL nodes to become reachable.
+6. Repeat the same stop/write/read/restart flow for `tidb-secure-pd-2` and
+   `tidb-secure-pd-3`.
+
+Pass/fail criteria:
+
+- The 3-PD secure topology must start before the drill begins.
+- With any one PD container stopped, both TiDB SQL nodes must keep accepting
+  TLS SQL writes and reads through dbtool.
+- Rows written while a PD node is down must be readable through the other SQL
+  node, proving the check is exercising shared TiKV state.
+- The stopped PD node must restart cleanly before the drill proceeds to the
+  next PD node.
+
+This drill proves dbtool remains usable through the local TiDB SQL endpoints
+while the PD quorum loses one member at a time. It does not identify or require
+stopping the current PD leader specifically, and it does not cover a TiKV store
+failure, placement-rule behavior, backup/restore, upgrade, certificate
+rotation, or existing-session migration. The script applies
+`DBTOOL_IT_TIDB_PD_DRILL_REQUEST_TIMEOUT` and
+`DBTOOL_IT_TIDB_PD_DRILL_DEADLINE` to each dbtool call so failed quorum behavior
+terminates as a bounded test failure.
+
 ## Failure Recovery
 
 Use the shared cleanup script if a run is interrupted:
@@ -209,6 +246,6 @@ The most likely local causes are a TiDB flag/version mismatch, not enough Docker
 
 - The default `tidb` profile is a single-node compatibility harness; use `tidb-secure` for local HA/security coverage.
 - The secure HA topology is still a local integration harness, not a production deployment model.
-- Password rotation, placement rules, TiProxy, PD/TiKV failover, certificate rotation, and upgrade scenarios are outside these tests.
+- Password rotation, placement rules, TiKV failover, certificate rotation, and upgrade scenarios are outside these tests.
 - The profile uses the local bootstrap root user only for disposable integration tests.
 - TiDB remains implemented through the MySQL-family adapter; the alias kind is preserved for user-facing metadata and test assertions.

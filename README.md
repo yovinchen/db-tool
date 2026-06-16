@@ -241,6 +241,13 @@ Run the same secure HA topology as a SQL-node failover drill:
 ./scripts/integration-tidb-ha-drill.sh
 ```
 
+Run the secure HA topology as a PD quorum drill, stopping each PD node one at a
+time while both TiDB SQL nodes keep accepting TLS writes and reads:
+
+```bash
+./scripts/integration-tidb-pd-drill.sh
+```
+
 Run the secure HA topology through TiProxy to validate the TLS proxy entrypoint
 and new-connection routing while each TiDB SQL node is stopped in turn:
 
