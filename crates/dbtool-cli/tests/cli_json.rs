@@ -231,3 +231,29 @@ request_timeout = "not-a-duration"
         .unwrap()
         .contains("request_timeout"));
 }
+
+#[test]
+fn configured_request_timeout_aborts_slow_data_commands() {
+    let output = dbtool_with_config(
+        &[
+            "--conn",
+            "timeout-test",
+            "sql",
+            "query",
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt LIMIT 100000000) SELECT sum(x) FROM cnt",
+        ],
+        r#"
+[connections.timeout-test]
+dsn = "sqlite::memory:"
+
+[connections.timeout-test.limits]
+request_timeout = "1ms"
+overall_deadline = "20ms"
+max_retries = 0
+"#,
+    );
+
+    let err = stderr_json(&output);
+
+    assert_eq!(err["error"]["code"], "TIMEOUT");
+}
