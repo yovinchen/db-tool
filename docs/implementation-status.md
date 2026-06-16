@@ -30,7 +30,7 @@ usable.
 | CockroachDB | `cockroach://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real CockroachDB compatibility live test |
 | TimescaleDB | `timescale://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real TimescaleDB compatibility live test |
 | Redshift | `redshift://` | SQL | Routed to Postgres adapter | Not live-tested against Redshift |
-| SQL Server | `sqlserver://`, `mssql://` | SQL Server/TDS | SQL query/exec/tables/schema, typed scalar values, result limiting | Service-free adapter tests plus opt-in SQL Server Docker live profile |
+| SQL Server | `sqlserver://`, `mssql://` | SQL Server/TDS | SQL query/exec/tables/schema, typed scalar values, result limiting | Service-free adapter tests plus real SQL Server Docker live test on GitHub Actions x86_64 runner |
 | Cassandra/ScyllaDB | `cassandra://`, `scylla://` | CQL over constrained SQL surface | `ping`, CQL query/exec through `sql` commands, keyspace table listing, schema inspection, primitive/collection typed values | Adapter tests plus real Cassandra Docker live test |
 | MySQL | `mysql://` | SQL | SQL query/exec/tables/schema, typed values, result limiting | Base Docker live test |
 | MariaDB | `mariadb://` | SQL | MySQL-family SQL lifecycle, typed values, result limiting | Real MariaDB compatibility live test |
@@ -61,7 +61,7 @@ usable.
 | `./scripts/integration-test.sh` | Postgres, MySQL, Redis, MongoDB | Canonical SQL, KV, and document workflows | Roughly 2 GiB container memory |
 | `./scripts/integration-compat-test.sh` | MariaDB, Valkey | MySQL and Redis compatible databases | Extra KeyDB/Dragonfly via `DBTOOL_IT_COMPAT_EXTRA=1` |
 | `./scripts/integration-pg-compat-test.sh` | CockroachDB, TimescaleDB | PostgreSQL-family compatible databases | Roughly 1 GiB container memory |
-| `./scripts/integration-sqlserver-test.sh` | SQL Server | TDS SQL lifecycle, typed values, limiting, tables, and schema | Requires amd64-capable Docker; roughly 2 GiB container memory |
+| `./scripts/integration-sqlserver-test.sh` | SQL Server | TDS SQL lifecycle, typed values, limiting, tables, and schema | Passed on GitHub Actions x86_64 runner; requires amd64-capable Docker locally; roughly 2 GiB container memory |
 | `./scripts/integration-cassandra-test.sh` | Cassandra | CQL lifecycle, keyspace-qualified tables, schema inspection, typed scalar and collection values | Roughly 2 GiB container memory; startup can be slow |
 | `./scripts/integration-tidb-test.sh` | PD, TiKV, TiDB | Real TiDB compatibility | Roughly 1.75 GiB container memory |
 | `./scripts/integration-tidb-secure-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB auth/TLS/local HA | Roughly 3.75 GiB container memory |
@@ -90,7 +90,6 @@ usable.
 | --- | --- | --- | --- |
 | Real OpenSearch security-plugin TLS profile | Partial | TLS transport is live-tested against a compatible HTTPS harness; the heavier OpenSearch security plugin TLS configuration is not part of the default profile. | Add only if security-plugin-specific OpenSearch behavior must be validated. |
 | Prometheus remote write | Not supported | The implemented Prometheus adapter intentionally covers read APIs only; remote write is a separate protobuf/snappy protocol. | Add only if write-heavy time-series workflows become a requirement. |
-| SQL Server heavyweight live run | Partially verified | Adapter, DSN schemes, Docker profile, scripts, and live test entry exist; the live container should be run on an amd64-capable Docker host because Microsoft documents SQL Server Linux containers as x86-64 supported. | Run `./scripts/integration-sqlserver-test.sh` in the target Docker environment. |
 | Cassandra trait split | Deferred | Cassandra is currently usable through a constrained CQL-over-`SqlEngine` surface so the existing CLI safety/limit/output paths work; a dedicated `CqlEngine` is not yet modeled. | Add `CqlEngine` only if CQL needs protocol-specific commands, prepared values, paging, or TUI forms. |
 | TUI rich workflows | Partial | Basic command dispatch exists, but command history, form controls, and richer per-capability screens are not implemented. | Expand after core protocol coverage remains stable. |
 | Production TiDB HA | Partial | Local secure HA topology and SQL-node failover drill are available, but TiProxy, PD/TiKV failure, certificate rotation, backup/restore, and upgrade drills are not covered. | Add product-specific production drills only when production-readiness is in scope. |
@@ -100,7 +99,6 @@ usable.
 
 ## Next Implementation Queue
 
-1. Run SQL Server live validation in an amd64-capable Docker environment and mark T13 done when it passes.
-2. Expand TUI command history and richer per-capability forms.
-3. Run the TiDB secure HA failover drill in the target Docker environment when production-readiness evidence is needed.
-4. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.
+1. Expand TUI command history and richer per-capability forms.
+2. Run the TiDB secure HA failover drill in the target Docker environment when production-readiness evidence is needed.
+3. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.

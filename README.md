@@ -275,7 +275,8 @@ Messaging metadata has protocol-specific boundaries. See [docs/messaging-boundar
 
 Heavyweight adapters such as SQL Server and Cassandra are implemented behind
 bounded Docker profiles and tracked in [docs/extended-backends.md](docs/extended-backends.md).
-SQL Server live coverage still needs an amd64-capable Docker environment.
+SQL Server live coverage has passed on a GitHub Actions x86_64 runner; local
+SQL Server runs still need an amd64-capable Docker environment.
 
 OpenSearch and Elasticsearch-compatible endpoints can use plain HTTP or TLS:
 
@@ -300,7 +301,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, Valkey, KeyDB, and Dragonfly compatibility profiles.
 - OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP/TLS mapping tests, plain HTTP OpenSearch live tests, and HTTPS live transport tests.
 - Prometheus HTTP time-series adapter: implemented for metric listing and range queries, with read-only semantics.
-- SQL Server and Cassandra/ScyllaDB adapters: implemented and registered, with service-free adapter coverage plus opt-in Docker integration profiles; Cassandra has passed local live coverage, while SQL Server live coverage is gated by amd64 Docker availability.
+- SQL Server and Cassandra/ScyllaDB adapters: implemented and registered, with service-free adapter coverage plus opt-in Docker integration profiles; Cassandra has passed local live coverage, and SQL Server has passed live coverage on GitHub Actions x86_64 runners.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; AMQPS and NATS TLS live paths, NATS JetStream admin, and RabbitMQ management-backed queue discovery are implemented.
 - TUI: basic connection picker, capability-aware command dispatch, read limits, and write confirmation are implemented; richer forms remain future work.

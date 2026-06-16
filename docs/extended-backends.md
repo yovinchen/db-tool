@@ -26,7 +26,7 @@ Acceptance tasks:
 - [x] Add SQL safety and limiter coverage through existing CLI paths.
 - [x] Add `sqlserver` Docker profile, up/test scripts, CI workflow input, and
       live CLI lifecycle tests.
-- [ ] Run the heavyweight live profile in an amd64-capable Docker environment
+- [x] Run the heavyweight live profile in an amd64-capable Docker environment
       and record the result in `docs/tasks.md`.
 
 ## Cassandra
@@ -61,7 +61,8 @@ Acceptance tasks:
 
 ## Dependency Gate
 
-SQL Server now carries its explicit TDS dependency and isolated Docker profile.
+SQL Server now carries its explicit TDS dependency and isolated Docker profile,
+with the heavyweight live profile verified on a GitHub Actions x86_64 runner.
 Cassandra now carries its explicit CQL dependency and isolated Docker profile.
 Keep future heavyweight protocol dependencies behind explicit adapter crates,
 Cargo features, and opt-in Compose profiles so default verification remains
