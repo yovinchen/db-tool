@@ -264,6 +264,14 @@ time while both TiDB SQL nodes keep accepting TLS writes and reads:
 ./scripts/integration-tidb-pd-drill.sh
 ```
 
+Run the secure HA topology as a certificate regeneration drill, recreating the
+local CA/server/client certificates between two cold starts and verifying TLS
+SQL through both generations:
+
+```bash
+./scripts/integration-tidb-cert-regeneration-test.sh
+```
+
 Run the secure HA topology through TiProxy to validate the TLS proxy entrypoint
 and new-connection routing while each TiDB SQL node is stopped in turn:
 

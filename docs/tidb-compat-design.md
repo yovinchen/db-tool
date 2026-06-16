@@ -173,9 +173,9 @@ Pass/fail criteria:
   if services are kept, it attempts to restart any SQL node it stopped.
 
 This drill proves local TiDB SQL frontend failover through dbtool's MySQL-family
-adapter. Together with the TiProxy drill, it still does not replace placement,
-PD leadership, TiKV failure, backup/restore, upgrade, certificate-rotation, or
-existing-session migration drills.
+adapter. Together with the TiProxy and certificate regeneration drills, it
+still does not replace placement, PD leadership, TiKV failure, backup/restore,
+upgrade, online certificate rotation, or existing-session migration drills.
 
 ## PD Quorum Drill
 
@@ -208,11 +208,44 @@ Pass/fail criteria:
 This drill proves dbtool remains usable through the local TiDB SQL endpoints
 while the PD quorum loses one member at a time. It does not identify or require
 stopping the current PD leader specifically, and it does not cover a TiKV store
-failure, placement-rule behavior, backup/restore, upgrade, certificate
+failure, placement-rule behavior, backup/restore, upgrade, online certificate
 rotation, or existing-session migration. The script applies
 `DBTOOL_IT_TIDB_PD_DRILL_REQUEST_TIMEOUT` and
 `DBTOOL_IT_TIDB_PD_DRILL_DEADLINE` to each dbtool call so failed quorum behavior
 terminates as a bounded test failure.
+
+## Certificate Regeneration Drill
+
+`./scripts/integration-tidb-cert-regeneration-test.sh` reuses the secure HA
+topology for a cold-restart certificate lifecycle exercise. It uses an isolated
+default Compose project name and secure working directory so it does not
+overwrite the normal secure HA certs unless the caller explicitly overrides the
+environment.
+
+The drill performs this flow:
+
+1. Generate a fresh CA, server certificate, and client certificate through
+   `integration-tidb-secure-prepare.sh`.
+2. Start the secure HA topology through `integration-tidb-secure-up.sh`.
+3. Verify both secure SQL nodes accept TLS `ping`, then create a fixture table
+   through node 1 and read the inserted row through node 2.
+4. Stop the topology with `integration-down.sh`.
+5. Regenerate the CA, server certificate, and client certificate.
+6. Require all three certificate fingerprints to change.
+7. Start the secure HA topology again and repeat the TLS SQL write/read check.
+
+Pass/fail criteria:
+
+- The first generated certificate set must start the secure HA topology.
+- The second generated certificate set must produce different CA, server, and
+  client certificate fingerprints.
+- After the second cold start, both TiDB SQL nodes must accept TLS SQL traffic
+  through dbtool.
+- The script removes the topology on exit unless `DBTOOL_IT_KEEP_SERVICES=1`.
+
+This drill proves local generated TLS material can be replaced across a full
+secure HA restart. It does not claim online certificate rotation for an
+already-running TiDB cluster.
 
 ## Failure Recovery
 
@@ -246,6 +279,7 @@ The most likely local causes are a TiDB flag/version mismatch, not enough Docker
 
 - The default `tidb` profile is a single-node compatibility harness; use `tidb-secure` for local HA/security coverage.
 - The secure HA topology is still a local integration harness, not a production deployment model.
-- Password rotation, placement rules, TiKV failover, certificate rotation, and upgrade scenarios are outside these tests.
+- Password rotation, placement rules, TiKV failover, online certificate
+  rotation, and upgrade scenarios are outside these tests.
 - The profile uses the local bootstrap root user only for disposable integration tests.
 - TiDB remains implemented through the MySQL-family adapter; the alias kind is preserved for user-facing metadata and test assertions.

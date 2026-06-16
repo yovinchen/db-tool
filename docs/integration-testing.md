@@ -155,6 +155,21 @@ Its dbtool calls use bounded defaults through
 `DBTOOL_IT_TIDB_PD_DRILL_DEADLINE` so a broken quorum fails fast instead of
 hanging indefinitely.
 
+Run the secure HA certificate regeneration drill when you need to prove the
+local TLS material can be regenerated and the topology can cold-start again
+with the new CA/server/client certificates:
+
+```bash
+./scripts/integration-tidb-cert-regeneration-test.sh
+```
+
+The drill uses its own default project name and working directory, starts the
+secure HA topology with one generated certificate set, verifies TLS SQL writes
+and reads, stops the topology, regenerates the certificate set, verifies the
+certificate fingerprints changed, then starts the topology again and repeats
+the TLS SQL check. It is a cold-restart certificate lifecycle test, not a claim
+of online production certificate rotation.
+
 Messaging integration tests use a separate profile so day-to-day database checks stay lighter:
 
 ```bash
@@ -295,6 +310,17 @@ DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
 DBTOOL_IT_TIDB_SECURE_PORT_1=45100 \
 DBTOOL_IT_TIDB_SECURE_PORT_2=45101 \
 ./scripts/integration-tidb-pd-drill.sh
+```
+
+Use isolated secure HA variables for the certificate regeneration drill:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-tidb-cert-drill \
+DBTOOL_IT_TIDB_SECURE_DIR=.tmp/my-dbtool-tidb-cert-drill \
+DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
+DBTOOL_IT_TIDB_SECURE_PORT_1=46100 \
+DBTOOL_IT_TIDB_SECURE_PORT_2=46101 \
+./scripts/integration-tidb-cert-regeneration-test.sh
 ```
 
 Add TiProxy-specific host ports when running the secure HA topology through the
@@ -445,6 +471,9 @@ The live tests cover:
 - TiDB secure HA through `tidb://` with 3 PD nodes, 2 TiKV nodes, 2 TiDB SQL nodes, component TLS, SQL TLS, TLS-required users, client-certificate-required users, insecure-login rejection, and SQL lifecycle coverage through both SQL nodes.
 - TiDB secure HA failover drill with one SQL node stopped at a time, writes through the surviving SQL node, and post-restart reads of rows created during each outage.
 - TiDB secure HA PD drill with one PD node stopped at a time, writes through both SQL nodes during each PD outage, and post-restart SQL reachability checks.
+- TiDB secure HA certificate regeneration drill with changed CA/server/client
+  certificate fingerprints across a cold restart and TLS SQL verification
+  through both generations.
 - TiDB TiProxy drill with a TLS proxy entrypoint, a `REQUIRE SSL` user, and new proxy connections that keep writing/reading while each TiDB SQL node is stopped in turn.
 - Real Valkey compatibility through `valkey://`; optional KeyDB and Dragonfly compatibility through `DBTOOL_IT_COMPAT_EXTRA=1`.
 - MongoDB ping, insert/find/update/aggregate/delete.
