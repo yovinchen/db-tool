@@ -228,6 +228,14 @@ build images with fixture data baked into service initialization:
 ./scripts/integration-fixture-images-test.sh
 ```
 
+Run the data roundtrip smoke when you need to prove dbtool can export fixture
+data from live services and restore it into independent target tables, keys,
+and collections:
+
+```bash
+./scripts/integration-data-roundtrip-test.sh
+```
+
 Compatible database integration tests start real MariaDB and Valkey services by default:
 
 ```bash

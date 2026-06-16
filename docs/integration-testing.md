@@ -68,6 +68,20 @@ profile, then verifies dbtool can read the preloaded PostgreSQL rows, MySQL
 rows, Redis keys, and MongoDB documents without first injecting fixture data
 from the host.
 
+Run the data roundtrip smoke when you need to validate dbtool-mediated logical
+export and restore behavior on the base database suite:
+
+```bash
+./scripts/integration-data-roundtrip-test.sh
+```
+
+The roundtrip smoke starts Postgres, MySQL, Redis, and MongoDB, loads the shared
+fixture data, exports rows/keys/documents to JSON or NDJSON files under `.tmp/`,
+restores them into independent target tables, Redis key prefixes, and MongoDB
+collections, then reads the restored data back through dbtool. This is a
+logical dbtool export/restore smoke, not a replacement for product-native
+physical backup tooling.
+
 Compatible database integration tests use a separate profile:
 
 ```bash
@@ -278,6 +292,13 @@ DBTOOL_IT_MYSQL_FIXTURE_PORT=24306 \
 DBTOOL_IT_REDIS_FIXTURE_PORT=27379 \
 DBTOOL_IT_MONGO_FIXTURE_PORT=28017 \
 ./scripts/integration-fixture-images-test.sh
+```
+
+Roundtrip exports are deleted after a successful run by default. Keep them for
+manual inspection with:
+
+```bash
+DBTOOL_IT_KEEP_EXPORTS=1 ./scripts/integration-data-roundtrip-test.sh
 ```
 
 Compatible service settings follow the same pattern:
@@ -560,6 +581,9 @@ The live tests cover:
 - Dockerfile-backed fixture images for PostgreSQL, MySQL, Redis, and MongoDB,
   with dbtool readback of rows, keys, and documents preloaded during service
   initialization.
+- dbtool-mediated logical data roundtrip for PostgreSQL, MySQL, Redis, and
+  MongoDB, exporting fixture rows/keys/documents to `.tmp/` and restoring them
+  into independent target resources.
 - MariaDB/TiDB alias DSNs against the MySQL protocol adapter, typed MySQL values, and result limiting.
 - CockroachDB/TimescaleDB alias DSNs against the PostgreSQL protocol adapter, typed Postgres-family values, result limiting, table listing, schema inspection, and SQL lifecycle.
 - Redis ping, set/get/scan/raw typed output, TTL, scan truncation, multi-key delete, blocked destructive raw command, and blocked mutating raw command without `--allow-write`.

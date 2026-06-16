@@ -67,6 +67,7 @@ usable.
 | `./scripts/integration-flow-control-test.sh` | Postgres, MySQL, Redis, MongoDB | Live request timeout, rate/admission flags, SQL/KV/document result limiting, and disposable fixture cleanup | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-fixture-data-test.sh` | Postgres, MySQL, Redis, MongoDB | File-backed reusable fixture loading for SQL rows, Redis keys, and MongoDB documents | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-fixture-images-test.sh` | Dockerfile-built Postgres, MySQL, Redis, MongoDB | Fixture data baked into database images and verified through dbtool readback | Roughly 2 GiB container memory; local-only while CI budget is frozen |
+| `./scripts/integration-data-roundtrip-test.sh` | Postgres, MySQL, Redis, MongoDB | dbtool-mediated logical export and restore of fixture rows, keys, and documents into independent target resources | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-compat-test.sh` | MariaDB, Valkey | MySQL and Redis compatible databases | Extra KeyDB/Dragonfly via `DBTOOL_IT_COMPAT_EXTRA=1` |
 | `./scripts/integration-pg-compat-test.sh` | CockroachDB, TimescaleDB | PostgreSQL-family compatible databases | Roughly 1 GiB container memory |
 | `./scripts/integration-sqlserver-test.sh` | SQL Server | TDS SQL lifecycle, typed values, limiting, tables, and schema | Passed on GitHub Actions x86_64 runner; requires amd64-capable Docker locally; roughly 2 GiB container memory |
