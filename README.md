@@ -183,6 +183,12 @@ Live messaging integration tests start Redis, Redpanda, RabbitMQ, and NATS:
 ./scripts/integration-mq-test.sh
 ```
 
+Messaging TLS integration starts RabbitMQ TLS and NATS TLS with a short-lived local CA:
+
+```bash
+./scripts/integration-mq-tls-test.sh
+```
+
 Kafka native/librdkafka can be tested against the same Docker services:
 
 ```bash
@@ -226,6 +232,6 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 - OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP/TLS mapping tests, plain HTTP OpenSearch live tests, and HTTPS live transport tests.
 - Prometheus HTTP time-series adapter: implemented for metric listing and range queries, with read-only semantics.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
-- Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.
+- Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; AMQPS and NATS TLS live paths, NATS JetStream admin, and RabbitMQ management-backed queue discovery are implemented.
 - TUI: basic connection picker, capability-aware command dispatch, read limits, and write confirmation are implemented; richer forms remain future work.
 - Release packaging: GitHub Release archive, npm, pip/uv, and mise/ubi metadata are wired; signing/notarization is still future work.

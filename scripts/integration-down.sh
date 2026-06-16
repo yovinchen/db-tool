@@ -8,6 +8,7 @@ docker compose \
   -f "$ROOT/docker-compose.integration.yml" \
   -p "$DBTOOL_IT_PROJECT" \
   --profile messaging \
+  --profile messaging-tls \
   --profile compat \
   --profile compat-extra \
   --profile pg-compat \

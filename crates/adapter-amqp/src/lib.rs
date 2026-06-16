@@ -11,11 +11,13 @@ use futures::future::BoxFuture;
 use lapin::{
     options::{BasicAckOptions, BasicGetOptions, BasicPublishOptions, QueueDeclareOptions},
     publisher_confirm::Confirmation,
+    tcp::OwnedTLSConfig,
     types::FieldTable,
     BasicProperties, Connection, ConnectionProperties,
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, fs};
 use tokio::time::{sleep, Instant};
+use url::Url;
 
 mod management;
 
@@ -28,9 +30,15 @@ pub struct AmqpAdapter {
 
 pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
-        let conn = Connection::connect(&dsn.raw, ConnectionProperties::default())
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let driver_url = amqp_driver_url(&dsn)?;
+        let tls_config = amqp_tls_config(&dsn)?;
+        let conn = Connection::connect_with_config(
+            &driver_url,
+            ConnectionProperties::default(),
+            tls_config,
+        )
+        .await
+        .map_err(|e| Error::Connection(e.to_string()))?;
         Ok(Box::new(AmqpAdapter {
             conn,
             kind: ConnectorKind(dsn.scheme),
@@ -242,4 +250,74 @@ pub(crate) fn validate_queue(queue: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn amqp_driver_url(dsn: &Dsn) -> Result<String> {
+    let mut url = Url::parse(&dsn.raw).map_err(|e| Error::Dsn(format!("invalid URL: {e}")))?;
+    match url.scheme() {
+        "amqp" | "amqps" => {}
+        scheme => {
+            return Err(Error::Dsn(format!(
+                "AMQP DSN must use amqp:// or amqps://, got {scheme}"
+            )))
+        }
+    }
+
+    let pairs = url
+        .query_pairs()
+        .filter(|(key, _)| !is_tls_ca_param(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    if !pairs.is_empty() {
+        url.query_pairs_mut()
+            .extend_pairs(pairs.iter().map(|(key, value)| (&**key, &**value)));
+    }
+
+    Ok(url.to_string())
+}
+
+fn amqp_tls_config(dsn: &Dsn) -> Result<OwnedTLSConfig> {
+    let cert_chain = match amqp_tls_ca(dsn) {
+        Some(path) => Some(
+            fs::read_to_string(path)
+                .map_err(|e| Error::Config(format!("failed to read AMQP TLS CA {path}: {e}")))?,
+        ),
+        None => None,
+    };
+
+    Ok(OwnedTLSConfig {
+        identity: None,
+        cert_chain,
+    })
+}
+
+fn amqp_tls_ca(dsn: &Dsn) -> Option<&str> {
+    dsn.params
+        .get("tls-ca")
+        .or_else(|| dsn.params.get("ssl-ca"))
+        .map(String::as_str)
+}
+
+fn is_tls_ca_param(key: &str) -> bool {
+    matches!(key, "tls-ca" | "ssl-ca")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amqps_driver_url_strips_dbtool_tls_ca_param() {
+        let dsn = Dsn::parse(
+            "amqps://user:pass@127.0.0.1:5671/vhost?tls-ca=/tmp/ca.pem&connection_timeout=5000",
+        )
+        .unwrap();
+
+        assert_eq!(
+            amqp_driver_url(&dsn).unwrap(),
+            "amqps://user:pass@127.0.0.1:5671/vhost?connection_timeout=5000"
+        );
+        assert_eq!(amqp_tls_ca(&dsn), Some("/tmp/ca.pem"));
+    }
 }

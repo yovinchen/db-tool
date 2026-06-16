@@ -1,14 +1,20 @@
 use std::{
     env,
+    path::PathBuf,
     process::{Command, Output, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use dbtool_core::dsn::Dsn;
 use serde_json::Value;
 
 fn integration_enabled() -> bool {
     env::var("DBTOOL_RUN_MQ_INTEGRATION").as_deref() == Ok("1")
+}
+
+fn tls_integration_enabled() -> bool {
+    env::var("DBTOOL_RUN_MQ_TLS_INTEGRATION").as_deref() == Ok("1")
 }
 
 fn dbtool(args: &[&str]) -> Output {
@@ -94,6 +100,33 @@ fn payload_text(message: &Value) -> String {
         }
         other => panic!("unexpected payload JSON: {other:?}"),
     }
+}
+
+async fn nats_client_for_test(raw_dsn: &str) -> async_nats::Client {
+    let dsn = Dsn::parse(raw_dsn).expect("NATS test DSN should parse");
+    let driver_url = match dsn.scheme.as_str() {
+        "nats" => dsn.raw.clone(),
+        "nats+tls" => dsn
+            .raw_with_scheme("tls")
+            .expect("nats+tls should rewrite to async-nats tls scheme"),
+        scheme => panic!("unexpected NATS test DSN scheme: {scheme}"),
+    };
+    let mut options = async_nats::ConnectOptions::new();
+    if dsn.scheme == "nats+tls" {
+        options = options.require_tls(true);
+    }
+    if let Some(path) = dsn
+        .params
+        .get("tls-ca")
+        .or_else(|| dsn.params.get("ssl-ca"))
+    {
+        options = options.add_root_certificates(PathBuf::from(path));
+    }
+
+    options
+        .connect(driver_url)
+        .await
+        .expect("NATS client should connect")
 }
 
 #[test]
@@ -386,6 +419,52 @@ fn rabbitmq_management_live_lists_detail_and_queue_lag() {
 }
 
 #[test]
+fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
+    if !tls_integration_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_AMQPS_DSN") else {
+        return;
+    };
+    let queue = unique_name("dbtool_amqps_queue");
+
+    let ping = stdout_json_retry(&["--dsn", &dsn, "ping"]);
+    assert_eq!(ping["kind"], "amqps");
+    assert_eq!(ping["ok"], true);
+
+    let blocked = stderr_json(dbtool(&["--dsn", &dsn, "mq", "produce", &queue, "blocked"]));
+    assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let produced = stdout_json_retry(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "mq",
+        "produce",
+        &queue,
+        "amqps-payload",
+    ]);
+    assert_eq!(produced["data"]["produced"], 1);
+
+    let detail = stdout_json_retry(&["--dsn", &dsn, "mq", "detail", &queue]);
+    assert_eq!(detail["data"]["info"]["name"], queue);
+    assert_eq!(detail["data"]["config"]["message_count"], "1");
+
+    let consumed = stdout_json_retry(&[
+        "--dsn",
+        &dsn,
+        "mq",
+        "consume",
+        &queue,
+        "--max",
+        "1",
+        "--timeout",
+        "5",
+    ]);
+    assert_eq!(payload_text(&consumed["data"][0]), "amqps-payload");
+}
+
+#[test]
 fn nats_live_publish_and_subscribe_round_trip() {
     if !integration_enabled() {
         return;
@@ -505,6 +584,124 @@ fn nats_live_jetstream_admin_lists_detail_and_lag() {
         let client = async_nats::connect(dsn)
             .await
             .expect("NATS client should reconnect for cleanup");
+        let jetstream = async_nats::jetstream::new(client);
+        let _ = jetstream.delete_stream(stream).await;
+    });
+}
+
+#[test]
+fn nats_mq_tls_live_publish_subscribe_and_jetstream_admin() {
+    if !tls_integration_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_NATS_TLS_DSN") else {
+        return;
+    };
+    let subject = unique_subject("dbtool_nats_tls_subject");
+
+    let ping = stdout_json_retry(&["--dsn", &dsn, "ping"]);
+    assert_eq!(ping["kind"], "nats+tls");
+    assert_eq!(ping["ok"], true);
+
+    let blocked = stderr_json(dbtool(&[
+        "--dsn", &dsn, "mq", "produce", &subject, "blocked",
+    ]));
+    assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let consumer = Command::new(env!("CARGO_BIN_EXE_dbtool"))
+        .args([
+            "--dsn",
+            &dsn,
+            "mq",
+            "consume",
+            &subject,
+            "--max",
+            "1",
+            "--timeout",
+            "5",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("NATS TLS consume command should start");
+    thread::sleep(Duration::from_millis(500));
+
+    let produced = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "mq",
+        "produce",
+        &subject,
+        "nats-tls-payload",
+    ]));
+    assert_eq!(produced["data"]["produced"], 1);
+
+    let output = consumer
+        .wait_with_output()
+        .expect("NATS TLS consume command should finish");
+    let consumed = stdout_json(output);
+    assert_eq!(payload_text(&consumed["data"][0]), "nats-tls-payload");
+
+    let stream = unique_name("DBTOOLNATSTLSSTREAM").to_ascii_uppercase();
+    let stream_subject = format!("{}.events", stream.to_ascii_lowercase());
+    let jetstream_consumer = "DBTOOLTLSCONSUMER";
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime should start");
+    rt.block_on(async {
+        let client = nats_client_for_test(&dsn).await;
+        let jetstream = async_nats::jetstream::new(client);
+        let stream_handle = jetstream
+            .get_or_create_stream(async_nats::jetstream::stream::Config {
+                name: stream.clone(),
+                subjects: vec![stream_subject.clone()],
+                max_messages: 100,
+                ..Default::default()
+            })
+            .await
+            .expect("NATS TLS JetStream stream should be created");
+        jetstream
+            .publish(stream_subject.clone(), "nats-tls-jetstream-payload".into())
+            .await
+            .expect("NATS TLS JetStream publish should start")
+            .await
+            .expect("NATS TLS JetStream publish should be acknowledged");
+        stream_handle
+            .get_or_create_consumer(
+                jetstream_consumer,
+                async_nats::jetstream::consumer::pull::Config {
+                    durable_name: Some(jetstream_consumer.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("NATS TLS JetStream consumer should be created");
+    });
+
+    let topics = stdout_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
+    assert!(topics["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == stream));
+
+    let detail = stdout_json(dbtool(&["--dsn", &dsn, "mq", "detail", &stream]));
+    assert_eq!(detail["data"]["info"]["name"], stream);
+    assert_eq!(detail["data"]["config"]["kind"], "jetstream");
+    assert_eq!(detail["data"]["config"]["messages"], "1");
+    assert_eq!(detail["data"]["config"]["consumer_count"], "1");
+
+    let lag = stdout_json(dbtool(&["--dsn", &dsn, "mq", "lag", jetstream_consumer]));
+    assert!(lag["data"]
+        .as_array()
+        .expect("lag should be an array")
+        .iter()
+        .any(|item| item["topic"] == stream
+            && item["group"] == jetstream_consumer
+            && item["lag"] == 1));
+
+    rt.block_on(async {
+        let client = nats_client_for_test(&dsn).await;
         let jetstream = async_nats::jetstream::new(client);
         let _ = jetstream.delete_stream(stream).await;
     });

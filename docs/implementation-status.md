@@ -15,7 +15,7 @@ usable.
 | CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `kv`, `doc`, `mq`, `search`, and `ts` command families exist with default backends for core read paths. |
 | Output formats | Implemented | JSON is the default. `--format table` and `--format ndjson` are implemented for successful command output; errors always stay JSON so `error.code` and confirmation tokens remain machine-readable. |
 | SQL safety | Implemented | Read statements are allowed, writes need `--allow-write`, destructive SQL needs a confirm token bound to the target. |
-| Docker integration | Implemented | Base databases, compatibility databases, TiDB, TiDB secure HA, and messaging profiles are available. |
+| Docker integration | Implemented | Base databases, compatibility databases, TiDB, TiDB secure HA, messaging, messaging TLS, and observability profiles are available. |
 | CI | Implemented | Service-free verification runs by default; live Docker jobs are manual workflow inputs. |
 | TUI | Partial | Connection picker, read command dispatch, read limits, write confirmation, and smoke tests exist; richer per-capability forms remain future work. |
 
@@ -44,9 +44,9 @@ usable.
 | AutoMQ | `automq://` | Kafka | Routed to Kafka adapter | Not live-tested against AutoMQ |
 | WarpStream | `warpstream://` | Kafka | Routed to Kafka adapter | Not live-tested against WarpStream |
 | Confluent | `confluent://` | Kafka | Routed to Kafka adapter | Not live-tested against Confluent Cloud/Platform |
-| AMQP/RabbitMQ | `amqp://`, `amqps://` | AMQP | produce, consume, queue detail | RabbitMQ live test; `amqps://` routing is registered but TLS is not live-tested |
+| AMQP/RabbitMQ | `amqp://`, `amqps://` | AMQP | produce, consume, queue detail | RabbitMQ plain and AMQPS TLS live tests |
 | RabbitMQ management | `rabbitmq+http://` | RabbitMQ HTTP admin | queue list, detail, lag | RabbitMQ management live test |
-| NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS live test; `nats+tls://` routing is registered but TLS is not live-tested |
+| NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS plain and TLS live tests |
 | OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list, search, single-document index | Service-free HTTP/TLS mapping tests, real OpenSearch plain HTTP live profile, and HTTPS compatible harness |
 | Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | Routed to OpenSearch-compatible HTTP adapter | Service-free HTTP/TLS mapping tests; OpenSearch-compatible live coverage covers the shared API surface |
 | Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list and range query | Service-free adapter tests plus Prometheus live profile |
@@ -61,6 +61,7 @@ usable.
 | `./scripts/integration-tidb-test.sh` | PD, TiKV, TiDB | Real TiDB compatibility | Roughly 1.75 GiB container memory |
 | `./scripts/integration-tidb-secure-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB auth/TLS/local HA | Roughly 3.75 GiB container memory |
 | `./scripts/integration-mq-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Streams/PubSub, Kafka, AMQP, NATS | Roughly 2 GiB container memory |
+| `./scripts/integration-mq-tls-test.sh` | RabbitMQ TLS, NATS TLS | AMQPS and NATS TLS aliases | Roughly 768 MiB container memory |
 | `./scripts/integration-mq-native-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Native Kafka backend plus messaging regression | Requires `full-native` build |
 | `./scripts/integration-observability-test.sh` | OpenSearch, OpenSearch-compatible HTTPS harness, Prometheus | Search, search TLS transport, and time-series workflows | Roughly 1.4 GiB container memory |
 
@@ -90,11 +91,9 @@ usable.
 | AMQP queue listing over pure AMQP | Not supported | AMQP 0.9.1 does not expose queue listing as a portable protocol operation. | Keep using `rabbitmq+http://` for RabbitMQ admin discovery. |
 | Redis Pub/Sub durable listing | Not supported | Pub/Sub channels are live subscriptions, not durable topics. | Keep durable list/detail semantics on Redis Streams only. |
 | NATS core subject listing | Not supported | Core NATS subjects are not durable catalog entries. | Keep list/detail/lag semantics on JetStream only. |
-| TLS live tests for aliases | Partial | `amqps://` and `nats+tls://` aliases are registered, but not live-tested. | Add TLS-enabled RabbitMQ/NATS compose services if needed. |
 
 ## Next Implementation Queue
 
-1. Add TLS live coverage for `amqps://` and `nats+tls://` aliases if secure messaging compatibility matters.
-2. Expand TUI command history and richer per-capability forms.
-3. Decide whether to add heavyweight protocol dependencies for SQL Server and Cassandra.
-4. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.
+1. Expand TUI command history and richer per-capability forms.
+2. Decide whether to add heavyweight protocol dependencies for SQL Server and Cassandra.
+3. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.

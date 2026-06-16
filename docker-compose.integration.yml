@@ -623,3 +623,47 @@ services:
       retries: 40
     cpus: ${DBTOOL_IT_NATS_CPUS:-0.25}
     mem_limit: ${DBTOOL_IT_NATS_MEMORY:-256m}
+
+  rabbitmq-tls:
+    profiles: ["messaging-tls"]
+    image: rabbitmq:3.13-management-alpine
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-rabbitmq-tls
+    environment:
+      RABBITMQ_DEFAULT_USER: ${DBTOOL_IT_AMQP_USER:-dbtool}
+      RABBITMQ_DEFAULT_PASS: ${DBTOOL_IT_AMQP_PASSWORD:-dbtool}
+      RABBITMQ_DEFAULT_VHOST: ${DBTOOL_IT_AMQP_VHOST:-dbtool_it}
+    volumes:
+      - ${DBTOOL_IT_MQ_TLS_DIR:-.tmp/dbtool-it-mq-tls}/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ${DBTOOL_IT_MQ_TLS_DIR:-.tmp/dbtool-it-mq-tls}/certs:/etc/rabbitmq/certs:ro
+    ports:
+      - "${DBTOOL_IT_AMQPS_PORT:-25671}:5671"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "rabbitmq-diagnostics -q ping && rabbitmq-diagnostics -q check_running",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+    cpus: ${DBTOOL_IT_AMQP_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_AMQP_MEMORY:-512m}
+
+  nats-tls:
+    profiles: ["messaging-tls"]
+    image: nats:2.10-alpine
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-nats-tls
+    command: ["-c", "/etc/nats/nats.conf"]
+    volumes:
+      - ${DBTOOL_IT_MQ_TLS_DIR:-.tmp/dbtool-it-mq-tls}/nats.conf:/etc/nats/nats.conf:ro
+      - ${DBTOOL_IT_MQ_TLS_DIR:-.tmp/dbtool-it-mq-tls}/certs:/etc/nats/certs:ro
+    ports:
+      - "${DBTOOL_IT_NATS_TLS_PORT:-24222}:4222"
+      - "${DBTOOL_IT_NATS_TLS_MONITOR_PORT:-28222}:8222"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    cpus: ${DBTOOL_IT_NATS_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_NATS_MEMORY:-256m}

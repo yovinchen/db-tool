@@ -108,6 +108,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Docker Compose TiDB profile for PD, TiKV, and TiDB SQL server.
 - [x] Docker Compose TiDB secure HA profile for 3 PD, 2 TiKV, and 2 TiDB SQL nodes.
 - [x] Docker Compose messaging profile for Redis, Redpanda, RabbitMQ, and NATS.
+- [x] Docker Compose messaging TLS profile for RabbitMQ TLS and NATS TLS.
 - [x] Custom project name, database names, credentials, and host ports through environment variables.
 - [x] CPU/memory/resource limits for integration services.
 - [x] Integration scripts for up/down/test lifecycle.
@@ -117,6 +118,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Live CLI tests for real TiDB compatibility service.
 - [x] Live CLI tests for TiDB auth, SQL TLS, component TLS, X509, and local HA topology.
 - [x] Live CLI tests for Redis Streams/PubSub, Kafka, AMQP, and NATS messaging workflows.
+- [x] Live CLI tests for AMQPS and NATS TLS messaging workflows.
 - [x] Live CLI tests for OpenSearch search and Prometheus time-series workflows.
 - [x] Documented integration workflow and cleanup.
 
@@ -226,7 +228,7 @@ major database compatibility loop became stable.
 | --- | --- | --- | --- | --- |
 | T9 Search TLS live validation | P1 | Done | Added a TLS-enabled OpenSearch-compatible harness with generated local CA, then exercised `opensearch+https://` through `search indices`, `search search`, and `search index`. | `cargo test -p adapter-search`; `cargo test -p dbtool-cli --test live_observability`; observability compose config validation; optional `./scripts/integration-observability-test.sh`. |
 | T10 PostgreSQL-family live compatibility | P1 | Done | Added resource-bounded CockroachDB and TimescaleDB profiles for the existing Postgres adapter aliases. | `./scripts/integration-pg-compat-test.sh` covers SQL lifecycle, typed values, limiting, tables, and schema tests for `cockroach://` and `timescale://`. |
-| T11 Messaging TLS live validation | P2 | Pending | Add TLS-enabled RabbitMQ and NATS profiles for already-registered `amqps://` and `nats+tls://` aliases. | Live produce/consume/detail for AMQPS and publish/subscribe/JetStream checks for NATS TLS. |
+| T11 Messaging TLS live validation | P2 | Done | Added TLS-enabled RabbitMQ and NATS profiles for already-registered `amqps://` and `nats+tls://` aliases, with generated local CA support through `tls-ca`/`ssl-ca` DSN params. | `./scripts/integration-mq-tls-test.sh` covers AMQPS produce/consume/detail and NATS TLS publish/subscribe plus JetStream topics/detail/lag. |
 | T12 TUI workflow depth | P2 | Pending | Add command history, richer per-capability forms, and polished full-screen navigation while reusing core confirmation and limit behavior. | TUI smoke tests for history, forms, write confirmation, and error rendering. |
 | T13 SQL Server adapter gate | P3 | Pending | Decide whether to accept TDS dependency/resource cost, then add adapter, DSN scheme, Docker profile, and SQL CLI coverage. | Unit mapping tests plus optional SQL Server live profile if image cost is accepted. |
 | T14 Cassandra/CQL adapter gate | P3 | Pending | Decide whether CQL belongs behind a new trait or limited SQL-like interface, then add adapter and Docker profile. | CQL trait contract tests plus Cassandra/Scylla live smoke tests if accepted. |

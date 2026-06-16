@@ -64,6 +64,17 @@ Messaging integration tests use a separate profile so day-to-day database checks
 
 The messaging script starts Redis, Redpanda (Kafka API), RabbitMQ, and NATS, waits for health checks, runs the live CLI tests with `--features full`, and removes the containers and volumes.
 
+Messaging TLS integration starts RabbitMQ TLS and NATS TLS with a short-lived local CA:
+
+```bash
+./scripts/integration-mq-tls-test.sh
+```
+
+The TLS script generates certificates under `.tmp/`, validates `amqps://` queue
+produce/detail/consume, validates `nats+tls://` publish/subscribe plus
+JetStream topics/detail/lag, and passes the local CA with the `tls-ca` DSN
+parameter.
+
 Run the same suite with the optional native Kafka backend:
 
 ```bash
@@ -161,6 +172,20 @@ DBTOOL_IT_NATS_PORT=24222 \
 ./scripts/integration-mq-test.sh
 ```
 
+Messaging TLS settings can be overridden independently:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-mq-tls-run \
+DBTOOL_IT_AMQP_USER=my_user \
+DBTOOL_IT_AMQP_PASSWORD=my_pass \
+DBTOOL_IT_AMQP_VHOST=my_vhost \
+DBTOOL_IT_AMQPS_PORT=45671 \
+DBTOOL_IT_NATS_TLS_PORT=44222 \
+DBTOOL_IT_NATS_TLS_MONITOR_PORT=48222 \
+DBTOOL_IT_MQ_TLS_DIR=.tmp/my-dbtool-mq-tls \
+./scripts/integration-mq-tls-test.sh
+```
+
 Observability service settings follow the same pattern:
 
 ```bash
@@ -185,7 +210,7 @@ DBTOOL_IT_PROJECT=my-dbtool-run ./scripts/integration-down.sh
 
 ## CI Profiles
 
-Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, PostgreSQL-family compatibility, TiDB, messaging, and observability Docker Compose configs without starting containers.
+Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, PostgreSQL-family compatibility, TiDB, messaging, messaging TLS, and observability Docker Compose configs without starting containers.
 
 Live integration jobs are opt-in from the GitHub Actions **Run workflow** button:
 
@@ -195,6 +220,7 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_tidb` runs `./scripts/integration-tidb-test.sh` for TiDB through a local PD/TiKV/TiDB topology.
 - `run_live_tidb_secure` runs `./scripts/integration-tidb-secure-test.sh` for TiDB auth/TLS/HA coverage.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
+- `run_live_messaging_tls` runs `./scripts/integration-mq-tls-test.sh` for RabbitMQ TLS and NATS TLS.
 - `run_live_messaging_native` can run `./scripts/integration-mq-native-test.sh` when native Kafka coverage is desired.
 - `run_live_observability` runs `./scripts/integration-observability-test.sh` for OpenSearch and Prometheus.
 
@@ -223,13 +249,15 @@ The compose file applies conservative defaults:
 - Redpanda/Kafka API: `0.75` CPU, `1g` memory, broker memory `512M`
 - RabbitMQ/AMQP: `0.50` CPU, `512m` memory
 - NATS: `0.25` CPU, `256m` memory
+- RabbitMQ TLS/AMQPS: `0.50` CPU, `512m` memory
+- NATS TLS: `0.25` CPU, `256m` memory
 - OpenSearch: `1.00` CPU, `1g` memory, JVM heap `256m`
 - OpenSearch-compatible HTTPS harness: `0.25` CPU, `128m` memory
 - Prometheus: `0.25` CPU, `256m` memory
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the messaging suite is capped at roughly 2 GiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, CockroachDB, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
+The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the messaging suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly 768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, CockroachDB, RabbitMQ, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
 
 ## Live Test Scope
 
@@ -250,6 +278,7 @@ The live tests cover:
 - Optional native Kafka/librdkafka coverage through the same Redpanda test data.
 - RabbitMQ queue publish, passive detail/message count, acked consume, write guard, and HTTP management queue listing/detail/lag.
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
+- AMQPS queue publish/detail/consume and NATS TLS publish/subscribe plus JetStream topics/detail/lag through local CA-backed TLS services.
 - OpenSearch ping, write guard, single-document indexing, search, and index listing over plain HTTP plus TLS transport through `opensearch+https://`.
 - Prometheus ping, metric listing, and range query through `ts`.
 

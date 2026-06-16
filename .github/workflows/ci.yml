@@ -36,6 +36,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_messaging_tls:
+        description: "Run Docker-backed AMQPS and NATS TLS integration tests"
+        required: false
+        type: boolean
+        default: false
       run_live_messaging_native:
         description: "Run Docker-backed messaging integration tests with native Kafka"
         required: false
@@ -107,6 +112,9 @@ jobs:
 
       - name: Validate messaging integration compose config
         run: docker compose -f docker-compose.integration.yml --profile messaging config
+
+      - name: Validate messaging TLS integration compose config
+        run: docker compose -f docker-compose.integration.yml --profile messaging-tls config
 
       - name: Validate observability integration compose config
         run: docker compose -f docker-compose.integration.yml --profile observability config
@@ -275,6 +283,23 @@ jobs:
 
       - name: Run messaging integration tests
         run: ./scripts/integration-mq-test.sh
+
+  integration-messaging-tls:
+    name: Live messaging TLS integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_messaging_tls
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-mq-tls
+      DBTOOL_IT_AMQPS_PORT: 45671
+      DBTOOL_IT_NATS_TLS_PORT: 44222
+      DBTOOL_IT_NATS_TLS_MONITOR_PORT: 48222
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run messaging TLS integration tests
+        run: ./scripts/integration-mq-tls-test.sh
 
   integration-messaging-native:
     name: Live messaging native Kafka integration

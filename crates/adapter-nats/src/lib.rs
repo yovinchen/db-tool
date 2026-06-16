@@ -12,7 +12,7 @@ use dbtool_core::{
 };
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 use tokio::time::{timeout, Instant};
 
 pub struct NatsAdapter {
@@ -22,7 +22,16 @@ pub struct NatsAdapter {
 
 pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
-        let client = async_nats::connect(dsn.raw)
+        let driver_url = nats_driver_url(&dsn)?;
+        let mut options = async_nats::ConnectOptions::new();
+        if dsn.scheme == "nats+tls" {
+            options = options.require_tls(true);
+        }
+        if let Some(path) = nats_tls_ca(&dsn) {
+            options = options.add_root_certificates(PathBuf::from(path));
+        }
+        let client = options
+            .connect(driver_url)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
         Ok(Box::new(NatsAdapter {
@@ -245,6 +254,23 @@ fn validate_jetstream_name(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn nats_driver_url(dsn: &Dsn) -> Result<String> {
+    match dsn.scheme.as_str() {
+        "nats" => Ok(dsn.raw.clone()),
+        "nats+tls" => dsn.raw_with_scheme("tls"),
+        scheme => Err(Error::Dsn(format!(
+            "NATS DSN must use nats:// or nats+tls://, got {scheme}"
+        ))),
+    }
+}
+
+fn nats_tls_ca(dsn: &Dsn) -> Option<&str> {
+    dsn.params
+        .get("tls-ca")
+        .or_else(|| dsn.params.get("ssl-ca"))
+        .map(String::as_str)
+}
+
 fn nats_topic_info(info: &async_nats::jetstream::stream::Info) -> TopicInfo {
     TopicInfo {
         name: info.config.name.clone(),
@@ -296,6 +322,17 @@ fn usize_to_i16(value: usize) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nats_tls_alias_rewrites_to_async_nats_tls_scheme() {
+        let dsn = Dsn::parse("nats+tls://127.0.0.1:4222?tls-ca=/tmp/ca.pem").unwrap();
+
+        assert_eq!(
+            nats_driver_url(&dsn).unwrap(),
+            "tls://127.0.0.1:4222?tls-ca=/tmp/ca.pem"
+        );
+        assert_eq!(nats_tls_ca(&dsn), Some("/tmp/ca.pem"));
+    }
 
     #[test]
     fn jetstream_names_reject_subject_wildcards_and_dots() {
