@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_sqlserver:
+        description: "Run Docker-backed SQL Server integration tests"
+        required: false
+        type: boolean
+        default: false
       run_live_tidb:
         description: "Run Docker-backed TiDB compatibility integration tests"
         required: false
@@ -103,6 +108,9 @@ jobs:
 
       - name: Validate PostgreSQL-family compatibility compose config
         run: docker compose -f docker-compose.integration.yml --profile pg-compat config
+
+      - name: Validate SQL Server integration compose config
+        run: docker compose -f docker-compose.integration.yml --profile sqlserver config
 
       - name: Validate TiDB integration compose config
         run: docker compose -f docker-compose.integration.yml --profile tidb config
@@ -229,6 +237,21 @@ jobs:
 
       - name: Run PostgreSQL-family compatibility tests
         run: ./scripts/integration-pg-compat-test.sh
+
+  integration-sqlserver:
+    name: Live SQL Server integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_sqlserver
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-sqlserver
+      DBTOOL_IT_SQLSERVER_PORT: 31433
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run SQL Server integration tests
+        run: ./scripts/integration-sqlserver-test.sh
 
   integration-tidb:
     name: Live TiDB compatibility integration

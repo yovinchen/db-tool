@@ -28,6 +28,10 @@ fn tidb_secure_enabled() -> bool {
     env::var("DBTOOL_RUN_TIDB_SECURE_INTEGRATION").as_deref() == Ok("1")
 }
 
+fn sqlserver_enabled() -> bool {
+    env::var("DBTOOL_RUN_SQLSERVER_INTEGRATION").as_deref() == Ok("1")
+}
+
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args(args)
@@ -221,6 +225,42 @@ fn postgres_family_typed_probe(dsn: &str, expected_kind: &str) {
         "sql",
         "query",
         "select cast(42 as integer) as int_value, cast(3.5 as double precision) as float_value, cast(true as boolean) as bool_value, cast('hi' as text) as text_value, cast(null as text) as null_value",
+    ]));
+    let row = &typed["data"]["rows"][0];
+    assert_eq!(row[0], 42);
+    assert_eq!(row[1].as_f64().expect("float should decode"), 3.5);
+    assert_eq!(row[2], true);
+    assert_eq!(row[3], "hi");
+    assert_eq!(row[4], Value::Null);
+
+    let limited = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--limit",
+        "2",
+        "sql",
+        "query",
+        "select 1 as n union all select 2 union all select 3",
+    ]));
+    assert_eq!(limited["data"]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(limited["meta"]["truncated"], true);
+}
+
+fn sqlserver_typed_probe(dsn: &str, expected_kind: &str) {
+    let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
+    assert_eq!(ping["kind"], expected_kind);
+    assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
+    assert_eq!(caps["kind"], expected_kind);
+    assert_eq!(caps["data"]["sql"], true);
+
+    let typed = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        "select cast(42 as int) as int_value, cast(3.5 as float) as float_value, cast(1 as bit) as bool_value, cast('hi' as nvarchar(32)) as text_value, cast(null as nvarchar(32)) as null_value",
     ]));
     let row = &typed["data"]["rows"][0];
     assert_eq!(row[0], 42);
@@ -605,6 +645,26 @@ fn tidb_secure_auth_tls_and_ha_live_sql_lifecycle() {
         &table_x509,
         format!("create table {table_x509} (id integer primary key, name varchar(64) not null)"),
         format!("drop table {table_x509}"),
+    );
+}
+
+#[test]
+fn sqlserver_live_sql_lifecycle_and_typed_values() {
+    if !sqlserver_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_SQLSERVER_DSN") else {
+        return;
+    };
+    let table = unique_name("dbtool_sqlserver_users");
+    let qualified_table = format!("dbo.{table}");
+
+    sqlserver_typed_probe(&dsn, "sqlserver");
+    sql_lifecycle(
+        &dsn,
+        &qualified_table,
+        format!("create table {qualified_table} (id int primary key, name nvarchar(64) not null)"),
+        format!("drop table {qualified_table}"),
     );
 }
 

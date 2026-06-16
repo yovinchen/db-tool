@@ -12,6 +12,11 @@ pub fn build_registry() -> Registry {
         r.register("sqlite", sqlite_factory);
     }
 
+    #[cfg(feature = "sqlserver")]
+    {
+        r.register_family("sqlserver", adapter_sqlserver::factory);
+    }
+
     #[cfg(feature = "redis")]
     {
         r.register_family("redis", adapter_redis::factory);

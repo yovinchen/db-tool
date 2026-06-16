@@ -1,0 +1,16 @@
+[package]
+name        = "adapter-sqlserver"
+description = "SQL Server adapter for dbtool"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+dbtool-core = { path = "../dbtool-core" }
+async-trait = { workspace = true }
+futures     = { workspace = true }
+tiberius    = { workspace = true }
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }

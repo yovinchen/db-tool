@@ -10,6 +10,7 @@ members = [
     "crates/adapter-kafka",
     "crates/adapter-amqp",
     "crates/adapter-nats",
+    "crates/adapter-sqlserver",
     "crates/dbtool-registry",
     "crates/dbtool-cli",
     "crates/dbtool-tui",
@@ -46,6 +47,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sqlx          = { version = "0.8", default-features = false, features = [
                     "runtime-tokio", "tls-rustls", "mysql", "postgres", "sqlite", "macros",
                 ] }
+tiberius      = { version = "0.12", default-features = false, features = [
+                    "tds73", "tokio", "tokio-util", "rustls",
+                ] }
 
 # ── SQL safety parser ─────────────────────────────────────────────────────────
 sqlparser     = "0.51"
@@ -73,7 +77,7 @@ tokio-rustls  = { version = "0.26", default-features = false, features = ["ring"
 
 # ── Flow control ──────────────────────────────────────────────────────────────
 governor      = "0.6"
-tokio-util    = { version = "0.7", features = ["time"] }
+tokio-util    = { version = "0.7", features = ["compat", "time"] }
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 clap          = { version = "4", features = ["derive", "env", "color"] }

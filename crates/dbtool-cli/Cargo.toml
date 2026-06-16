@@ -15,6 +15,7 @@ path = "src/main.rs"
 default = ["dbtool-registry/default"]
 full    = ["dbtool-registry/full"]
 full-native = ["dbtool-registry/full-native"]
+sqlserver = ["dbtool-registry/sqlserver"]
 
 [dependencies]
 dbtool-core     = { path = "../dbtool-core" }

@@ -38,6 +38,20 @@ The PostgreSQL-family compatibility script starts CockroachDB and TimescaleDB,
 waits for health checks, runs `cockroach://` and `timescale://` live SQL tests,
 and removes the containers and volumes.
 
+SQL Server uses a separate opt-in profile because the image is larger and the
+Linux container is intended for x86-64 Docker environments:
+
+```bash
+./scripts/integration-sqlserver-test.sh
+```
+
+The SQL Server script starts `mcr.microsoft.com/mssql/server`, waits for the
+server-ready log health check, runs `sqlserver://` live SQL lifecycle tests, and
+removes the container by default. The default DSN uses
+`trust-server-certificate=true` for the local developer certificate. On non
+`x86_64` hosts the up script exits before pulling the image unless
+`DBTOOL_IT_SQLSERVER_ALLOW_UNSUPPORTED_ARCH=1` is set.
+
 TiDB compatibility uses its own profile because it starts a small PD/TiKV/TiDB topology:
 
 ```bash
@@ -135,6 +149,15 @@ DBTOOL_IT_TIMESCALE_PORT=35432 \
 ./scripts/integration-pg-compat-test.sh
 ```
 
+SQL Server settings can be overridden independently:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-sqlserver-run \
+DBTOOL_IT_SQLSERVER_PORT=31433 \
+DBTOOL_IT_SQLSERVER_PASSWORD='My_Strong_SQLServer_123!' \
+./scripts/integration-sqlserver-test.sh
+```
+
 TiDB service settings follow the same pattern:
 
 ```bash
@@ -217,6 +240,7 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_services` runs `./scripts/integration-test.sh` for Postgres, MySQL, Redis, and MongoDB.
 - `run_live_compat` can run `./scripts/integration-compat-test.sh` for MariaDB and Valkey, with `DBTOOL_IT_COMPAT_EXTRA=1` for KeyDB and Dragonfly.
 - `run_live_pg_compat` runs `./scripts/integration-pg-compat-test.sh` for CockroachDB and TimescaleDB.
+- `run_live_sqlserver` runs `./scripts/integration-sqlserver-test.sh` for SQL Server/TDS coverage.
 - `run_live_tidb` runs `./scripts/integration-tidb-test.sh` for TiDB through a local PD/TiKV/TiDB topology.
 - `run_live_tidb_secure` runs `./scripts/integration-tidb-secure-test.sh` for TiDB auth/TLS/HA coverage.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
@@ -237,6 +261,7 @@ The compose file applies conservative defaults:
 - MariaDB compat: `0.50` CPU, `512m` memory
 - CockroachDB pg-compat: `0.50` CPU, `512m` memory
 - TimescaleDB pg-compat: `0.50` CPU, `512m` memory
+- SQL Server: `1.00` CPU, `2g` memory
 - Valkey compat: `0.25` CPU, `256m` memory plus `128mb` maxmemory
 - KeyDB compat-extra: `0.25` CPU, `256m` memory plus `128mb` maxmemory
 - Dragonfly compat-extra: `0.25` CPU, `384m` memory plus `256mb` maxmemory
@@ -257,7 +282,7 @@ The compose file applies conservative defaults:
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the messaging suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly 768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, CockroachDB, RabbitMQ, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
+The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the SQL Server suite is capped at roughly 2 GiB, the messaging suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly 768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, SQL Server, CockroachDB, RabbitMQ, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_SQLSERVER_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
 
 ## Live Test Scope
 

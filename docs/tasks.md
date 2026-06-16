@@ -96,7 +96,7 @@ Goal: release-quality packages and optional advanced backends.
 - [x] Optional native Kafka implementation.
 - [x] OpenSearch/Elasticsearch HTTP search adapter.
 - [x] Prometheus HTTP time-series adapter.
-- [ ] Future adapters: SQL Server, Cassandra; implementation gate is documented in [extended-backends.md](extended-backends.md).
+- [ ] Future adapters: SQL Server adapter is implemented behind an opt-in feature/profile; Cassandra remains gated by the CQL trait decision in [extended-backends.md](extended-backends.md).
 
 ## P7: Live Integration Automation
 
@@ -107,6 +107,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Docker Compose compatibility-extra profile for KeyDB and Dragonfly.
 - [x] Docker Compose TiDB profile for PD, TiKV, and TiDB SQL server.
 - [x] Docker Compose TiDB secure HA profile for 3 PD, 2 TiKV, and 2 TiDB SQL nodes.
+- [x] Docker Compose SQL Server profile for TDS/SQL Server coverage.
 - [x] Docker Compose messaging profile for Redis, Redpanda, RabbitMQ, and NATS.
 - [x] Docker Compose messaging TLS profile for RabbitMQ TLS and NATS TLS.
 - [x] Custom project name, database names, credentials, and host ports through environment variables.
@@ -117,6 +118,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Live CLI tests for real MariaDB, Valkey, KeyDB, and Dragonfly compatibility services.
 - [x] Live CLI tests for real TiDB compatibility service.
 - [x] Live CLI tests for TiDB auth, SQL TLS, component TLS, X509, and local HA topology.
+- [x] Live CLI test entry for SQL Server SQL lifecycle, typed values, limiting, tables, and schema.
 - [x] Live CLI tests for Redis Streams/PubSub, Kafka, AMQP, and NATS messaging workflows.
 - [x] Live CLI tests for AMQPS and NATS TLS messaging workflows.
 - [x] Live CLI tests for OpenSearch search and Prometheus time-series workflows.
@@ -216,7 +218,7 @@ Goal: add new families only after the core behavior remains stable under integra
 - [x] Search HTTPS/TLS live Docker profile and CLI test coverage through a local compatible harness.
 - [x] Time-series HTTP adapter with Prometheus measurement list/query operations.
 - [x] Prometheus resource-bounded Docker profile and live CLI tests.
-- [ ] SQL Server adapter.
+- [x] SQL Server adapter.
 - [ ] Cassandra adapter.
 
 ## Remaining Task Board
@@ -230,7 +232,7 @@ major database compatibility loop became stable.
 | T10 PostgreSQL-family live compatibility | P1 | Done | Added resource-bounded CockroachDB and TimescaleDB profiles for the existing Postgres adapter aliases. | `./scripts/integration-pg-compat-test.sh` covers SQL lifecycle, typed values, limiting, tables, and schema tests for `cockroach://` and `timescale://`. |
 | T11 Messaging TLS live validation | P2 | Done | Added TLS-enabled RabbitMQ and NATS profiles for already-registered `amqps://` and `nats+tls://` aliases, with generated local CA support through `tls-ca`/`ssl-ca` DSN params. | `./scripts/integration-mq-tls-test.sh` covers AMQPS produce/consume/detail and NATS TLS publish/subscribe plus JetStream topics/detail/lag. |
 | T12 TUI workflow depth | P2 | Pending | Add command history, richer per-capability forms, and polished full-screen navigation while reusing core confirmation and limit behavior. | TUI smoke tests for history, forms, write confirmation, and error rendering. |
-| T13 SQL Server adapter gate | P3 | Pending | Decide whether to accept TDS dependency/resource cost, then add adapter, DSN scheme, Docker profile, and SQL CLI coverage. | Unit mapping tests plus optional SQL Server live profile if image cost is accepted. |
+| T13 SQL Server adapter gate | P3 | In progress | Added `adapter-sqlserver`, `sqlserver://` and `mssql://` registration, Docker profile, integration scripts, and CLI live lifecycle coverage. Remaining gate is running the heavyweight Docker profile in an x86_64-capable environment. | `cargo test -p adapter-sqlserver`; `docker compose -f docker-compose.integration.yml --profile sqlserver config`; optional `./scripts/integration-sqlserver-test.sh`. |
 | T14 Cassandra/CQL adapter gate | P3 | Pending | Decide whether CQL belongs behind a new trait or limited SQL-like interface, then add adapter and Docker profile. | CQL trait contract tests plus Cassandra/Scylla live smoke tests if accepted. |
 | T15 Prometheus remote write | P3 | Deferred | Add protobuf/snappy remote-write support only if write-heavy time-series workflows become required. | Service-free encoding tests plus Prometheus-compatible remote-write receiver test. |
 | T16 Production TiDB HA drills | P3 | Deferred | Keep local secure HA documented as compatibility validation; add TiProxy/failover/cert-rotation drills only when production-readiness is in scope. | Explicit failover drill script and documented pass/fail criteria. |

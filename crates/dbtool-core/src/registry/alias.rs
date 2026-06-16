@@ -2,6 +2,7 @@
 /// (canonical_scheme, &[aliases])
 pub const PROTOCOL_ALIASES: &[(&str, &[&str])] = &[
     ("mysql", &["mariadb", "tidb"]),
+    ("sqlserver", &["mssql"]),
     (
         "postgres",
         &["postgresql", "cockroach", "timescale", "redshift"],
@@ -41,6 +42,7 @@ mod tests {
     #[test]
     fn canonicalizes_known_aliases() {
         assert_eq!(canonical_scheme("postgresql"), "postgres");
+        assert_eq!(canonical_scheme("mssql"), "sqlserver");
         assert_eq!(canonical_scheme("cockroach"), "postgres");
         assert_eq!(canonical_scheme("valkey"), "redis");
         assert_eq!(canonical_scheme("redpanda"), "kafka");

@@ -11,21 +11,23 @@ Recommended adapter shape:
 - Crate: `adapter-sqlserver`
 - Scheme: `sqlserver://`
 - Capability: `SqlEngine`
-- Likely client dependency: a TDS client such as `tiberius`
+- Client dependency: `tiberius`
 - Docker image: `mcr.microsoft.com/mssql/server`
 - Resource note: SQL Server images are large and usually need at least 2 GiB
   memory; keep it in an opt-in profile separate from default integration tests.
 
 Acceptance tasks:
 
-- [ ] Add the adapter crate and feature gate.
-- [ ] Parse `sqlserver://user:pass@host:port/database` DSNs and preserve
+- [x] Add the adapter crate and feature gate.
+- [x] Parse `sqlserver://user:pass@host:port/database` DSNs and preserve
       caller-facing kind.
-- [ ] Implement `ping`, `query`, `execute`, `list_tables`, and `describe_table`.
-- [ ] Map SQL Server scalar types into core `Value`.
-- [ ] Add SQL safety and limiter coverage through existing CLI paths.
-- [ ] Add `sqlserver` Docker profile, up/test scripts, CI workflow input, and
+- [x] Implement `ping`, `query`, `execute`, `list_tables`, and `describe_table`.
+- [x] Map SQL Server scalar types into core `Value`.
+- [x] Add SQL safety and limiter coverage through existing CLI paths.
+- [x] Add `sqlserver` Docker profile, up/test scripts, CI workflow input, and
       live CLI lifecycle tests.
+- [ ] Run the heavyweight live profile in an amd64-capable Docker environment
+      and record the result in `docs/tasks.md`.
 
 ## Cassandra
 
@@ -55,7 +57,8 @@ Acceptance tasks:
 
 ## Dependency Gate
 
-Both adapters require new protocol dependencies and heavier Docker images. Add
-them only when a dedicated implementation task explicitly accepts those costs.
-Until then, keep the schemes unregistered so unsupported targets fail early and
-honestly.
+SQL Server now carries its explicit TDS dependency and isolated Docker profile.
+Cassandra still requires a new protocol dependency and heavier Docker image. Add
+the Cassandra scheme only when a dedicated implementation task explicitly
+accepts the CQL trait and resource costs. Until then, keep the scheme
+unregistered so unsupported Cassandra targets fail early and honestly.

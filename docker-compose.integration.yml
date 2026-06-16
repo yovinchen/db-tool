@@ -130,6 +130,31 @@ services:
     cpus: ${DBTOOL_IT_TIMESCALE_CPUS:-0.50}
     mem_limit: ${DBTOOL_IT_TIMESCALE_MEMORY:-512m}
 
+  sqlserver:
+    profiles: ["sqlserver"]
+    image: mcr.microsoft.com/mssql/server:${DBTOOL_IT_SQLSERVER_VERSION:-2022-latest}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-sqlserver
+    platform: ${DBTOOL_IT_SQLSERVER_PLATFORM:-linux/amd64}
+    hostname: dbtool-it-sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: ${DBTOOL_IT_SQLSERVER_PID:-Developer}
+      MSSQL_SA_PASSWORD: ${DBTOOL_IT_SQLSERVER_PASSWORD:-Dbtool_SQLServer_123!}
+    ports:
+      - "${DBTOOL_IT_SQLSERVER_PORT:-11433}:1433"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "grep -q 'SQL Server is now ready for client connections' /var/opt/mssql/log/errorlog",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 80
+      start_period: 20s
+    cpus: ${DBTOOL_IT_SQLSERVER_CPUS:-1.00}
+    mem_limit: ${DBTOOL_IT_SQLSERVER_MEMORY:-2g}
+
   tidb-pd:
     profiles: ["tidb"]
     image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
