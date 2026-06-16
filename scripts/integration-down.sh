@@ -7,6 +7,7 @@ source "$ROOT/scripts/integration-env.sh"
 docker compose \
   -f "$ROOT/docker-compose.integration.yml" \
   -p "$DBTOOL_IT_PROJECT" \
+  --profile fixture-images \
   --profile messaging \
   --profile messaging-tls \
   --profile compat \

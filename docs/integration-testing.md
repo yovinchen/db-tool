@@ -55,6 +55,19 @@ normal CLI surfaces:
 - [base-redis-seed.commands](../testdata/base-redis-seed.commands) for Redis.
 - [base-mongo-seed.ndjson](../testdata/base-mongo-seed.ndjson) for MongoDB.
 
+Run the fixture-image smoke when you need to validate database Dockerfiles that
+carry the same fixture data inside service startup:
+
+```bash
+./scripts/integration-fixture-images-test.sh
+```
+
+The fixture-image smoke builds the Dockerfiles under
+[docker/fixtures](../docker/fixtures), starts the `fixture-images` Compose
+profile, then verifies dbtool can read the preloaded PostgreSQL rows, MySQL
+rows, Redis keys, and MongoDB documents without first injecting fixture data
+from the host.
+
 Compatible database integration tests use a separate profile:
 
 ```bash
@@ -228,6 +241,18 @@ DBTOOL_IT_MONGO_PORT=27018 \
 ./scripts/integration-test.sh
 ```
 
+Fixture-image service settings use separate defaults so they can run without
+colliding with the base service suite:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-fixture-images \
+DBTOOL_IT_POSTGRES_FIXTURE_PORT=26432 \
+DBTOOL_IT_MYSQL_FIXTURE_PORT=24306 \
+DBTOOL_IT_REDIS_FIXTURE_PORT=27379 \
+DBTOOL_IT_MONGO_FIXTURE_PORT=28017 \
+./scripts/integration-fixture-images-test.sh
+```
+
 Compatible service settings follow the same pattern:
 
 ```bash
@@ -391,8 +416,9 @@ DBTOOL_IT_PROJECT=my-dbtool-run ./scripts/integration-down.sh
 
 Daily push and pull request CI run service-free verification through
 `./scripts/verify.sh` and validate base, compatibility, PostgreSQL-family
-compatibility, SQL Server, Cassandra, TiDB, messaging, messaging TLS, and
-observability Docker Compose configs without starting containers through:
+compatibility, SQL Server, Cassandra, TiDB, fixture-image, messaging,
+messaging TLS, and observability Docker Compose configs without starting
+containers through:
 
 ```bash
 ./scripts/validate-compose-configs.sh
@@ -414,7 +440,9 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_messaging_native` can run `./scripts/integration-mq-native-test.sh` when native Kafka coverage is desired.
 - `run_live_observability` runs `./scripts/integration-observability-test.sh` for OpenSearch and Prometheus.
 
-The CI jobs use separate Compose project names and host ports so the database, compatibility, TiDB, messaging, and observability suites can run in parallel.
+The CI jobs use separate Compose project names and host ports so the database,
+fixture-image, compatibility, TiDB, messaging, and observability suites can run
+in parallel.
 
 ## Resource Limits
 
@@ -424,6 +452,10 @@ The compose file applies conservative defaults:
 - MySQL: `0.75` CPU, `768m` memory
 - Redis: `0.25` CPU, `256m` memory plus `128mb` Redis maxmemory
 - MongoDB: `0.50` CPU, `512m` memory
+- PostgreSQL fixture image: `0.50` CPU, `512m` memory
+- MySQL fixture image: `0.75` CPU, `768m` memory
+- Redis fixture image: `0.25` CPU, `256m` memory plus `128mb` Redis maxmemory
+- MongoDB fixture image: `0.50` CPU, `512m` memory
 - MariaDB compat: `0.50` CPU, `512m` memory
 - CockroachDB pg-compat: `0.50` CPU, `512m` memory
 - TimescaleDB pg-compat: `0.50` CPU, `512m` memory
@@ -450,7 +482,22 @@ The compose file applies conservative defaults:
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the SQL Server suite is capped at roughly 2 GiB, the messaging suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly 768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, the TiDB secure HA suite, SQL-node failover drill, or PD drill is capped at roughly 3.75 GiB, and the TiProxy drill is capped at roughly 4 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, SQL Server, CockroachDB, RabbitMQ, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_SQLSERVER_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_TIPROXY_MEMORY` if one fails to become healthy under local load.
+The base service suite and fixture-image suite are each capped at roughly 2 GiB
+of container memory, the PostgreSQL-family compatibility suite is capped at
+roughly 1 GiB, the SQL Server suite is capped at roughly 2 GiB, the messaging
+suite is capped at roughly 2 GiB, the messaging TLS suite is capped at roughly
+768 MiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite
+is capped at roughly 1.75 GiB, the TiDB secure HA suite, SQL-node failover
+drill, PD drill, or certificate regeneration drill is capped at roughly 3.75
+GiB, and the TiProxy drill is capped at roughly 4 GiB. If several suites are
+kept running at the same time, reserve Docker memory for their combined limits
+plus headroom. Redpanda, OpenSearch, SQL Server, CockroachDB, RabbitMQ, and
+TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with
+`DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`,
+`DBTOOL_IT_SQLSERVER_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`,
+`DBTOOL_IT_AMQP_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`,
+`DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_TIPROXY_MEMORY` if one
+fails to become healthy under local load.
 
 ## Live Test Scope
 
@@ -462,6 +509,9 @@ The live tests cover:
   limits, and disposable fixture cleanup.
 - Reusable base fixture loading for PostgreSQL, MySQL, Redis, and MongoDB from
   SQL, command, and NDJSON files under `testdata/`.
+- Dockerfile-backed fixture images for PostgreSQL, MySQL, Redis, and MongoDB,
+  with dbtool readback of rows, keys, and documents preloaded during service
+  initialization.
 - MariaDB/TiDB alias DSNs against the MySQL protocol adapter, typed MySQL values, and result limiting.
 - CockroachDB/TimescaleDB alias DSNs against the PostgreSQL protocol adapter, typed Postgres-family values, result limiting, table listing, schema inspection, and SQL lifecycle.
 - Redis ping, set/get/scan/raw typed output, TTL, scan truncation, multi-key delete, blocked destructive raw command, and blocked mutating raw command without `--allow-write`.

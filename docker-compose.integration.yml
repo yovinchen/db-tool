@@ -559,6 +559,123 @@ services:
     cpus: ${DBTOOL_IT_MONGO_CPUS:-0.50}
     mem_limit: ${DBTOOL_IT_MONGO_MEMORY:-512m}
 
+  postgres-fixture:
+    profiles: ["fixture-images"]
+    image: ${DBTOOL_IT_POSTGRES_FIXTURE_IMAGE:-dbtool-fixture-postgres:local}
+    build:
+      context: .
+      dockerfile: docker/fixtures/postgres/Dockerfile
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-postgres-fixture
+    environment:
+      POSTGRES_DB: ${DBTOOL_IT_POSTGRES_FIXTURE_DB:-dbtool_it_pg_fixture}
+      POSTGRES_USER: ${DBTOOL_IT_POSTGRES_FIXTURE_USER:-dbtool}
+      POSTGRES_PASSWORD: ${DBTOOL_IT_POSTGRES_FIXTURE_PASSWORD:-dbtool}
+    ports:
+      - "${DBTOOL_IT_POSTGRES_FIXTURE_PORT:-16432}:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DBTOOL_IT_POSTGRES_FIXTURE_USER:-dbtool} -d ${DBTOOL_IT_POSTGRES_FIXTURE_DB:-dbtool_it_pg_fixture}",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cpus: ${DBTOOL_IT_POSTGRES_FIXTURE_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_POSTGRES_FIXTURE_MEMORY:-512m}
+
+  mysql-fixture:
+    profiles: ["fixture-images"]
+    image: ${DBTOOL_IT_MYSQL_FIXTURE_IMAGE:-dbtool-fixture-mysql:local}
+    build:
+      context: .
+      dockerfile: docker/fixtures/mysql/Dockerfile
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mysql-fixture
+    environment:
+      MYSQL_DATABASE: ${DBTOOL_IT_MYSQL_FIXTURE_DB:-dbtool_it_mysql_fixture}
+      MYSQL_USER: ${DBTOOL_IT_MYSQL_FIXTURE_USER:-dbtool}
+      MYSQL_PASSWORD: ${DBTOOL_IT_MYSQL_FIXTURE_PASSWORD:-dbtool}
+      MYSQL_ROOT_PASSWORD: ${DBTOOL_IT_MYSQL_FIXTURE_ROOT_PASSWORD:-dbtool_root}
+    command:
+      [
+        "mysqld",
+        "--mysql-native-password=ON",
+        "--max-connections=40",
+        "--performance-schema=OFF",
+      ]
+    ports:
+      - "${DBTOOL_IT_MYSQL_FIXTURE_PORT:-14306}:3306"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -u${DBTOOL_IT_MYSQL_FIXTURE_USER:-dbtool} -p${DBTOOL_IT_MYSQL_FIXTURE_PASSWORD:-dbtool} --silent",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    cpus: ${DBTOOL_IT_MYSQL_FIXTURE_CPUS:-0.75}
+    mem_limit: ${DBTOOL_IT_MYSQL_FIXTURE_MEMORY:-768m}
+
+  redis-fixture:
+    profiles: ["fixture-images"]
+    image: ${DBTOOL_IT_REDIS_FIXTURE_IMAGE:-dbtool-fixture-redis:local}
+    build:
+      context: .
+      dockerfile: docker/fixtures/redis/Dockerfile
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-redis-fixture
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "no",
+        "--save",
+        "",
+        "--maxmemory",
+        "${DBTOOL_IT_REDIS_FIXTURE_MAXMEMORY:-128mb}",
+        "--maxmemory-policy",
+        "allkeys-lru",
+      ]
+    ports:
+      - "${DBTOOL_IT_REDIS_FIXTURE_PORT:-17379}:6379"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test \"$(redis-cli get dbtool:fixture:user:1)\" = alice",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    cpus: ${DBTOOL_IT_REDIS_FIXTURE_CPUS:-0.25}
+    mem_limit: ${DBTOOL_IT_REDIS_FIXTURE_MEMORY:-256m}
+
+  mongo-fixture:
+    profiles: ["fixture-images"]
+    image: ${DBTOOL_IT_MONGO_FIXTURE_IMAGE:-dbtool-fixture-mongo:local}
+    build:
+      context: .
+      dockerfile: docker/fixtures/mongo/Dockerfile
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mongo-fixture
+    command: ["mongod", "--bind_ip", "0.0.0.0"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${DBTOOL_IT_MONGO_FIXTURE_USER:-dbtool}
+      MONGO_INITDB_ROOT_PASSWORD: ${DBTOOL_IT_MONGO_FIXTURE_PASSWORD:-dbtool}
+      MONGO_INITDB_DATABASE: ${DBTOOL_IT_MONGO_FIXTURE_DB:-dbtool_it_mongo_fixture}
+    ports:
+      - "${DBTOOL_IT_MONGO_FIXTURE_PORT:-18017}:27017"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --username ${DBTOOL_IT_MONGO_FIXTURE_USER:-dbtool} --password ${DBTOOL_IT_MONGO_FIXTURE_PASSWORD:-dbtool} --authenticationDatabase admin --eval 'db.getSiblingDB(\"${DBTOOL_IT_MONGO_FIXTURE_DB:-dbtool_it_mongo_fixture}\").dbtool_fixture_people.countDocuments({kind:\"dbtool-fixture\"})' | grep 3",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    cpus: ${DBTOOL_IT_MONGO_FIXTURE_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_MONGO_FIXTURE_MEMORY:-512m}
+
   opensearch:
     profiles: ["observability"]
     image: opensearchproject/opensearch:${DBTOOL_IT_OPENSEARCH_VERSION:-2.17.1}

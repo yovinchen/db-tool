@@ -12,6 +12,7 @@ run_config() {
 }
 
 run_config "base"
+run_config "fixture-images" --profile fixture-images
 run_config "compat" --profile compat --profile compat-extra
 run_config "pg-compat" --profile pg-compat
 run_config "sqlserver" --profile sqlserver

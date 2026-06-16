@@ -221,6 +221,13 @@ and document services:
 ./scripts/integration-fixture-data-test.sh
 ```
 
+Run the fixture-image smoke when you need to prove database Dockerfiles can
+build images with fixture data baked into service initialization:
+
+```bash
+./scripts/integration-fixture-images-test.sh
+```
+
 Compatible database integration tests start real MariaDB and Valkey services by default:
 
 ```bash
