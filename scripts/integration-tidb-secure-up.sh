@@ -47,7 +47,12 @@ start_phase() {
   shift
 
   echo "TiDB secure HA: starting $label"
-  compose up -d --wait --wait-timeout "${DBTOOL_IT_WAIT_TIMEOUT:-360}" "$@"
+  if ! compose up -d --wait --wait-timeout "${DBTOOL_IT_WAIT_TIMEOUT:-360}" "$@"; then
+    echo "TiDB secure HA: $label startup failed" >&2
+    compose ps "${services[@]}" >&2 || true
+    compose logs --tail "${DBTOOL_IT_TIDB_SECURE_FAILURE_LOG_LINES:-160}" "${services[@]}" >&2 || true
+    return 1
+  fi
   compose ps "$@"
 }
 
