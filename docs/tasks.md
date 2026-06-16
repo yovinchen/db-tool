@@ -51,6 +51,7 @@ Goal: machine-readable CLI suitable for Claude Code skill calls.
 - [x] Table/NDJSON format support.
 - [x] `SKILL.md` with command examples and safety workflow.
 - [x] CLI integration tests for JSON envelopes and error codes.
+- [x] Service-free executable smoke script with SQLite fixture data, write confirmation, limits, and timeout coverage.
 
 ## P3: KV And Document Stores
 
@@ -115,6 +116,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Custom project name, database names, credentials, and host ports through environment variables.
 - [x] CPU/memory/resource limits for integration services.
 - [x] Integration scripts for up/down/test lifecycle.
+- [x] Service-free smoke script for core SQLite CRUD, safety, result limiting, and configured timeout behavior.
 - [x] Live CLI tests for SQL, KV, and document workflows.
 - [x] Live CLI tests for MySQL protocol aliases and Redis-compatible protocol aliases.
 - [x] Live CLI tests for real MariaDB, Valkey, KeyDB, and Dragonfly compatibility services.

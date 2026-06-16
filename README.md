@@ -156,6 +156,16 @@ cargo fmt --all -- --check
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+./scripts/smoke-core-flow.sh
+```
+
+Service-free executable smoke coverage uses a temporary SQLite database,
+`connections.toml`, and [testdata/sqlite-core-flow.sql](testdata/sqlite-core-flow.sql)
+to verify ping, write confirmation, insert/query, result limiting,
+table/schema inspection, write guards, and configured request timeout:
+
+```bash
+./scripts/smoke-core-flow.sh
 ```
 
 Live database integration tests can start local Docker services with resource limits:

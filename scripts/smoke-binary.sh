@@ -3,6 +3,7 @@ set -euo pipefail
 
 TARGET="${1:?target triple is required}"
 BIN="${2:?binary path is required}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ ! -f "$BIN" ]]; then
   echo "missing binary: $BIN" >&2
@@ -27,6 +28,13 @@ esac
 
 if [[ "$can_run" == "1" ]]; then
   "$BIN" --version >/dev/null
+  case "$TARGET" in
+    *windows*)
+      ;;
+    *)
+      "$ROOT/scripts/smoke-core-flow.sh" "$BIN" >/dev/null
+      ;;
+  esac
 else
   echo "structural smoke only for $TARGET on $host_os/$host_arch"
 fi
