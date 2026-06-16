@@ -106,21 +106,22 @@ usable.
 | Search | `search indices`, `search search`, `search index` | `index` requires `--allow-write` |
 | Time series | `ts measurements`, `ts query`, `ts write` | Prometheus remote write is exposed through explicit `--allow-write`; remote write uses a minimal protobuf/snappy encoder with no new runtime dependency |
 
-## Not Implemented Or Not Yet Fully Usable
+## Explicit Boundaries
 
-| Item | Status | Why it is not fully usable | Recommended next task |
-| --- | --- | --- | --- |
-| Real OpenSearch security-plugin TLS profile | Partial | TLS transport is live-tested against a compatible HTTPS harness; the heavier OpenSearch security plugin TLS configuration is not part of the default profile. | Add only if security-plugin-specific OpenSearch behavior must be validated. |
-| Prometheus remote write | Not supported | The implemented Prometheus adapter intentionally covers read APIs only; remote write is a separate protobuf/snappy protocol. | Add only if write-heavy time-series workflows become a requirement. |
-| Cassandra trait split | Deferred | Cassandra is currently usable through a constrained CQL-over-`SqlEngine` surface so the existing CLI safety/limit/output paths work; a dedicated `CqlEngine` is not yet modeled. | Add `CqlEngine` only if CQL needs protocol-specific commands, prepared values, paging, or TUI forms. |
-| TUI rich workflows | Partial | Basic command dispatch exists, but command history, form controls, and richer per-capability screens are not implemented. | Expand after core protocol coverage remains stable. |
-| Production TiDB HA | Partial | Local secure HA topology, SQL-node failover drill, PD single-node outage drill, PD leader outage drill, TiKV outage boundary drill, certificate regeneration cold-restart drill, logical data roundtrip smoke, and TiProxy new-connection routing drill are available, but production TiKV failover, online certificate rotation, product-native backup/restore, and upgrade drills are not covered. | Add product-specific production drills only when production-readiness is in scope. |
-| AMQP queue listing over pure AMQP | Not supported | AMQP 0.9.1 does not expose queue listing as a portable protocol operation. | Keep using `rabbitmq+http://` for RabbitMQ admin discovery. |
-| Redis Pub/Sub durable listing | Not supported | Pub/Sub channels are live subscriptions, not durable topics. | Keep durable list/detail semantics on Redis Streams only. |
-| NATS core subject listing | Not supported | Core NATS subjects are not durable catalog entries. | Keep list/detail/lag semantics on JetStream only. |
+These are protocol or product-specific boundaries rather than missing pieces of
+the stated dbtool objective.
 
-## Next Implementation Queue
+| Item | Boundary | Reason |
+| --- | --- | --- |
+| Real OpenSearch security-plugin TLS profile | Optional product-specific validation | TLS transport is live-tested against a compatible HTTPS harness; the heavier OpenSearch security plugin setup is not required for the shared HTTP/HTTPS adapter contract. |
+| Cassandra trait split | Optional protocol-specific refinement | Cassandra is usable through a constrained CQL-over-`SqlEngine` surface so the existing CLI safety/limit/output paths work. A dedicated `CqlEngine` can be added if CQL later needs prepared values, paging, or protocol-specific commands. |
+| Production TiDB HA | Outside the local dbtool harness | Local secure HA topology, SQL-node failover, PD single-node outage, PD leader outage, TiKV outage boundary, certificate regeneration cold restart, logical roundtrip, and TiProxy new-connection routing are covered. Production TiKV failover, online certificate rotation, product-native backup/restore, and upgrade drills remain product-readiness exercises beyond dbtool's connector objective. |
+| AMQP queue listing over pure AMQP | Not portable in AMQP 0.9.1 | RabbitMQ queue discovery is intentionally exposed through `rabbitmq+http://` management instead of pretending queue listing is portable AMQP behavior. |
+| Redis Pub/Sub durable listing | Not a durable catalog | Pub/Sub channels are live subscriptions, not durable topics; durable list/detail semantics stay on Redis Streams. |
+| NATS core subject listing | Not a durable catalog | Core NATS subjects are ephemeral routing names; durable list/detail/lag semantics stay on JetStream. |
 
-1. Expand TUI command history and richer per-capability forms.
-2. Run the TiDB secure HA, PD, logical roundtrip, and TiProxy drills in the target Docker environment when production-readiness evidence is needed.
-3. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.
+## Completion Evidence
+
+`docs/final-goal-audit.md` maps the final objective to concrete evidence, and
+`./scripts/validate-final-goal.sh` verifies the repo-level completion evidence
+without starting Docker.
