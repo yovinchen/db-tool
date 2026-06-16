@@ -271,6 +271,13 @@ time while both TiDB SQL nodes keep accepting TLS writes and reads:
 ./scripts/integration-tidb-pd-drill.sh
 ```
 
+Run the secure HA topology as a PD leader drill, discovering and stopping the
+current PD leader before verifying SQL continuity:
+
+```bash
+./scripts/integration-tidb-pd-leader-drill.sh
+```
+
 Run the secure HA topology as a certificate regeneration drill, recreating the
 local CA/server/client certificates between two cold starts and verifying TLS
 SQL through both generations:

@@ -173,8 +173,8 @@ Pass/fail criteria:
   if services are kept, it attempts to restart any SQL node it stopped.
 
 This drill proves local TiDB SQL frontend failover through dbtool's MySQL-family
-adapter. Together with the TiProxy and certificate regeneration drills, it
-still does not replace placement, PD leadership, TiKV failure, backup/restore,
+adapter. Together with the PD leader, TiProxy, and certificate regeneration
+drills, it still does not replace placement, TiKV failure, backup/restore,
 upgrade, online certificate rotation, or existing-session migration drills.
 
 ## PD Quorum Drill
@@ -207,12 +207,54 @@ Pass/fail criteria:
 
 This drill proves dbtool remains usable through the local TiDB SQL endpoints
 while the PD quorum loses one member at a time. It does not identify or require
-stopping the current PD leader specifically, and it does not cover a TiKV store
-failure, placement-rule behavior, backup/restore, upgrade, online certificate
+stopping the current PD leader specifically; use the PD leader drill for that.
+It does not cover a TiKV store failure, placement-rule behavior,
+backup/restore, upgrade, online certificate
 rotation, or existing-session migration. The script applies
 `DBTOOL_IT_TIDB_PD_DRILL_REQUEST_TIMEOUT` and
 `DBTOOL_IT_TIDB_PD_DRILL_DEADLINE` to each dbtool call so failed quorum behavior
 terminates as a bounded test failure.
+
+## PD Leader Drill
+
+`./scripts/integration-tidb-pd-leader-drill.sh` reuses the secure HA topology
+for a targeted current-leader outage exercise. It is local-only while the CI
+budget freeze is in effect.
+
+The drill performs this flow:
+
+1. Start the secure HA topology through `integration-tidb-secure-up.sh`.
+2. Create a fixture table through `tidb-secure-1` and read it through
+   `tidb-secure-2`.
+3. Query `/pd/api/v1/members` from a running PD container over TLS with the
+   generated CA/server certificate and key.
+4. Map the reported leader name `pd-1`, `pd-2`, or `pd-3` to the matching
+   Compose service.
+5. Stop that current PD leader.
+6. Wait until a different running PD node reports itself as the replacement
+   leader.
+7. Require both TiDB SQL nodes to keep accepting TLS `ping`, then write through
+   each SQL node and read each row from the opposite SQL node.
+8. Restart the stopped PD service and require both SQL nodes to remain
+   reachable.
+
+Pass/fail criteria:
+
+- The current PD leader must be discovered through the TLS PD API before any PD
+  node is stopped.
+- The stopped service must be the service corresponding to that discovered
+  leader.
+- A replacement PD leader must be visible before SQL continuity checks run.
+- Both SQL nodes must keep accepting TLS SQL writes and reads while the original
+  leader is stopped.
+- The stopped leader must restart cleanly before the script exits.
+
+This drill proves dbtool remains usable while the local TiDB secure HA cluster
+elects a replacement PD leader after the current leader is stopped. It does not
+cover TiKV store failure, placement-rule behavior, backup/restore, upgrade,
+online certificate rotation, or existing-session migration. The script applies
+`DBTOOL_IT_TIDB_PD_LEADER_DRILL_REQUEST_TIMEOUT` and
+`DBTOOL_IT_TIDB_PD_LEADER_DRILL_DEADLINE` to each dbtool call.
 
 ## Certificate Regeneration Drill
 

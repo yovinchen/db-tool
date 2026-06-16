@@ -168,6 +168,18 @@ Its dbtool calls use bounded defaults through
 `DBTOOL_IT_TIDB_PD_DRILL_DEADLINE` so a broken quorum fails fast instead of
 hanging indefinitely.
 
+Run the secure HA PD leader drill when you need to prove dbtool remains usable
+after the current PD leader, not just an arbitrary PD member, is stopped:
+
+```bash
+./scripts/integration-tidb-pd-leader-drill.sh
+```
+
+The leader drill queries the TLS PD API from a running PD container, maps the
+reported `pd-1`/`pd-2`/`pd-3` leader to the matching Compose service, stops that
+service, waits for a replacement leader, and then requires both TiDB SQL nodes
+to keep accepting TLS writes and reads.
+
 Run the secure HA certificate regeneration drill when you need to prove the
 local TLS material can be regenerated and the topology can cold-start again
 with the new CA/server/client certificates:
@@ -335,6 +347,16 @@ DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
 DBTOOL_IT_TIDB_SECURE_PORT_1=45100 \
 DBTOOL_IT_TIDB_SECURE_PORT_2=45101 \
 ./scripts/integration-tidb-pd-drill.sh
+```
+
+Use the same secure HA variables for the PD leader drill:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-tidb-pd-leader-drill \
+DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
+DBTOOL_IT_TIDB_SECURE_PORT_1=45200 \
+DBTOOL_IT_TIDB_SECURE_PORT_2=45201 \
+./scripts/integration-tidb-pd-leader-drill.sh
 ```
 
 Use isolated secure HA variables for the certificate regeneration drill:
@@ -521,6 +543,9 @@ The live tests cover:
 - TiDB secure HA through `tidb://` with 3 PD nodes, 2 TiKV nodes, 2 TiDB SQL nodes, component TLS, SQL TLS, TLS-required users, client-certificate-required users, insecure-login rejection, and SQL lifecycle coverage through both SQL nodes.
 - TiDB secure HA failover drill with one SQL node stopped at a time, writes through the surviving SQL node, and post-restart reads of rows created during each outage.
 - TiDB secure HA PD drill with one PD node stopped at a time, writes through both SQL nodes during each PD outage, and post-restart SQL reachability checks.
+- TiDB secure HA PD leader drill with TLS PD API leader discovery, targeted
+  leader stop, replacement-leader detection, and SQL continuity checks through
+  both SQL nodes.
 - TiDB secure HA certificate regeneration drill with changed CA/server/client
   certificate fingerprints across a cold restart and TLS SQL verification
   through both generations.
