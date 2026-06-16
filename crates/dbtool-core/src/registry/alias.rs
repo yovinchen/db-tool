@@ -9,7 +9,10 @@ pub const PROTOCOL_ALIASES: &[(&str, &[&str])] = &[
     ("redis", &["valkey", "keydb", "dragonfly"]),
     ("kafka", &["automq", "redpanda", "warpstream", "confluent"]),
     ("mongodb", &[]),
-    ("opensearch", &["elasticsearch"]),
+    (
+        "opensearch",
+        &["elasticsearch", "opensearch+https", "elasticsearch+https"],
+    ),
     ("prometheus", &["prometheus+http"]),
     ("amqp", &["amqps"]),
     ("nats", &["nats+tls"]),
@@ -42,6 +45,8 @@ mod tests {
         assert_eq!(canonical_scheme("valkey"), "redis");
         assert_eq!(canonical_scheme("redpanda"), "kafka");
         assert_eq!(canonical_scheme("elasticsearch"), "opensearch");
+        assert_eq!(canonical_scheme("opensearch+https"), "opensearch");
+        assert_eq!(canonical_scheme("elasticsearch+https"), "opensearch");
         assert_eq!(canonical_scheme("prometheus+http"), "prometheus");
     }
 

@@ -8,11 +8,15 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
+use rustls::{ClientConfig, RootCertStore};
+use rustls_pki_types::ServerName;
 use serde_json::{json, Map, Value as JsonValue};
+use std::sync::Arc;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
+use tokio_rustls::TlsConnector;
 use url::Url;
 
 pub struct SearchAdapter {
@@ -103,24 +107,35 @@ struct SearchHttpClient {
     port: u16,
     base_path: String,
     authorization: Option<String>,
+    transport: SearchTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchTransport {
+    Plain,
+    Tls,
 }
 
 impl SearchHttpClient {
     fn from_dsn(dsn: &Dsn) -> Result<Self> {
         let url = Url::parse(&dsn.raw).map_err(|e| Error::Dsn(format!("invalid URL: {e}")))?;
-        match url.scheme() {
-            "opensearch" | "elasticsearch" => {}
+        let transport = match url.scheme() {
+            "opensearch" | "elasticsearch" => SearchTransport::Plain,
+            "opensearch+https" | "elasticsearch+https" => SearchTransport::Tls,
             scheme => {
                 return Err(Error::Dsn(format!(
-                    "search DSN must use opensearch:// or elasticsearch://, got {scheme}"
+                    "search DSN must use opensearch://, elasticsearch://, opensearch+https://, or elasticsearch+https://, got {scheme}"
                 )))
             }
-        }
+        };
 
         let host = url
             .host_str()
             .ok_or_else(|| Error::Dsn("search DSN requires a host".into()))?
             .to_owned();
+        if transport == SearchTransport::Tls {
+            validate_tls_server_name(&host)?;
+        }
         let port = url.port().unwrap_or(9200);
         let username = percent_decode(url.username())?;
         let password = url
@@ -140,6 +155,7 @@ impl SearchHttpClient {
             port,
             base_path,
             authorization,
+            transport,
         })
     }
 
@@ -151,26 +167,22 @@ impl SearchHttpClient {
     ) -> Result<JsonValue> {
         let (request, body) = self.build_request(method, path, body)?;
 
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))
+        let stream = TcpStream::connect((self.host.as_str(), self.port))
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
-        if !body.is_empty() {
-            stream
-                .write_all(&body)
+
+        if self.transport == SearchTransport::Tls {
+            let connector = TlsConnector::from(Arc::new(tls_client_config()?));
+            let server_name = ServerName::try_from(self.host.clone())
+                .map_err(|e| Error::Dsn(format!("invalid TLS server name: {e}")))?;
+            let stream = connector
+                .connect(server_name, stream)
                 .await
                 .map_err(|e| Error::Connection(e.to_string()))?;
+            return send_http_request(stream, &request, &body).await;
         }
 
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
-        parse_http_json(&response)
+        send_http_request(stream, &request, &body).await
     }
 
     fn build_request(
@@ -208,6 +220,59 @@ impl SearchHttpClient {
             format!("{}{}", self.base_path, path)
         }
     }
+}
+
+async fn send_http_request<S>(mut stream: S, request: &str, body: &[u8]) -> Result<JsonValue>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| Error::Connection(e.to_string()))?;
+    if !body.is_empty() {
+        stream
+            .write_all(body)
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+    }
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .map_err(|e| Error::Connection(e.to_string()))?;
+    parse_http_json(&response)
+}
+
+fn validate_tls_server_name(host: &str) -> Result<()> {
+    ServerName::try_from(host.to_owned())
+        .map(|_| ())
+        .map_err(|e| Error::Dsn(format!("invalid TLS server name: {e}")))
+}
+
+fn tls_client_config() -> Result<ClientConfig> {
+    let cert_result = rustls_native_certs::load_native_certs();
+    let load_errors = cert_result
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut roots = RootCertStore::empty();
+    let (valid, invalid) = roots.add_parsable_certificates(cert_result.certs);
+
+    if valid == 0 {
+        let mut reason = format!("no usable native root certificates found; ignored {invalid}");
+        if !load_errors.is_empty() {
+            reason.push_str(&format!("; load errors: {load_errors}"));
+        }
+        return Err(Error::Connection(reason));
+    }
+
+    Ok(ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
 }
 
 fn normalize_base_path(path: &str) -> String {
@@ -515,6 +580,29 @@ mod tests {
         assert!(request.starts_with("GET /_cat/indices?format=json&h=index HTTP/1.1"));
         assert!(request.contains("Host: search.local:9200"));
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn accepts_https_transport_schemes() {
+        let dsn = Dsn::parse("opensearch+https://search.local:9200/root").unwrap();
+        let client = SearchHttpClient::from_dsn(&dsn).unwrap();
+        let (request, body) = client
+            .build_request("GET", "/_cat/indices?format=json&h=index", None)
+            .unwrap();
+
+        assert_eq!(client.transport, SearchTransport::Tls);
+        assert!(request.starts_with("GET /root/_cat/indices?format=json&h=index HTTP/1.1"));
+        assert!(request.contains("Host: search.local:9200"));
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn accepts_elasticsearch_https_transport_scheme() {
+        let dsn = Dsn::parse("elasticsearch+https://search.local").unwrap();
+        let client = SearchHttpClient::from_dsn(&dsn).unwrap();
+
+        assert_eq!(client.transport, SearchTransport::Tls);
+        assert_eq!(client.port, 9200);
     }
 
     #[test]

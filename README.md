@@ -195,6 +195,14 @@ Messaging metadata has protocol-specific boundaries. See [docs/messaging-boundar
 
 Heavyweight future adapters such as SQL Server and Cassandra are tracked in [docs/extended-backends.md](docs/extended-backends.md); they intentionally remain unregistered until their protocol dependencies and Docker resource costs are accepted.
 
+OpenSearch and Elasticsearch-compatible endpoints can use plain HTTP or TLS:
+
+```bash
+dbtool --dsn opensearch://127.0.0.1:9200 search indices
+dbtool --dsn opensearch+https://search.example.com:9200 search indices
+dbtool --dsn elasticsearch+https://elastic.example.com:9200 search search logs '{"match_all":{}}'
+```
+
 ## Distribution
 
 Release builds compile each target once, upload raw binary artifacts, and reuse those artifacts for GitHub Release archives plus npm and pip/uv wrappers.
@@ -208,7 +216,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, Valkey, KeyDB, and Dragonfly compatibility profiles.
-- OpenSearch/Elasticsearch HTTP search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP mapping tests.
+- OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP/TLS mapping tests and plain HTTP OpenSearch live tests.
 - Prometheus HTTP time-series adapter: implemented for metric listing and range queries, with read-only semantics.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; NATS JetStream admin and RabbitMQ management-backed queue discovery are implemented.

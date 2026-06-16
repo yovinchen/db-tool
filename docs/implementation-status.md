@@ -47,8 +47,8 @@ usable.
 | AMQP/RabbitMQ | `amqp://`, `amqps://` | AMQP | produce, consume, queue detail | RabbitMQ live test; `amqps://` routing is registered but TLS is not live-tested |
 | RabbitMQ management | `rabbitmq+http://` | RabbitMQ HTTP admin | queue list, detail, lag | RabbitMQ management live test |
 | NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS live test; `nats+tls://` routing is registered but TLS is not live-tested |
-| OpenSearch | `opensearch://` | Search HTTP | index list, search, single-document index | Service-free fake HTTP adapter tests plus OpenSearch live profile |
-| Elasticsearch | `elasticsearch://` | Search HTTP | Routed to OpenSearch-compatible HTTP adapter | Service-free fake HTTP adapter tests; OpenSearch live profile covers compatible API surface |
+| OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list, search, single-document index | Service-free HTTP/TLS mapping tests plus OpenSearch live profile for plain HTTP |
+| Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | Routed to OpenSearch-compatible HTTP adapter | Service-free HTTP/TLS mapping tests; OpenSearch live profile covers compatible plain HTTP API surface |
 | Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list and range query | Service-free adapter tests plus Prometheus live profile |
 
 ## Docker Service Profiles
@@ -80,7 +80,7 @@ usable.
 
 | Item | Status | Why it is not fully usable | Recommended next task |
 | --- | --- | --- | --- |
-| Search HTTPS/TLS | Not implemented | The current search adapter uses a small plain HTTP client over Tokio TCP. | Add a TLS-capable HTTP path before advertising `https` support. |
+| Search HTTPS/TLS live coverage | Partial | `opensearch+https://` and `elasticsearch+https://` use rustls with native root certificates, but the Docker profile still validates plain HTTP OpenSearch only. | Add a TLS-enabled OpenSearch/Elasticsearch profile and live CLI tests. |
 | Prometheus remote write | Not supported | The implemented Prometheus adapter intentionally covers read APIs only; remote write is a separate protobuf/snappy protocol. | Add only if write-heavy time-series workflows become a requirement. |
 | SQL Server | Not implemented | No TDS adapter, DSN scheme, Docker profile, or tests exist; dependency and resource gate is documented. | Add `sqlserver://` adapter and a SQL Server container profile if image cost is acceptable. |
 | Cassandra | Not implemented | No CQL adapter, DSN scheme, Docker profile, or tests exist; trait decision is still needed. | Add only after accepting the CQL trait/dependency plan in `docs/extended-backends.md`. |
@@ -93,8 +93,8 @@ usable.
 
 ## Next Implementation Queue
 
-1. Add Search HTTPS/TLS support if secure OpenSearch/Elasticsearch compatibility matters.
+1. Add Search HTTPS/TLS live Docker coverage for the newly supported `opensearch+https://` and `elasticsearch+https://` schemes.
 2. Harden PostgreSQL-family compatibility with live CockroachDB and TimescaleDB profiles.
-3. Decide whether to add heavyweight protocol dependencies for SQL Server and Cassandra.
-4. Add TLS live coverage for `amqps://` and `nats+tls://` aliases if secure messaging compatibility matters.
-5. Expand TUI command history and richer per-capability forms.
+3. Add TLS live coverage for `amqps://` and `nats+tls://` aliases if secure messaging compatibility matters.
+4. Expand TUI command history and richer per-capability forms.
+5. Decide whether to add heavyweight protocol dependencies for SQL Server and Cassandra.
