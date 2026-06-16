@@ -278,6 +278,13 @@ current PD leader before verifying SQL continuity:
 ./scripts/integration-tidb-pd-leader-drill.sh
 ```
 
+Run the secure HA topology as a TiKV outage boundary drill, stopping one local
+TiKV node and requiring dbtool SQL probes to return within bounded time:
+
+```bash
+./scripts/integration-tidb-tikv-outage-boundary.sh
+```
+
 Run the secure HA topology as a certificate regeneration drill, recreating the
 local CA/server/client certificates between two cold starts and verifying TLS
 SQL through both generations:

@@ -174,8 +174,9 @@ Pass/fail criteria:
 
 This drill proves local TiDB SQL frontend failover through dbtool's MySQL-family
 adapter. Together with the PD leader, TiProxy, and certificate regeneration
-drills, it still does not replace placement, TiKV failure, backup/restore,
-upgrade, online certificate rotation, or existing-session migration drills.
+drills, it still does not replace placement, production TiKV failover,
+backup/restore, upgrade, online certificate rotation, or existing-session
+migration drills.
 
 ## PD Quorum Drill
 
@@ -256,6 +257,40 @@ online certificate rotation, or existing-session migration. The script applies
 `DBTOOL_IT_TIDB_PD_LEADER_DRILL_REQUEST_TIMEOUT` and
 `DBTOOL_IT_TIDB_PD_LEADER_DRILL_DEADLINE` to each dbtool call.
 
+## TiKV Outage Boundary Drill
+
+`./scripts/integration-tidb-tikv-outage-boundary.sh` reuses the secure HA
+topology for a bounded behavior check when one local TiKV service is stopped.
+It is local-only while the CI budget freeze is in effect.
+
+The drill performs this flow:
+
+1. Start the secure HA topology through `integration-tidb-secure-up.sh`.
+2. Create a fixture table through `tidb-secure-1` and read it through
+   `tidb-secure-2`.
+3. Stop `${DBTOOL_IT_TIDB_TIKV_OUTAGE_SERVICE:-tidb-secure-tikv-1}`.
+4. Run dbtool TLS SQL probes with
+   `DBTOOL_IT_TIDB_TIKV_OUTAGE_REQUEST_TIMEOUT` and
+   `DBTOOL_IT_TIDB_TIKV_OUTAGE_DEADLINE`.
+5. If the local topology continues serving a write, read the new row through
+   the opposite SQL node.
+6. If the local topology cannot serve a probe, require the dbtool command to
+   return before `DBTOOL_IT_TIDB_TIKV_OUTAGE_HARD_TIMEOUT`.
+7. Restart the stopped TiKV service and require both SQL nodes to accept TLS
+   `ping` again.
+
+Pass/fail criteria:
+
+- The drill must never hang while a TiKV service is stopped.
+- SQL probes during the outage must either succeed with cross-node readback or
+  return a bounded dbtool failure.
+- A probe that exceeds the hard timeout fails the drill.
+- The stopped TiKV service must restart cleanly before the script exits.
+
+This is a local boundary test for the two-TiKV integration harness. It does not
+claim production TiKV fault tolerance, placement-rule correctness, or quorum
+semantics for a production TiDB deployment.
+
 ## Certificate Regeneration Drill
 
 `./scripts/integration-tidb-cert-regeneration-test.sh` reuses the secure HA
@@ -321,7 +356,7 @@ The most likely local causes are a TiDB flag/version mismatch, not enough Docker
 
 - The default `tidb` profile is a single-node compatibility harness; use `tidb-secure` for local HA/security coverage.
 - The secure HA topology is still a local integration harness, not a production deployment model.
-- Password rotation, placement rules, TiKV failover, online certificate
+- Password rotation, placement rules, production TiKV failover, online certificate
   rotation, and upgrade scenarios are outside these tests.
 - The profile uses the local bootstrap root user only for disposable integration tests.
 - TiDB remains implemented through the MySQL-family adapter; the alias kind is preserved for user-facing metadata and test assertions.

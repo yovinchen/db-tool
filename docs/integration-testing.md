@@ -180,6 +180,21 @@ reported `pd-1`/`pd-2`/`pd-3` leader to the matching Compose service, stops that
 service, waits for a replacement leader, and then requires both TiDB SQL nodes
 to keep accepting TLS writes and reads.
 
+Run the secure HA TiKV outage boundary drill when you need to prove dbtool SQL
+operations are bounded while one local TiKV node is stopped:
+
+```bash
+./scripts/integration-tidb-tikv-outage-boundary.sh
+```
+
+The boundary drill starts the secure HA topology, creates a fixture table,
+stops one TiKV service, then runs TLS SQL probes with `--request-timeout` and
+`--deadline`. If the local 2-TiKV topology continues serving the probe, the
+script verifies cross-node readback. If the topology cannot serve the probe, the
+script still passes only when dbtool returns a bounded failure before the hard
+timeout. This is a timeout/failure-boundary check, not a production TiKV
+failover claim.
+
 Run the secure HA certificate regeneration drill when you need to prove the
 local TLS material can be regenerated and the topology can cold-start again
 with the new CA/server/client certificates:
@@ -357,6 +372,17 @@ DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
 DBTOOL_IT_TIDB_SECURE_PORT_1=45200 \
 DBTOOL_IT_TIDB_SECURE_PORT_2=45201 \
 ./scripts/integration-tidb-pd-leader-drill.sh
+```
+
+Use the same secure HA variables for the TiKV outage boundary drill:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-tidb-tikv-boundary \
+DBTOOL_IT_TIDB_SECURE_DB=my_tidb_secure \
+DBTOOL_IT_TIDB_SECURE_PORT_1=45300 \
+DBTOOL_IT_TIDB_SECURE_PORT_2=45301 \
+DBTOOL_IT_TIDB_TIKV_OUTAGE_SERVICE=tidb-secure-tikv-1 \
+./scripts/integration-tidb-tikv-outage-boundary.sh
 ```
 
 Use isolated secure HA variables for the certificate regeneration drill:
@@ -546,6 +572,9 @@ The live tests cover:
 - TiDB secure HA PD leader drill with TLS PD API leader discovery, targeted
   leader stop, replacement-leader detection, and SQL continuity checks through
   both SQL nodes.
+- TiDB secure HA TiKV outage boundary drill with one TiKV service stopped,
+  dbtool request/deadline bounded probes, and explicit success-vs-bounded
+  failure reporting.
 - TiDB secure HA certificate regeneration drill with changed CA/server/client
   certificate fingerprints across a cold restart and TLS SQL verification
   through both generations.
