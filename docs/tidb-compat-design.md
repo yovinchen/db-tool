@@ -72,6 +72,26 @@ docker compose -f docker-compose.integration.yml --profile tidb-secure config
 
 The live TiDB runs are opt-in through the `run_live_tidb` and `run_live_tidb_secure` workflow_dispatch inputs. This keeps PR feedback fast while preserving an automated path for compatibility and security verification.
 
+## HA Drill Manifest
+
+`testdata/tidb-ha-drills.manifest` is the service-free source of truth for the
+local TiDB secure HA drill evidence chain. Each row maps a drill id to its
+`integration-db-suite.sh` phase, executable script, documentation heading, and
+status (`done` or `boundary`).
+
+`./scripts/validate-tidb-ha-drills.sh` checks the manifest without starting
+Docker:
+
+- every listed script exists and is executable;
+- every listed suite phase is accepted by `integration-db-suite.sh` in dry-run
+  mode;
+- every listed documentation heading is present in this file;
+- the known production boundaries remain documented.
+
+The validator is part of `./scripts/verify.sh`, so ordinary local verification
+now fails if a TiDB HA drill script, suite phase, or documented pass/fail
+section drifts out of sync.
+
 ## Secure HA Profile
 
 `./scripts/integration-tidb-secure-test.sh` adds a heavier local topology:

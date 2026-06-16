@@ -1,0 +1,9 @@
+# id|suite-phase|script|documentation-heading|status
+secure-auth-tls|tidb-secure|scripts/integration-tidb-secure-test.sh|## Secure HA Profile|done
+sql-node-failover|tidb-ha|scripts/integration-tidb-ha-drill.sh|## Secure HA Failover Drill|done
+pd-quorum|tidb-pd|scripts/integration-tidb-pd-drill.sh|## PD Quorum Drill|done
+pd-leader|tidb-pd-leader|scripts/integration-tidb-pd-leader-drill.sh|## PD Leader Drill|done
+tikv-outage-boundary|tidb-tikv-boundary|scripts/integration-tidb-tikv-outage-boundary.sh|## TiKV Outage Boundary Drill|boundary
+cert-regeneration|tidb-cert|scripts/integration-tidb-cert-regeneration-test.sh|## Certificate Regeneration Drill|done
+logical-roundtrip|tidb-logical-roundtrip|scripts/integration-tidb-logical-roundtrip-test.sh|## Logical Roundtrip Smoke|done
+tiproxy-routing|tidb-tiproxy|scripts/integration-tidb-tiproxy-test.sh|## TiProxy Profile|done
