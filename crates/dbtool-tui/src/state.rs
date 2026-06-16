@@ -65,6 +65,7 @@ pub enum CapabilityForm {
     SearchIndex,
     TimeSeriesMeasurements,
     TimeSeriesQuery,
+    TimeSeriesWrite,
 }
 
 impl AppState {
@@ -323,6 +324,7 @@ impl CapabilityForm {
             Self::SearchIndex,
             Self::TimeSeriesMeasurements,
             Self::TimeSeriesQuery,
+            Self::TimeSeriesWrite,
         ]
     }
 
@@ -343,6 +345,7 @@ impl CapabilityForm {
             Self::SearchIndex => "Search index",
             Self::TimeSeriesMeasurements => "Time-series measurements",
             Self::TimeSeriesQuery => "Time-series query",
+            Self::TimeSeriesWrite => "Time-series write",
         }
     }
 
@@ -363,6 +366,7 @@ impl CapabilityForm {
             Self::SearchIndex => &["index", "document"],
             Self::TimeSeriesMeasurements => &[],
             Self::TimeSeriesQuery => &["expression"],
+            Self::TimeSeriesWrite => &["measurement", "value", "field", "tags"],
         }
     }
 
@@ -383,6 +387,7 @@ impl CapabilityForm {
             Self::SearchIndex => &["index", "{}"],
             Self::TimeSeriesMeasurements => &[],
             Self::TimeSeriesQuery => &["up"],
+            Self::TimeSeriesWrite => &["dbtool_sample", "1", "value", "job=dbtool"],
         }
     }
 
@@ -423,6 +428,15 @@ impl CapabilityForm {
             Self::SearchIndex => format!("search index {} {}", value(0), value(1)),
             Self::TimeSeriesMeasurements => "ts measurements".to_owned(),
             Self::TimeSeriesQuery => format!("ts query {}", value(0)),
+            Self::TimeSeriesWrite => {
+                format!(
+                    "ts write {} {} field={} {}",
+                    value(0),
+                    value(1),
+                    value(2),
+                    value(3)
+                )
+            }
         }
     }
 }
@@ -579,5 +593,27 @@ mod tests {
             "sql exec create table example (id integer primary key)"
         );
         assert_eq!(state.active_panel, Panel::QueryInput);
+    }
+
+    #[test]
+    fn time_series_write_form_generates_write_command() {
+        let mut form = CommandFormState::new(CapabilityForm::TimeSeriesWrite);
+
+        assert_eq!(
+            form.command(),
+            "ts write dbtool_sample 1 field=value job=dbtool"
+        );
+        for c in "requests_total".chars() {
+            form.push_char(c);
+        }
+        form.next_field();
+        for c in "2".chars() {
+            form.push_char(c);
+        }
+
+        assert_eq!(
+            form.command(),
+            "ts write requests_total 2 field=value job=dbtool"
+        );
     }
 }

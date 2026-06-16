@@ -19,7 +19,7 @@ usable.
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`, then apply CLI overrides such as `--rate`, `--request-timeout`, and `--deadline`; CLI execution uses the one-shot path so writes are not replayed by retries. |
 | Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, and observability profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; live Docker jobs are manual workflow inputs. |
-| TUI | Partial | Connection picker, read command dispatch, read limits, write confirmation, and smoke tests exist; richer per-capability forms remain future work. |
+| TUI | Implemented | Connection picker, capability-aware command dispatch, read limits, write confirmation, command history, full-screen status, per-capability forms, and smoke tests are in place. |
 
 ## Usable Database And Protocol Matrix
 
@@ -59,7 +59,7 @@ usable.
 | NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS plain and TLS live tests |
 | OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list, search, single-document index | Service-free HTTP/TLS mapping tests, real OpenSearch plain HTTP live profile, and HTTPS compatible harness |
 | Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | Routed to OpenSearch-compatible HTTP adapter | Service-free HTTP/TLS mapping tests; OpenSearch-compatible live coverage covers the shared API surface |
-| Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list and range query | Service-free adapter tests plus Prometheus live profile |
+| Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list, range query, and remote write | Service-free adapter tests plus Prometheus live profile |
 
 ## Docker Service Profiles
 
@@ -104,7 +104,7 @@ usable.
 | Document | `doc collections`, `doc find`, `doc insert`, `doc update`, `doc delete`, `doc aggregate` | insert/update/delete require `--allow-write`; delete refuses empty filters adapter-side |
 | Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write` |
 | Search | `search indices`, `search search`, `search index` | `index` requires `--allow-write` |
-| Time series | `ts measurements`, `ts query` | Prometheus adapter is read-only; point writes are not exposed by CLI |
+| Time series | `ts measurements`, `ts query`, `ts write` | Prometheus remote write is exposed through explicit `--allow-write`; remote write uses a minimal protobuf/snappy encoder with no new runtime dependency |
 
 ## Not Implemented Or Not Yet Fully Usable
 

@@ -11,13 +11,13 @@ use dbtool_core::{
     config::{env::discover_env_connections, ConnectionConfig},
     dsn::Dsn,
     error::Error,
-    model::{FindOptions, TimeRange, Value},
+    model::{FindOptions, Point, TimeRange, Value},
     registry::Registry,
     service::{safety::SafetyGuard, ConnectionManager},
     Result,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 pub struct App {
     _manager: Arc<ConnectionManager>,
@@ -35,7 +35,7 @@ impl App {
     }
 
     pub fn help_text() -> &'static str {
-        "dbtool-tui\n\nUsage: dbtool-tui [--smoke]\n\nKeys: Tab changes panel, Enter runs a query command, Up/Down recall command history in the query panel, F2 changes the capability form, F3 changes form field, F4 applies the form, y confirms a pending write, n cancels it, q quits.\nCommands: ping, caps, sql <query>, sql exec <statement>, tables, schema <table>, kv get/scan/set/del, doc collections/find, search indices/index/query, ts measurements/query."
+        "dbtool-tui\n\nUsage: dbtool-tui [--smoke]\n\nKeys: Tab changes panel, Enter runs a query command, Up/Down recall command history in the query panel, F2 changes the capability form, F3 changes form field, F4 applies the form, y confirms a pending write, n cancels it, q quits.\nCommands: ping, caps, sql <query>, sql exec <statement>, tables, schema <table>, kv get/scan/set/del, doc collections/find, search indices/index/query, ts measurements/query/write."
     }
 
     pub fn smoke_summary(&self) -> String {
@@ -395,11 +395,55 @@ async fn run_ts_command(
     if command == "measurements" {
         return render_json(ts.list_measurements().await?);
     }
+    if let Some(rest) = command.strip_prefix("write ").map(str::trim) {
+        let point = parse_tui_ts_point(rest)?;
+        ts.write_points(vec![point]).await?;
+        return render_json(serde_json::json!({
+            "written_points": 1,
+            "written_samples": 1
+        }));
+    }
     let query = command
         .strip_prefix("query ")
         .map(str::trim)
-        .ok_or_else(|| Error::Config("ts command must be measurements or query <expr>".into()))?;
+        .ok_or_else(|| Error::Config("ts command must be measurements, query <expr>, or write <measurement> <value> [field=<name>] [tag=value...]".into()))?;
     render_json(ts.query_range(query, TimeRange::last_n_minutes(60)).await?)
+}
+
+fn parse_tui_ts_point(raw: &str) -> Result<Point> {
+    let mut parts = raw.split_whitespace();
+    let measurement = parts
+        .next()
+        .ok_or_else(|| Error::Config("ts write requires a measurement".into()))?
+        .to_owned();
+    let value = parts
+        .next()
+        .ok_or_else(|| Error::Config("ts write requires a value".into()))?
+        .parse::<f64>()
+        .map_err(|e| Error::Config(format!("invalid ts write value: {e}")))?;
+    let mut field = "value".to_owned();
+    let mut tags = HashMap::new();
+
+    for token in parts {
+        let (key, value) = token
+            .split_once('=')
+            .ok_or_else(|| Error::Config(format!("invalid ts write option '{token}'")))?;
+        if key == "field" {
+            field = value.to_owned();
+        } else {
+            tags.insert(key.to_owned(), value.to_owned());
+        }
+    }
+
+    Ok(Point {
+        measurement,
+        tags,
+        fields: HashMap::from([(field, value)]),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+    })
 }
 
 fn command_requires_write(command: &str) -> bool {
@@ -412,6 +456,7 @@ fn command_requires_write(command: &str) -> bool {
         || command.starts_with("doc update ")
         || command.starts_with("doc delete ")
         || command.starts_with("search index ")
+        || command.starts_with("ts write ")
 }
 
 fn parse_json_value(raw: &str) -> Result<Value> {
@@ -460,8 +505,20 @@ mod tests {
         ));
         assert!(command_requires_write("kv set key value"));
         assert!(command_requires_write("search index users {}"));
+        assert!(command_requires_write("ts write requests_total 1"));
         assert!(!command_requires_write("sql select 1"));
         assert!(!command_requires_write("kv get key"));
+    }
+
+    #[test]
+    fn parses_tui_time_series_write_point() {
+        let point =
+            parse_tui_ts_point("requests_total 2.5 field=count job=api instance=local").unwrap();
+
+        assert_eq!(point.measurement, "requests_total");
+        assert_eq!(point.fields["count"], 2.5);
+        assert_eq!(point.tags["job"], "api");
+        assert_eq!(point.tags["instance"], "local");
     }
 
     #[test]

@@ -79,6 +79,7 @@ cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 --limit 10 search s
 cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 --allow-write search index users '{"name":"alice"}'
 cargo run -p dbtool-cli -- --dsn prometheus://127.0.0.1:9090 ts measurements
 cargo run -p dbtool-cli -- --dsn prometheus://127.0.0.1:9090 ts query up --last-minutes 10
+cargo run -p dbtool-cli -- --dsn prometheus://127.0.0.1:9090 --allow-write ts write dbtool_sample 1 --tag job=dbtool
 ```
 
 Named connections resolve in this order:

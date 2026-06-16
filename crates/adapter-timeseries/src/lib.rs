@@ -71,11 +71,14 @@ impl TimeSeriesStore for PrometheusAdapter {
         measurement_names_from_response(&response)
     }
 
-    async fn write_points(&self, _points: Vec<Point>) -> Result<()> {
-        Err(Error::UnsupportedCapability {
-            kind: self.kind.0.clone(),
-            needed: "TimeSeriesStore::write_points",
-        })
+    async fn write_points(&self, points: Vec<Point>) -> Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+
+        let protobuf = remote_write_protobuf(&points)?;
+        let payload = snappy_literal_block(&protobuf)?;
+        self.client.request_remote_write(&payload).await
     }
 
     async fn query_range(&self, query: &str, range: TimeRange) -> Result<SeriesSet> {
@@ -167,6 +170,28 @@ impl PrometheusHttpClient {
         parse_http_json(&response)
     }
 
+    async fn request_remote_write(&self, body: &[u8]) -> Result<()> {
+        let request = self.build_remote_write_request(body.len());
+        let mut stream = TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        stream
+            .write_all(body)
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        parse_http_success(&response, "prometheus remote write")
+    }
+
     fn build_request(
         &self,
         method: &str,
@@ -191,6 +216,22 @@ impl PrometheusHttpClient {
         }
         request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
         Ok((request, body))
+    }
+
+    fn build_remote_write_request(&self, body_len: usize) -> String {
+        let path = self.full_path("/api/v1/write");
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}:{}\r\nAccept: application/json\r\nConnection: close\r\n",
+            self.host, self.port
+        );
+        if let Some(authorization) = &self.authorization {
+            request.push_str(&format!("Authorization: Basic {authorization}\r\n"));
+        }
+        request.push_str("Content-Type: application/x-protobuf\r\n");
+        request.push_str("Content-Encoding: snappy\r\n");
+        request.push_str("X-Prometheus-Remote-Write-Version: 0.1.0\r\n");
+        request.push_str(&format!("Content-Length: {body_len}\r\n\r\n"));
+        request
     }
 
     fn query_range_path(&self, query: &str, range: TimeRange) -> String {
@@ -300,6 +341,137 @@ fn ensure_success(response: &JsonValue) -> Result<()> {
     Err(Error::Query(error.to_owned()))
 }
 
+fn remote_write_protobuf(points: &[Point]) -> Result<Vec<u8>> {
+    let mut request = Vec::new();
+
+    for point in points {
+        validate_metric_name(&point.measurement)?;
+        let mut fields = point.fields.iter().collect::<Vec<_>>();
+        fields.sort_by(|a, b| a.0.cmp(b.0));
+        for (field, value) in fields {
+            let metric = metric_name_for_field(point, field)?;
+            let mut timeseries = Vec::new();
+
+            encode_label(&mut timeseries, "__name__", &metric);
+            let mut tags = point.tags.iter().collect::<Vec<_>>();
+            tags.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, value) in tags {
+                validate_label_name(name)?;
+                encode_label(&mut timeseries, name, value);
+            }
+            encode_sample(&mut timeseries, *value, point.timestamp);
+            encode_len_delimited(1, &timeseries, &mut request);
+        }
+    }
+
+    Ok(request)
+}
+
+fn metric_name_for_field(point: &Point, field: &str) -> Result<String> {
+    validate_label_name(field)?;
+    let metric = if point.fields.len() == 1 && field == "value" {
+        point.measurement.clone()
+    } else {
+        format!("{}_{}", point.measurement, field)
+    };
+    validate_metric_name(&metric)?;
+    Ok(metric)
+}
+
+fn encode_label(output: &mut Vec<u8>, name: &str, value: &str) {
+    let mut label = Vec::new();
+    encode_string(1, name, &mut label);
+    encode_string(2, value, &mut label);
+    encode_len_delimited(1, &label, output);
+}
+
+fn encode_sample(output: &mut Vec<u8>, value: f64, timestamp: i64) {
+    let mut sample = Vec::new();
+    encode_key(1, 1, &mut sample);
+    sample.extend_from_slice(&value.to_le_bytes());
+    encode_key(2, 0, &mut sample);
+    encode_varint(timestamp as u64, &mut sample);
+    encode_len_delimited(2, &sample, output);
+}
+
+fn encode_string(field_number: u32, value: &str, output: &mut Vec<u8>) {
+    encode_len_delimited(field_number, value.as_bytes(), output);
+}
+
+fn encode_len_delimited(field_number: u32, value: &[u8], output: &mut Vec<u8>) {
+    encode_key(field_number, 2, output);
+    encode_varint(value.len() as u64, output);
+    output.extend_from_slice(value);
+}
+
+fn encode_key(field_number: u32, wire_type: u8, output: &mut Vec<u8>) {
+    encode_varint(((field_number as u64) << 3) | u64::from(wire_type), output);
+}
+
+fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn snappy_literal_block(input: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    encode_varint(input.len() as u64, &mut output);
+
+    if input.is_empty() {
+        return Ok(output);
+    }
+
+    let literal_len = input.len() - 1;
+    if literal_len < 60 {
+        output.push((literal_len as u8) << 2);
+    } else {
+        let mut length_bytes = Vec::new();
+        let mut value = literal_len;
+        while value > 0 {
+            length_bytes.push((value & 0xff) as u8);
+            value >>= 8;
+        }
+        if length_bytes.len() > 4 {
+            return Err(Error::Serialization(
+                "prometheus remote write payload is too large".into(),
+            ));
+        }
+        output.push(((59 + length_bytes.len()) as u8) << 2);
+        output.extend_from_slice(&length_bytes);
+    }
+    output.extend_from_slice(input);
+    Ok(output)
+}
+
+fn validate_metric_name(name: &str) -> Result<()> {
+    validate_name(name, true, "prometheus metric name")
+}
+
+fn validate_label_name(name: &str) -> Result<()> {
+    validate_name(name, false, "prometheus label name")
+}
+
+fn validate_name(name: &str, allow_colon: bool, label: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(Error::Config(format!("{label} must not be empty")));
+    };
+    let valid_first = first == '_' || first.is_ascii_alphabetic() || (allow_colon && first == ':');
+    if !valid_first {
+        return Err(Error::Config(format!("invalid {label}: {name}")));
+    }
+    let valid_rest =
+        chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric() || (allow_colon && ch == ':'));
+    if valid_rest {
+        Ok(())
+    } else {
+        Err(Error::Config(format!("invalid {label}: {name}")))
+    }
+}
+
 fn sorted_labels(metric: &Map<String, JsonValue>) -> Vec<(String, String)> {
     let mut labels = metric
         .iter()
@@ -390,6 +562,32 @@ fn millis_to_seconds(millis: i64) -> String {
 }
 
 fn parse_http_json(response: &[u8]) -> Result<JsonValue> {
+    let (status, body) = parse_http_response(response)?;
+    let body_text = std::str::from_utf8(&body).map_err(|e| Error::Serialization(e.to_string()))?;
+
+    if !(200..300).contains(&status) {
+        return Err(Error::Query(format!(
+            "prometheus backend returned HTTP {status}: {body_text}"
+        )));
+    }
+    if body_text.trim().is_empty() {
+        return Ok(JsonValue::Object(Map::new()));
+    }
+    serde_json::from_str(body_text).map_err(|e| Error::Serialization(e.to_string()))
+}
+
+fn parse_http_success(response: &[u8], operation: &str) -> Result<()> {
+    let (status, body) = parse_http_response(response)?;
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    let body_text = String::from_utf8_lossy(&body);
+    Err(Error::Query(format!(
+        "{operation} returned HTTP {status}: {body_text}"
+    )))
+}
+
+fn parse_http_response(response: &[u8]) -> Result<(u16, Vec<u8>)> {
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -412,17 +610,7 @@ fn parse_http_json(response: &[u8]) -> Result<JsonValue> {
     } else {
         body.to_vec()
     };
-    let body_text = std::str::from_utf8(&body).map_err(|e| Error::Serialization(e.to_string()))?;
-
-    if !(200..300).contains(&status) {
-        return Err(Error::Query(format!(
-            "prometheus backend returned HTTP {status}: {body_text}"
-        )));
-    }
-    if body_text.trim().is_empty() {
-        return Ok(JsonValue::Object(Map::new()));
-    }
-    serde_json::from_str(body_text).map_err(|e| Error::Serialization(e.to_string()))
+    Ok((status, body))
 }
 
 fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
@@ -512,6 +700,7 @@ fn base64_encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn parses_measurement_names() {
@@ -594,10 +783,110 @@ mod tests {
     }
 
     #[test]
+    fn builds_remote_write_request_headers() {
+        let dsn = Dsn::parse("prometheus://alice:secret@prom.local:9091/base").unwrap();
+        let client = PrometheusHttpClient::from_dsn(&dsn).unwrap();
+        let request = client.build_remote_write_request(123);
+
+        assert!(request.starts_with("POST /base/api/v1/write HTTP/1.1"));
+        assert!(request.contains("Authorization: Basic YWxpY2U6c2VjcmV0"));
+        assert!(request.contains("Content-Type: application/x-protobuf"));
+        assert!(request.contains("Content-Encoding: snappy"));
+        assert!(request.contains("X-Prometheus-Remote-Write-Version: 0.1.0"));
+        assert!(request.contains("Content-Length: 123"));
+    }
+
+    #[test]
+    fn remote_write_protobuf_encodes_labels_and_samples() {
+        let point = Point {
+            measurement: "http_requests_total".to_owned(),
+            tags: HashMap::from([
+                ("method".to_owned(), "GET".to_owned()),
+                ("service".to_owned(), "api".to_owned()),
+            ]),
+            fields: HashMap::from([("value".to_owned(), 42.5)]),
+            timestamp: 1_710_000_000_123,
+        };
+
+        let encoded = remote_write_protobuf(&[point]).unwrap();
+
+        assert!(contains_bytes(&encoded, b"__name__"));
+        assert!(contains_bytes(&encoded, b"http_requests_total"));
+        assert!(contains_bytes(&encoded, b"method"));
+        assert!(contains_bytes(&encoded, b"GET"));
+        assert!(contains_bytes(&encoded, b"service"));
+        assert!(contains_bytes(&encoded, b"api"));
+        assert!(contains_bytes(&encoded, &42.5_f64.to_le_bytes()));
+    }
+
+    #[test]
+    fn remote_write_rejects_invalid_prometheus_names() {
+        let point = Point {
+            measurement: "bad metric".to_owned(),
+            tags: HashMap::new(),
+            fields: HashMap::from([("value".to_owned(), 1.0)]),
+            timestamp: 1,
+        };
+
+        assert!(matches!(
+            remote_write_protobuf(&[point]),
+            Err(Error::Config(message)) if message.contains("metric name")
+        ));
+    }
+
+    #[test]
+    fn snappy_literal_block_round_trips_without_external_dependency() {
+        let payload = (0..300).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let block = snappy_literal_block(&payload).unwrap();
+        let decoded = decode_test_snappy_literal(&block);
+
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
     fn decodes_chunked_json_response() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n13\r\n{\"status\":\"success\"\r\n1\r\n}\r\n0\r\n\r\n";
         let value = parse_http_json(response).unwrap();
 
         assert_eq!(value["status"], "success");
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn decode_test_snappy_literal(block: &[u8]) -> Vec<u8> {
+        let mut pos = 0;
+        let mut len = 0usize;
+        let mut shift = 0;
+        loop {
+            let byte = block[pos];
+            pos += 1;
+            len |= ((byte & 0x7f) as usize) << shift;
+            if byte < 0x80 {
+                break;
+            }
+            shift += 7;
+        }
+
+        let tag = block[pos];
+        pos += 1;
+        assert_eq!(tag & 0b11, 0);
+        let literal_len = match tag >> 2 {
+            n @ 0..=59 => n as usize + 1,
+            n => {
+                let length_bytes = (n - 59) as usize;
+                let mut value = 0usize;
+                for index in 0..length_bytes {
+                    value |= (block[pos + index] as usize) << (index * 8);
+                }
+                pos += length_bytes;
+                value + 1
+            }
+        };
+        assert_eq!(literal_len, len);
+        block[pos..pos + literal_len].to_vec()
     }
 }

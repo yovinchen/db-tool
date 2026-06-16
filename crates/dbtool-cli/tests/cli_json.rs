@@ -216,6 +216,20 @@ fn search_index_requires_write_flag_before_connecting() {
 }
 
 #[test]
+fn ts_write_requires_write_flag_before_connecting() {
+    let err = stderr_json(&dbtool(&[
+        "--dsn",
+        "prometheus://127.0.0.1:1",
+        "ts",
+        "write",
+        "dbtool_sample",
+        "1",
+    ]));
+
+    assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");
+}
+
+#[test]
 fn named_connection_limits_are_loaded_for_data_commands() {
     let output = dbtool_with_config(
         &["--conn", "limit-test", "ping"],
