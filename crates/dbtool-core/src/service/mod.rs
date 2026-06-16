@@ -10,4 +10,4 @@ pub use limiter::ResultLimiter;
 pub use manager::ConnectionManager;
 pub use resolver::ConnectionResolver;
 pub use safety::SafetyGuard;
-pub use throttle::{FlowControl, ThrottleConfig};
+pub use throttle::{FlowControl, Rate, ThrottleConfig};

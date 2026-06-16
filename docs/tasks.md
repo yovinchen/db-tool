@@ -23,7 +23,7 @@ Goal: frontends and adapters share one behavior layer.
 - [x] JSON formatter envelope.
 - [x] Result limiter.
 - [x] SQL safety guard and two-step token confirmation.
-- [x] Flow-control service with bounded retry budget.
+- [x] Flow-control service with concurrency, rate limiting, timeout, and bounded retry budget.
 - [x] Replace keyword SQL classifier with `sqlparser`-backed classification.
 - [x] Bind confirm token to target connection and impact summary.
 - [x] Unit tests for resolver, formatter, flow control, and safety edge cases.
