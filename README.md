@@ -168,6 +168,20 @@ table/schema inspection, write guards, and configured request timeout:
 ./scripts/smoke-core-flow.sh
 ```
 
+The dbtool CLI can also be built as a container image and checked with the same
+core smoke flow:
+
+```bash
+docker build -f docker/dbtool/Dockerfile -t dbtool:local .
+./scripts/smoke-core-flow.sh docker://dbtool:local
+```
+
+For one command that builds and smokes the image:
+
+```bash
+./scripts/smoke-docker-image.sh
+```
+
 Live database integration tests can start local Docker services with resource limits:
 
 ```bash

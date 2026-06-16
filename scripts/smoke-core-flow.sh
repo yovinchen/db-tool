@@ -3,6 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${1:-}"
+DOCKER_IMAGE=""
+
+case "$BIN" in
+  docker://*)
+    DOCKER_IMAGE="${BIN#docker://}"
+    BIN=""
+    ;;
+esac
 
 if [[ -n "$BIN" && ! -x "$BIN" ]]; then
   echo "binary is not executable: $BIN" >&2
@@ -17,6 +25,14 @@ trap cleanup EXIT
 
 db_file="$tmp/core-flow.db"
 config_home="$tmp/config"
+config_env="$config_home"
+db_dsn="sqlite://$db_file"
+
+if [[ -n "$DOCKER_IMAGE" ]]; then
+  config_env="/work/config"
+  db_dsn="sqlite:///work/core-flow.db"
+fi
+
 mkdir -p "$config_home/dbtool"
 touch "$db_file"
 
@@ -30,11 +46,11 @@ overall_deadline = "5s"
 max_retries = 0
 
 [connections.smoke-sqlite]
-dsn = "sqlite://$db_file"
+dsn = "$db_dsn"
 readonly = false
 
 [connections.timeout-sqlite]
-dsn = "sqlite://$db_file"
+dsn = "$db_dsn"
 readonly = false
 
 [connections.timeout-sqlite.limits]
@@ -44,7 +60,12 @@ max_retries = 0
 EOF
 
 run_dbtool() {
-  if [[ -n "$BIN" ]]; then
+  if [[ -n "$DOCKER_IMAGE" ]]; then
+    docker run --rm \
+      -e XDG_CONFIG_HOME="$config_env" \
+      -v "$tmp:/work" \
+      "$DOCKER_IMAGE" "$@"
+  elif [[ -n "$BIN" ]]; then
     XDG_CONFIG_HOME="$config_home" "$BIN" "$@"
   else
     XDG_CONFIG_HOME="$config_home" cargo run -q -p dbtool-cli -- "$@"

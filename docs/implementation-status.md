@@ -16,7 +16,7 @@ usable.
 | Output formats | Implemented | JSON is the default. `--format table` and `--format ndjson` are implemented for successful command output; errors always stay JSON so `error.code` and confirmation tokens remain machine-readable. |
 | SQL safety | Implemented | Read statements are allowed, writes need `--allow-write`, destructive SQL needs a confirm token bound to the target. |
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`; CLI execution uses the one-shot path so writes are not replayed by retries. |
-| Docker integration | Implemented | Base databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, and observability profiles are available. |
+| Docker integration | Implemented | Base databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, and observability profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; live Docker jobs are manual workflow inputs. |
 | TUI | Partial | Connection picker, read command dispatch, read limits, write confirmation, and smoke tests exist; richer per-capability forms remain future work. |
 

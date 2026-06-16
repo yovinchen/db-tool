@@ -96,6 +96,7 @@ Goal: release-quality packages and optional advanced backends.
 - [x] Make workflows reuse build artifacts and avoid duplicate builds.
 - [x] npm/pip/uv/mise packaging.
 - [x] Optional native Kafka implementation.
+- [x] Dockerfile for containerized dbtool CLI runtime plus Docker image smoke script.
 - [x] OpenSearch/Elasticsearch HTTP search adapter.
 - [x] Prometheus HTTP time-series adapter.
 - [x] SQL Server adapter behind an opt-in Docker profile with service-free coverage and documented amd64 live gate.
@@ -117,6 +118,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] CPU/memory/resource limits for integration services.
 - [x] Integration scripts for up/down/test lifecycle.
 - [x] Service-free smoke script for core SQLite CRUD, safety, result limiting, and configured timeout behavior.
+- [x] Docker image smoke script that runs the same core SQLite flow inside the containerized dbtool CLI.
 - [x] Live CLI tests for SQL, KV, and document workflows.
 - [x] Live CLI tests for MySQL protocol aliases and Redis-compatible protocol aliases.
 - [x] Live CLI tests for real MariaDB, Valkey, KeyDB, and Dragonfly compatibility services.
