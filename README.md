@@ -159,6 +159,12 @@ Run the optional Redis-compatible matrix with KeyDB and Dragonfly as well:
 DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh
 ```
 
+PostgreSQL-family compatibility tests start real CockroachDB and TimescaleDB services:
+
+```bash
+./scripts/integration-pg-compat-test.sh
+```
+
 TiDB compatibility uses a heavier PD/TiKV/TiDB profile:
 
 ```bash

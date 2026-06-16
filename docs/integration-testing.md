@@ -28,6 +28,16 @@ DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh
 
 That extra mode adds KeyDB and Dragonfly. KeyDB is pinned to `linux/amd64` by default because its published Alpine image is amd64-only on Apple Silicon.
 
+PostgreSQL-family compatibility tests use their own profile:
+
+```bash
+./scripts/integration-pg-compat-test.sh
+```
+
+The PostgreSQL-family compatibility script starts CockroachDB and TimescaleDB,
+waits for health checks, runs `cockroach://` and `timescale://` live SQL tests,
+and removes the containers and volumes.
+
 TiDB compatibility uses its own profile because it starts a small PD/TiKV/TiDB topology:
 
 ```bash
@@ -103,6 +113,17 @@ DBTOOL_IT_COMPAT_EXTRA=1 \
 ./scripts/integration-compat-test.sh
 ```
 
+PostgreSQL-family compatible service settings can be overridden separately:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-pg-compat-run \
+DBTOOL_IT_COCKROACH_PORT=36257 \
+DBTOOL_IT_COCKROACH_HTTP_PORT=38080 \
+DBTOOL_IT_TIMESCALE_DB=my_timescale \
+DBTOOL_IT_TIMESCALE_PORT=35432 \
+./scripts/integration-pg-compat-test.sh
+```
+
 TiDB service settings follow the same pattern:
 
 ```bash
@@ -164,12 +185,13 @@ DBTOOL_IT_PROJECT=my-dbtool-run ./scripts/integration-down.sh
 
 ## CI Profiles
 
-Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, TiDB, messaging, and observability Docker Compose configs without starting containers.
+Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, PostgreSQL-family compatibility, TiDB, messaging, and observability Docker Compose configs without starting containers.
 
 Live integration jobs are opt-in from the GitHub Actions **Run workflow** button:
 
 - `run_live_services` runs `./scripts/integration-test.sh` for Postgres, MySQL, Redis, and MongoDB.
 - `run_live_compat` can run `./scripts/integration-compat-test.sh` for MariaDB and Valkey, with `DBTOOL_IT_COMPAT_EXTRA=1` for KeyDB and Dragonfly.
+- `run_live_pg_compat` runs `./scripts/integration-pg-compat-test.sh` for CockroachDB and TimescaleDB.
 - `run_live_tidb` runs `./scripts/integration-tidb-test.sh` for TiDB through a local PD/TiKV/TiDB topology.
 - `run_live_tidb_secure` runs `./scripts/integration-tidb-secure-test.sh` for TiDB auth/TLS/HA coverage.
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
@@ -187,6 +209,8 @@ The compose file applies conservative defaults:
 - Redis: `0.25` CPU, `256m` memory plus `128mb` Redis maxmemory
 - MongoDB: `0.50` CPU, `512m` memory
 - MariaDB compat: `0.50` CPU, `512m` memory
+- CockroachDB pg-compat: `0.50` CPU, `512m` memory
+- TimescaleDB pg-compat: `0.50` CPU, `512m` memory
 - Valkey compat: `0.25` CPU, `256m` memory plus `128mb` maxmemory
 - KeyDB compat-extra: `0.25` CPU, `256m` memory plus `128mb` maxmemory
 - Dragonfly compat-extra: `0.25` CPU, `384m` memory plus `256mb` maxmemory
@@ -205,7 +229,7 @@ The compose file applies conservative defaults:
 
 Override with variables such as `DBTOOL_IT_MYSQL_MEMORY=1g` or `DBTOOL_IT_REDIS_MAXMEMORY=64mb`.
 
-The base service suite is capped at roughly 2 GiB of container memory, the messaging suite is capped at roughly 2 GiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
+The base service suite is capped at roughly 2 GiB of container memory, the PostgreSQL-family compatibility suite is capped at roughly 1 GiB, the messaging suite is capped at roughly 2 GiB, the observability suite is capped at roughly 1.4 GiB, the TiDB suite is capped at roughly 1.75 GiB, and the TiDB secure HA suite is capped at roughly 3.75 GiB. If several suites are kept running at the same time, reserve Docker memory for their combined limits plus headroom. Redpanda, OpenSearch, CockroachDB, and TiKV are the largest single services; increase `DBTOOL_IT_KAFKA_MEMORY` with `DBTOOL_IT_KAFKA_BROKER_MEMORY`, `DBTOOL_IT_OPENSEARCH_MEMORY`, `DBTOOL_IT_COCKROACH_MEMORY`, `DBTOOL_IT_TIDB_TIKV_MEMORY`, or `DBTOOL_IT_TIDB_SECURE_TIKV_MEMORY` if one fails to become healthy under local load.
 
 ## Live Test Scope
 
@@ -213,6 +237,7 @@ The live tests cover:
 
 - Postgres and MySQL ping, destructive SQL confirmation, insert/query/schema/drop.
 - MariaDB/TiDB alias DSNs against the MySQL protocol adapter, typed MySQL values, and result limiting.
+- CockroachDB/TimescaleDB alias DSNs against the PostgreSQL protocol adapter, typed Postgres-family values, result limiting, table listing, schema inspection, and SQL lifecycle.
 - Redis ping, set/get/scan/raw typed output, TTL, scan truncation, multi-key delete, blocked destructive raw command, and blocked mutating raw command without `--allow-write`.
 - Valkey/KeyDB/Dragonfly alias DSNs against the Redis protocol adapter.
 - Real MariaDB compatibility through `mariadb://` against a MariaDB container.

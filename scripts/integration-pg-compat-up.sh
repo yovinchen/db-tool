@@ -7,11 +7,12 @@ source "$ROOT/scripts/integration-env.sh"
 docker compose \
   -f "$ROOT/docker-compose.integration.yml" \
   -p "$DBTOOL_IT_PROJECT" \
-  --profile messaging \
-  --profile compat \
-  --profile compat-extra \
   --profile pg-compat \
-  --profile tidb \
-  --profile tidb-secure \
-  --profile observability \
-  down -v --remove-orphans
+  up -d --wait --wait-timeout "${DBTOOL_IT_WAIT_TIMEOUT:-240}" \
+  cockroach timescale
+
+docker compose \
+  -f "$ROOT/docker-compose.integration.yml" \
+  -p "$DBTOOL_IT_PROJECT" \
+  --profile pg-compat \
+  ps cockroach timescale

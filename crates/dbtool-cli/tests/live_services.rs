@@ -15,6 +15,11 @@ fn compat_enabled(flag: &str) -> bool {
         && env::var(flag).as_deref() == Ok("1")
 }
 
+fn pg_compat_enabled(flag: &str) -> bool {
+    env::var("DBTOOL_RUN_PG_COMPAT_INTEGRATION").as_deref() == Ok("1")
+        && env::var(flag).as_deref() == Ok("1")
+}
+
 fn tidb_enabled() -> bool {
     env::var("DBTOOL_RUN_TIDB_INTEGRATION").as_deref() == Ok("1")
 }
@@ -187,6 +192,42 @@ fn mysql_family_typed_probe(dsn: &str, expected_kind: &str) {
     assert_eq!(row[1].as_f64().expect("float should decode"), 3.5);
     assert_eq!(row[2], serde_json::json!([104, 105]));
     assert_eq!(row[3], Value::Null);
+
+    let limited = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--limit",
+        "2",
+        "sql",
+        "query",
+        "select 1 as n union all select 2 union all select 3",
+    ]));
+    assert_eq!(limited["data"]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(limited["meta"]["truncated"], true);
+}
+
+fn postgres_family_typed_probe(dsn: &str, expected_kind: &str) {
+    let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
+    assert_eq!(ping["kind"], expected_kind);
+    assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
+    assert_eq!(caps["kind"], expected_kind);
+    assert_eq!(caps["data"]["sql"], true);
+
+    let typed = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        "select cast(42 as integer) as int_value, cast(3.5 as double precision) as float_value, cast(true as boolean) as bool_value, cast('hi' as text) as text_value, cast(null as text) as null_value",
+    ]));
+    let row = &typed["data"]["rows"][0];
+    assert_eq!(row[0], 42);
+    assert_eq!(row[1].as_f64().expect("float should decode"), 3.5);
+    assert_eq!(row[2], true);
+    assert_eq!(row[3], "hi");
+    assert_eq!(row[4], Value::Null);
 
     let limited = stdout_json(dbtool(&[
         "--dsn",
@@ -399,6 +440,44 @@ fn mariadb_compat_live_sql_lifecycle_and_typed_values() {
         &dsn,
         &table,
         format!("create table {table} (id integer primary key, name varchar(64) not null)"),
+        format!("drop table {table}"),
+    );
+}
+
+#[test]
+fn cockroach_pg_compat_live_sql_lifecycle_and_typed_values() {
+    if !pg_compat_enabled("DBTOOL_RUN_COCKROACH_COMPAT") {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_COCKROACH_DSN") else {
+        return;
+    };
+    let table = unique_name("dbtool_cockroach_users");
+
+    postgres_family_typed_probe(&dsn, "cockroach");
+    sql_lifecycle(
+        &dsn,
+        &table,
+        format!("create table {table} (id integer primary key, name text not null)"),
+        format!("drop table {table}"),
+    );
+}
+
+#[test]
+fn timescale_pg_compat_live_sql_lifecycle_and_typed_values() {
+    if !pg_compat_enabled("DBTOOL_RUN_TIMESCALE_COMPAT") {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_TIMESCALE_DSN") else {
+        return;
+    };
+    let table = unique_name("dbtool_timescale_users");
+
+    postgres_family_typed_probe(&dsn, "timescale");
+    sql_lifecycle(
+        &dsn,
+        &table,
+        format!("create table {table} (id integer primary key, name text not null)"),
         format!("drop table {table}"),
     );
 }

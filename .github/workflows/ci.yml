@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_pg_compat:
+        description: "Run Docker-backed PostgreSQL-family compatibility tests"
+        required: false
+        type: boolean
+        default: false
       run_live_tidb:
         description: "Run Docker-backed TiDB compatibility integration tests"
         required: false
@@ -90,6 +95,9 @@ jobs:
 
       - name: Validate compatibility integration compose config
         run: docker compose -f docker-compose.integration.yml --profile compat --profile compat-extra config
+
+      - name: Validate PostgreSQL-family compatibility compose config
+        run: docker compose -f docker-compose.integration.yml --profile pg-compat config
 
       - name: Validate TiDB integration compose config
         run: docker compose -f docker-compose.integration.yml --profile tidb config
@@ -196,6 +204,23 @@ jobs:
 
       - name: Run compatible database integration tests
         run: ./scripts/integration-compat-test.sh
+
+  integration-pg-compat:
+    name: Live PostgreSQL-family compatibility integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_pg_compat
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-pg-compat
+      DBTOOL_IT_COCKROACH_PORT: 36257
+      DBTOOL_IT_COCKROACH_HTTP_PORT: 38080
+      DBTOOL_IT_TIMESCALE_PORT: 35432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run PostgreSQL-family compatibility tests
+        run: ./scripts/integration-pg-compat-test.sh
 
   integration-tidb:
     name: Live TiDB compatibility integration

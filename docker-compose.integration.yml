@@ -80,6 +80,56 @@ services:
     cpus: ${DBTOOL_IT_MARIADB_CPUS:-0.50}
     mem_limit: ${DBTOOL_IT_MARIADB_MEMORY:-512m}
 
+  cockroach:
+    profiles: ["pg-compat"]
+    image: cockroachdb/cockroach:${DBTOOL_IT_COCKROACH_VERSION:-v24.3.8}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-cockroach
+    command:
+      [
+        "start-single-node",
+        "--insecure",
+        "--listen-addr=:26257",
+        "--http-addr=0.0.0.0:8080",
+        "--cache=64MiB",
+        "--max-sql-memory=64MiB",
+      ]
+    ports:
+      - "${DBTOOL_IT_COCKROACH_PORT:-26257}:26257"
+      - "${DBTOOL_IT_COCKROACH_HTTP_PORT:-28080}:8080"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/cockroach/cockroach sql --insecure --host=127.0.0.1:26257 --execute='select 1' >/dev/null 2>&1",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 50
+    cpus: ${DBTOOL_IT_COCKROACH_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_COCKROACH_MEMORY:-512m}
+
+  timescale:
+    profiles: ["pg-compat"]
+    image: timescale/timescaledb:${DBTOOL_IT_TIMESCALE_VERSION:-2.17.2-pg16}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-timescale
+    environment:
+      POSTGRES_DB: ${DBTOOL_IT_TIMESCALE_DB:-dbtool_it_timescale}
+      POSTGRES_USER: ${DBTOOL_IT_TIMESCALE_USER:-dbtool}
+      POSTGRES_PASSWORD: ${DBTOOL_IT_TIMESCALE_PASSWORD:-dbtool}
+    ports:
+      - "${DBTOOL_IT_TIMESCALE_PORT:-25432}:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DBTOOL_IT_TIMESCALE_USER:-dbtool} -d ${DBTOOL_IT_TIMESCALE_DB:-dbtool_it_timescale}",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    cpus: ${DBTOOL_IT_TIMESCALE_CPUS:-0.50}
+    mem_limit: ${DBTOOL_IT_TIMESCALE_MEMORY:-512m}
+
   tidb-pd:
     profiles: ["tidb"]
     image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}

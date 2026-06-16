@@ -26,8 +26,8 @@ usable.
 | SQLite | `sqlite:` | SQL | `ping`, `sql query`, `sql exec`, `sql tables`, `sql schema` | In-memory unit and CLI tests |
 | PostgreSQL | `postgres://` | SQL | SQL query/exec/tables/schema with write safety | Base Docker live test |
 | PostgreSQL alias | `postgresql://` | SQL | Same as Postgres adapter | Registry alias test only |
-| CockroachDB | `cockroach://` | SQL | Routed to Postgres adapter | Not live-tested against CockroachDB |
-| TimescaleDB | `timescale://` | SQL | Routed to Postgres adapter | Not live-tested against TimescaleDB |
+| CockroachDB | `cockroach://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real CockroachDB compatibility live test |
+| TimescaleDB | `timescale://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real TimescaleDB compatibility live test |
 | Redshift | `redshift://` | SQL | Routed to Postgres adapter | Not live-tested against Redshift |
 | MySQL | `mysql://` | SQL | SQL query/exec/tables/schema, typed values, result limiting | Base Docker live test |
 | MariaDB | `mariadb://` | SQL | MySQL-family SQL lifecycle, typed values, result limiting | Real MariaDB compatibility live test |
@@ -57,6 +57,7 @@ usable.
 | --- | --- | --- | --- |
 | `./scripts/integration-test.sh` | Postgres, MySQL, Redis, MongoDB | Canonical SQL, KV, and document workflows | Roughly 2 GiB container memory |
 | `./scripts/integration-compat-test.sh` | MariaDB, Valkey | MySQL and Redis compatible databases | Extra KeyDB/Dragonfly via `DBTOOL_IT_COMPAT_EXTRA=1` |
+| `./scripts/integration-pg-compat-test.sh` | CockroachDB, TimescaleDB | PostgreSQL-family compatible databases | Roughly 1 GiB container memory |
 | `./scripts/integration-tidb-test.sh` | PD, TiKV, TiDB | Real TiDB compatibility | Roughly 1.75 GiB container memory |
 | `./scripts/integration-tidb-secure-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB auth/TLS/local HA | Roughly 3.75 GiB container memory |
 | `./scripts/integration-mq-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Streams/PubSub, Kafka, AMQP, NATS | Roughly 2 GiB container memory |
@@ -93,8 +94,7 @@ usable.
 
 ## Next Implementation Queue
 
-1. Harden PostgreSQL-family compatibility with live CockroachDB and TimescaleDB profiles.
-2. Add TLS live coverage for `amqps://` and `nats+tls://` aliases if secure messaging compatibility matters.
-3. Expand TUI command history and richer per-capability forms.
-4. Decide whether to add heavyweight protocol dependencies for SQL Server and Cassandra.
-5. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.
+1. Add TLS live coverage for `amqps://` and `nats+tls://` aliases if secure messaging compatibility matters.
+2. Expand TUI command history and richer per-capability forms.
+3. Decide whether to add heavyweight protocol dependencies for SQL Server and Cassandra.
+4. Add real OpenSearch security-plugin TLS coverage only if that product-specific profile becomes necessary.
