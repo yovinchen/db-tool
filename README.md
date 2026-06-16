@@ -210,12 +210,20 @@ DBTOOL_IT_DB_SUITE_PHASES=all ./scripts/integration-db-suite.sh
 
 The default suite runs Compose profile validation, the service-free verifier,
 base database workflows, flow-control smoke, live `connections.toml` named
-connection checks, fixture data/image checks, logical roundtrip checks,
-MariaDB/Valkey compatibility, PostgreSQL-family compatibility, and the
+connection checks, custom database names/credentials/ports smoke, fixture
+data/image checks, logical roundtrip checks, MariaDB/Valkey compatibility,
+PostgreSQL-family compatibility, and the
 single-topology TiDB compatibility script. Heavy phases such as the dbtool
 Docker image smoke, SQL Server, Cassandra, TiDB secure HA drills, and
 observability can be selected with
 `DBTOOL_IT_DB_SUITE_PHASES=heavy` or `all`.
+
+Run the custom-environment smoke when you need to prove database names,
+credentials, and host ports can be overridden through environment variables:
+
+```bash
+./scripts/integration-custom-env-test.sh
+```
 
 Live database integration tests can start local Docker services with resource limits:
 

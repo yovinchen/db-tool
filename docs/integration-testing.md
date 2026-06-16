@@ -28,6 +28,7 @@ The default suite runs:
 - `./scripts/integration-test.sh`
 - `./scripts/integration-flow-control-test.sh`
 - `./scripts/integration-connection-config-test.sh`
+- `./scripts/integration-custom-env-test.sh`
 - `./scripts/integration-fixture-data-test.sh`
 - `./scripts/integration-fixture-images-test.sh`
 - `./scripts/integration-data-roundtrip-test.sh`
@@ -62,6 +63,20 @@ Redis, and MongoDB, then uses only `--conn` names to run pings and SQL/KV/doc
 commands. It also adds a PostgreSQL named connection with short
 `request_timeout` and `overall_deadline` values and verifies a live
 `pg_sleep(1)` returns `TIMEOUT`.
+
+Run the custom-environment smoke when you need to prove the base Docker
+services can be started with non-default project names, database names,
+credentials, and host ports:
+
+```bash
+./scripts/integration-custom-env-test.sh
+```
+
+The custom-environment smoke starts Postgres, MySQL, Redis, and MongoDB through
+the shared integration launcher with overridden environment variables. It then
+verifies the generated DSNs include the custom host ports and database names,
+pings every backend, and performs SQL/KV/document writes and reads through
+dbtool using the custom credentials.
 
 Run a narrower flow-control smoke when you need to validate throttling-facing
 CLI flags against real services without running the whole live test binary:

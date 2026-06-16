@@ -9,6 +9,7 @@ DEFAULT_PHASES=(
   base
   flow-control
   connection-config
+  custom-env
   fixture-data
   fixture-images
   data-roundtrip
@@ -52,7 +53,7 @@ Environment:
 
 Default phases:
   compose-config service-free base flow-control connection-config fixture-data
-  fixture-images data-roundtrip compat pg-compat tidb
+  custom-env fixture-images data-roundtrip compat pg-compat tidb
 
 Heavy phases:
   dbtool-image compat-extra sqlserver cassandra tidb-secure tidb-ha tidb-pd
@@ -73,6 +74,7 @@ phase_description() {
     base) echo "Postgres/MySQL/Redis/MongoDB live CLI workflows" ;;
     flow-control) echo "live timeout, rate/admission, and result-limit checks" ;;
     connection-config) echo "live connections.toml named-connection workflows and limits" ;;
+    custom-env) echo "custom database names, credentials, and host ports smoke" ;;
     fixture-data) echo "file-backed base database fixture data" ;;
     fixture-images) echo "Dockerfile-backed base database fixture images" ;;
     data-roundtrip) echo "base SQL/KV/document dbtool logical roundtrip" ;;
@@ -143,6 +145,7 @@ run_phase() {
     base) "$ROOT/scripts/integration-test.sh" ;;
     flow-control) "$ROOT/scripts/integration-flow-control-test.sh" ;;
     connection-config) "$ROOT/scripts/integration-connection-config-test.sh" ;;
+    custom-env) "$ROOT/scripts/integration-custom-env-test.sh" ;;
     fixture-data) "$ROOT/scripts/integration-fixture-data-test.sh" ;;
     fixture-images) "$ROOT/scripts/integration-fixture-images-test.sh" ;;
     data-roundtrip) "$ROOT/scripts/integration-data-roundtrip-test.sh" ;;
