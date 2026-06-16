@@ -168,6 +168,13 @@ table/schema inspection, write guards, and configured request timeout:
 ./scripts/smoke-core-flow.sh
 ```
 
+Docker Compose profile validation checks every integration profile without
+starting containers:
+
+```bash
+./scripts/validate-compose-configs.sh
+```
+
 The dbtool CLI can also be built as a container image and checked with the same
 core smoke flow:
 

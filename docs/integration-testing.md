@@ -260,7 +260,14 @@ DBTOOL_IT_PROJECT=my-dbtool-run ./scripts/integration-down.sh
 
 ## CI Profiles
 
-Daily push and pull request CI run service-free verification through `./scripts/verify.sh` and validate base, compatibility, PostgreSQL-family compatibility, SQL Server, Cassandra, TiDB, messaging, messaging TLS, and observability Docker Compose configs without starting containers.
+Daily push and pull request CI run service-free verification through
+`./scripts/verify.sh` and validate base, compatibility, PostgreSQL-family
+compatibility, SQL Server, Cassandra, TiDB, messaging, messaging TLS, and
+observability Docker Compose configs without starting containers through:
+
+```bash
+./scripts/validate-compose-configs.sh
+```
 
 Live integration jobs are opt-in from the GitHub Actions **Run workflow** button:
 

@@ -153,6 +153,7 @@ Goal: make verification repeatable locally and in CI without forcing Docker on e
 - [x] CI profile for service-free `./scripts/verify.sh`.
 - [x] Optional CI/manual profile for `./scripts/integration-test.sh`.
 - [x] Compose config validation in CI.
+- [x] Local `scripts/validate-compose-configs.sh` covers every integration profile without starting containers.
 - [x] Optional CI/manual profiles for compatible database and TiDB integration scripts.
 - [x] Document required Docker resources and failure recovery.
 - [x] Optional native Kafka integration script using the messaging Docker profile.

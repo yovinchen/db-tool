@@ -105,35 +105,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate base integration compose config
-        run: docker compose -f docker-compose.integration.yml config
-
-      - name: Validate compatibility integration compose config
-        run: docker compose -f docker-compose.integration.yml --profile compat --profile compat-extra config
-
-      - name: Validate PostgreSQL-family compatibility compose config
-        run: docker compose -f docker-compose.integration.yml --profile pg-compat config
-
-      - name: Validate SQL Server integration compose config
-        run: docker compose -f docker-compose.integration.yml --profile sqlserver config
-
-      - name: Validate Cassandra integration compose config
-        run: docker compose -f docker-compose.integration.yml --profile cassandra config
-
-      - name: Validate TiDB integration compose config
-        run: docker compose -f docker-compose.integration.yml --profile tidb config
-
-      - name: Validate TiDB secure HA integration compose config
-        run: docker compose -f docker-compose.integration.yml --profile tidb-secure config
-
-      - name: Validate messaging integration compose config
-        run: docker compose -f docker-compose.integration.yml --profile messaging config
-
-      - name: Validate messaging TLS integration compose config
-        run: docker compose -f docker-compose.integration.yml --profile messaging-tls config
-
-      - name: Validate observability integration compose config
-        run: docker compose -f docker-compose.integration.yml --profile observability config
+      - name: Validate integration compose configs
+        run: ./scripts/validate-compose-configs.sh
 
   test:
     name: Tests
