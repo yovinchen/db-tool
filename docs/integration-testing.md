@@ -24,6 +24,7 @@ automated from one entrypoint:
 The default suite runs:
 
 - `./scripts/verify.sh`
+- `./scripts/validate-compose-configs.sh`
 - `./scripts/integration-test.sh`
 - `./scripts/integration-flow-control-test.sh`
 - `./scripts/integration-fixture-data-test.sh`
@@ -42,11 +43,11 @@ DBTOOL_IT_DB_SUITE_PHASES=all ./scripts/integration-db-suite.sh
 DBTOOL_IT_DB_SUITE_DRY_RUN=1 DBTOOL_IT_DB_SUITE_PHASES=all ./scripts/integration-db-suite.sh
 ```
 
-`quick` means service-free verification plus the base database and
-flow-control live checks. `heavy` adds opt-in resource-heavy phases such as
-SQL Server, Cassandra, TiDB secure HA drills, TiDB TiProxy, and observability.
-`DBTOOL_IT_DB_SUITE_CONTINUE=1` keeps running after a failed phase and reports
-all failed phase names at the end.
+`quick` means Compose config validation, service-free verification, plus the
+base database and flow-control live checks. `heavy` adds opt-in phases such as
+the dbtool Docker image smoke, SQL Server, Cassandra, TiDB secure HA drills,
+TiDB TiProxy, and observability. `DBTOOL_IT_DB_SUITE_CONTINUE=1` keeps running
+after a failed phase and reports all failed phase names at the end.
 
 Run a narrower flow-control smoke when you need to validate throttling-facing
 CLI flags against real services without running the whole live test binary:

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 DEFAULT_PHASES=(
+  compose-config
   service-free
   base
   flow-control
@@ -16,6 +17,7 @@ DEFAULT_PHASES=(
 )
 
 HEAVY_PHASES=(
+  dbtool-image
   compat-extra
   sqlserver
   cassandra
@@ -48,11 +50,11 @@ Environment:
                                   failed phases at the end.
 
 Default phases:
-  service-free base flow-control fixture-data fixture-images data-roundtrip
-  compat pg-compat tidb
+  compose-config service-free base flow-control fixture-data fixture-images
+  data-roundtrip compat pg-compat tidb
 
 Heavy phases:
-  compat-extra sqlserver cassandra tidb-secure tidb-ha tidb-pd
+  dbtool-image compat-extra sqlserver cassandra tidb-secure tidb-ha tidb-pd
   tidb-pd-leader tidb-tikv-boundary tidb-cert tidb-logical-roundtrip
   tidb-tiproxy observability
 EOF
@@ -64,7 +66,9 @@ timestamp() {
 
 phase_description() {
   case "$1" in
+    compose-config) echo "Docker Compose integration profile config validation" ;;
     service-free) echo "service-free cargo verification and SQLite smoke" ;;
+    dbtool-image) echo "containerized dbtool CLI image smoke" ;;
     base) echo "Postgres/MySQL/Redis/MongoDB live CLI workflows" ;;
     flow-control) echo "live timeout, rate/admission, and result-limit checks" ;;
     fixture-data) echo "file-backed base database fixture data" ;;
@@ -121,7 +125,7 @@ expand_phase_token() {
     default) append_phases "${DEFAULT_PHASES[@]}" ;;
     heavy) append_phases "${HEAVY_PHASES[@]}" ;;
     all) append_phases "${ALL_PHASES[@]}" ;;
-    quick) append_phases service-free base flow-control ;;
+    quick) append_phases compose-config service-free base flow-control ;;
     "") ;;
     *) append_phase "$token" ;;
   esac
@@ -131,7 +135,9 @@ run_phase() {
   local phase="$1"
 
   case "$phase" in
+    compose-config) "$ROOT/scripts/validate-compose-configs.sh" ;;
     service-free) "$ROOT/scripts/verify.sh" ;;
+    dbtool-image) "$ROOT/scripts/smoke-docker-image.sh" ;;
     base) "$ROOT/scripts/integration-test.sh" ;;
     flow-control) "$ROOT/scripts/integration-flow-control-test.sh" ;;
     fixture-data) "$ROOT/scripts/integration-fixture-data-test.sh" ;;

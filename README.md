@@ -208,11 +208,12 @@ DBTOOL_IT_DB_SUITE_PHASES=quick ./scripts/integration-db-suite.sh
 DBTOOL_IT_DB_SUITE_PHASES=all ./scripts/integration-db-suite.sh
 ```
 
-The default suite runs the service-free verifier, base database workflows,
-flow-control smoke, fixture data/image checks, logical roundtrip checks,
-MariaDB/Valkey compatibility, PostgreSQL-family compatibility, and the
-single-topology TiDB compatibility script. Heavy phases such as SQL Server,
-Cassandra, TiDB secure HA drills, and observability can be selected with
+The default suite runs Compose profile validation, the service-free verifier,
+base database workflows, flow-control smoke, fixture data/image checks,
+logical roundtrip checks, MariaDB/Valkey compatibility, PostgreSQL-family
+compatibility, and the single-topology TiDB compatibility script. Heavy phases
+such as the dbtool Docker image smoke, SQL Server, Cassandra, TiDB secure HA
+drills, and observability can be selected with
 `DBTOOL_IT_DB_SUITE_PHASES=heavy` or `all`.
 
 Live database integration tests can start local Docker services with resource limits:
