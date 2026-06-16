@@ -47,7 +47,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
     let input_title = if state.pending_write.is_some() {
         "Query [y confirm / n cancel]"
     } else {
-        "Query [Enter]"
+        "Query [Enter, Up/Down history]"
     };
     let input = Paragraph::new(state.query_input.as_str()).block(
         Block::default()

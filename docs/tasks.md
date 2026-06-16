@@ -252,7 +252,8 @@ Goal: build a TUI that consumes the same verified core/CLI behavior.
 - [x] Capability-aware SQL/KV/Document/Search/Time-series command dispatch.
 - [x] Read limits and write-confirmation prompts.
 - [x] TUI smoke tests for navigation and command dispatch.
-- [ ] Full-screen polish, command history, and richer per-capability forms.
+- [x] Bounded query command history with Up/Down recall and write-confirmation-aware recording.
+- [ ] Full-screen polish and richer per-capability forms.
 
 ### T5: Extended Backends
 
@@ -291,3 +292,4 @@ major database compatibility loop became stable.
 | T23 Server-side SQL timeout smoke | P2 | Done | Added Docker-backed database-side timeout coverage for PostgreSQL and MySQL. The script keeps dbtool client deadlines larger than DB-side timeout budgets, then proves PostgreSQL `statement_timeout` cancels slow statements, `idle_in_transaction_session_timeout` terminates idle transactions, `lock_timeout` cancels blocked writes, and MySQL `innodb_lock_wait_timeout` cancels blocked dbtool writes at the server layer. | `./scripts/integration-server-timeout-test.sh`; included in the default `./scripts/integration-db-suite.sh`; local-only while CI budget is frozen. |
 | T24 Cassandra fixture data smoke | P2 | Done | Added reusable CQL fixture data and a Docker-backed Cassandra smoke. The script loads `testdata/base-cassandra-seed.cql` through dbtool, verifies seeded row readback, table listing, and schema inspection, and keeps the slower JVM-backed check in the heavy suite. | `./scripts/integration-cassandra-fixture-data-test.sh`; `DBTOOL_IT_DB_SUITE_PHASES=cassandra-fixture ./scripts/integration-db-suite.sh`; local-only while CI budget is frozen. |
 | T25 Embedded library smoke | P1 | Done | Added a service-free Rust integration test proving consumers can use `dbtool-core` and `dbtool-registry` directly: build the registry, reuse a SQLite connector through `ConnectionManager`, apply `SafetyGuard`, and run SQL under `FlowControl` without spawning the CLI. | `cargo test -p dbtool-registry --test embedded_library`; covered by `./scripts/verify.sh`. |
+| T26 TUI command history | P2 | Done | Added bounded in-memory command history for the TUI query panel. Up/Down recalls prior commands without losing the current draft, adjacent duplicates are skipped, history is capped, read commands record after execution, and pending writes record only after confirmation. | `cargo test -p dbtool-tui`; covered by `./scripts/verify.sh`. |

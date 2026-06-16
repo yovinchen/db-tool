@@ -35,7 +35,7 @@ impl App {
     }
 
     pub fn help_text() -> &'static str {
-        "dbtool-tui\n\nUsage: dbtool-tui [--smoke]\n\nKeys: Tab changes panel, Enter runs a query command, y confirms a pending write, n cancels it, q quits.\nCommands: ping, caps, sql <query>, sql exec <statement>, tables, schema <table>, kv get/scan/set/del, doc collections/find, search indices/index/query, ts measurements/query."
+        "dbtool-tui\n\nUsage: dbtool-tui [--smoke]\n\nKeys: Tab changes panel, Enter runs a query command, Up/Down recall command history in the query panel, y confirms a pending write, n cancels it, q quits.\nCommands: ping, caps, sql <query>, sql exec <statement>, tables, schema <table>, kv get/scan/set/del, doc collections/find, search indices/index/query, ts measurements/query."
     }
 
     pub fn smoke_summary(&self) -> String {
@@ -110,6 +110,7 @@ impl App {
         let output =
             execute_tui_command(&self._manager, &connection, &command, self.state.limit).await;
         self.state.pending_write = None;
+        self.state.record_command(&command);
         self.state.result_text = match output {
             Ok(value) => value,
             Err(err) => format_error(&err),
@@ -469,6 +470,7 @@ mod tests {
         let app = App::new(registry);
 
         assert!(App::help_text().contains("Usage: dbtool-tui"));
+        assert!(App::help_text().contains("Up/Down recall command history"));
         assert!(app.smoke_summary().contains("loaded"));
     }
 
@@ -512,6 +514,56 @@ mod tests {
         app.execute_current(true).await;
 
         assert!(app.state.result_text.contains("readonly"));
+        assert!(app.state.pending_write.is_none());
+    }
+
+    #[tokio::test]
+    async fn executed_commands_are_recorded_in_history() {
+        let registry = Arc::new(build_registry());
+        let mut app = App {
+            _manager: Arc::new(ConnectionManager::new(registry)),
+            state: AppState {
+                active_panel: crate::state::Panel::QueryInput,
+                query_input: "ping".to_owned(),
+                ..AppState::with_connections(vec![ConnectionItem {
+                    name: "sqlite".to_owned(),
+                    dsn: "sqlite::memory:".to_owned(),
+                    readonly: false,
+                }])
+            },
+        };
+
+        app.execute_current(false).await;
+
+        assert_eq!(app.state.command_history, vec!["ping"]);
+    }
+
+    #[tokio::test]
+    async fn pending_write_is_recorded_only_after_confirmation() {
+        let registry = Arc::new(build_registry());
+        let mut app = App {
+            _manager: Arc::new(ConnectionManager::new(registry)),
+            state: AppState {
+                active_panel: crate::state::Panel::QueryInput,
+                query_input: "exec create table tui_history (id integer primary key)".to_owned(),
+                ..AppState::with_connections(vec![ConnectionItem {
+                    name: "sqlite".to_owned(),
+                    dsn: "sqlite::memory:".to_owned(),
+                    readonly: false,
+                }])
+            },
+        };
+
+        app.execute_current(false).await;
+        assert!(app.state.command_history.is_empty());
+        assert!(app.state.pending_write.is_some());
+
+        app.execute_current(true).await;
+
+        assert_eq!(
+            app.state.command_history,
+            vec!["exec create table tui_history (id integer primary key)"]
+        );
         assert!(app.state.pending_write.is_none());
     }
 }
