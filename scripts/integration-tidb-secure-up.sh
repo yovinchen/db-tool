@@ -4,28 +4,61 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/integration-tidb-secure-prepare.sh"
 
-services=(
+pd_services=(
   tidb-secure-pd-1
   tidb-secure-pd-2
   tidb-secure-pd-3
+)
+
+tikv_services=(
   tidb-secure-tikv-1
   tidb-secure-tikv-2
+)
+
+tidb_services=(
   tidb-secure-1
   tidb-secure-2
 )
 
-docker compose \
-  -f "$ROOT/docker-compose.integration.yml" \
-  -p "$DBTOOL_IT_PROJECT" \
-  --profile tidb-secure \
-  up -d --wait --wait-timeout "${DBTOOL_IT_WAIT_TIMEOUT:-360}" \
-  "${services[@]}"
+services=("${pd_services[@]}" "${tikv_services[@]}" "${tidb_services[@]}")
 
-docker compose \
-  -f "$ROOT/docker-compose.integration.yml" \
-  -p "$DBTOOL_IT_PROJECT" \
-  --profile tidb-secure \
-  ps "${services[@]}"
+compose() {
+  docker compose \
+    -f "$ROOT/docker-compose.integration.yml" \
+    -p "$DBTOOL_IT_PROJECT" \
+    --profile tidb-secure \
+    "$@"
+}
+
+phase_sleep() {
+  local label="$1"
+  local seconds="$2"
+
+  if ((seconds <= 0)); then
+    return 0
+  fi
+
+  echo "TiDB secure HA: waiting ${seconds}s for $label"
+  sleep "$seconds"
+}
+
+start_phase() {
+  local label="$1"
+  shift
+
+  echo "TiDB secure HA: starting $label"
+  compose up -d --wait --wait-timeout "${DBTOOL_IT_WAIT_TIMEOUT:-360}" "$@"
+  compose ps "$@"
+}
+
+start_phase "PD" "${pd_services[@]}"
+phase_sleep "PD peer election" "${DBTOOL_IT_TIDB_SECURE_PD_BOOTSTRAP_DELAY:-8}"
+
+start_phase "TiKV" "${tikv_services[@]}"
+phase_sleep "TiKV cluster bootstrap" "${DBTOOL_IT_TIDB_SECURE_TIKV_BOOTSTRAP_DELAY:-30}"
+
+start_phase "TiDB SQL" "${tidb_services[@]}"
+compose ps "${services[@]}"
 
 ping_with_timeout() {
   local dsn="$1"
@@ -58,11 +91,7 @@ for attempt in $(seq 1 "$deadline"); do
   sleep 2
 done
 
-docker compose \
-  -f "$ROOT/docker-compose.integration.yml" \
-  -p "$DBTOOL_IT_PROJECT" \
-  --profile tidb-secure \
-  logs --tail 120 "${services[@]}"
+compose logs --tail 120 "${services[@]}"
 
 echo "TiDB secure HA cluster did not become SQL-ready in time" >&2
 exit 1

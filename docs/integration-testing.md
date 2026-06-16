@@ -85,6 +85,12 @@ TiDB secure HA integration starts a larger local topology with component TLS and
 
 The secure script generates a short-lived local CA plus server/client certificates under `.tmp/`, starts 3 PD nodes, 2 TiKV nodes, and 2 TiDB SQL nodes, verifies `REQUIRE SSL` and `REQUIRE X509` users, and removes the containers and network by default.
 
+The secure HA launcher starts PD, TiKV, and TiDB SQL in phases so slower Docker
+runners do not start SQL nodes before TiKV has bootstrapped the cluster. Tune
+`DBTOOL_IT_TIDB_SECURE_PD_BOOTSTRAP_DELAY` and
+`DBTOOL_IT_TIDB_SECURE_TIKV_BOOTSTRAP_DELAY` if a constrained runner needs a
+longer or shorter warm-up window.
+
 Run the secure HA failover drill when you need to prove the two exposed TiDB SQL nodes can be stopped one at a time while the remaining node keeps accepting TLS SQL traffic:
 
 ```bash
