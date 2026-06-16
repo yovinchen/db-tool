@@ -76,7 +76,7 @@ jobs:
     name: Service-free verification
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -89,7 +89,7 @@ jobs:
     name: Check & Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -108,7 +108,7 @@ jobs:
     name: Compose config validation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
 
       - name: Validate integration compose configs
         run: ./scripts/validate-compose-configs.sh
@@ -120,7 +120,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -152,7 +152,7 @@ jobs:
             runner: windows-latest
             use_cross: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -181,7 +181,7 @@ jobs:
       DBTOOL_IT_REDIS_PORT: 26379
       DBTOOL_IT_MONGO_PORT: 27017
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -200,7 +200,7 @@ jobs:
       DBTOOL_IT_DRAGONFLY_PORT: 36381
       DBTOOL_IT_COMPAT_EXTRA: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -217,7 +217,7 @@ jobs:
       DBTOOL_IT_COCKROACH_HTTP_PORT: 38080
       DBTOOL_IT_TIMESCALE_PORT: 35432
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -232,7 +232,7 @@ jobs:
       DBTOOL_IT_PROJECT: dbtool-it-ci-sqlserver
       DBTOOL_IT_SQLSERVER_PORT: 31433
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -247,7 +247,7 @@ jobs:
       DBTOOL_IT_PROJECT: dbtool-it-ci-cassandra
       DBTOOL_IT_CASSANDRA_PORT: 39042
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -263,7 +263,7 @@ jobs:
       DBTOOL_IT_TIDB_PORT: 34000
       DBTOOL_IT_TIDB_STATUS_PORT: 31080
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -281,7 +281,7 @@ jobs:
       DBTOOL_IT_TIDB_SECURE_STATUS_PORT_1: 31100
       DBTOOL_IT_TIDB_SECURE_STATUS_PORT_2: 31101
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -299,7 +299,7 @@ jobs:
       DBTOOL_IT_TIDB_SECURE_STATUS_PORT_1: 41100
       DBTOOL_IT_TIDB_SECURE_STATUS_PORT_2: 41101
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -319,7 +319,7 @@ jobs:
       DBTOOL_IT_NATS_PORT: 24222
       DBTOOL_IT_NATS_MONITOR_PORT: 28222
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -336,7 +336,7 @@ jobs:
       DBTOOL_IT_NATS_TLS_PORT: 44222
       DBTOOL_IT_NATS_TLS_MONITOR_PORT: 48222
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -356,7 +356,7 @@ jobs:
       DBTOOL_IT_NATS_PORT: 34222
       DBTOOL_IT_NATS_MONITOR_PORT: 38222
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -373,7 +373,7 @@ jobs:
       DBTOOL_IT_OPENSEARCH_TLS_PORT: 29201
       DBTOOL_IT_PROMETHEUS_PORT: 29090
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
