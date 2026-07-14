@@ -132,6 +132,23 @@ assert_query_contains() {
   fi
 }
 
+assert_complete_fixture() {
+  local dsn="$1"
+  local table="$2"
+  local output
+
+  output="$(dbtool_cli --dsn "$dsn" sql query "select id, note from $table order by id")"
+  printf '%s' "$output" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+assert data["data"]["rows"] == [
+    [1, "leader-baseline"],
+    [2, "node1-while-pd-leader-down"],
+    [3, "node2-while-pd-leader-down"],
+], data
+'
+}
+
 assert_identifier() {
   local value="$1"
   local label="$2"
@@ -230,8 +247,9 @@ start_service() {
 database="$DBTOOL_IT_TIDB_SECURE_DB"
 assert_identifier "$database" "database"
 
-table="dbtool_tidb_pd_leader_drill_$(date +%s)_$$"
+table="dbtool_it_tidb_pd_leader_drill_$(date +%s)_$$"
 qualified_table="$database.$table"
+echo "TiDB PD leader resource: table=$qualified_table"
 
 echo "TiDB PD leader drill: preparing $qualified_table through SQL node 1"
 sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "create database if not exists $database"
@@ -265,5 +283,10 @@ echo "TiDB PD leader drill: restarting stopped PD leader $leader_service"
 start_service "$leader_service"
 wait_for_ping "SQL node 1 after PD leader restart" "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1"
 wait_for_ping "SQL node 2 after PD leader restart" "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2"
+restored_leader="$(current_pd_leader_service)"
+echo "TiDB PD leader drill: healthy cluster leader after recovery is $restored_leader"
+assert_complete_fixture "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" "$qualified_table"
+
+sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "drop table $qualified_table"
 
 echo "TiDB PD leader failover drill passed"
