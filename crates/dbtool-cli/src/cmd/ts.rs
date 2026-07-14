@@ -2,7 +2,7 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::{Point, TimeRange},
+    model::{Point, SeriesSet, TimeRange},
     Result,
 };
 use std::collections::HashMap;
@@ -51,6 +51,9 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
     if matches!(cmd.action, TsAction::Write { .. }) {
         ensure_write_allowed(ctx)?;
     }
+    if let TsAction::Query { last_minutes, .. } = &cmd.action {
+        validate_last_minutes(*last_minutes)?;
+    }
 
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
@@ -75,7 +78,7 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
             last_minutes,
         } => {
             let range = TimeRange::last_n_minutes(last_minutes);
-            let result = ts.query_range(&query, range).await?;
+            let result = limit_series_set(ts.query_range(&query, range).await?, ctx.limit);
             let truncated = result.truncated;
             ctx.render_success(&kind, result, start.elapsed().as_millis() as u64, truncated)
         }
@@ -107,6 +110,49 @@ fn ensure_write_allowed(ctx: &Context) -> Result<()> {
     ctx.ensure_write_allowed()
 }
 
+fn validate_last_minutes(last_minutes: i64) -> Result<()> {
+    if last_minutes <= 0 {
+        return Err(Error::Config(
+            "--last-minutes must be greater than zero".into(),
+        ));
+    }
+    last_minutes.checked_mul(60_000).ok_or_else(|| {
+        Error::Config("--last-minutes is too large to represent in milliseconds".into())
+    })?;
+    Ok(())
+}
+
+/// Apply the CLI row budget across all samples in all returned series.
+///
+/// Prometheus range queries return one row vector per series, so limiting every
+/// series independently would allow high-cardinality queries to multiply the
+/// configured limit. Empty trailing series are removed only when truncation is
+/// required, keeping the returned shape bounded along with the sample count.
+fn limit_series_set(mut result: SeriesSet, limit: usize) -> SeriesSet {
+    let total_samples = result.series.iter().fold(0usize, |total, series| {
+        total.saturating_add(series.values.len())
+    });
+
+    if total_samples <= limit {
+        return result;
+    }
+
+    let mut remaining = limit;
+    for series in &mut result.series {
+        if remaining == 0 {
+            series.values.clear();
+            continue;
+        }
+        if series.values.len() > remaining {
+            series.values.truncate(remaining);
+        }
+        remaining -= series.values.len();
+    }
+    result.series.retain(|series| !series.values.is_empty());
+    result.truncated = true;
+    result
+}
+
 fn parse_tags(tags: &[String]) -> Result<HashMap<String, String>> {
     let mut parsed = HashMap::new();
     for tag in tags {
@@ -131,7 +177,9 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbtool_core::model::series::Series;
     use dbtool_core::service::formatter::Format;
+    use serde_json::json;
 
     fn test_context(allow_write: bool) -> Context {
         Context {
@@ -165,5 +213,71 @@ mod tests {
             parse_tags(&["bad".to_owned()]),
             Err(Error::Config(message)) if message.contains("expected key=value")
         ));
+    }
+
+    #[test]
+    fn rejects_non_positive_and_overflowing_query_windows() {
+        assert!(matches!(
+            validate_last_minutes(0),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        assert!(matches!(
+            validate_last_minutes(-1),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        assert!(matches!(
+            validate_last_minutes(i64::MAX),
+            Err(Error::Config(message)) if message.contains("too large")
+        ));
+        assert!(validate_last_minutes(1).is_ok());
+    }
+
+    #[test]
+    fn limits_samples_across_all_series_and_marks_truncation() {
+        let result = SeriesSet {
+            series: vec![series("first", &[1, 2]), series("second", &[3, 4])],
+            truncated: false,
+        };
+
+        let limited = limit_series_set(result, 3);
+
+        assert_eq!(limited.series.len(), 2);
+        assert_eq!(limited.series[0].values.len(), 2);
+        assert_eq!(limited.series[1].values, vec![vec![json!(3)]]);
+        assert!(limited.truncated);
+    }
+
+    #[test]
+    fn preserves_backend_truncation_without_over_limit() {
+        let result = SeriesSet {
+            series: vec![series("only", &[1, 2])],
+            truncated: true,
+        };
+
+        let limited = limit_series_set(result, 2);
+
+        assert_eq!(limited.series[0].values.len(), 2);
+        assert!(limited.truncated);
+    }
+
+    #[test]
+    fn zero_limit_returns_no_samples_and_marks_truncation() {
+        let result = SeriesSet {
+            series: vec![series("only", &[1])],
+            truncated: false,
+        };
+
+        let limited = limit_series_set(result, 0);
+
+        assert!(limited.series.is_empty());
+        assert!(limited.truncated);
+    }
+
+    fn series(name: &str, values: &[i64]) -> Series {
+        Series {
+            name: name.to_owned(),
+            columns: vec!["value".to_owned()],
+            values: values.iter().map(|value| vec![json!(value)]).collect(),
+        }
     }
 }
