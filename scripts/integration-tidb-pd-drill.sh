@@ -132,6 +132,27 @@ assert_query_contains() {
   fi
 }
 
+assert_complete_fixture() {
+  local dsn="$1"
+  local table="$2"
+  local output
+
+  output="$(dbtool_cli --dsn "$dsn" sql query "select id, note from $table order by id")"
+  printf '%s' "$output" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+assert data["data"]["rows"] == [
+    [1, "pd-baseline"],
+    [2, "write-through-node1-while-tidb-secure-pd-1-down"],
+    [3, "write-through-node2-while-tidb-secure-pd-1-down"],
+    [4, "write-through-node1-while-tidb-secure-pd-2-down"],
+    [5, "write-through-node2-while-tidb-secure-pd-2-down"],
+    [6, "write-through-node1-while-tidb-secure-pd-3-down"],
+    [7, "write-through-node2-while-tidb-secure-pd-3-down"],
+], data
+'
+}
+
 assert_identifier() {
   local value="$1"
   local label="$2"
@@ -161,9 +182,10 @@ start_service() {
 database="$DBTOOL_IT_TIDB_SECURE_DB"
 assert_identifier "$database" "database"
 
-table="dbtool_tidb_pd_drill_$(date +%s)_$$"
+table="dbtool_it_tidb_pd_drill_$(date +%s)_$$"
 qualified_table="$database.$table"
 row_id=1
+echo "TiDB PD N-1 resource: table=$qualified_table"
 
 echo "TiDB PD drill: preparing $qualified_table through SQL node 1"
 sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "create database if not exists $database"
@@ -194,4 +216,7 @@ for pd_service in "${pd_services[@]}"; do
   wait_for_ping "SQL node 2 after $pd_service restart" "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2"
 done
 
-echo "TiDB PD failover drill passed"
+assert_complete_fixture "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" "$qualified_table"
+sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "drop table $qualified_table"
+
+echo "TiDB PD N-1 continuity drill passed"
