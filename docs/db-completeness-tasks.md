@@ -69,11 +69,11 @@ being created and is normalized in the final campaign summary.
 | DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | NOT_RUN | - | public API has no update/delete |
 | DB-ELASTICSEARCH-001 | Search | Elasticsearch `elasticsearch://` | Docker elasticsearch | Ready | NOT_RUN | - | product-native HTTPS is not covered |
 | DB-PROMETHEUS-001 | Time series | Prometheus `prometheus://` | Docker observability | Ready | NOT_RUN | - | delete/update are not applicable |
-| DB-REDIS-MQ-001 | Messaging | Redis Streams/PubSub | Docker messaging | Ready | NOT_RUN | - | Pub/Sub has no durable catalog |
-| DB-KAFKA-001 | Messaging | Kafka API on Redpanda | Docker messaging | Ready | NOT_RUN | - | consumer lag currently returns an empty list |
-| DB-RABBITMQ-001 | Messaging | AMQP + RabbitMQ management | Docker messaging | Ready | NOT_RUN | - | admin listing uses `rabbitmq+http://` |
-| DB-NATS-001 | Messaging | NATS Core + JetStream | Docker messaging | Ready | NOT_RUN | - | core subjects have no durable catalog |
-| DB-MQ-TLS-001 | Messaging | AMQPS + NATS TLS | Docker messaging-tls | Ready | NOT_RUN | - | - |
+| DB-REDIS-MQ-001 | Messaging | Redis Streams/PubSub | Docker messaging | Ready | COMPLETE | `docs/test-evidence/redis-messaging.md` | this commit; Streams deleted, Pub/Sub ephemeral |
+| DB-KAFKA-001 | Messaging | Kafka API on Redpanda | Docker messaging | Ready | COMPLETE | `docs/test-evidence/kafka-redpanda.md` | this commit; pure/native and `kafka://`/`redpanda://`; lag/delete unsupported |
+| DB-RABBITMQ-001 | Messaging | AMQP + RabbitMQ management | Docker messaging | Ready | COMPLETE | `docs/test-evidence/rabbitmq.md` | this commit; confirms/acks/drain and management lag passed |
+| DB-NATS-001 | Messaging | NATS Core + JetStream | Docker messaging | Ready | COMPLETE | `docs/test-evidence/nats.md` | this commit; Core ephemeral and JetStream delete verified |
+| DB-MQ-TLS-001 | Messaging | AMQPS + NATS TLS | Docker messaging-tls | Ready | COMPLETE | `docs/test-evidence/messaging-tls.md` | this commit; regenerated CA-backed TLS passed |
 | DB-KAFKA-VENDORS-001 | Messaging | AutoMQ/WarpStream/Confluent | external | Ready | EXTERNAL | - | no vendor DSNs are supplied |
 
 ## Per-Resource Evidence Contract

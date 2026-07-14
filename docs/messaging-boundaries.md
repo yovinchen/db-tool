@@ -11,7 +11,7 @@ Current core behavior:
 - `mq produce <queue>` declares the named queue when needed and publishes to it.
 - `mq consume <queue>` declares the named queue when needed and performs bounded `basic.get` with ack.
 - `mq detail <queue>` uses passive queue declare and returns `message_count` and `consumer_count`.
-- `mq topics` returns an empty list for pure AMQP because queue discovery requires RabbitMQ's HTTP management plugin.
+- `mq topics` and `mq lag` return `UNSUPPORTED_CAPABILITY` for pure AMQP because queue discovery and queue-depth lag require RabbitMQ's HTTP management plugin. An empty success would incorrectly mean that the broker was inspected and contained no queues.
 
 RabbitMQ queue listing is exposed through an explicit management boundary, not hidden inside the pure AMQP protocol path:
 

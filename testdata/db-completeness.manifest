@@ -20,9 +20,9 @@ DB-OPENSEARCH-001|search|OpenSearch|opensearch|default|docker-observability|./sc
 DB-OPENSEARCH-TLS-001|search|OpenSearch security HTTPS|opensearch+https|default|docker-opensearch-security|./scripts/integration-opensearch-security-test.sh|HARNESS_READY|-|public API has no update/delete
 DB-ELASTICSEARCH-001|search|Elasticsearch|elasticsearch|default|docker-elasticsearch|./scripts/integration-elasticsearch-test.sh|HARNESS_READY|-|product-native HTTPS is not covered
 DB-PROMETHEUS-001|timeseries|Prometheus|prometheus,prometheus+http|default|docker-observability|./scripts/integration-observability-test.sh|HARNESS_READY|-|delete/update are not applicable
-DB-REDIS-MQ-001|messaging|Redis Streams and PubSub|redis|full|docker-messaging|./scripts/integration-mq-test.sh|HARNESS_READY|-|PubSub has no durable catalog
-DB-KAFKA-001|messaging|Kafka API on Redpanda|kafka,redpanda|full|docker-messaging|./scripts/integration-mq-test.sh|HARNESS_READY|-|consumer lag currently returns an empty list
-DB-RABBITMQ-001|messaging|AMQP and RabbitMQ management|amqp,rabbitmq+http|full|docker-messaging|./scripts/integration-mq-test.sh|HARNESS_READY|-|queue listing uses the management connector
-DB-NATS-001|messaging|NATS Core and JetStream|nats|full|docker-messaging|./scripts/integration-mq-test.sh|HARNESS_READY|-|core subjects have no durable catalog
-DB-MQ-TLS-001|messaging|AMQPS and NATS TLS|amqps,nats+tls|full|docker-messaging-tls|./scripts/integration-mq-tls-test.sh|HARNESS_READY|-|-
+DB-REDIS-MQ-001|messaging|Redis Streams and PubSub|redis|full|docker-messaging|./scripts/integration-mq-test.sh + native regression|COMPLETE|docs/test-evidence/redis-messaging.md|Streams cleaned through public KV API; PubSub has no durable catalog
+DB-KAFKA-001|messaging|Kafka API on Redpanda|kafka,redpanda|full + full-native|docker-messaging|./scripts/integration-mq-test.sh + native|COMPLETE|docs/test-evidence/kafka-redpanda.md|consumer lag and public topic delete are unsupported; disposable volume cleanup
+DB-RABBITMQ-001|messaging|AMQP and RabbitMQ management|amqp,rabbitmq+http|full|docker-messaging|./scripts/integration-mq-test.sh + native regression|COMPLETE|docs/test-evidence/rabbitmq.md|portable list/lag unsupported; management connector provides them; queues drained and volume removed
+DB-NATS-001|messaging|NATS Core and JetStream|nats|full|docker-messaging|./scripts/integration-mq-test.sh + native regression|COMPLETE|docs/test-evidence/nats.md|core subjects ephemeral; JetStream resources explicitly deleted
+DB-MQ-TLS-001|messaging|AMQPS and NATS TLS|amqps,nats+tls|full|docker-messaging-tls|./scripts/integration-mq-tls-test.sh|COMPLETE|docs/test-evidence/messaging-tls.md|AMQPS queue drained/volume removed; NATS JetStream explicitly deleted
 DB-KAFKA-VENDORS-001|messaging|AutoMQ WarpStream Confluent|automq,warpstream,confluent|full-native|external|./scripts/integration-kafka-vendor-test.sh|EXTERNAL|-|vendor DSNs are not supplied

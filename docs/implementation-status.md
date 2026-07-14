@@ -51,9 +51,9 @@ usable.
 | KeyDB | `keydb://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Optional real KeyDB live test with `DBTOOL_IT_COMPAT_EXTRA=1` |
 | Dragonfly | `dragonfly://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Optional real Dragonfly live test with `DBTOOL_IT_COMPAT_EXTRA=1` |
 | MongoDB | `mongodb://` | MongoDB | collections, find, insert, update, delete, aggregate | Base Docker live test |
-| Kafka | `kafka://` | Kafka | ping, produce, consume, topics, detail/watermarks | Redpanda live test through pure Rust backend |
-| Kafka native | `kafka://` with `full-native` | Kafka | librdkafka-backed ping, produce, consume, topics/detail | Optional native live test |
-| Redpanda | `redpanda://` | Kafka | Routed to Kafka adapter | Redpanda service backs Kafka live tests |
+| Kafka | `kafka://` | Kafka | ping, produce, consume, topics, detail/watermarks; lag explicitly unsupported | Redpanda live test through pure Rust backend |
+| Kafka native | `kafka://` with `full-native` | Kafka | librdkafka-backed ping, produce, consume, topics/detail; machine-readable unsupported lag | Native live test passed against Redpanda |
+| Redpanda | `redpanda://` | Kafka | Full Kafka-compatible lifecycle through product-named scheme | Real Redpanda pure/native live tests |
 | AutoMQ | `automq://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_AUTOMQ_DSN` is supplied |
 | WarpStream | `warpstream://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_WARPSTREAM_DSN` is supplied |
 | Confluent | `confluent://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_CONFLUENT_DSN` is supplied |
