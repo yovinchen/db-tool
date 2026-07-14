@@ -97,12 +97,12 @@ seed_redis_commands() {
   local command
 
   run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --allow-write kv del \
-    dbtool:fixture:user:1 \
-    dbtool:fixture:user:2 \
-    dbtool:fixture:user:3 \
-    dbtool:roundtrip:user:1 \
-    dbtool:roundtrip:user:2 \
-    dbtool:roundtrip:user:3 >/dev/null || true
+    dbtool_it_fixture:user:1 \
+    dbtool_it_fixture:user:2 \
+    dbtool_it_fixture:user:3 \
+    dbtool_it_roundtrip:user:1 \
+    dbtool_it_roundtrip:user:2 \
+    dbtool_it_roundtrip:user:3 >/dev/null || true
 
   while IFS= read -r command || [[ -n "$command" ]]; do
     [[ -z "$command" || "$command" == \#* ]] && continue
@@ -117,7 +117,7 @@ seed_mongo_ndjson() {
   local doc
 
   run_dbtool --dsn "$DBTOOL_IT_MONGO_DSN" --allow-write doc delete \
-    --filter '{"kind":"dbtool-fixture"}' \
+    --filter '{"kind":"dbtool-it-fixture"}' \
     "$collection" >/dev/null || true
 
   while IFS= read -r doc || [[ -n "$doc" ]]; do
@@ -130,11 +130,13 @@ postgres_seed="$ROOT/testdata/base-postgres-seed.sql"
 mysql_seed="$ROOT/testdata/base-mysql-seed.sql"
 redis_seed="$ROOT/testdata/base-redis-seed.commands"
 mongo_seed="$ROOT/testdata/base-mongo-seed.ndjson"
-mongo_collection="dbtool_fixture_people"
+mongo_collection="dbtool_it_fixture_people"
 
-postgres_restore="dbtool_fixture_people_restore_$suffix"
-mysql_restore="dbtool_fixture_people_restore_$suffix"
-mongo_restore="dbtool_fixture_people_restore_$suffix"
+postgres_restore="dbtool_it_fixture_people_restore_$suffix"
+mysql_restore="dbtool_it_fixture_people_restore_$suffix"
+mongo_restore="dbtool_it_fixture_people_restore_$suffix"
+
+echo "dbtool data roundtrip resources: postgres=$postgres_restore mysql=$mysql_restore redis=dbtool_it_roundtrip:user:* mongo=$mongo_restore"
 
 echo "dbtool data roundtrip: seeding base fixtures"
 seed_sql_file "$DBTOOL_IT_POSTGRES_DSN" "$postgres_seed"
@@ -149,7 +151,7 @@ run_dbtool \
   --dsn "$DBTOOL_IT_POSTGRES_DSN" \
   --limit 10 \
   export sql \
-  --query "select id, name, role, active from dbtool_fixture_people order by id" \
+  --query "select id, name, role, active from dbtool_it_fixture_people order by id" \
   --out "$export_dir/postgres-people.json" >/dev/null
 run_dbtool \
   --dsn "$DBTOOL_IT_POSTGRES_DSN" \
@@ -161,10 +163,9 @@ postgres_roundtrip="$(
   run_dbtool \
     --dsn "$DBTOOL_IT_POSTGRES_DSN" \
     --limit 3 \
-    sql query "select name, role from $postgres_restore order by id"
+    sql query "select id, name, role, active from $postgres_restore order by id"
 )"
-assert_json_field "$postgres_roundtrip" "data.rows.0.0" "alice"
-assert_json_field "$postgres_roundtrip" "data.rows.2.1" "reviewer"
+assert_json_predicate "$postgres_roundtrip" 'data["data"]["rows"] == [[1,"alice","reader",True],[2,"bob","writer",False],[3,"carol","reviewer",True]]'
 
 echo "dbtool data roundtrip: exporting MySQL fixture rows"
 sql_exec "$DBTOOL_IT_MYSQL_DSN" "drop table if exists $mysql_restore"
@@ -173,7 +174,7 @@ run_dbtool \
   --dsn "$DBTOOL_IT_MYSQL_DSN" \
   --limit 10 \
   export sql \
-  --query "select id, name, role, active from dbtool_fixture_people order by id" \
+  --query "select id, name, role, active from dbtool_it_fixture_people order by id" \
   --out "$export_dir/mysql-people.json" >/dev/null
 run_dbtool \
   --dsn "$DBTOOL_IT_MYSQL_DSN" \
@@ -185,30 +186,33 @@ mysql_roundtrip="$(
   run_dbtool \
     --dsn "$DBTOOL_IT_MYSQL_DSN" \
     --limit 3 \
-    sql query "select name, role from $mysql_restore order by id"
+    sql query "select id, name, role, active from $mysql_restore order by id"
 )"
-assert_json_field "$mysql_roundtrip" "data.rows.0.0" "alice"
-assert_json_field "$mysql_roundtrip" "data.rows.2.1" "reviewer"
+assert_json_predicate "$mysql_roundtrip" 'data["data"]["rows"] == [[1,"alice","reader",True],[2,"bob","writer",False],[3,"carol","reviewer",True]]'
 
 echo "dbtool data roundtrip: exporting Redis fixture keys"
 run_dbtool \
   --dsn "$DBTOOL_IT_REDIS_DSN" \
   --limit 10 \
   export kv \
-  --pattern "dbtool:fixture:user:*" \
+  --pattern "dbtool_it_fixture:user:*" \
   --out "$export_dir/redis-values.json" >/dev/null
 run_dbtool \
   --dsn "$DBTOOL_IT_REDIS_DSN" \
   --allow-write \
   import kv \
   --input "$export_dir/redis-values.json" \
-  --strip-prefix "dbtool:fixture:user:" \
-  --key-prefix "dbtool:roundtrip:user:" \
+  --strip-prefix "dbtool_it_fixture:user:" \
+  --key-prefix "dbtool_it_roundtrip:user:" \
   --ttl 120 >/dev/null
-redis_roundtrip="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" kv get dbtool:roundtrip:user:1)"
-assert_json_field "$redis_roundtrip" "data.value" "alice"
-redis_roundtrip_keys="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --limit 3 kv scan "dbtool:roundtrip:user:*")"
+redis_roundtrip="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" kv raw MGET dbtool_it_roundtrip:user:1 dbtool_it_roundtrip:user:2 dbtool_it_roundtrip:user:3)"
+assert_json_predicate "$redis_roundtrip" 'data["data"] == ["alice","bob","carol"]'
+redis_roundtrip_keys="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --limit 3 kv scan "dbtool_it_roundtrip:user:*")"
 assert_json_predicate "$redis_roundtrip_keys" 'len(data["data"]) == 3'
+for key in dbtool_it_roundtrip:user:1 dbtool_it_roundtrip:user:2 dbtool_it_roundtrip:user:3; do
+  redis_ttl="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" kv raw TTL "$key")"
+  assert_json_predicate "$redis_ttl" '1 <= data["data"] <= 120'
+done
 
 echo "dbtool data roundtrip: exporting MongoDB fixture documents"
 run_dbtool \
@@ -216,10 +220,10 @@ run_dbtool \
   --limit 10 \
   export doc \
   "$mongo_collection" \
-  --filter '{"kind":"dbtool-fixture"}' \
+  --filter '{"kind":"dbtool-it-fixture"}' \
   --out "$export_dir/mongo-people.json" >/dev/null
 run_dbtool --dsn "$DBTOOL_IT_MONGO_DSN" --allow-write doc delete \
-  --filter '{"kind":"dbtool-fixture"}' \
+  --filter '{"kind":"dbtool-it-fixture"}' \
   "$mongo_restore" >/dev/null || true
 run_dbtool \
   --dsn "$DBTOOL_IT_MONGO_DSN" \
@@ -232,19 +236,26 @@ mongo_roundtrip="$(
   run_dbtool \
     --dsn "$DBTOOL_IT_MONGO_DSN" \
     --limit 3 \
-    doc find --filter '{"kind":"dbtool-fixture"}' "$mongo_restore"
+    doc find --filter '{"kind":"dbtool-it-fixture"}' "$mongo_restore"
 )"
-assert_json_predicate "$mongo_roundtrip" 'len(data["data"]) == 3'
-assert_json_predicate "$mongo_roundtrip" 'any(doc.get("name") == "alice" and doc.get("role") == "reader" for doc in data["data"])'
+assert_json_predicate "$mongo_roundtrip" 'sorted((doc["id"],doc["name"],doc["role"],doc["active"]) for doc in data["data"]) == [(1,"alice","reader",True),(2,"bob","writer",False),(3,"carol","reviewer",True)]'
 
 sql_exec "$DBTOOL_IT_POSTGRES_DSN" "drop table if exists $postgres_restore" || true
+sql_exec "$DBTOOL_IT_POSTGRES_DSN" "drop table if exists dbtool_it_fixture_people" || true
 sql_exec "$DBTOOL_IT_MYSQL_DSN" "drop table if exists $mysql_restore" || true
+sql_exec "$DBTOOL_IT_MYSQL_DSN" "drop table if exists dbtool_it_fixture_people" || true
 run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --allow-write kv del \
-  dbtool:roundtrip:user:1 \
-  dbtool:roundtrip:user:2 \
-  dbtool:roundtrip:user:3 >/dev/null || true
+  dbtool_it_fixture:user:1 \
+  dbtool_it_fixture:user:2 \
+  dbtool_it_fixture:user:3 \
+  dbtool_it_roundtrip:user:1 \
+  dbtool_it_roundtrip:user:2 \
+  dbtool_it_roundtrip:user:3 >/dev/null || true
 run_dbtool --dsn "$DBTOOL_IT_MONGO_DSN" --allow-write doc delete \
-  --filter '{"kind":"dbtool-fixture"}' \
+  --filter '{"kind":"dbtool-it-fixture"}' \
+  "$mongo_collection" >/dev/null || true
+run_dbtool --dsn "$DBTOOL_IT_MONGO_DSN" --allow-write doc delete \
+  --filter '{"kind":"dbtool-it-fixture"}' \
   "$mongo_restore" >/dev/null || true
 
 echo "dbtool data roundtrip passed"
