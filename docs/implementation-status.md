@@ -130,11 +130,18 @@ the stated dbtool objective.
 | NATS core subject listing | Not a durable catalog | Core NATS subjects are ephemeral routing names; durable list/detail/lag semantics stay on JetStream. |
 | IBM Db2 end-to-end live Docker run | Requires IBM ODBC runtime at the OS level | The adapter, Docker Compose profile, and integration script exist. Running them requires IBM Data Server Driver for ODBC installed outside the container — this is an explicit runtime boundary analogous to Redshift needing a supplied external endpoint. Service-free adapter tests pass in all environments. |
 
-## Recommended Enhancement Candidates
+## Active Verification Work
 
-No open recommended enhancement candidates remain in this inventory. Future
-productization ideas should be added here only when they are intentionally kept
-outside the current completed objective and have a concrete verification gate.
+The implementation surface is broad, but real-product completeness is now
+tracked separately in `docs/db-completeness-tasks.md`. A connector or test
+script being present does not by itself mean that a product completed CRUD or
+the equivalent family checklist. External DSN skips, compatible aliases, and
+missing host runtimes remain explicit non-pass states in
+`testdata/db-completeness.manifest`.
+
+Design-only candidates such as Oracle, etcd, InfluxDB, VictoriaMetrics, Pulsar,
+MQTT, and RocketMQ do not have registered factories and are not listed as
+implemented backends.
 
 ## Completion Evidence
 

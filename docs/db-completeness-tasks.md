@@ -1,0 +1,95 @@
+# Database Capability Completeness Tasks
+
+This is the execution ledger for real dbtool backend verification. It is
+separate from `docs/tasks.md`: implementation, a runnable harness, and a real
+successful service run are intentionally different states.
+
+## Scope And Safety
+
+- Only disposable resources prefixed with `dbtool_it_` are created or mutated.
+- "All contents" means every row/document/key/message created by the fixture
+  named in an evidence file. The suite never performs an unbounded dump of an
+  arbitrary user or production database.
+- Credentials, raw DSNs, certificates, and full container logs are not committed.
+- A skipped external endpoint or a missing runtime is not a pass.
+- Heavy profiles run serially on the current 2 CPU / 8 GiB Docker allocation.
+
+## Status Model
+
+`NOT_RUN -> HARNESS_READY -> LIVE_PASS -> COMPLETE`
+
+- `HARNESS_READY`: code and an invocation path exist, but the real product has
+  not passed in the current validation campaign.
+- `LIVE_PASS`: the real product completed its capability-family checklist and
+  has a committed evidence file.
+- `COMPLETE`: `LIVE_PASS` plus documentation and the manifest are synchronized.
+- `BLOCKED`: a concrete architecture/runtime prerequisite is unavailable.
+- `EXTERNAL`: a real endpoint and credentials must be supplied.
+- `PARTIAL`: alias routing or a compatible harness passed, not the named product.
+
+## Capability-Family Checklists
+
+| Family | Required operations for a complete result |
+| --- | --- |
+| SQL | ping/caps, schemas/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/index metadata, typed values, limit/truncation, write guard/confirm, cleanup |
+| CQL | ping/caps, keyspaces/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/primary-key metadata, typed values, limit, write guard, cleanup |
+| KV/cache | ping/caps, SET, GET, overwrite, TTL, SCAN, raw read, raw write guard, DELETE, post-delete read, cleanup |
+| Document | ping/caps, collections, INSERT, FIND, UPDATE, aggregate, targeted DELETE, empty result verification, cleanup |
+| Search | ping/caps, write guard, index document, list indices, search/readback; update/delete are recorded `UNSUPPORTED` until the public capability exposes them |
+| Time series | ping/caps, write guard, remote write, measurement list, range readback; update/delete are not applicable to the Prometheus model |
+| Messaging | ping/caps, write guard, produce/publish, bounded consume, list/detail/lag where the protocol supports them, timeout/ack behavior, cleanup where the public API supports it |
+
+## Execution Task Table
+
+The machine-readable source for this table is
+`testdata/db-completeness.manifest`. `Commit` is filled with the commit that
+contains the corresponding evidence; `this commit` is used while that commit is
+being created and is normalized in the final campaign summary.
+
+| Task | Family | Product / scheme | Environment | Harness | Live result | Evidence | Commit / boundary |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| DB-SQLITE-001 | SQL | SQLite `sqlite:` | service-free | Ready | NOT_RUN | - | - |
+| DB-POSTGRES-001 | SQL | PostgreSQL `postgres://` | Docker base | Ready | NOT_RUN | - | - |
+| DB-MYSQL-001 | SQL | MySQL `mysql://` | Docker base | Ready | NOT_RUN | - | - |
+| DB-MARIADB-001 | SQL | MariaDB `mariadb://` | Docker compat | Ready | NOT_RUN | - | - |
+| DB-TIDB-001 | SQL | TiDB `tidb://` | Docker tidb | Ready | NOT_RUN | - | - |
+| DB-COCKROACH-001 | SQL | CockroachDB `cockroach://` | Docker pg-compat | Ready | NOT_RUN | - | - |
+| DB-TIMESCALE-001 | SQL | TimescaleDB `timescale://` | Docker pg-compat | Ready | NOT_RUN | - | - |
+| DB-SQLSERVER-001 | SQL | SQL Server `sqlserver://` | Docker sqlserver | Ready | BLOCKED | - | local host is arm64; image gate requires x86_64 |
+| DB-REDSHIFT-001 | SQL | Redshift `redshift://` | external | Ready | EXTERNAL | - | `DBTOOL_IT_REDSHIFT_DSN` is not supplied |
+| DB-CASSANDRA-001 | CQL | Cassandra `cassandra://` | Docker cassandra | Ready | NOT_RUN | - | - |
+| DB-SCYLLA-001 | CQL | ScyllaDB `scylla://` | compatible alias only | Ready | PARTIAL | - | no real ScyllaDB product profile |
+| DB-DB2-001 | SQL/Db2 | IBM Db2 `db2://` | Docker db2 + host ODBC | Ready | BLOCKED | - | IBM Db2 ODBC driver is not registered on the host |
+| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | NOT_RUN | - | - |
+| DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | NOT_RUN | - | - |
+| DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | NOT_RUN | - | - |
+| DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | NOT_RUN | - | - |
+| DB-MONGO-001 | Document | MongoDB `mongodb://` | Docker base | Ready | NOT_RUN | - | - |
+| DB-OPENSEARCH-001 | Search | OpenSearch `opensearch://` | Docker observability | Ready | NOT_RUN | - | public API has no update/delete |
+| DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | NOT_RUN | - | public API has no update/delete |
+| DB-ELASTICSEARCH-001 | Search | Elasticsearch `elasticsearch://` | Docker elasticsearch | Ready | NOT_RUN | - | product-native HTTPS is not covered |
+| DB-PROMETHEUS-001 | Time series | Prometheus `prometheus://` | Docker observability | Ready | NOT_RUN | - | delete/update are not applicable |
+| DB-REDIS-MQ-001 | Messaging | Redis Streams/PubSub | Docker messaging | Ready | NOT_RUN | - | Pub/Sub has no durable catalog |
+| DB-KAFKA-001 | Messaging | Kafka API on Redpanda | Docker messaging | Ready | NOT_RUN | - | consumer lag currently returns an empty list |
+| DB-RABBITMQ-001 | Messaging | AMQP + RabbitMQ management | Docker messaging | Ready | NOT_RUN | - | admin listing uses `rabbitmq+http://` |
+| DB-NATS-001 | Messaging | NATS Core + JetStream | Docker messaging | Ready | NOT_RUN | - | core subjects have no durable catalog |
+| DB-MQ-TLS-001 | Messaging | AMQPS + NATS TLS | Docker messaging-tls | Ready | NOT_RUN | - | - |
+| DB-KAFKA-VENDORS-001 | Messaging | AutoMQ/WarpStream/Confluent | external | Ready | EXTERNAL | - | no vendor DSNs are supplied |
+
+## Per-Resource Evidence Contract
+
+Every `LIVE_PASS` evidence file under `docs/test-evidence/` contains one row per
+fixture resource:
+
+| Resource | Create | Insert/write | Read all fixture data | Update/overwrite | Targeted delete | Metadata/admin | Guard | Limit/timeout | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `dbtool_it_*` | PASS/N/A | PASS/N/A | expected and actual row/key/document/message counts plus stable IDs | PASS/N/A/UNSUPPORTED | PASS/N/A/UNSUPPORTED | PASS/N/A | PASS | PASS/N/A | PASS/UNSUPPORTED |
+
+The evidence must also record the exact runner, UTC timestamp, image/product
+version, architecture, result, and any unsupported capability boundary.
+
+## Design-Only, Not Registered
+
+Oracle, etcd, InfluxDB, VictoriaMetrics, Pulsar, MQTT, and RocketMQ still appear
+as design candidates in `dbtool-design.md`, but no factory is registered for
+them. They are not counted as current support and cannot be marked tested.

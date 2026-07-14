@@ -158,8 +158,9 @@ require_pattern "crates/dbtool-registry/tests/embedded_library.rs" "FlowControl"
 require_pattern "crates/dbtool-tui/src/state.rs" "CommandFormState"
 require_pattern "crates/dbtool-tui/src/app.rs" "pending_write"
 
-if grep -Eq 'Pending|In progress|Deferred|\[ \]' "$ROOT/docs/tasks.md"; then
-  fail "docs/tasks.md still contains an unfinished task marker"
+if grep -Ev '^\| T42 Real backend completeness campaign ' "$ROOT/docs/tasks.md" \
+  | grep -Eq 'Pending|In progress|Deferred|\[ \]'; then
+  fail "docs/tasks.md still contains an unfinished implementation task marker"
 fi
 
 require_no_pattern "docs/implementation-status.md" "Prometheus remote write | Not supported"
@@ -185,7 +186,10 @@ require_pattern "docs/implementation-status.md" "integration-elasticsearch-test.
 require_pattern "docs/implementation-status.md" "integration-opensearch-security-test.sh"
 require_pattern "docs/implementation-status.md" "integration-kafka-vendor-test.sh"
 require_pattern "docs/implementation-status.md" "integration-redshift-test.sh"
-require_pattern "docs/implementation-status.md" "No open recommended enhancement candidates remain"
+require_pattern "docs/implementation-status.md" "Active Verification Work"
+require_pattern "docs/implementation-status.md" "db-completeness-tasks.md"
+require_pattern "docs/tasks.md" "T41 Per-backend completeness ledger"
+require_pattern "docs/tasks.md" "T42 Real backend completeness campaign"
 require_pattern "docs/tasks.md" "T35 Generic export/import CLI"
 require_pattern "docs/tasks.md" "T36 Product-native Elasticsearch profile"
 require_pattern "docs/tasks.md" "T37 Vendor Kafka-compatible smoke profiles"

@@ -1,0 +1,28 @@
+# id|family|product|schemes|feature|environment|runner|status|evidence|boundary
+DB-SQLITE-001|sql|SQLite|sqlite|default|service-free|cargo test -p dbtool-cli --test db_completeness sqlite_full_crud|HARNESS_READY|-|local file-backed fixture
+DB-POSTGRES-001|sql|PostgreSQL|postgres|default|docker-base|./scripts/integration-test.sh|HARNESS_READY|-|-
+DB-MYSQL-001|sql|MySQL|mysql|default|docker-base|./scripts/integration-test.sh|HARNESS_READY|-|-
+DB-MARIADB-001|sql|MariaDB|mariadb|default|docker-compat|./scripts/integration-compat-test.sh|HARNESS_READY|-|-
+DB-TIDB-001|sql|TiDB|tidb|default|docker-tidb|./scripts/integration-tidb-test.sh|HARNESS_READY|-|-
+DB-COCKROACH-001|sql|CockroachDB|cockroach|default|docker-pg-compat|./scripts/integration-pg-compat-test.sh|HARNESS_READY|-|-
+DB-TIMESCALE-001|sql|TimescaleDB|timescale|default|docker-pg-compat|./scripts/integration-pg-compat-test.sh|HARNESS_READY|-|-
+DB-SQLSERVER-001|sql|SQL Server|sqlserver,mssql|full|docker-sqlserver|./scripts/integration-sqlserver-test.sh|BLOCKED|-|arm64 host; local image gate requires x86_64
+DB-REDSHIFT-001|sql|Amazon Redshift|redshift|default|external|./scripts/integration-redshift-test.sh|EXTERNAL|-|DBTOOL_IT_REDSHIFT_DSN is not supplied
+DB-CASSANDRA-001|cql|Apache Cassandra|cassandra|full|docker-cassandra|./scripts/integration-cassandra-test.sh|HARNESS_READY|-|-
+DB-SCYLLA-001|cql|ScyllaDB|scylla|full|alias-only|cargo test -p dbtool-core registry::alias|PARTIAL|-|no real ScyllaDB product profile
+DB-DB2-001|sql|IBM Db2|db2,ibmdb2,as400|full|docker-db2-and-host-odbc|./scripts/integration-db2-test.sh|BLOCKED|-|IBM Db2 ODBC driver is not registered on the host
+DB-REDIS-001|kv|Redis|redis|default|docker-base|./scripts/integration-test.sh|HARNESS_READY|-|-
+DB-VALKEY-001|kv|Valkey|valkey|default|docker-compat|./scripts/integration-compat-test.sh|HARNESS_READY|-|-
+DB-KEYDB-001|kv|KeyDB|keydb|default|docker-compat-extra|DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh|HARNESS_READY|-|-
+DB-DRAGONFLY-001|kv|Dragonfly|dragonfly|default|docker-compat-extra|DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh|HARNESS_READY|-|-
+DB-MONGO-001|document|MongoDB|mongodb|default|docker-base|./scripts/integration-test.sh|HARNESS_READY|-|-
+DB-OPENSEARCH-001|search|OpenSearch|opensearch|default|docker-observability|./scripts/integration-observability-test.sh|HARNESS_READY|-|public API has no update/delete
+DB-OPENSEARCH-TLS-001|search|OpenSearch security HTTPS|opensearch+https|default|docker-opensearch-security|./scripts/integration-opensearch-security-test.sh|HARNESS_READY|-|public API has no update/delete
+DB-ELASTICSEARCH-001|search|Elasticsearch|elasticsearch|default|docker-elasticsearch|./scripts/integration-elasticsearch-test.sh|HARNESS_READY|-|product-native HTTPS is not covered
+DB-PROMETHEUS-001|timeseries|Prometheus|prometheus,prometheus+http|default|docker-observability|./scripts/integration-observability-test.sh|HARNESS_READY|-|delete/update are not applicable
+DB-REDIS-MQ-001|messaging|Redis Streams and PubSub|redis|full|docker-messaging|./scripts/integration-mq-test.sh|HARNESS_READY|-|PubSub has no durable catalog
+DB-KAFKA-001|messaging|Kafka API on Redpanda|kafka,redpanda|full|docker-messaging|./scripts/integration-mq-test.sh|HARNESS_READY|-|consumer lag currently returns an empty list
+DB-RABBITMQ-001|messaging|AMQP and RabbitMQ management|amqp,rabbitmq+http|full|docker-messaging|./scripts/integration-mq-test.sh|HARNESS_READY|-|queue listing uses the management connector
+DB-NATS-001|messaging|NATS Core and JetStream|nats|full|docker-messaging|./scripts/integration-mq-test.sh|HARNESS_READY|-|core subjects have no durable catalog
+DB-MQ-TLS-001|messaging|AMQPS and NATS TLS|amqps,nats+tls|full|docker-messaging-tls|./scripts/integration-mq-tls-test.sh|HARNESS_READY|-|-
+DB-KAFKA-VENDORS-001|messaging|AutoMQ WarpStream Confluent|automq,warpstream,confluent|full-native|external|./scripts/integration-kafka-vendor-test.sh|EXTERNAL|-|vendor DSNs are not supplied
