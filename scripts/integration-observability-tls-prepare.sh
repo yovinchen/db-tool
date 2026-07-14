@@ -13,7 +13,21 @@ export DBTOOL_IT_SEARCH_TLS_DIR
 CERT_DIR="$DBTOOL_IT_SEARCH_TLS_DIR/certs"
 mkdir -p "$CERT_DIR"
 
-if [[ "${DBTOOL_IT_SEARCH_TLS_REGENERATE_CERTS:-0}" == "1" ]]; then
+CERT_RENEWAL_SECONDS="${DBTOOL_IT_SEARCH_TLS_CERT_RENEWAL_SECONDS:-3600}"
+
+cert_is_current() {
+  local cert="$1"
+  [[ -f "$cert" ]] && openssl x509 \
+    -checkend "$CERT_RENEWAL_SECONDS" \
+    -noout \
+    -in "$cert" >/dev/null 2>&1
+}
+
+if [[ "${DBTOOL_IT_SEARCH_TLS_REGENERATE_CERTS:-0}" == "1" ]] \
+  || [[ ! -f "$CERT_DIR/ca-key.pem" ]] \
+  || [[ ! -f "$CERT_DIR/server-key.pem" ]] \
+  || ! cert_is_current "$CERT_DIR/ca.pem" \
+  || ! cert_is_current "$CERT_DIR/server.pem"; then
   rm -f "$CERT_DIR"/*
 fi
 
