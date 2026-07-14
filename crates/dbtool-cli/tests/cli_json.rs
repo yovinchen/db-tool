@@ -467,6 +467,69 @@ fn cql_exec_requires_write_flag_before_connecting() {
 }
 
 #[test]
+fn cql_query_rejects_writes_before_connecting() {
+    let err = stderr_json(&dbtool(&[
+        "--dsn",
+        "cassandra://127.0.0.1:1/app",
+        "cql",
+        "query",
+        "insert into app.users (id) values (1)",
+    ]));
+
+    assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");
+}
+
+#[test]
+fn document_aggregate_write_stage_requires_write_flag_before_connecting() {
+    let err = stderr_json(&dbtool(&[
+        "--dsn",
+        "mongodb://127.0.0.1:1/app",
+        "doc",
+        "aggregate",
+        "users",
+        r#"[{"$match":{}},{"$out":"users_archive"}]"#,
+    ]));
+
+    assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");
+}
+
+#[test]
+fn readonly_named_connection_blocks_sql_and_kv_writes() {
+    let config = r#"
+[connections.locked]
+dsn = "sqlite::memory:"
+readonly = true
+"#;
+
+    let sql = stderr_json(&dbtool_with_config(
+        &[
+            "--conn",
+            "locked",
+            "--allow-write",
+            "sql",
+            "exec",
+            "insert into users (id) values (1)",
+        ],
+        config,
+    ));
+    assert_eq!(sql["error"]["code"], "READ_ONLY");
+
+    let kv = stderr_json(&dbtool_with_config(
+        &[
+            "--conn",
+            "locked",
+            "--allow-write",
+            "kv",
+            "set",
+            "user:1",
+            "alice",
+        ],
+        config,
+    ));
+    assert_eq!(kv["error"]["code"], "READ_ONLY");
+}
+
+#[test]
 fn named_connection_limits_are_loaded_for_data_commands() {
     let output = dbtool_with_config(
         &["--conn", "limit-test", "ping"],

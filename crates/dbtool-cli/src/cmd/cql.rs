@@ -1,6 +1,13 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{error::Error, service::limiter::ResultLimiter, Result};
+use dbtool_core::{
+    error::Error,
+    service::{
+        limiter::ResultLimiter,
+        safety::{SafetyGuard, StatementKind},
+    },
+    Result,
+};
 
 #[derive(Args)]
 #[command(
@@ -43,8 +50,10 @@ pub enum CqlAction {
 }
 
 pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
-    if matches!(cmd.action, CqlAction::Exec { .. }) {
-        ensure_write_allowed(ctx)?;
+    match &cmd.action {
+        CqlAction::Query { cql } => ensure_readonly_query(cql)?,
+        CqlAction::Exec { .. } => ensure_write_allowed(ctx)?,
+        CqlAction::Keyspaces | CqlAction::Tables { .. } | CqlAction::Schema { .. } => {}
     }
 
     let dsn = ctx.resolve_dsn()?;
@@ -99,10 +108,13 @@ fn cql_table_ref(table: &str, keyspace: Option<&str>) -> Result<String> {
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
-    if ctx.allow_write {
-        Ok(())
-    } else {
-        Err(Error::WriteNotAllowed)
+    ctx.ensure_write_allowed()
+}
+
+fn ensure_readonly_query(cql: &str) -> Result<()> {
+    match SafetyGuard::check(cql, false, None) {
+        Ok(StatementKind::Read) => Ok(()),
+        _ => Err(Error::WriteNotAllowed),
     }
 }
 
@@ -131,6 +143,19 @@ mod tests {
             Err(Error::WriteNotAllowed)
         ));
         assert!(ensure_write_allowed(&test_context(true)).is_ok());
+    }
+
+    #[test]
+    fn cql_query_rejects_write_and_ddl_statements() {
+        assert!(ensure_readonly_query("select * from system.local").is_ok());
+        assert!(matches!(
+            ensure_readonly_query("insert into app.users (id) values (1)"),
+            Err(Error::WriteNotAllowed)
+        ));
+        assert!(matches!(
+            ensure_readonly_query("/* hidden */ truncate app.users"),
+            Err(Error::WriteNotAllowed)
+        ));
     }
 
     #[test]

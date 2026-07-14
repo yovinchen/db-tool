@@ -2,7 +2,10 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    service::{limiter::ResultLimiter, safety::SafetyGuard},
+    service::{
+        limiter::ResultLimiter,
+        safety::{SafetyGuard, StatementKind},
+    },
     Result,
 };
 
@@ -52,7 +55,15 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
 
     match &cmd.action {
         SqlAction::Query { sql, .. } | SqlAction::Exec { sql } => {
-            SafetyGuard::check_with_target(sql, &target, ctx.allow_write, ctx.confirm.as_deref())?;
+            let kind = SafetyGuard::check_with_target(
+                sql,
+                &target,
+                ctx.allow_write,
+                ctx.confirm.as_deref(),
+            )?;
+            if kind != StatementKind::Read {
+                ctx.ensure_write_allowed()?;
+            }
         }
         SqlAction::Tables { .. } | SqlAction::Schema { .. } | SqlAction::Schemas => {}
     }

@@ -44,6 +44,21 @@ pub enum KvAction {
 }
 
 pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
+    match &cmd.action {
+        KvAction::Set { .. } | KvAction::Del { .. } => ensure_write_allowed(ctx)?,
+        KvAction::Raw { args } => {
+            let Some(command) = args.first() else {
+                return Err(Error::Config(
+                    "raw command requires at least one argument".into(),
+                ));
+            };
+            if !is_readonly_raw_command(command) {
+                ensure_write_allowed(ctx)?;
+            }
+        }
+        KvAction::Get { .. } | KvAction::Scan { .. } => {}
+    }
+
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
     let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
@@ -67,7 +82,6 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             )
         }
         KvAction::Set { key, value, ttl } => {
-            ensure_write_allowed(ctx)?;
             kv.set(
                 &key,
                 value.as_bytes(),
@@ -85,19 +99,10 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             ctx.render_success(&kind, keys, elapsed(), truncated)
         }
         KvAction::Del { keys } => {
-            ensure_write_allowed(ctx)?;
             let n = kv.delete(&keys).await?;
             ctx.render_success(&kind, serde_json::json!({"deleted": n}), elapsed(), false)
         }
         KvAction::Raw { args } => {
-            if args.is_empty() {
-                return Err(Error::Config(
-                    "raw command requires at least one argument".into(),
-                ));
-            }
-            if !is_readonly_raw_command(&args[0]) {
-                ensure_write_allowed(ctx)?;
-            }
             let val = kv.raw_command(&args).await?;
             ctx.render_success(&kind, val, elapsed(), false)
         }
@@ -105,11 +110,7 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
-    if ctx.allow_write {
-        Ok(())
-    } else {
-        Err(Error::WriteNotAllowed)
-    }
+    ctx.ensure_write_allowed()
 }
 
 fn is_readonly_raw_command(command: &str) -> bool {

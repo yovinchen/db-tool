@@ -92,11 +92,7 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
-    if ctx.allow_write {
-        Ok(())
-    } else {
-        Err(Error::WriteNotAllowed)
-    }
+    ctx.ensure_write_allowed()
 }
 
 fn parse_json_value(raw: &str) -> Result<Value> {

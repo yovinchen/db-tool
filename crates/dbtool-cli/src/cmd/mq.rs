@@ -135,9 +135,5 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
-    if ctx.allow_write {
-        Ok(())
-    } else {
-        Err(Error::WriteNotAllowed)
-    }
+    ctx.ensure_write_allowed()
 }

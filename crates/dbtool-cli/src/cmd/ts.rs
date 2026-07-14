@@ -104,11 +104,7 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
-    if ctx.allow_write {
-        Ok(())
-    } else {
-        Err(Error::WriteNotAllowed)
-    }
+    ctx.ensure_write_allowed()
 }
 
 fn parse_tags(tags: &[String]) -> Result<HashMap<String, String>> {

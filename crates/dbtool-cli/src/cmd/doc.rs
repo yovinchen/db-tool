@@ -60,6 +60,19 @@ pub enum DocAction {
 }
 
 pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
+    match &cmd.action {
+        DocAction::Insert { .. } | DocAction::Update { .. } | DocAction::Delete { .. } => {
+            ensure_write_allowed(ctx)?;
+        }
+        DocAction::Aggregate { pipeline, .. } => {
+            let pipeline = parse_pipeline(pipeline)?;
+            if pipeline_has_write_stage(&pipeline) {
+                ensure_write_allowed(ctx)?;
+            }
+        }
+        DocAction::Collections | DocAction::Find { .. } => {}
+    }
+
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
     let doc = conn
@@ -91,7 +104,6 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             collection,
             doc: raw_doc,
         } => {
-            ensure_write_allowed(ctx)?;
             let d = parse_document(&raw_doc)?;
             let outcome = doc.insert(&collection, vec![d]).await?;
             ctx.render_success(&kind, outcome, elapsed(), false)
@@ -101,14 +113,12 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             filter,
             update,
         } => {
-            ensure_write_allowed(ctx)?;
             let filter = parse_json_value(&filter)?;
             let update = parse_json_value(&update)?;
             let outcome = doc.update(&collection, filter, update).await?;
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
         DocAction::Delete { collection, filter } => {
-            ensure_write_allowed(ctx)?;
             let filter = parse_json_value(&filter)?;
             let deleted = doc.delete(&collection, filter).await?;
             ctx.render_success(
@@ -131,11 +141,7 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
-    if ctx.allow_write {
-        Ok(())
-    } else {
-        Err(Error::WriteNotAllowed)
-    }
+    ctx.ensure_write_allowed()
 }
 
 fn parse_json_value(raw: &str) -> Result<Value> {
@@ -161,5 +167,31 @@ fn parse_pipeline(raw: &str) -> Result<Vec<Value>> {
     match value {
         serde_json::Value::Array(items) => Ok(items.into_iter().map(Value::Json).collect()),
         _ => Err(Error::Serialization("expected JSON array pipeline".into())),
+    }
+}
+
+fn pipeline_has_write_stage(pipeline: &[Value]) -> bool {
+    pipeline.iter().any(|stage| match stage {
+        Value::Json(serde_json::Value::Object(stage)) => {
+            stage.contains_key("$out") || stage.contains_key("$merge")
+        }
+        _ => false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_write_stages_are_detected() {
+        let readonly = parse_pipeline(r#"[{"$match":{"active":true}}]"#).unwrap();
+        assert!(!pipeline_has_write_stage(&readonly));
+
+        let out = parse_pipeline(r#"[{"$match":{}},{"$out":"archive"}]"#).unwrap();
+        assert!(pipeline_has_write_stage(&out));
+
+        let merge = parse_pipeline(r#"[{"$merge":{"into":"archive"}}]"#).unwrap();
+        assert!(pipeline_has_write_stage(&merge));
     }
 }

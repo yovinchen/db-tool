@@ -428,11 +428,7 @@ fn require_version(version: u32) -> Result<()> {
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
-    if ctx.allow_write {
-        Ok(())
-    } else {
-        Err(Error::WriteNotAllowed)
-    }
+    ctx.ensure_write_allowed()
 }
 
 fn restore_key(source: &str, strip_prefix: Option<&str>, key_prefix: &str) -> Result<String> {

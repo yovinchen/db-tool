@@ -31,6 +31,31 @@ pub struct Context {
 }
 
 impl Context {
+    pub fn ensure_write_allowed(&self) -> dbtool_core::Result<()> {
+        if !self.allow_write {
+            return Err(Error::WriteNotAllowed);
+        }
+
+        let Some(name) = self.conn.as_deref() else {
+            return Ok(());
+        };
+        if self.dsn.is_some() || std::env::var_os(ConnectionResolver::env_key(name)).is_some() {
+            return Ok(());
+        }
+
+        let config = ConnectionConfig::load(&ConnectionConfig::default_path())?;
+        if config
+            .connections
+            .get(name)
+            .and_then(|entry| entry.readonly)
+            .unwrap_or(false)
+        {
+            return Err(Error::ReadOnly);
+        }
+
+        Ok(())
+    }
+
     /// Resolve the connection name/DSN from this context.
     pub fn resolve_dsn(&self) -> dbtool_core::Result<String> {
         if let Some(raw) = &self.dsn {
