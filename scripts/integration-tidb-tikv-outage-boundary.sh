@@ -102,6 +102,38 @@ assert_query_contains() {
   fi
 }
 
+assert_recovered_fixture() {
+  local dsn="$1"
+  local table="$2"
+  local outage_outcome="$3"
+  local output
+
+  output="$(dbtool_cli --dsn "$dsn" sql query "select id, note from $table order by id")"
+  printf '%s' "$output" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+outcome=sys.argv[1]
+rows=data["data"]["rows"]
+without_outage_write = [
+    [1, "tikv-baseline"],
+    [3, "write-after-tikv-restart"],
+]
+with_outage_write = [
+    [1, "tikv-baseline"],
+    [2, "write-while-tikv-down"],
+    [3, "write-after-tikv-restart"],
+]
+if outcome == "client-success":
+    assert rows == with_outage_write, data
+else:
+    assert outcome == "bounded-storage-failure", outcome
+    assert rows in (without_outage_write, with_outage_write), data
+print("TiDB TiKV outage boundary: recovered fixture rows=%d outage_write=%s committed=%s" % (
+    len(rows), outcome, "yes" if rows == with_outage_write else "no"
+))
+' "$outage_outcome"
+}
+
 assert_identifier() {
   local value="$1"
   local label="$2"
@@ -151,7 +183,43 @@ bounded_probe() {
     echo "$output" | sed -n '1,20p'
   fi
 
-  return "$status"
+  return 0
+}
+
+bounded_baseline_read() {
+  local hard_timeout="$1"
+  local output
+  local status
+
+  set +e
+  output="$(
+    run_with_timeout "$hard_timeout" \
+      dbtool_cli \
+        --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" \
+        sql query "select note from $qualified_table where id = 1" \
+      2>&1
+  )"
+  status=$?
+  set -e
+
+  if ((status == 124)); then
+    echo "TiDB TiKV outage boundary: baseline read exceeded ${hard_timeout}s hard timeout" >&2
+    echo "$output" >&2
+    return 1
+  fi
+
+  if ((status != 0)); then
+    echo "TiDB TiKV outage boundary: baseline read returned bounded failure status $status"
+    echo "$output" | sed -n '1,20p'
+    return 0
+  fi
+
+  printf '%s' "$output" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+assert data["data"]["rows"] == [["tikv-baseline"]], data
+'
+  echo "TiDB TiKV outage boundary: baseline read succeeded with the exact value"
 }
 
 probe_write_with_one_tikv_down() {
@@ -178,6 +246,7 @@ probe_write_with_one_tikv_down() {
   fi
 
   if ((status == 0)); then
+    outage_write_outcome="client-success"
     echo "TiDB TiKV outage boundary: write succeeded while one TiKV was stopped"
     assert_query_contains "cross-node read after TiKV outage write" \
       "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" \
@@ -186,6 +255,15 @@ probe_write_with_one_tikv_down() {
     return 0
   fi
 
+  if ! grep -Eqi \
+    'tikv|region|raft|store.*(unavailable|not|error|timeout)|unavailable|deadline exceeded|operation timed out|request timeout|context canceled|connection (closed|reset|refused)|broken pipe|server is busy|not leader|epoch.*not match' \
+    <<<"$output"; then
+    echo "TiDB TiKV outage boundary: write failed for an unexpected non-storage reason" >&2
+    echo "$output" >&2
+    return 1
+  fi
+
+  outage_write_outcome="bounded-storage-failure"
   echo "TiDB TiKV outage boundary: write returned bounded failure status $status"
   echo "$output" | sed -n '1,20p'
   return 0
@@ -196,8 +274,9 @@ probe_write_with_one_tikv_down() {
 database="$DBTOOL_IT_TIDB_SECURE_DB"
 assert_identifier "$database" "database"
 
-table="dbtool_tidb_tikv_outage_$(date +%s)_$$"
+table="dbtool_it_tidb_tikv_outage_$(date +%s)_$$"
 qualified_table="$database.$table"
+echo "TiDB TiKV outage boundary resource: table=$qualified_table"
 
 echo "TiDB TiKV outage boundary: preparing $qualified_table through SQL node 1"
 sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "create database if not exists $database"
@@ -221,16 +300,14 @@ hard_timeout="${DBTOOL_IT_TIDB_TIKV_OUTAGE_HARD_TIMEOUT:-45}"
 bounded_probe \
   "SQL node 1 ping" \
   "$hard_timeout" \
-  dbtool_cli --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" ping || true
+  dbtool_cli --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" ping
 bounded_probe \
   "SQL node 2 ping" \
   "$hard_timeout" \
-  dbtool_cli --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" ping || true
-bounded_probe \
-  "baseline read through SQL node 1" \
-  "$hard_timeout" \
-  dbtool_cli --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" --format table sql query "select note from $qualified_table where id = 1" || true
+  dbtool_cli --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" ping
+bounded_baseline_read "$hard_timeout"
 
+outage_write_outcome="unknown"
 probe_write_with_one_tikv_down
 
 echo "TiDB TiKV outage boundary: restarting $stopped_tikv"
@@ -244,5 +321,18 @@ bounded_probe \
   "SQL node 2 ping after TiKV restart" \
   "$hard_timeout" \
   dbtool_cli --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" ping
+
+assert_query_contains "baseline after TiKV restart" \
+  "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" \
+  "select note from $qualified_table where id = 1" \
+  "tikv-baseline"
+sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" \
+  "insert into $qualified_table (id, note) values (3, 'write-after-tikv-restart')"
+assert_recovered_fixture \
+  "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" \
+  "$qualified_table" \
+  "$outage_write_outcome"
+
+sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "drop table $qualified_table"
 
 echo "TiDB TiKV outage boundary drill passed"
