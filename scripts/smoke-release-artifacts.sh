@@ -25,5 +25,19 @@ for entry in "${targets[@]}"; do
   tmp="$(mktemp -d)"
   tar -C "$tmp" -xzf "$archive"
   "$ROOT/scripts/smoke-binary.sh" "$target" "$tmp/dbtool$suffix"
+  for artifact in \
+    completions/dbtool.bash \
+    completions/dbtool.zsh \
+    completions/dbtool.fish \
+    man/dbtool.1; do
+    if [[ ! -f "$tmp/$artifact" ]]; then
+      echo "missing release artifact $artifact in $archive" >&2
+      exit 1
+    fi
+  done
+  grep -Fq "complete -F _dbtool dbtool" "$tmp/completions/dbtool.bash"
+  grep -Fq "#compdef dbtool" "$tmp/completions/dbtool.zsh"
+  grep -Fq "complete -c dbtool" "$tmp/completions/dbtool.fish"
+  grep -Fq ".TH DBTOOL 1" "$tmp/man/dbtool.1"
   rm -rf "$tmp"
 done

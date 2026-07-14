@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -60,11 +60,13 @@ const repoRoot = resolve(scriptDir, "..");
 const artifactRoot = resolve(artifactRootArg);
 const outDir = resolve(outDirArg);
 const workDir = join(outDir, ".work");
+const cliArtifactsDir = join(workDir, "cli-artifacts");
 const version = normalizeVersion(refNameArg);
 
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 mkdirSync(workDir, { recursive: true });
+generateCliArtifacts();
 
 const optionalDependencies = {};
 for (const target of targets) {
@@ -105,6 +107,7 @@ function packPlatformPackage(target) {
   const dir = join(workDir, target.target);
   mkdirSync(join(dir, "bin"), { recursive: true });
   copyFileSync(findBinary(target), join(dir, "bin", target.exe));
+  copyCliArtifacts(dir);
   writeFileSync(
     join(dir, "package.json"),
     `${JSON.stringify(
@@ -119,7 +122,7 @@ function packPlatformPackage(target) {
         },
         os: [target.os],
         cpu: [target.cpu],
-        files: ["bin"],
+        files: ["bin", "completions", "man"],
       },
       null,
       2,
@@ -134,12 +137,29 @@ function packMainPackage(optionalDependencies) {
   mkdirSync(join(dir, "bin"), { recursive: true });
   copyFileSync(join(src, "bin", "dbtool.js"), join(dir, "bin", "dbtool.js"));
   copyFileSync(join(src, "README.md"), join(dir, "README.md"));
+  copyCliArtifacts(dir);
 
   const packageJson = JSON.parse(readFileSync(join(src, "package.json"), "utf8"));
   packageJson.version = version;
   packageJson.optionalDependencies = optionalDependencies;
+  packageJson.files = Array.from(new Set([...(packageJson.files ?? []), "completions", "man"]));
   writeFileSync(join(dir, "package.json"), `${JSON.stringify(packageJson, null, 2)}\n`);
   npmPack(dir);
+}
+
+function generateCliArtifacts() {
+  const script = join(repoRoot, "scripts", "generate-cli-artifacts.sh");
+  const result = spawnSync("bash", [script, artifactRoot, cliArtifactsDir], {
+    stdio: "inherit",
+  });
+  if (result.status !== 0) {
+    process.exit(result.status ?? 1);
+  }
+}
+
+function copyCliArtifacts(dir) {
+  cpSync(join(cliArtifactsDir, "completions"), join(dir, "completions"), { recursive: true });
+  cpSync(join(cliArtifactsDir, "man"), join(dir, "man"), { recursive: true });
 }
 
 function npmPack(dir) {

@@ -30,14 +30,15 @@ objective.
 | Requirement | Evidence |
 | --- | --- |
 | Single shared core | `crates/dbtool-core` defines models, connector traits, DSN parsing, formatter, safety, limiter, and flow-control services. |
-| CLI / Claude Skill shape | `crates/dbtool-cli` exposes `ping`, `caps`, `conn`, `sql`, `kv`, `doc`, `mq`, `search`, and `ts`; `SKILL.md` documents machine-readable usage. |
+| CLI / Claude Skill shape | `crates/dbtool-cli` exposes `ping`, `caps`, `conn`, `sql`, `cql`, `kv`, `doc`, `export`, `import`, `mq`, `search`, and `ts` with help text for safety boundaries and JSON inputs; `SKILL.md` documents machine-readable usage. |
 | TUI shape | `crates/dbtool-tui` uses the same registry/connection manager, write confirmation, command history, status layout, and capability forms. |
 | Embedded-library shape | `crates/dbtool-registry/tests/embedded_library.rs` builds the registry directly and uses `ConnectionManager`, `SafetyGuard`, and `FlowControl` without spawning the CLI. |
-| Protocol-family reuse | `crates/dbtool-core/src/registry/alias.rs` maps compatible schemes to canonical families including MySQL/MariaDB/TiDB, PostgreSQL/Cockroach/Timescale/Redshift, Redis/Valkey/KeyDB/Dragonfly, Kafka/AutoMQ/Redpanda/WarpStream/Confluent, and OpenSearch/Elasticsearch. |
-| SQL, NoSQL, search, time-series coverage | SQL, Redis-compatible KV, MongoDB documents, OpenSearch/Elasticsearch search, and Prometheus time-series adapters are implemented and listed in `docs/implementation-status.md`. |
-| Messaging coverage | Kafka/Redpanda-compatible, AMQP/RabbitMQ, Redis Streams/PubSub, RabbitMQ management, and NATS/JetStream coverage are implemented and documented. |
+| Protocol-family reuse | `crates/dbtool-core/src/registry/alias.rs` maps compatible schemes to canonical families including MySQL/MariaDB/TiDB, PostgreSQL/Cockroach/Timescale/Redshift, Redis/Valkey/KeyDB/Dragonfly, Kafka/AutoMQ/Redpanda/WarpStream/Confluent, and OpenSearch/Elasticsearch; external Redshift and Kafka vendor smokes verify supplied non-local endpoints without committing secrets. |
+| SQL, CQL, NoSQL, search, time-series coverage | SQL, Cassandra/ScyllaDB CQL, Redis-compatible KV, MongoDB documents, OpenSearch/Elasticsearch search, and Prometheus time-series adapters are implemented and listed in `docs/implementation-status.md`; public export/import commands cover logical SQL row, KV, and document transfers, while OpenSearch security-plugin TLS and product-native Elasticsearch have opt-in live profiles. |
+| Messaging coverage | Kafka/Redpanda-compatible, env-gated AutoMQ/WarpStream/Confluent vendor smoke, AMQP/RabbitMQ, Redis Streams/PubSub, RabbitMQ management, and NATS/JetStream coverage are implemented and documented. |
 | Cross-platform release | `.github/workflows/release.yml`, `scripts/package-release.sh`, `scripts/package-npm.mjs`, `scripts/package-python-wheel.py`, and `dist/mise/README.md` all list Linux musl, macOS, and Windows targets for x64 and arm64. |
 | Single binary artifact | Release archives contain `dbtool` or `dbtool.exe`; `scripts/smoke-binary.sh` and `scripts/smoke-release-artifacts.sh` validate packaged binaries. |
+| Completion and manpage artifacts | `dbtool generate-artifacts` emits bash/zsh/fish completions and `dbtool.1` from clap metadata; release, npm, and Python package scripts include those files. |
 | npm / pip / uv / mise install paths | `dist/npm`, `scripts/package-npm.mjs`, `dist/python`, `scripts/package-python-wheel.py`, and `dist/mise/README.md` provide wrapper packages and mise/ubi metadata. |
 | Environment connections | `ConnectionResolver` handles raw DSNs, named config, and `DBTOOL_CONN_*`; `docs/connections.example.toml` documents named connection config. |
 | Read-only default | CLI tests cover write refusal before connection for search and time-series writes; SQL safety tests cover read/write/destructive classification. |

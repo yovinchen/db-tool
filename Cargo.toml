@@ -12,6 +12,7 @@ members = [
     "crates/adapter-nats",
     "crates/adapter-sqlserver",
     "crates/adapter-cassandra",
+    "crates/adapter-db2",
     "crates/dbtool-registry",
     "crates/dbtool-cli",
     "crates/dbtool-tui",
@@ -52,6 +53,8 @@ tiberius      = { version = "0.12", default-features = false, features = [
                     "tds73", "tokio", "tokio-util", "rustls",
                 ] }
 scylla        = { version = "1.7", default-features = false }
+odbc-api      = "2"
+once_cell     = "1"
 
 # ── SQL safety parser ─────────────────────────────────────────────────────────
 sqlparser     = "0.51"

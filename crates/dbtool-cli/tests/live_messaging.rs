@@ -17,6 +17,10 @@ fn tls_integration_enabled() -> bool {
     env::var("DBTOOL_RUN_MQ_TLS_INTEGRATION").as_deref() == Ok("1")
 }
 
+fn vendor_kafka_integration_enabled() -> bool {
+    env::var("DBTOOL_RUN_VENDOR_KAFKA_INTEGRATION").as_deref() == Ok("1")
+}
+
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args(args)
@@ -183,6 +187,32 @@ fn redis_live_stream_produce_detail_and_consume() {
         .as_str()
         .expect("stream id header should be present")
         .contains('-'));
+
+    // Create a consumer group at offset 0 so it sees the already-produced message as undelivered.
+    let group = unique_name("dbtool_redis_group");
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "raw",
+        "XGROUP",
+        "CREATE",
+        &stream,
+        &group,
+        "0",
+    ]));
+
+    let lag = stdout_json(dbtool(&["--dsn", &dsn, "mq", "lag", &group]));
+    let lag_items = lag["data"]
+        .as_array()
+        .expect("mq lag should return an array");
+    assert!(
+        lag_items
+            .iter()
+            .any(|item| item["topic"] == stream && item["lag"].as_i64().unwrap_or_default() >= 1),
+        "expected lag >= 1 for group {group} on stream {stream}; output: {lag}"
+    );
 }
 
 #[test]
@@ -252,37 +282,81 @@ fn kafka_live_topic_produce_detail_and_consume() {
     let Some(dsn) = dsn("DBTOOL_IT_KAFKA_DSN") else {
         return;
     };
-    let topic = unique_name("dbtool_kafka_topic");
+    run_kafka_smoke(&dsn, "kafka", "dbtool_kafka_topic", "kafka-payload");
+}
 
-    let blocked = stderr_json(dbtool(&["--dsn", &dsn, "mq", "produce", &topic, "blocked"]));
+#[test]
+fn vendor_kafka_compatible_smoke_profiles() {
+    if !vendor_kafka_integration_enabled() {
+        return;
+    }
+
+    let vendors = [
+        (
+            "DBTOOL_IT_AUTOMQ_DSN",
+            "automq",
+            "dbtool_automq_topic",
+            "automq-payload",
+        ),
+        (
+            "DBTOOL_IT_WARPSTREAM_DSN",
+            "warpstream",
+            "dbtool_warpstream_topic",
+            "warpstream-payload",
+        ),
+        (
+            "DBTOOL_IT_CONFLUENT_DSN",
+            "confluent",
+            "dbtool_confluent_topic",
+            "confluent-payload",
+        ),
+    ];
+
+    let mut tested = 0;
+    for (env_name, expected_kind, prefix, payload) in vendors {
+        if let Some(dsn) = dsn(env_name) {
+            run_kafka_smoke(&dsn, expected_kind, prefix, payload);
+            tested += 1;
+        }
+    }
+
+    assert!(tested > 0, "set at least one vendor Kafka DSN env var");
+}
+
+fn run_kafka_smoke(dsn: &str, expected_kind: &str, prefix: &str, payload: &str) {
+    let ping = stdout_json_retry(&["--dsn", dsn, "ping"]);
+    assert_eq!(ping["kind"], expected_kind);
+
+    let topic = unique_name(prefix);
+    let blocked = stderr_json(dbtool(&["--dsn", dsn, "mq", "produce", &topic, "blocked"]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
 
     let produced = stdout_json_retry(&[
         "--dsn",
-        &dsn,
+        dsn,
         "--allow-write",
         "mq",
         "produce",
         &topic,
-        "kafka-payload",
+        payload,
     ]);
     assert_eq!(produced["data"]["produced"], 1);
 
-    let topics = stdout_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
+    let topics = stdout_json(dbtool(&["--dsn", dsn, "mq", "topics"]));
     assert!(topics["data"]
         .as_array()
         .expect("topics should be an array")
         .iter()
         .any(|item| item["name"] == topic));
 
-    let detail = stdout_json(dbtool(&["--dsn", &dsn, "mq", "detail", &topic]));
+    let detail = stdout_json(dbtool(&["--dsn", dsn, "mq", "detail", &topic]));
     assert_eq!(detail["data"]["info"]["name"], topic);
     assert_eq!(detail["data"]["watermarks"][0]["low"], 0);
     assert!(detail["data"]["watermarks"][0]["high"].as_i64().unwrap() >= 1);
 
     let consumed = stdout_json(dbtool(&[
         "--dsn",
-        &dsn,
+        dsn,
         "mq",
         "consume",
         &topic,
@@ -291,7 +365,13 @@ fn kafka_live_topic_produce_detail_and_consume() {
         "--timeout",
         "5",
     ]));
-    assert_eq!(payload_text(&consumed["data"][0]), "kafka-payload");
+    assert_eq!(payload_text(&consumed["data"][0]), payload);
+
+    let lag = stdout_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
+    assert!(
+        lag["data"].as_array().is_some(),
+        "mq lag should return a JSON array; output: {lag}"
+    );
 }
 
 #[test]
@@ -321,6 +401,12 @@ fn amqp_live_queue_produce_detail_and_consume() {
     let detail = stdout_json_retry(&["--dsn", &dsn, "mq", "detail", &queue]);
     assert_eq!(detail["data"]["info"]["name"], queue);
     assert_eq!(detail["data"]["config"]["message_count"], "1");
+
+    let lag = stdout_json_retry(&["--dsn", &dsn, "mq", "lag", &queue]);
+    assert!(
+        lag["data"].as_array().is_some(),
+        "mq lag should return a JSON array; output: {lag}"
+    );
 
     let consumed = stdout_json_retry(&[
         "--dsn",

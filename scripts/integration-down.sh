@@ -15,8 +15,11 @@ docker compose \
   --profile pg-compat \
   --profile sqlserver \
   --profile cassandra \
+  --profile db2 \
   --profile tidb \
   --profile tidb-secure \
   --profile tidb-tiproxy \
   --profile observability \
+  --profile opensearch-security \
+  --profile elasticsearch \
   down -v --remove-orphans

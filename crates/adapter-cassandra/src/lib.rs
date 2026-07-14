@@ -8,9 +8,11 @@ use std::{
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value},
+    model::{
+        ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind, TableSchema, Value,
+    },
     port::{
-        capability::SqlEngine,
+        capability::{CqlEngine, SqlEngine},
         connector::{Capabilities, Connector, ConnectorKind},
     },
 };
@@ -82,6 +84,7 @@ impl Connector for CassandraAdapter {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             sql: true,
+            cql: true,
             ..Default::default()
         }
     }
@@ -99,6 +102,10 @@ impl Connector for CassandraAdapter {
     }
 
     fn as_sql(&self) -> Option<&dyn SqlEngine> {
+        Some(self)
+    }
+
+    fn as_cql(&self) -> Option<&dyn CqlEngine> {
         Some(self)
     }
 }
@@ -234,6 +241,8 @@ impl SqlEngine for CassandraAdapter {
                         name,
                         type_name,
                         nullable: !matches!(kind, "partition_key" | "clustering"),
+                        primary_key: matches!(kind, "partition_key" | "clustering"),
+                        default_value: None,
                     },
                     kind_rank: cql_column_kind_rank(kind),
                     position,
@@ -248,11 +257,60 @@ impl SqlEngine for CassandraAdapter {
                 .then_with(|| left.meta.name.cmp(&right.meta.name))
         });
 
+        let idx_result = self
+            .query(
+                &format!(
+                    "SELECT index_name, column_name FROM system_schema.indexes \
+                     WHERE keyspace_name = '{}' AND table_name = '{}'",
+                    keyspace, table_ref.name
+                ),
+                &[],
+            )
+            .await?;
+
+        let indexes = idx_result
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                let name = row.first().and_then(value_text)?.to_owned();
+                let col = row.get(1).and_then(value_text)?.to_owned();
+                Some(IndexInfo {
+                    name,
+                    columns: vec![col],
+                    unique: false,
+                    primary: false,
+                })
+            })
+            .collect();
+
         Ok(TableSchema {
             name: table_ref.name,
             columns: columns.into_iter().map(|column| column.meta).collect(),
-            indexes: vec![],
+            indexes,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl CqlEngine for CassandraAdapter {
+    async fn query_cql(&self, cql: &str) -> Result<ResultSet> {
+        <Self as SqlEngine>::query(self, cql, &[]).await
+    }
+
+    async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome> {
+        <Self as SqlEngine>::execute(self, cql, &[]).await
+    }
+
+    async fn list_keyspaces(&self) -> Result<Vec<String>> {
+        <Self as SqlEngine>::list_schemas(self).await
+    }
+
+    async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>> {
+        <Self as SqlEngine>::list_tables(self, keyspace).await
+    }
+
+    async fn describe_cql_table(&self, table: &str) -> Result<TableSchema> {
+        <Self as SqlEngine>::describe_table(self, table).await
     }
 }
 
@@ -344,6 +402,8 @@ fn rows_to_result_set(rows: QueryRowsResult) -> Result<ResultSet> {
             name: spec.name().to_owned(),
             type_name: cql_type_name(spec.typ()),
             nullable: true,
+            primary_key: false,
+            default_value: None,
         })
         .collect();
 

@@ -1,0 +1,151 @@
+use super::Context;
+use clap::{Args, Subcommand};
+use dbtool_core::{error::Error, service::limiter::ResultLimiter, Result};
+
+#[derive(Args)]
+#[command(
+    about = "Run Cassandra/ScyllaDB CQL commands.",
+    long_about = "CQL commands expose Cassandra-specific keyspace/table wording while reusing dbtool's JSON output, result limits, timeouts, and write gate. CQL writes and DDL use cql exec and require --allow-write."
+)]
+pub struct CqlCmd {
+    #[command(subcommand)]
+    pub action: CqlAction,
+}
+
+#[derive(Subcommand)]
+pub enum CqlAction {
+    /// Execute a read-only CQL query and return rows.
+    Query {
+        /// CQL SELECT statement to execute.
+        cql: String,
+    },
+    /// Execute a CQL write or DDL statement.
+    Exec {
+        /// CQL write or DDL statement; requires --allow-write.
+        cql: String,
+    },
+    /// List keyspaces.
+    Keyspaces,
+    /// List tables, optionally within one keyspace.
+    Tables {
+        /// Keyspace to inspect. Defaults to the DSN keyspace when present.
+        #[arg(long)]
+        keyspace: Option<String>,
+    },
+    /// Describe a table's CQL columns.
+    Schema {
+        /// Table name. Use keyspace.table or pass --keyspace.
+        table: String,
+        /// Keyspace qualifier for an unqualified table name.
+        #[arg(long)]
+        keyspace: Option<String>,
+    },
+}
+
+pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
+    if matches!(cmd.action, CqlAction::Exec { .. }) {
+        ensure_write_allowed(ctx)?;
+    }
+
+    let dsn = ctx.resolve_dsn()?;
+    let conn = ctx.registry.connect(&dsn).await?;
+    let cql = conn.as_cql().ok_or_else(|| Error::UnsupportedCapability {
+        kind: conn.kind().0.clone(),
+        needed: "CqlEngine",
+    })?;
+    let start = std::time::Instant::now();
+    let kind = conn.kind().0.clone();
+    let elapsed = || start.elapsed().as_millis() as u64;
+
+    Ok(match cmd.action {
+        CqlAction::Query { cql: query } => {
+            let result = cql.query_cql(&query).await?;
+            let result = ResultLimiter::new(ctx.limit).apply(result);
+            let truncated = result.truncated;
+            ctx.render_success(&kind, result, elapsed(), truncated)
+        }
+        CqlAction::Exec { cql: statement } => {
+            let outcome = cql.execute_cql(&statement).await?;
+            ctx.render_success(&kind, outcome, elapsed(), false)
+        }
+        CqlAction::Keyspaces => {
+            let keyspaces = cql.list_keyspaces().await?;
+            ctx.render_success(&kind, keyspaces, elapsed(), false)
+        }
+        CqlAction::Tables { keyspace } => {
+            let tables = cql.list_cql_tables(keyspace.as_deref()).await?;
+            ctx.render_success(&kind, tables, elapsed(), false)
+        }
+        CqlAction::Schema { table, keyspace } => {
+            let table = cql_table_ref(&table, keyspace.as_deref())?;
+            let schema = cql.describe_cql_table(&table).await?;
+            ctx.render_success(&kind, schema, elapsed(), false)
+        }
+    })
+}
+
+fn cql_table_ref(table: &str, keyspace: Option<&str>) -> Result<String> {
+    if table.contains('.') || keyspace.is_none() {
+        return Ok(table.to_owned());
+    }
+
+    let keyspace = keyspace.expect("checked is_some");
+    if keyspace.contains('.') {
+        return Err(Error::Config(
+            "CQL keyspace must not contain a dot when --keyspace is used".to_owned(),
+        ));
+    }
+    Ok(format!("{keyspace}.{table}"))
+}
+
+fn ensure_write_allowed(ctx: &Context) -> Result<()> {
+    if ctx.allow_write {
+        Ok(())
+    } else {
+        Err(Error::WriteNotAllowed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbtool_core::service::formatter::Format;
+
+    fn test_context(allow_write: bool) -> Context {
+        Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: Format::Json,
+            limit: 100,
+            throttle_overrides: Default::default(),
+            allow_write,
+            confirm: None,
+        }
+    }
+
+    #[test]
+    fn cql_exec_requires_write_flag() {
+        assert!(matches!(
+            ensure_write_allowed(&test_context(false)),
+            Err(Error::WriteNotAllowed)
+        ));
+        assert!(ensure_write_allowed(&test_context(true)).is_ok());
+    }
+
+    #[test]
+    fn cql_schema_target_accepts_keyspace_or_qualified_table() {
+        assert_eq!(
+            cql_table_ref("users", Some("app")).unwrap(),
+            "app.users".to_owned()
+        );
+        assert_eq!(
+            cql_table_ref("app.users", Some("ignored")).unwrap(),
+            "app.users".to_owned()
+        );
+        assert!(matches!(
+            cql_table_ref("users", Some("bad.keyspace")),
+            Err(Error::Config(message)) if message.contains("must not contain a dot")
+        ));
+    }
+}

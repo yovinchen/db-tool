@@ -11,7 +11,8 @@ dbtool-v0.1.0-x86_64-pc-windows-msvc.tar.gz
 dbtool-v0.1.0-aarch64-pc-windows-msvc.tar.gz
 ```
 
-The archive root contains `dbtool` on Unix platforms and `dbtool.exe` on Windows.
+The archive root contains `dbtool` on Unix platforms and `dbtool.exe` on Windows,
+plus shell completions under `completions/` and a manpage at `man/dbtool.1`.
 
 Expected mise form:
 

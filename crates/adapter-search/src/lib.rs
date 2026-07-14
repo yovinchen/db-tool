@@ -347,6 +347,7 @@ fn indices_from_response(response: &JsonValue) -> Result<Vec<IndexInfo>> {
                 name,
                 columns: vec![],
                 unique: false,
+                primary: false,
             })
         })
         .collect::<Result<Vec<_>>>()?;

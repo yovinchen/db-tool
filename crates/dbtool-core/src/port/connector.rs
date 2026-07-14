@@ -1,6 +1,6 @@
 use super::capability::{
-    AdminInspect, DocumentStore, KeyValueStore, MessageConsumer, MessageProducer, SearchEngine,
-    SqlEngine, TimeSeriesStore,
+    AdminInspect, CqlEngine, Db2Engine, DocumentStore, KeyValueStore, MessageConsumer,
+    MessageProducer, SearchEngine, SqlEngine, TimeSeriesStore,
 };
 use crate::Result;
 use async_trait::async_trait;
@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Capabilities {
     pub sql: bool,
+    pub cql: bool,
+    pub db2: bool,
     pub key_value: bool,
     pub document: bool,
     pub time_series: bool,
@@ -33,6 +35,12 @@ pub trait Connector: Send + Sync {
 
     // ── Capability accessors ─────────────────────────────────────────────────
     fn as_sql(&self) -> Option<&dyn SqlEngine> {
+        None
+    }
+    fn as_cql(&self) -> Option<&dyn CqlEngine> {
+        None
+    }
+    fn as_db2(&self) -> Option<&dyn Db2Engine> {
         None
     }
     fn as_kv(&self) -> Option<&dyn KeyValueStore> {
@@ -153,6 +161,7 @@ mod tests {
         assert!(connector.capabilities().key_value);
         assert!(connector.as_kv().is_some());
         assert!(connector.as_sql().is_none());
+        assert!(connector.as_cql().is_none());
         assert!(connector.as_document().is_none());
         assert!(connector.as_producer().is_none());
         connector.ping().await.unwrap();

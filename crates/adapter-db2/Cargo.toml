@@ -1,0 +1,16 @@
+[package]
+name        = "adapter-db2"
+description = "IBM Db2 adapter for dbtool — ODBC-backed SqlEngine"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+dbtool-core  = { path = "../dbtool-core" }
+odbc-api     = { workspace = true }
+once_cell    = { workspace = true }
+futures      = { workspace = true }
+async-trait  = { workspace = true }
+tokio        = { workspace = true }

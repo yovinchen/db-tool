@@ -7,6 +7,10 @@ use dbtool_core::{
 };
 
 #[derive(Args)]
+#[command(
+    about = "Inspect configured named connections.",
+    long_about = "Connection commands read DBTOOL_CONN_* environment entries and the default connections.toml path, redact DSNs, and report supported schemes from the active registry."
+)]
 pub struct ConnCmd {
     #[command(subcommand)]
     pub action: ConnAction,

@@ -12,6 +12,8 @@
   },
   "files": [
     "bin",
+    "completions",
+    "man",
     "README.md"
   ],
   "engines": {

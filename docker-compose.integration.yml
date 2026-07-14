@@ -737,6 +737,40 @@ services:
     cpus: ${DBTOOL_IT_SEARCH_TLS_CPUS:-0.25}
     mem_limit: ${DBTOOL_IT_SEARCH_TLS_MEMORY:-128m}
 
+  opensearch-security:
+    profiles: ["opensearch-security"]
+    image: opensearchproject/opensearch:${DBTOOL_IT_OPENSEARCH_SECURITY_VERSION:-2.17.1}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-opensearch-security
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${DBTOOL_IT_OPENSEARCH_SECURITY_ADMIN_PASSWORD:-DbtoolAdmin1!}
+      OPENSEARCH_JAVA_OPTS: ${DBTOOL_IT_OPENSEARCH_SECURITY_JAVA_OPTS:--Xms512m -Xmx512m}
+      plugins.security.allow_default_init_securityindex: "true"
+      plugins.security.nodes_dn: '["CN=dbtool-it-opensearch-security"]'
+      plugins.security.ssl.http.enabled: "true"
+      plugins.security.ssl.http.pemcert_filepath: dbtool-certs/node.pem
+      plugins.security.ssl.http.pemkey_filepath: dbtool-certs/node-key.pem
+      plugins.security.ssl.http.pemtrustedcas_filepath: dbtool-certs/ca.pem
+      plugins.security.ssl.transport.pemcert_filepath: dbtool-certs/node.pem
+      plugins.security.ssl.transport.pemkey_filepath: dbtool-certs/node-key.pem
+      plugins.security.ssl.transport.pemtrustedcas_filepath: dbtool-certs/ca.pem
+      plugins.security.ssl.transport.enforce_hostname_verification: "false"
+    volumes:
+      - ${DBTOOL_IT_OPENSEARCH_SECURITY_DIR:-.tmp/dbtool-it-opensearch-security}/certs:/usr/share/opensearch/config/dbtool-certs:ro
+    ports:
+      - "${DBTOOL_IT_OPENSEARCH_SECURITY_PORT:-19203}:9200"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsSk -u admin:${DBTOOL_IT_OPENSEARCH_SECURITY_ADMIN_PASSWORD:-DbtoolAdmin1!} https://127.0.0.1:9200/_cluster/health >/dev/null || exit 1",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 80
+    cpus: ${DBTOOL_IT_OPENSEARCH_SECURITY_CPUS:-1.00}
+    mem_limit: ${DBTOOL_IT_OPENSEARCH_SECURITY_MEMORY:-1536m}
+
   prometheus:
     profiles: ["observability"]
     image: prom/prometheus:${DBTOOL_IT_PROMETHEUS_VERSION:-v2.55.1}
@@ -756,6 +790,29 @@ services:
       retries: 40
     cpus: ${DBTOOL_IT_PROMETHEUS_CPUS:-0.25}
     mem_limit: ${DBTOOL_IT_PROMETHEUS_MEMORY:-256m}
+
+  elasticsearch:
+    profiles: ["elasticsearch"]
+    image: docker.elastic.co/elasticsearch/elasticsearch:${DBTOOL_IT_ELASTICSEARCH_VERSION:-8.15.5}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      ES_JAVA_OPTS: ${DBTOOL_IT_ELASTICSEARCH_JAVA_OPTS:--Xms512m -Xmx512m}
+    ports:
+      - "${DBTOOL_IT_ELASTICSEARCH_PORT:-19202}:9200"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null || exit 1",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 80
+    cpus: ${DBTOOL_IT_ELASTICSEARCH_CPUS:-1.00}
+    mem_limit: ${DBTOOL_IT_ELASTICSEARCH_MEMORY:-1536m}
 
   kafka:
     profiles: ["messaging"]
@@ -873,3 +930,33 @@ services:
       retries: 40
     cpus: ${DBTOOL_IT_NATS_CPUS:-0.25}
     mem_limit: ${DBTOOL_IT_NATS_MEMORY:-256m}
+
+  db2:
+    profiles: ["db2"]
+    image: icr.io/db2_community/db2:${DBTOOL_IT_DB2_VERSION:-latest}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-db2
+    hostname: dbtool-it-db2
+    privileged: true
+    environment:
+      LICENSE: accept
+      DB2INSTANCE: ${DBTOOL_IT_DB2_INSTANCE:-db2inst1}
+      DB2INST1_PASSWORD: ${DBTOOL_IT_DB2_PASSWORD:-Dbtool_DB2_123!}
+      DBNAME: ${DBTOOL_IT_DB2_DB:-DBTOOLIT}
+      UPDATEAVAIL: "NO"
+      AUTOCONFIG: "false"
+      HADR_ENABLED: "false"
+      ENABLE_ORACLE_COMPATIBILITY: "false"
+    ports:
+      - "${DBTOOL_IT_DB2_PORT:-50000}:50000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "su - db2inst1 -c 'db2 connect to ${DBTOOL_IT_DB2_DB:-DBTOOLIT}' > /dev/null 2>&1 && echo OK",
+        ]
+      interval: 15s
+      timeout: 30s
+      retries: 60
+      start_period: 120s
+    cpus: ${DBTOOL_IT_DB2_CPUS:-2.00}
+    mem_limit: ${DBTOOL_IT_DB2_MEMORY:-4g}

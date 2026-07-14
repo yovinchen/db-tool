@@ -4,6 +4,7 @@ set -euo pipefail
 ARTIFACT_ROOT="${1:?artifact root is required}"
 OUT_DIR="${2:?output directory is required}"
 REF_NAME="${3:?release ref name is required}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 mkdir -p "$OUT_DIR"
 
@@ -34,6 +35,9 @@ find_binary() {
   find "$ARTIFACT_ROOT" -path "*/dbtool-bin-$target/dbtool$suffix" -type f -print -quit
 }
 
+cli_artifacts="$(mktemp -d)"
+"$ROOT/scripts/generate-cli-artifacts.sh" "$ARTIFACT_ROOT" "$cli_artifacts"
+
 for entry in "${targets[@]}"; do
   target="${entry%%:*}"
   suffix="${entry#*:}"
@@ -45,10 +49,14 @@ for entry in "${targets[@]}"; do
 
   tmp="$(mktemp -d)"
   cp "$bin" "$tmp/dbtool$suffix"
+  cp -R "$cli_artifacts/completions" "$tmp/completions"
+  cp -R "$cli_artifacts/man" "$tmp/man"
   chmod +x "$tmp/dbtool$suffix" 2>/dev/null || true
 
   archive="$OUT_DIR/dbtool-$REF_NAME-$target.tar.gz"
-  tar -C "$tmp" -czf "$archive" "dbtool$suffix"
+  tar -C "$tmp" -czf "$archive" "dbtool$suffix" "completions" "man"
   rm -rf "$tmp"
   echo "wrote $archive"
 done
+
+rm -rf "$cli_artifacts"

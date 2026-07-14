@@ -205,15 +205,9 @@ impl AdminInspect for AmqpAdapter {
         })
     }
 
-    async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>> {
-        Ok(vec![LagInfo {
-            topic: String::new(),
-            partition: 0,
-            group: group.to_owned(),
-            committed: 0,
-            latest: 0,
-            lag: 0,
-        }])
+    async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
+        // AMQP 0-9-1 has no consumer-group lag concept; use the RabbitMQ management adapter.
+        Ok(vec![])
     }
 }
 

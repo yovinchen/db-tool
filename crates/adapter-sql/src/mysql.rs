@@ -12,6 +12,7 @@ use sqlx::mysql::MySqlRow;
 use sqlx::{Column, MySqlPool, Row};
 
 use crate::{
+    group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
     value::{column_type_name, mysql_value},
 };
@@ -84,6 +85,8 @@ impl SqlEngine for MySqlAdapter {
                 name: c.name().to_owned(),
                 type_name: column_type_name(c),
                 nullable: true,
+                primary_key: false,
+                default_value: None,
             })
             .collect();
 
@@ -157,18 +160,21 @@ impl SqlEngine for MySqlAdapter {
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
         let table_ref = parse_table_ref(table)?;
         let schema = table_ref.schema.as_deref();
-        let rows = if let Some(schema) = schema {
+
+        let col_rows = if let Some(s) = schema {
             sqlx::query(
-                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT \
+                 FROM information_schema.COLUMNS \
                  WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
             )
-            .bind(schema)
+            .bind(s)
             .bind(&table_ref.name)
             .fetch_all(&self.pool)
             .await
         } else {
             sqlx::query(
-                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT \
+                 FROM information_schema.COLUMNS \
                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
             )
             .bind(&table_ref.name)
@@ -177,21 +183,56 @@ impl SqlEngine for MySqlAdapter {
         }
         .map_err(|e| Error::Query(e.to_string()))?;
 
-        let columns = rows
+        let columns = col_rows
             .iter()
             .map(|r| {
                 Ok(ColumnMeta {
                     name: mysql_text(r, 0)?,
                     type_name: mysql_text(r, 1)?,
                     nullable: mysql_text(r, 2)? == "YES",
+                    primary_key: mysql_text(r, 3)? == "PRI",
+                    default_value: r.try_get::<Option<String>, _>(4).ok().flatten(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let idx_rows = if let Some(s) = schema {
+            sqlx::query(
+                "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME \
+                 FROM information_schema.STATISTICS \
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                 ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+            )
+            .bind(s)
+            .bind(&table_ref.name)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME \
+                 FROM information_schema.STATISTICS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+                 ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+            )
+            .bind(&table_ref.name)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| Error::Query(e.to_string()))?;
+
+        let indexes = group_index_rows(idx_rows.iter().filter_map(|r| {
+            let name = mysql_text(r, 0).ok()?;
+            let non_unique: i64 = r.try_get(1).ok()?;
+            let col = mysql_text(r, 2).ok()?;
+            let unique = non_unique == 0;
+            let primary = name == "PRIMARY";
+            Some((name, unique, primary, col))
+        }));
+
         Ok(TableSchema {
             name: table_ref.name,
             columns,
-            indexes: vec![],
+            indexes,
         })
     }
 }

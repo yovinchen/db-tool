@@ -1,0 +1,9 @@
+# Build-time search paths for native libraries.
+# On Apple Silicon Macs, Homebrew installs to /opt/homebrew; add it so that
+# optional adapters that link against system libraries (e.g. adapter-db2 →
+# unixODBC) are found without requiring manual LIBRARY_PATH exports.
+[target.aarch64-apple-darwin]
+rustflags = ["-L", "/opt/homebrew/lib"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-L", "/usr/local/lib"]

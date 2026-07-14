@@ -1,7 +1,9 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value},
+    model::{
+        ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind, TableSchema, Value,
+    },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, Connector, ConnectorKind},
@@ -81,6 +83,8 @@ impl SqlEngine for SqliteAdapter {
                 name: c.name().to_owned(),
                 type_name: column_type_name(c),
                 nullable: true,
+                primary_key: false,
+                default_value: None,
             })
             .collect();
 
@@ -144,23 +148,73 @@ impl SqlEngine for SqliteAdapter {
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
         let table_ref = parse_table_ref(table)?;
-        let rows = sqlx::query("SELECT name, type, \"notnull\" FROM pragma_table_info(?)")
-            .bind(&table_ref.name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-        let columns = rows
+
+        let col_rows =
+            sqlx::query("SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)")
+                .bind(&table_ref.name)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+
+        let columns: Vec<ColumnMeta> = col_rows
             .iter()
             .map(|r| ColumnMeta {
                 name: r.get(0),
                 type_name: r.get(1),
                 nullable: r.get::<i32, _>(2) == 0,
+                default_value: r.get::<Option<String>, _>(3),
+                primary_key: r.get::<i32, _>(4) > 0,
             })
             .collect();
+
+        let idx_list = sqlx::query("SELECT name, \"unique\" FROM pragma_index_list(?)")
+            .bind(&table_ref.name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        let mut indexes: Vec<IndexInfo> = Vec::new();
+        for idx_row in &idx_list {
+            let idx_name: String = idx_row.get(0);
+            let is_unique: bool = idx_row.get(1);
+            let col_rows = sqlx::query("SELECT name FROM pragma_index_info(?)")
+                .bind(&idx_name)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+            let cols: Vec<String> = col_rows
+                .iter()
+                .filter_map(|r| r.try_get::<Option<String>, _>(0).ok().flatten())
+                .collect();
+            indexes.push(IndexInfo {
+                primary: false,
+                name: idx_name,
+                columns: cols,
+                unique: is_unique,
+            });
+        }
+
+        let pk_cols: Vec<String> = columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        if !pk_cols.is_empty() {
+            indexes.insert(
+                0,
+                IndexInfo {
+                    name: format!("{}_pkey", table_ref.name),
+                    columns: pk_cols,
+                    unique: true,
+                    primary: true,
+                },
+            );
+        }
+
         Ok(TableSchema {
             name: table_ref.name,
             columns,
-            indexes: vec![],
+            indexes,
         })
     }
 }
@@ -225,6 +279,22 @@ mod tests {
         assert_eq!(schema.name, "users");
         assert_eq!(schema.columns.len(), 5);
         assert_eq!(schema.columns[0].name, "id");
+        assert!(
+            schema.columns[0].primary_key,
+            "id should be detected as primary key"
+        );
+        assert!(
+            !schema.columns[1].primary_key,
+            "active should not be a primary key"
+        );
+
+        let pk_index = schema.indexes.iter().find(|i| i.primary);
+        assert!(
+            pk_index.is_some(),
+            "describe_table should return a primary-key index"
+        );
+        assert_eq!(pk_index.unwrap().columns, vec!["id"]);
+        assert!(pk_index.unwrap().unique);
     }
 
     #[tokio::test]

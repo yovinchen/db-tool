@@ -1,8 +1,8 @@
 use crate::{
     model::{
-        ConsumeOptions, Document, ExecOutcome, FindOptions, InsertOutcome, LagInfo, Message, Point,
-        ProduceOutcome, ResultSet, SeriesSet, TableInfo, TableSchema, TimeRange, TopicDetail,
-        TopicInfo, UpdateOutcome, Value,
+        ConsumeOptions, Document, ExecOutcome, FindOptions, ForeignKeyInfo, InsertOutcome, LagInfo,
+        Message, Point, ProduceOutcome, ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo,
+        TableSchema, TablespaceInfo, TimeRange, TopicDetail, TopicInfo, UpdateOutcome, Value,
     },
     Result,
 };
@@ -17,6 +17,15 @@ pub trait SqlEngine: Connector {
     async fn list_schemas(&self) -> Result<Vec<String>>;
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>>;
     async fn describe_table(&self, table: &str) -> Result<TableSchema>;
+}
+
+#[async_trait]
+pub trait CqlEngine: Connector {
+    async fn query_cql(&self, cql: &str) -> Result<ResultSet>;
+    async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome>;
+    async fn list_keyspaces(&self) -> Result<Vec<String>>;
+    async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>>;
+    async fn describe_cql_table(&self, table: &str) -> Result<TableSchema>;
 }
 
 #[async_trait]
@@ -97,4 +106,23 @@ pub trait AdminInspect: Connector {
     async fn list_topics(&self) -> Result<Vec<TopicInfo>>;
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail>;
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>>;
+}
+
+/// IBM Db2-specific schema inspection capability.
+///
+/// Exposes catalog-level metadata that is Db2-specific and not part of the
+/// portable `SqlEngine` surface: sequences, routines, tablespaces, foreign
+/// keys, and DDL generation from SYSCAT catalog tables.
+#[async_trait]
+pub trait Db2Engine: Connector {
+    /// List user-defined sequences in a schema (defaults to current schema).
+    async fn list_sequences(&self, schema: Option<&str>) -> Result<Vec<SequenceInfo>>;
+    /// List stored procedures and user-defined functions in a schema.
+    async fn list_routines(&self, schema: Option<&str>) -> Result<Vec<RoutineInfo>>;
+    /// List all tablespaces visible in the current database.
+    async fn list_tablespaces(&self) -> Result<Vec<TablespaceInfo>>;
+    /// List foreign-key constraints for a table (schema.table or bare table name).
+    async fn list_foreign_keys(&self, table: &str) -> Result<Vec<ForeignKeyInfo>>;
+    /// Generate a CREATE TABLE DDL statement from the Db2 catalog.
+    async fn generate_ddl(&self, table: &str) -> Result<String>;
 }

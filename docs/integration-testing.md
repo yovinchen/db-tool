@@ -172,8 +172,9 @@ export and restore behavior on the base database suite:
 ```
 
 The roundtrip smoke starts Postgres, MySQL, Redis, and MongoDB, loads the shared
-fixture data, exports rows/keys/documents to JSON or NDJSON files under `.tmp/`,
-restores them into independent target tables, Redis key prefixes, and MongoDB
+fixture data, writes versioned JSON artifacts through public `dbtool export
+sql/kv/doc` commands, restores them through public `dbtool import sql/kv/doc`
+commands into independent target tables, Redis key prefixes, and MongoDB
 collections, then reads the restored data back through dbtool. This is a
 logical dbtool export/restore smoke, not a replacement for product-native
 physical backup tooling.
@@ -202,6 +203,18 @@ The PostgreSQL-family compatibility script starts CockroachDB and TimescaleDB,
 waits for health checks, runs `cockroach://` and `timescale://` live SQL tests,
 and removes the containers and volumes.
 
+Externally supplied Redshift endpoints can be checked without committing
+credentials:
+
+```bash
+DBTOOL_IT_REDSHIFT_DSN='redshift://user:pass@host:5439/dev?sslmode=require' \
+./scripts/integration-redshift-test.sh
+```
+
+The Redshift smoke runs ping, caps, typed query, result limiting,
+create/insert/query/schema/drop lifecycle, and exits successfully without doing
+anything when `DBTOOL_IT_REDSHIFT_DSN` is unset.
+
 SQL Server uses a separate opt-in profile because the image is larger and the
 Linux container is intended for x86-64 Docker environments:
 
@@ -225,10 +238,11 @@ memory and can take longer to become healthy:
 
 The Cassandra script starts the official `cassandra` image, waits for `cqlsh`
 health checks, creates the test keyspace from the live test, runs
-`cassandra://` and `scylla://` CQL lifecycle coverage through the existing
-`sql` command family, and removes the container by default. The default DSN does
-not include a keyspace so the first connection can create it safely. It also
-uses `address-translator=contact-point` so the Rust CQL driver translates
+`cassandra://` and `scylla://` CQL lifecycle coverage through the dedicated
+`cql` command family, keeps the existing SQL-compatible CQL path covered, and
+removes the container by default. The default DSN does not include a keyspace so
+the first connection can create it safely. It also uses
+`address-translator=contact-point` so the Rust CQL driver translates
 Docker-internal broadcast addresses back to the published host port.
 
 Run the Cassandra fixture-data smoke when you need reusable file-backed CQL
@@ -241,8 +255,8 @@ seed data instead of only lifecycle-generated rows:
 The fixture smoke starts the same Cassandra profile, loads
 [base-cassandra-seed.cql](../testdata/base-cassandra-seed.cql) through dbtool,
 then verifies seeded rows, table listing, and schema inspection through the
-existing `sql` command surface. It is also available from the local suite as
-the heavy `cassandra-fixture` phase.
+SQL-compatible CQL command surface. It is also available from the local suite
+as the heavy `cassandra-fixture` phase.
 
 TiDB compatibility uses its own profile because it starts a small PD/TiKV/TiDB topology:
 
@@ -376,6 +390,21 @@ Run the same suite with the optional native Kafka backend:
 
 That script uses `--no-default-features --features full-native`, so Kafka commands go through librdkafka while the other message backends remain unchanged.
 
+Externally supplied Kafka-compatible vendor endpoints can be checked without
+committing credentials:
+
+```bash
+DBTOOL_IT_AUTOMQ_DSN='automq://host:9092' \
+DBTOOL_IT_WARPSTREAM_DSN='warpstream://host:9092' \
+DBTOOL_IT_CONFLUENT_DSN='confluent://user:pass@host:9092?security-protocol=SASL_SSL&sasl-mechanism=PLAIN' \
+./scripts/integration-kafka-vendor-test.sh
+```
+
+The vendor smoke uses the native Kafka backend, maps DSN username/password and
+selected SASL/TLS query parameters into librdkafka config, then runs
+ping/topics/produce/detail/consume for every supplied DSN. If no vendor DSNs are
+set, the script exits successfully after printing the required variables.
+
 Search and time-series integration tests use the observability profile:
 
 ```bash
@@ -390,6 +419,29 @@ loads seed documents from
 [testdata/search-tls-seed.ndjson](../testdata/search-tls-seed.ndjson), uses a
 short-lived local CA under `.tmp/`, and validates the `opensearch+https://` path
 with the `tls-ca` DSN parameter.
+
+OpenSearch security-plugin TLS coverage uses a separate heavier profile:
+
+```bash
+./scripts/integration-opensearch-security-test.sh
+```
+
+The script generates a short-lived local CA and OpenSearch node certificate,
+starts the real OpenSearch security plugin with HTTPS/basic auth, then validates
+`opensearch+https://admin:...?...tls-ca=...` ping, write guard,
+single-document indexing, search, and index listing through dbtool.
+
+Product-native Elasticsearch uses a separate opt-in profile so the shared
+OpenSearch-compatible adapter can be checked against Elasticsearch response
+drift without making the observability suite heavier:
+
+```bash
+./scripts/integration-elasticsearch-test.sh
+```
+
+The script starts Elasticsearch with security disabled for the disposable local
+profile, then validates `elasticsearch://` ping, write guard, single-document
+indexing, search, and index listing through dbtool.
 
 ## Custom Names And Ports
 
@@ -605,6 +657,23 @@ DBTOOL_IT_PROMETHEUS_PORT=29090 \
 ./scripts/integration-observability-test.sh
 ```
 
+OpenSearch security settings are separate:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-opensearch-security-run \
+DBTOOL_IT_OPENSEARCH_SECURITY_PORT=29203 \
+DBTOOL_IT_OPENSEARCH_SECURITY_DIR=.tmp/my-dbtool-opensearch-security \
+./scripts/integration-opensearch-security-test.sh
+```
+
+Elasticsearch settings are separate:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-elasticsearch-run \
+DBTOOL_IT_ELASTICSEARCH_PORT=29202 \
+./scripts/integration-elasticsearch-test.sh
+```
+
 Set `DBTOOL_IT_KEEP_SERVICES=1` to leave containers running for manual inspection, then clean up with:
 
 ```bash
@@ -634,6 +703,7 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_services` runs `./scripts/integration-test.sh` for Postgres, MySQL, Redis, and MongoDB.
 - `run_live_compat` can run `./scripts/integration-compat-test.sh` for MariaDB and Valkey, with `DBTOOL_IT_COMPAT_EXTRA=1` for KeyDB and Dragonfly.
 - `run_live_pg_compat` runs `./scripts/integration-pg-compat-test.sh` for CockroachDB and TimescaleDB.
+- `run_live_redshift` can run `./scripts/integration-redshift-test.sh` when a Redshift DSN is supplied through repository secrets.
 - `run_live_sqlserver` runs `./scripts/integration-sqlserver-test.sh` for SQL Server/TDS coverage.
 - `run_live_cassandra` runs `./scripts/integration-cassandra-test.sh` for Cassandra/CQL coverage.
 - `run_live_tidb` runs `./scripts/integration-tidb-test.sh` for TiDB through a local PD/TiKV/TiDB topology.
@@ -643,7 +713,10 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_messaging` runs `./scripts/integration-mq-test.sh` for Redis Streams/Pub/Sub, Redpanda, RabbitMQ, and NATS.
 - `run_live_messaging_tls` runs `./scripts/integration-mq-tls-test.sh` for RabbitMQ TLS and NATS TLS.
 - `run_live_messaging_native` can run `./scripts/integration-mq-native-test.sh` when native Kafka coverage is desired.
+- `run_live_kafka_vendors` can run `./scripts/integration-kafka-vendor-test.sh` when vendor DSNs are supplied through repository secrets.
 - `run_live_observability` runs `./scripts/integration-observability-test.sh` for OpenSearch and Prometheus.
+- `run_live_opensearch_security` runs `./scripts/integration-opensearch-security-test.sh` for real OpenSearch security-plugin HTTPS/basic-auth coverage.
+- `run_live_elasticsearch` runs `./scripts/integration-elasticsearch-test.sh` for product-native Elasticsearch coverage.
 
 The CI jobs use separate Compose project names and host ports so the database,
 fixture-image, compatibility, TiDB, messaging, and observability suites can run
@@ -722,6 +795,7 @@ The live tests cover:
   into independent target resources.
 - MariaDB/TiDB alias DSNs against the MySQL protocol adapter, typed MySQL values, and result limiting.
 - CockroachDB/TimescaleDB alias DSNs against the PostgreSQL protocol adapter, typed Postgres-family values, result limiting, table listing, schema inspection, and SQL lifecycle.
+- Env-gated Redshift compatibility through an externally supplied `redshift://` DSN.
 - Redis ping, set/get/scan/raw typed output, TTL, scan truncation, multi-key delete, blocked destructive raw command, and blocked mutating raw command without `--allow-write`.
 - Valkey/KeyDB/Dragonfly alias DSNs against the Redis protocol adapter.
 - Real MariaDB compatibility through `mariadb://` against a MariaDB container.
@@ -746,11 +820,14 @@ The live tests cover:
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.
 - Kafka ping through metadata, produce, topics, detail/watermarks, and consume.
 - Optional native Kafka/librdkafka coverage through the same Redpanda test data.
+- Env-gated AutoMQ, WarpStream, and Confluent smoke through externally supplied DSNs.
 - RabbitMQ queue publish, passive detail/message count, acked consume, write guard, and HTTP management queue listing/detail/lag.
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
 - AMQPS queue publish/detail/consume and NATS TLS publish/subscribe plus JetStream topics/detail/lag through local CA-backed TLS services.
 - OpenSearch ping, write guard, single-document indexing, search, and index listing over plain HTTP plus TLS transport through `opensearch+https://`.
 - OpenSearch TLS harness fixture loading by searching the seeded `dbtool_seed` index from the Dockerfile-built image.
+- OpenSearch security-plugin HTTPS/basic-auth through generated local CA/node certificates and `tls-ca` validation.
+- Elasticsearch ping, write guard, single-document indexing, search, and index listing against the product-native Elasticsearch image.
 - Prometheus ping, metric listing, and range query through `ts`.
 
 Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; use an explicit `rabbitmq+http://` management DSN for RabbitMQ queue discovery.

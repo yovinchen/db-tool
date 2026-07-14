@@ -125,7 +125,7 @@ Goal: release-quality packages and optional advanced backends.
 - [x] OpenSearch/Elasticsearch HTTP search adapter.
 - [x] Prometheus HTTP time-series adapter.
 - [x] SQL Server adapter behind an opt-in Docker profile with service-free coverage and documented amd64 live gate.
-- [x] Cassandra/ScyllaDB CQL adapter through the constrained SQL command surface with real Cassandra live coverage.
+- [x] Cassandra/ScyllaDB CQL adapter through a dedicated CQL command surface plus the SQL-compatible path, with real Cassandra live coverage.
 
 ## P7: Live Integration Automation
 
@@ -139,6 +139,8 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Docker Compose SQL Server profile for TDS/SQL Server coverage.
 - [x] Docker Compose messaging profile for Redis, Redpanda, RabbitMQ, and NATS.
 - [x] Docker Compose messaging TLS profile for RabbitMQ TLS and NATS TLS.
+- [x] Docker Compose OpenSearch security-plugin TLS profile with generated local CA/node certs.
+- [x] Docker Compose product-native Elasticsearch profile for search compatibility drift checks.
 - [x] Custom project name, database names, credentials, and host ports through environment variables.
 - [x] CPU/memory/resource limits for integration services.
 - [x] Integration scripts for up/down/test lifecycle.
@@ -156,6 +158,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] Live CLI tests for MySQL protocol aliases and Redis-compatible protocol aliases.
 - [x] Live CLI tests for real MariaDB, Valkey, KeyDB, and Dragonfly compatibility services.
 - [x] Live CLI tests for real TiDB compatibility service.
+- [x] Env-gated external Redshift compatibility smoke for supplied Redshift endpoints.
 - [x] Live CLI tests for TiDB auth, SQL TLS, component TLS, X509, and local HA topology.
 - [x] TiDB secure HA SQL-node failover drill script with CI manual entry and documented pass/fail criteria.
 - [x] TiDB secure HA PD leader outage drill with TLS PD API leader discovery and documented pass/fail criteria.
@@ -166,6 +169,7 @@ Goal: self-start local services with bounded resources and verify real CLI workf
 - [x] File-backed Cassandra/CQL fixture data with Docker-backed dbtool readback, table listing, and schema verification.
 - [x] Live CLI tests for Redis Streams/PubSub, Kafka, AMQP, and NATS messaging workflows.
 - [x] Live CLI tests for AMQPS and NATS TLS messaging workflows.
+- [x] Env-gated vendor Kafka-compatible smoke for externally supplied AutoMQ, WarpStream, and Confluent endpoints.
 - [x] Live CLI tests for OpenSearch search and Prometheus time-series workflows.
 - [x] Documented integration workflow and cleanup.
 
@@ -298,4 +302,13 @@ major database compatibility loop became stable.
 | T28 TUI capability forms | P2 | Done | Added a form palette for SQL, KV, document, search, and time-series commands. Forms expose editable fields, generate the existing command syntax, and keep execution on the same shared safety and dispatch path. | `cargo test -p dbtool-tui`; covered by `./scripts/verify.sh`. |
 | T29 TiDB HA drill manifest | P3 | Done | Added a service-free manifest and validator for the TiDB secure HA drill chain so scripts, suite phases, documentation headings, and known production boundaries cannot drift silently. | `./scripts/validate-tidb-ha-drills.sh`; covered by `./scripts/verify.sh`. |
 | T30 Prometheus remote write | P3 | Done | Implemented no-dependency Prometheus remote write support for `TimeSeriesStore::write_points`, exposed `ts write` in CLI, and added TUI write parsing/forms that reuse the existing write-confirmation path. | `cargo test -p adapter-timeseries`; `cargo test -p dbtool-cli ts::tests`; `cargo test -p dbtool-tui`; covered by `./scripts/verify.sh`. |
-| T31 CLI discoverability polish | P3 | Done | Added user-facing help text for KV and document subcommands so `dbtool kv --help` and `dbtool doc --help` describe read/write behavior, JSON inputs, scan bounds, and raw command arguments. | `cargo test -p dbtool-cli --test cli_json cli_help_documents_kv_and_doc_subcommands`; covered by targeted CLI help assertions. |
+| T31 CLI discoverability polish | P3 | Done | Added user-facing help text for KV and document subcommands so `dbtool kv --help` and `dbtool doc --help` describe read/write behavior, JSON inputs, scan bounds, and raw command arguments. | `cargo test -p dbtool-cli --test cli_json cli_help_documents_core_command_families`; covered by targeted CLI help assertions. |
+| T32 Shell completions and manpage artifacts | P3 | Done | Added a hidden clap-metadata artifact generator, release archive packaging for bash/zsh/fish completions and `dbtool.1`, and npm/Python wrapper package inclusion for the same generated files. | `cargo test -p dbtool-cli --test cli_json cli_generate_artifacts_writes_completion_and_manpage_files`; `./scripts/smoke-release-artifacts.sh` checks archive contents. |
+| T33 Full CLI help coverage | P3 | Done | Expanded root, SQL, search, time-series, messaging, and connection help text with safety boundaries, JSON input expectations, bounded consume/query behavior, and concrete examples without changing command execution. | `cargo test -p dbtool-cli --test cli_json cli_help_documents_core_command_families`; covered by `./scripts/verify.sh`. |
+| T34 Dedicated CQL command surface | P2 | Done | Added `CqlEngine`, a `cql` capability bit, Cassandra/ScyllaDB `as_cql` support, and `dbtool cql query/exec/keyspaces/tables/schema` while preserving the existing SQL-compatible CQL path. | `cargo test -p adapter-cassandra`; `cargo test -p dbtool-cli --test cli_json cql_exec_requires_write_flag_before_connecting`; `cargo test -p dbtool-cli --test live_services cassandra_live_cql_lifecycle_and_typed_values`; covered by `./scripts/verify.sh`. |
+| T35 Generic export/import CLI | P2 | Done | Added public read-only `export sql/kv/doc` commands and write-gated `import sql/kv/doc` commands using versioned JSON artifacts. The base database roundtrip smoke now uses only these public commands for PostgreSQL, MySQL, Redis, and MongoDB restores. | `cargo test -p dbtool-cli --test cli_json export_import_sql_round_trips_sqlite_rows`; `cargo test -p dbtool-cli transfer::tests`; `./scripts/integration-data-roundtrip-test.sh`; local-only while CI budget is frozen. |
+| T36 Product-native Elasticsearch profile | P2 | Done | Added an opt-in `elasticsearch` Compose profile, up/test scripts, manual CI input, db-suite heavy phase, and a live test that exercises `elasticsearch://` ping, write guard, document indexing, search, and index listing against the real Elasticsearch image. | `docker compose -f docker-compose.integration.yml --profile elasticsearch config`; `DBTOOL_IT_DB_SUITE_DRY_RUN=1 DBTOOL_IT_DB_SUITE_PHASES=elasticsearch ./scripts/integration-db-suite.sh`; optional `./scripts/integration-elasticsearch-test.sh`. |
+| T37 Vendor Kafka-compatible smoke profiles | P2 | Done | Added an env-gated vendor Kafka smoke script for AutoMQ, WarpStream, and Confluent endpoints. The script runs the native Kafka backend, maps DSN username/password plus selected SASL/TLS query params into librdkafka config, and skips safely when no external DSNs are supplied. | `cargo test -p dbtool-cli --no-default-features --features full-native --test live_messaging vendor_kafka_compatible_smoke_profiles`; `DBTOOL_IT_DB_SUITE_DRY_RUN=1 DBTOOL_IT_DB_SUITE_PHASES=kafka-vendors ./scripts/integration-db-suite.sh`; optional `./scripts/integration-kafka-vendor-test.sh`. |
+| T38 OpenSearch security-plugin TLS profile | P2 | Done | Added an opt-in `opensearch-security` Compose profile with generated local CA/node certificates, HTTPS transport, basic auth, up/test scripts, manual CI input, db-suite heavy phase, and a live test for `opensearch+https://admin:...?...tls-ca=...` ping, write guard, index, search, and index listing. | `docker compose -f docker-compose.integration.yml --profile opensearch-security config`; `DBTOOL_IT_DB_SUITE_DRY_RUN=1 DBTOOL_IT_DB_SUITE_PHASES=opensearch-security ./scripts/integration-db-suite.sh`; optional `./scripts/integration-opensearch-security-test.sh`. |
+| T39 External Redshift compatibility smoke | P2 | Done | Added an env-gated Redshift smoke script and manual CI input. The smoke uses a supplied `DBTOOL_IT_REDSHIFT_DSN` to verify the `redshift://` alias through ping, caps, typed query, result limiting, create/insert/query/schema/drop lifecycle, and skips safely when no DSN is supplied. | `cargo test -p dbtool-cli --test live_services redshift_external_sql_lifecycle_and_typed_values`; `DBTOOL_IT_DB_SUITE_DRY_RUN=1 DBTOOL_IT_DB_SUITE_PHASES=redshift ./scripts/integration-db-suite.sh`; optional `./scripts/integration-redshift-test.sh`. |
+| T40 IBM Db2 adapter | P3 | Done | Added `adapter-db2` using ODBC, DSN scheme `db2://`, aliases `ibmdb2://`/`as400://`, full `SqlEngine` surface, `db2` Docker Compose profile, up/test integration scripts, and a live CLI lifecycle test. The live Docker profile requires IBM Data Server Driver for ODBC at the OS level; this is an explicit runtime boundary — service-free adapter tests pass everywhere, and the Docker profile plus integration script are available when the IBM ODBC runtime is installed. | `cargo test -p adapter-db2`; `docker compose -f docker-compose.integration.yml --profile db2 config`; optional `./scripts/integration-db2-test.sh` with `DBTOOL_RUN_DB2_INTEGRATION=1`. |

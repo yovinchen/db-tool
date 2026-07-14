@@ -11,6 +11,14 @@ fn integration_enabled() -> bool {
     env::var("DBTOOL_RUN_OBSERVABILITY_INTEGRATION").as_deref() == Ok("1")
 }
 
+fn elasticsearch_integration_enabled() -> bool {
+    env::var("DBTOOL_RUN_ELASTICSEARCH_INTEGRATION").as_deref() == Ok("1")
+}
+
+fn opensearch_security_integration_enabled() -> bool {
+    env::var("DBTOOL_RUN_OPENSEARCH_SECURITY_INTEGRATION").as_deref() == Ok("1")
+}
+
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args(args)
@@ -83,6 +91,26 @@ fn opensearch_tls_live_index_search_and_list() {
     let dsn = required_env("DBTOOL_IT_OPENSEARCH_TLS_DSN");
     assert_tls_seed_fixture(&dsn);
     run_search_lifecycle(&dsn, "opensearch+https", "dbtool_search_tls");
+}
+
+#[test]
+fn elasticsearch_native_live_index_search_and_list() {
+    if !elasticsearch_integration_enabled() {
+        return;
+    }
+
+    let dsn = required_env("DBTOOL_IT_ELASTICSEARCH_DSN");
+    run_search_lifecycle(&dsn, "elasticsearch", "dbtool_elasticsearch");
+}
+
+#[test]
+fn opensearch_security_tls_live_index_search_and_list() {
+    if !opensearch_security_integration_enabled() {
+        return;
+    }
+
+    let dsn = required_env("DBTOOL_IT_OPENSEARCH_SECURITY_DSN");
+    run_search_lifecycle(&dsn, "opensearch+https", "dbtool_search_security");
 }
 
 fn assert_tls_seed_fixture(dsn: &str) {
@@ -191,4 +219,43 @@ fn prometheus_live_measurements_and_query() {
         },
     );
     assert_eq!(query["data"]["truncated"], false);
+
+    // ts write — blocked without --allow-write
+    let blocked = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "ts",
+        "write",
+        "dbtool_integration_probe",
+        "1.0",
+    ]));
+    assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    // ts write — succeeds with --allow-write, then readable via ts query
+    let metric = unique_name("dbtool_probe");
+    let written = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "ts",
+        "write",
+        &metric,
+        "42.0",
+        "--tag",
+        "source=dbtool_integration",
+    ]));
+    assert_eq!(written["data"]["written_points"], 1);
+
+    let probed = stdout_json_retry(
+        &["--dsn", &dsn, "ts", "query", &metric, "--last-minutes", "2"],
+        |value| {
+            value["data"]["series"]
+                .as_array()
+                .is_some_and(|series| !series.is_empty())
+        },
+    );
+    assert!(
+        probed["data"]["series"].as_array().is_some(),
+        "written metric {metric} should appear in ts query; output: {probed}"
+    );
 }

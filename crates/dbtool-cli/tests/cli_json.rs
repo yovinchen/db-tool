@@ -80,8 +80,46 @@ fn stdout_text(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("stdout should be valid UTF-8")
 }
 
+fn confirmed_sql_exec(dsn: &str, sql: &str) {
+    let first = dbtool(&["--dsn", dsn, "--allow-write", "sql", "exec", sql]);
+    if first.status.success() {
+        return;
+    }
+
+    let first = stderr_json(&first);
+    assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
+    let token = first["error"]["confirm_token"]
+        .as_str()
+        .expect("confirm token should be present");
+    let second = stdout_json(&dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "--confirm",
+        token,
+        "sql",
+        "exec",
+        sql,
+    ]));
+    assert_eq!(second["ok"], true);
+}
+
 #[test]
-fn cli_help_documents_kv_and_doc_subcommands() {
+fn cli_help_documents_core_command_families() {
+    let root_help = stdout_text(&dbtool(&["--help"]));
+    assert!(root_help.contains("JSON-first CLI"));
+    assert!(root_help.contains("CQL"));
+    assert!(root_help.contains("Examples:"));
+
+    let sql_help = stdout_text(&dbtool(&["sql", "--help"]));
+    assert!(sql_help.contains("shared safety path"));
+    assert!(sql_help.contains("query"));
+    assert!(sql_help.contains("schema"));
+
+    let cql_help = stdout_text(&dbtool(&["cql", "--help"]));
+    assert!(cql_help.contains("Cassandra-specific keyspace"));
+    assert!(cql_help.contains("require --allow-write"));
+
     let kv_help = stdout_text(&dbtool(&["kv", "--help"]));
     assert!(kv_help.contains("Read one key"));
     assert!(kv_help.contains("Write one string value"));
@@ -93,6 +131,167 @@ fn cli_help_documents_kv_and_doc_subcommands() {
     assert!(doc_help.contains("Find documents with a JSON filter"));
     assert!(doc_help.contains("Insert one JSON document"));
     assert!(doc_help.contains("Run a JSON aggregation pipeline"));
+
+    let search_help = stdout_text(&dbtool(&["search", "--help"]));
+    assert!(search_help.contains("OpenSearch/Elasticsearch-compatible"));
+    assert!(search_help.contains("requires --allow-write"));
+
+    let ts_help = stdout_text(&dbtool(&["ts", "--help"]));
+    assert!(ts_help.contains("Prometheus-compatible"));
+    assert!(ts_help.contains("remote write"));
+
+    let mq_help = stdout_text(&dbtool(&["mq", "--help"]));
+    assert!(mq_help.contains("Kafka-compatible"));
+    assert!(mq_help.contains("consume is always bounded"));
+
+    let conn_help = stdout_text(&dbtool(&["conn", "--help"]));
+    assert!(conn_help.contains("DBTOOL_CONN_*"));
+    assert!(conn_help.contains("redact DSNs"));
+}
+
+#[test]
+fn cli_generate_artifacts_writes_completion_and_manpage_files() {
+    let root = std::env::temp_dir().join(format!(
+        "dbtool-cli-artifacts-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let out_dir = root.join("artifacts");
+    let out_dir_arg = out_dir.to_string_lossy().to_string();
+
+    let output = stdout_text(&dbtool(&["generate-artifacts", "--out-dir", &out_dir_arg]));
+    assert!(output.contains("completions/dbtool.bash"));
+    assert!(output.contains("man/dbtool.1"));
+
+    let bash = fs::read_to_string(out_dir.join("completions/dbtool.bash"))
+        .expect("bash completion should be written");
+    assert!(bash.contains("complete -F _dbtool dbtool"));
+    assert!(bash.contains("sql"));
+    assert!(bash.contains("cql"));
+    assert!(!bash.contains("generate-artifacts"));
+
+    let zsh = fs::read_to_string(out_dir.join("completions/dbtool.zsh"))
+        .expect("zsh completion should be written");
+    assert!(zsh.contains("#compdef dbtool"));
+
+    let fish = fs::read_to_string(out_dir.join("completions/dbtool.fish"))
+        .expect("fish completion should be written");
+    assert!(fish.contains("complete -c dbtool"));
+    assert!(fish.contains("mq"));
+
+    let man = fs::read_to_string(out_dir.join("man/dbtool.1")).expect("manpage should be written");
+    assert!(man.contains(".TH DBTOOL 1"));
+    assert!(man.contains("dbtool sql query"));
+    assert!(man.contains("dbtool cql keyspaces"));
+    assert!(man.contains("dbtool export sql"));
+    assert!(man.contains("dbtool import sql"));
+
+    cleanup_dir(&root);
+}
+
+#[test]
+fn export_import_sql_round_trips_sqlite_rows() {
+    let root = std::env::temp_dir().join(format!(
+        "dbtool-cli-transfer-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::create_dir_all(&root).expect("transfer temp dir should be created");
+    let db_file = root.join("roundtrip.db");
+    fs::File::create(&db_file).expect("sqlite db file should be created");
+    let export_file = root.join("people.json");
+    let dsn = format!("sqlite://{}", db_file.display());
+    let export_arg = export_file.to_string_lossy().to_string();
+
+    confirmed_sql_exec(
+        &dsn,
+        "create table people (id integer primary key, name text not null, active boolean not null)",
+    );
+    stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        "insert into people (id, name, active) values (1, 'alice', true), (2, 'bob', false)",
+    ]));
+    confirmed_sql_exec(
+        &dsn,
+        "create table people_copy (id integer primary key, name text not null, active boolean not null)",
+    );
+
+    let export = stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "export",
+        "sql",
+        "--query",
+        "select id, name, active from people order by id",
+        "--out",
+        &export_arg,
+    ]));
+    assert_eq!(export["data"]["kind"], "sql-rows");
+    assert_eq!(export["data"]["rows"], 2);
+
+    let artifact: Value =
+        serde_json::from_slice(&fs::read(&export_file).expect("export artifact should exist"))
+            .expect("export artifact should be JSON");
+    assert_eq!(artifact["kind"], "sql-rows");
+    assert_eq!(
+        artifact["columns"],
+        serde_json::json!(["id", "name", "active"])
+    );
+
+    let blocked = stderr_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "import",
+        "sql",
+        "--table",
+        "people_copy",
+        "--input",
+        &export_arg,
+    ]));
+    assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let imported = stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "import",
+        "sql",
+        "--table",
+        "people_copy",
+        "--input",
+        &export_arg,
+    ]));
+    assert_eq!(imported["data"]["inserted"], 2);
+
+    let rows = stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "sql",
+        "query",
+        "select name, active from people_copy order by id",
+    ]));
+    assert_eq!(rows["data"]["rows"][0][0], "alice");
+    assert_eq!(rows["data"]["rows"][1][0], "bob");
+
+    cleanup_dir(&root);
+}
+
+#[test]
+fn sql_schemas_returns_list_for_sqlite() {
+    let value = stdout_json(&dbtool(&["--dsn", "sqlite::memory:", "sql", "schemas"]));
+
+    assert_eq!(value["ok"], true);
+    let schemas = value["data"]
+        .as_array()
+        .expect("sql schemas should return an array");
+    assert!(
+        schemas.iter().any(|s| s == "main"),
+        "sqlite should report the 'main' schema; got: {schemas:?}"
+    );
 }
 
 #[test]
@@ -249,6 +448,19 @@ fn ts_write_requires_write_flag_before_connecting() {
         "write",
         "dbtool_sample",
         "1",
+    ]));
+
+    assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");
+}
+
+#[test]
+fn cql_exec_requires_write_flag_before_connecting() {
+    let err = stderr_json(&dbtool(&[
+        "--dsn",
+        "cassandra://127.0.0.1:1/app",
+        "cql",
+        "exec",
+        "create table app.users (id int primary key)",
     ]));
 
     assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");

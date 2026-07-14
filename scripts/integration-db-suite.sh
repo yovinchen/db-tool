@@ -34,6 +34,10 @@ HEAVY_PHASES=(
   tidb-logical-roundtrip
   tidb-tiproxy
   observability
+  opensearch-security
+  elasticsearch
+  kafka-vendors
+  redshift
 )
 
 ALL_PHASES=("${DEFAULT_PHASES[@]}" "${HEAVY_PHASES[@]}")
@@ -60,7 +64,8 @@ Default phases:
 Heavy phases:
   dbtool-image compat-extra sqlserver cassandra cassandra-fixture tidb-secure
   tidb-ha tidb-pd tidb-pd-leader tidb-tikv-boundary tidb-cert
-  tidb-logical-roundtrip tidb-tiproxy observability
+  tidb-logical-roundtrip tidb-tiproxy observability opensearch-security
+  elasticsearch kafka-vendors redshift
 EOF
 }
 
@@ -97,6 +102,10 @@ phase_description() {
     cassandra) echo "Cassandra CQL live lifecycle" ;;
     cassandra-fixture) echo "Cassandra CQL file-backed fixture data" ;;
     observability) echo "OpenSearch/TLS search and Prometheus workflows" ;;
+    opensearch-security) echo "OpenSearch security-plugin HTTPS/basic-auth workflows" ;;
+    elasticsearch) echo "product-native Elasticsearch search workflows" ;;
+    kafka-vendors) echo "env-gated external AutoMQ/WarpStream/Confluent smoke" ;;
+    redshift) echo "env-gated external Redshift SQL compatibility smoke" ;;
     *) return 1 ;;
   esac
 }
@@ -175,6 +184,10 @@ run_phase() {
     cassandra) "$ROOT/scripts/integration-cassandra-test.sh" ;;
     cassandra-fixture) "$ROOT/scripts/integration-cassandra-fixture-data-test.sh" ;;
     observability) "$ROOT/scripts/integration-observability-test.sh" ;;
+    opensearch-security) "$ROOT/scripts/integration-opensearch-security-test.sh" ;;
+    elasticsearch) "$ROOT/scripts/integration-elasticsearch-test.sh" ;;
+    kafka-vendors) "$ROOT/scripts/integration-kafka-vendor-test.sh" ;;
+    redshift) "$ROOT/scripts/integration-redshift-test.sh" ;;
     *)
       echo "unknown db suite phase: $phase" >&2
       return 2

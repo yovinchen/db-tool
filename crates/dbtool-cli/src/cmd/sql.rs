@@ -7,6 +7,10 @@ use dbtool_core::{
 };
 
 #[derive(Args)]
+#[command(
+    about = "Run SQL queries, writes, and schema inspection commands.",
+    long_about = "SQL commands use the shared safety path: read queries run directly, writes require --allow-write, and destructive statements may return a target-bound confirmation token."
+)]
 pub struct SqlCmd {
     #[command(subcommand)]
     pub action: SqlAction,
@@ -16,19 +20,30 @@ pub struct SqlCmd {
 pub enum SqlAction {
     /// Execute a SELECT and return results
     Query {
+        /// SQL SELECT or read-only statement to execute.
         sql: String,
+        /// Optional schema/database qualifier used by compatible adapters.
         #[arg(long)]
         schema: Option<String>,
     },
     /// Execute a non-SELECT statement
-    Exec { sql: String },
+    Exec {
+        /// SQL write or DDL statement; requires --allow-write.
+        sql: String,
+    },
     /// List tables in the current database / schema
     Tables {
+        /// Optional schema/database qualifier.
         #[arg(long)]
         schema: Option<String>,
     },
     /// Describe a table's columns and indexes
-    Schema { table: String },
+    Schema {
+        /// Table name, optionally schema-qualified where the backend supports it.
+        table: String,
+    },
+    /// List schemas (databases) available on the backend
+    Schemas,
 }
 
 pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
@@ -39,7 +54,7 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
         SqlAction::Query { sql, .. } | SqlAction::Exec { sql } => {
             SafetyGuard::check_with_target(sql, &target, ctx.allow_write, ctx.confirm.as_deref())?;
         }
-        SqlAction::Tables { .. } | SqlAction::Schema { .. } => {}
+        SqlAction::Tables { .. } | SqlAction::Schema { .. } | SqlAction::Schemas => {}
     }
 
     let conn = ctx.registry.connect(&dsn).await?;
@@ -85,6 +100,15 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             ctx.render_success(
                 conn.kind().0.as_str(),
                 schema,
+                start.elapsed().as_millis() as u64,
+                false,
+            )
+        }
+        SqlAction::Schemas => {
+            let schemas = sql_engine.list_schemas().await?;
+            ctx.render_success(
+                conn.kind().0.as_str(),
+                schemas,
                 start.elapsed().as_millis() as u64,
                 false,
             )

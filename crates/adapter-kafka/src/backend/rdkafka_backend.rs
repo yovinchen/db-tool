@@ -39,17 +39,17 @@ pub struct RdkafkaAdapter {
 pub fn connect(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
         let brokers = brokers_from_dsn(&dsn);
-        let producer = kafka_config(&brokers)
+        let producer = kafka_config(&dsn, &brokers)
             .create::<FutureProducer>()
             .map_err(kafka_connection_error)?;
-        let consumer = kafka_config(&brokers)
+        let consumer = kafka_config(&dsn, &brokers)
             .set("group.id", "dbtool")
             .set("enable.auto.commit", "false")
             .set("enable.partition.eof", "true")
             .set("auto.offset.reset", "earliest")
             .create::<BaseConsumer>()
             .map_err(kafka_connection_error)?;
-        let admin = kafka_config(&brokers)
+        let admin = kafka_config(&dsn, &brokers)
             .create::<AdminClient<DefaultClientContext>>()
             .map_err(kafka_connection_error)?;
 
@@ -276,13 +276,14 @@ impl RdkafkaAdapter {
     }
 }
 
-fn kafka_config(brokers: &str) -> ClientConfig {
+fn kafka_config(dsn: &Dsn, brokers: &str) -> ClientConfig {
     let mut config = ClientConfig::new();
     config
         .set("bootstrap.servers", brokers)
         .set("client.id", "dbtool")
         .set("message.timeout.ms", "5000")
         .set("socket.timeout.ms", "5000");
+    apply_client_params(&mut config, dsn);
     config
 }
 
@@ -290,6 +291,37 @@ fn brokers_from_dsn(dsn: &Dsn) -> String {
     let host = dsn.host.clone().unwrap_or_else(|| "localhost".into());
     let port = dsn.port.unwrap_or(9092);
     format!("{host}:{port}")
+}
+
+fn apply_client_params(config: &mut ClientConfig, dsn: &Dsn) {
+    if let Some(username) = dsn.username.as_deref() {
+        config.set("sasl.username", username);
+    }
+    if let Some(password) = dsn.password.as_deref() {
+        config.set("sasl.password", password);
+    }
+
+    for (key, value) in &dsn.params {
+        if let Some(config_key) = kafka_config_key(key) {
+            config.set(config_key, value);
+        }
+    }
+}
+
+fn kafka_config_key(key: &str) -> Option<&str> {
+    match key {
+        "security.protocol" | "security-protocol" => Some("security.protocol"),
+        "sasl.mechanism" | "sasl-mechanism" => Some("sasl.mechanism"),
+        "sasl.username" | "sasl-username" => Some("sasl.username"),
+        "sasl.password" | "sasl-password" => Some("sasl.password"),
+        "ssl.ca.location" | "ssl-ca-location" | "tls-ca" | "ssl-ca" => Some("ssl.ca.location"),
+        "ssl.certificate.location" | "ssl-certificate-location" => Some("ssl.certificate.location"),
+        "ssl.key.location" | "ssl-key-location" => Some("ssl.key.location"),
+        "ssl.key.password" | "ssl-key-password" => Some("ssl.key.password"),
+        _ => key
+            .strip_prefix("kafka.")
+            .filter(|stripped| !stripped.is_empty()),
+    }
 }
 
 fn topic_info(topic: &rdkafka::metadata::MetadataTopic) -> TopicInfo {

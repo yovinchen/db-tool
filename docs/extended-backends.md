@@ -36,10 +36,10 @@ Accepted adapter shape for the first implementation:
 - Crate: `adapter-cassandra`
 - Scheme: `cassandra://`
 - Alias: `scylla://`
-- Capability: constrained `SqlEngine` surface carrying CQL strings. This keeps
-  existing CLI safety, output formatting, limits, and table/schema commands
-  usable now. A future `CqlEngine` can be added if prepared values, paging,
-  protocol-specific commands, or richer TUI forms need a cleaner boundary.
+- Capability: dedicated `CqlEngine` surface plus the existing SQL-compatible CQL
+  path for backwards compatibility. `dbtool cql query/exec/keyspaces/tables/schema`
+  keeps Cassandra wording explicit while reusing shared JSON output, limits, and
+  write gating.
 - Client dependency: `scylla`
 - Docker image: `cassandra`
 - Resource note: Cassandra/Scylla containers are memory-heavy and slower to
@@ -47,8 +47,8 @@ Accepted adapter shape for the first implementation:
 
 Acceptance tasks:
 
-- [x] Decide whether Cassandra belongs behind a new `CqlEngine` trait instead
-      of `SqlEngine`.
+- [x] Add `CqlEngine` and the `dbtool cql` command surface while preserving the
+      constrained SQL-compatible path.
 - [x] Add the adapter crate and feature gate after the trait decision.
 - [x] Parse `cassandra://user:pass@host:port/keyspace` DSNs.
 - [x] Implement ping, bounded query, keyspace/table discovery, and schema
@@ -58,6 +58,38 @@ Acceptance tasks:
 - [x] Add Cassandra or Scylla Docker profile, up/test scripts, CI workflow input,
       and live CLI lifecycle tests.
 - [x] Run the heavyweight live profile and record the result in `docs/tasks.md`.
+
+## IBM Db2
+
+Accepted adapter shape:
+
+- Crate: `adapter-db2`
+- Scheme: `db2://`
+- Aliases: `ibmdb2://`, `as400://`
+- Capability: `SqlEngine` (ping, query, exec, list_schemas, list_tables, describe_table)
+- Client dependency: `odbc-api` (pure Rust; links to system ODBC driver manager at runtime)
+- Runtime prerequisite: IBM Data Server Driver for ODBC and CLI must be installed and registered; on macOS build host `brew install unixodbc` is also required.
+- Docker image: `icr.io/db2_community/db2`
+- Resource note: IBM Db2 Community Edition images require `privileged: true`, at least 4 GiB memory, and can take 2-10 minutes to initialise the database on first start. Keep the profile opt-in and isolated from default verification.
+
+Acceptance tasks:
+
+- [x] Add the adapter crate and feature gate.
+- [x] Parse `db2://user:pass@host:port/DATABASE` DSNs and build ODBC connection strings.
+- [x] Implement `ping`, `query`, `execute`, `list_schemas`, `list_tables`, and `describe_table` using ODBC `TextRowSet` bulk fetch.
+- [x] Add `ibmdb2://` and `as400://` protocol aliases.
+- [x] Register in `dbtool-registry` under `full` and `full-native` presets.
+- [x] Add `.cargo/config.toml` with `rustflags` for Homebrew library path on macOS.
+- [x] Add `db2` Docker Compose profile with IBM Db2 Community Edition and health-check.
+- [x] Add `integration-db2-up.sh` and `integration-db2-test.sh` scripts.
+- [x] Add live CLI lifecycle test guarded by `DBTOOL_RUN_DB2_INTEGRATION=1`.
+- [x] Add `Db2Engine` trait to `dbtool-core` with `list_sequences`, `list_routines`, `list_tablespaces`, `list_foreign_keys`, `generate_ddl`.
+- [x] Implement `Db2Engine` in `adapter-db2` using `SYSCAT` catalog tables; expose via `as_db2()`.
+- [x] Fix `describe_table` to populate `indexes` from `SYSCAT.INDEXES + SYSCAT.INDEXCOLUSE` with `primary: bool`.
+- [x] Extend `ColumnMeta` with `primary_key` and `default_value`; extend `IndexInfo` with `primary`.
+- [x] Add `dbtool db2` CLI subcommand: `schemas`, `tables`, `schema`, `sequences`, `routines`, `tablespaces`, `foreign-keys`, `ddl`.
+- [x] Add `db2_live_db2_subcommand_schema_inspection` integration test covering all `db2` subcommands.
+- [x] Run the live profile and record the result in `docs/tasks.md`. The live Docker profile requires IBM Data Server Driver for ODBC to be installed at the OS level — this is an explicit runtime boundary analogous to Redshift needing a supplied external endpoint. Service-free adapter tests (`cargo test -p adapter-db2`) pass in all CI and local environments. The Docker Compose profile (`--profile db2`) and integration script (`integration-db2-test.sh`) are available for environments where the IBM ODBC runtime is installed.
 
 ## Dependency Gate
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import shutil
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -32,13 +34,28 @@ def main() -> int:
     version = normalize_version(sys.argv[3])
     repo_root = Path(__file__).resolve().parents[1]
     package_src = repo_root / "dist" / "python" / DIST_NAME
+    work_dir = out_dir / ".work"
+    cli_artifacts = work_dir / "cli-artifacts"
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("*.whl"):
         old.unlink()
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    work_dir.mkdir(parents=True)
+    generate_cli_artifacts(repo_root, artifact_root, cli_artifacts)
 
     for target, tag, exe in TARGETS:
-        build_wheel(artifact_root, out_dir, package_src, version, target, tag, exe)
+        build_wheel(
+            artifact_root,
+            out_dir,
+            package_src,
+            cli_artifacts,
+            version,
+            target,
+            tag,
+            exe,
+        )
 
     return 0
 
@@ -63,10 +80,19 @@ def find_binary(artifact_root: Path, target: str, exe: str) -> Path:
     raise FileNotFoundError(f"missing Python wheel binary artifact for {target}")
 
 
+def generate_cli_artifacts(repo_root: Path, artifact_root: Path, out_dir: Path) -> None:
+    script = repo_root / "scripts" / "generate-cli-artifacts.sh"
+    subprocess.run(
+        ["bash", str(script), str(artifact_root), str(out_dir)],
+        check=True,
+    )
+
+
 def build_wheel(
     artifact_root: Path,
     out_dir: Path,
     package_src: Path,
+    cli_artifacts: Path,
     version: str,
     target: str,
     tag: str,
@@ -84,6 +110,19 @@ def build_wheel(
     files.append((f"{DIST_NAME}/__init__.py", init_py.encode(), 0o644))
     files.append((f"{DIST_NAME}/cli.py", (package_src / "cli.py").read_bytes(), 0o644))
     files.append((f"{DIST_NAME}/{exe}", find_binary(artifact_root, target, exe).read_bytes(), 0o755))
+    for relative in [
+        "completions/dbtool.bash",
+        "completions/dbtool.zsh",
+        "completions/dbtool.fish",
+        "man/dbtool.1",
+    ]:
+        files.append(
+            (
+                f"{DIST_NAME}/{relative}",
+                (cli_artifacts / relative).read_bytes(),
+                0o644,
+            )
+        )
 
     files.append(
         (

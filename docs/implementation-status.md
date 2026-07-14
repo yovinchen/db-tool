@@ -1,6 +1,6 @@
 # dbtool Implementation Status
 
-Last updated: 2026-06-16
+Last updated: 2026-06-18
 
 This document is the current implementation inventory for dbtool. It separates
 implemented behavior, compatibility that has been live-tested, compatibility
@@ -13,12 +13,13 @@ usable.
 | --- | --- | --- |
 | Core contracts | Implemented | `Connector`, capability traits, shared models, registry, DSN parsing, redaction, and protocol aliases are in place. |
 | Embedded library path | Implemented | `dbtool-registry` has a service-free embedded smoke that builds the registry directly, reuses a connection through `ConnectionManager`, applies `SafetyGuard`, and runs SQL under `FlowControl` without spawning the CLI. |
-| CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `kv`, `doc`, `mq`, `search`, and `ts` command families exist with default backends for core read paths. |
+| CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `cql`, `db2`, `kv`, `doc`, `mq`, `search`, and `ts` command families exist with default backends for core read paths. Root and command-family help describe safety boundaries, JSON inputs, bounded reads, and examples. |
 | Output formats | Implemented | JSON is the default. `--format table` and `--format ndjson` are implemented for successful command output; errors always stay JSON so `error.code` and confirmation tokens remain machine-readable. |
 | SQL safety | Implemented | Read statements are allowed, writes need `--allow-write`, destructive SQL needs a confirm token bound to the target. |
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`, then apply CLI overrides such as `--rate`, `--request-timeout`, and `--deadline`; CLI execution uses the one-shot path so writes are not replayed by retries. |
-| Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, and observability profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
+| Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, observability, OpenSearch security-plugin TLS, and product-native Elasticsearch profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; live Docker jobs are manual workflow inputs. |
+| Release artifacts | Implemented | Release archives and npm/Python wrapper packages include generated bash, zsh, and fish completions plus `dbtool.1` manpage artifacts derived from the clap command metadata. |
 | TUI | Implemented | Connection picker, capability-aware command dispatch, read limits, write confirmation, command history, full-screen status, per-capability forms, and smoke tests are in place. |
 
 ## Usable Database And Protocol Matrix
@@ -30,9 +31,11 @@ usable.
 | PostgreSQL alias | `postgresql://` | SQL | Same as Postgres adapter | Registry alias test only |
 | CockroachDB | `cockroach://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real CockroachDB compatibility live test |
 | TimescaleDB | `timescale://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real TimescaleDB compatibility live test |
-| Redshift | `redshift://` | SQL | Routed to Postgres adapter | Not live-tested against Redshift |
+| Redshift | `redshift://` | SQL | Routed to Postgres adapter | Env-gated external Redshift smoke through `./scripts/integration-redshift-test.sh` when `DBTOOL_IT_REDSHIFT_DSN` is supplied |
+| IBM Db2 | `db2://` | Db2 ODBC | `ping`, `sql query`, `sql exec`, `sql tables`, `sql schema`, `db2 schemas`, `db2 tables`, `db2 schema`, `db2 sequences`, `db2 routines`, `db2 tablespaces`, `db2 foreign-keys`, `db2 ddl` | Service-free adapter tests; live integration guarded by `DBTOOL_RUN_DB2_INTEGRATION=1` |
+| IBM Db2 alias | `ibmdb2://`, `as400://` | Db2 ODBC | Same as Db2 adapter | Registry alias test only |
 | SQL Server | `sqlserver://`, `mssql://` | SQL Server/TDS | SQL query/exec/tables/schema, typed scalar values, result limiting | Service-free adapter tests plus real SQL Server Docker live test on GitHub Actions x86_64 runner |
-| Cassandra/ScyllaDB | `cassandra://`, `scylla://` | CQL over constrained SQL surface | `ping`, CQL query/exec through `sql` commands, keyspace table listing, schema inspection, primitive/collection typed values | Adapter tests plus real Cassandra Docker live test |
+| Cassandra/ScyllaDB | `cassandra://`, `scylla://` | CQL | `ping`, `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema`, SQL-compatible CQL path, primitive/collection typed values | Adapter tests plus real Cassandra Docker live test |
 | MySQL | `mysql://` | SQL | SQL query/exec/tables/schema, typed values, result limiting | Base Docker live test |
 | MariaDB | `mariadb://` | SQL | MySQL-family SQL lifecycle, typed values, result limiting | Real MariaDB compatibility live test |
 | TiDB | `tidb://` | SQL | MySQL-family SQL lifecycle, typed values, table listing, schema-qualified tables | Real PD/TiKV/TiDB live test |
@@ -51,21 +54,21 @@ usable.
 | Kafka | `kafka://` | Kafka | ping, produce, consume, topics, detail/watermarks | Redpanda live test through pure Rust backend |
 | Kafka native | `kafka://` with `full-native` | Kafka | librdkafka-backed ping, produce, consume, topics/detail | Optional native live test |
 | Redpanda | `redpanda://` | Kafka | Routed to Kafka adapter | Redpanda service backs Kafka live tests |
-| AutoMQ | `automq://` | Kafka | Routed to Kafka adapter | Not live-tested against AutoMQ |
-| WarpStream | `warpstream://` | Kafka | Routed to Kafka adapter | Not live-tested against WarpStream |
-| Confluent | `confluent://` | Kafka | Routed to Kafka adapter | Not live-tested against Confluent Cloud/Platform |
+| AutoMQ | `automq://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_AUTOMQ_DSN` is supplied |
+| WarpStream | `warpstream://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_WARPSTREAM_DSN` is supplied |
+| Confluent | `confluent://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_CONFLUENT_DSN` is supplied |
 | AMQP/RabbitMQ | `amqp://`, `amqps://` | AMQP | produce, consume, queue detail | RabbitMQ plain and AMQPS TLS live tests |
 | RabbitMQ management | `rabbitmq+http://` | RabbitMQ HTTP admin | queue list, detail, lag | RabbitMQ management live test |
 | NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS plain and TLS live tests |
-| OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list, search, single-document index | Service-free HTTP/TLS mapping tests, real OpenSearch plain HTTP live profile, and HTTPS compatible harness |
-| Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | Routed to OpenSearch-compatible HTTP adapter | Service-free HTTP/TLS mapping tests; OpenSearch-compatible live coverage covers the shared API surface |
+| OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list, search, single-document index | Service-free HTTP/TLS mapping tests, real OpenSearch plain HTTP live profile, HTTPS compatible harness, and opt-in OpenSearch security-plugin HTTPS/basic-auth profile |
+| Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | Routed to OpenSearch-compatible HTTP adapter | Service-free HTTP/TLS mapping tests plus product-native Elasticsearch Docker live profile for `elasticsearch://` |
 | Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list, range query, and remote write | Service-free adapter tests plus Prometheus live profile |
 
 ## Docker Service Profiles
 
 | Script | Services | Main coverage | Resource note |
 | --- | --- | --- | --- |
-| `./scripts/integration-db-suite.sh` | Selectable local DB suite | Orchestrates Compose config validation, service-free checks, base DB workflows, flow-control, database-side SQL timeout checks, live connection config, custom environment smoke, fixture data/images, logical roundtrip, compatibility profiles, TiDB, and opt-in heavy DB phases | Default excludes heavy phases; `DBTOOL_IT_DB_SUITE_PHASES=all` includes the dbtool image smoke plus every DB/observability phase |
+| `./scripts/integration-db-suite.sh` | Selectable local DB suite | Orchestrates Compose config validation, service-free checks, base DB workflows, flow-control, database-side SQL timeout checks, live connection config, custom environment smoke, fixture data/images, logical roundtrip, compatibility profiles, TiDB, and opt-in heavy DB phases | Default excludes heavy phases; `DBTOOL_IT_DB_SUITE_PHASES=all` includes the dbtool image smoke plus every DB/observability/search phase |
 | `./scripts/integration-test.sh` | Postgres, MySQL, Redis, MongoDB | Canonical SQL, KV, and document workflows | Roughly 2 GiB container memory |
 | `./scripts/integration-flow-control-test.sh` | Postgres, MySQL, Redis, MongoDB | Live request timeout, rate/admission flags, SQL/KV/document result limiting, and disposable fixture cleanup | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-server-timeout-test.sh` | Postgres, MySQL | Database-side SQL timeout checks for PostgreSQL `statement_timeout`, PostgreSQL `idle_in_transaction_session_timeout`, PostgreSQL `lock_timeout`, and MySQL `innodb_lock_wait_timeout` | Roughly 1.25 GiB container memory; local-only while CI budget is frozen |
@@ -73,9 +76,10 @@ usable.
 | `./scripts/integration-custom-env-test.sh` | Postgres, MySQL, Redis, MongoDB | Custom project name, database names, credentials, host ports, generated DSNs, and read/write verification | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-fixture-data-test.sh` | Postgres, MySQL, Redis, MongoDB | File-backed reusable fixture loading for SQL rows, Redis keys, and MongoDB documents | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-fixture-images-test.sh` | Dockerfile-built Postgres, MySQL, Redis, MongoDB | Fixture data baked into database images and verified through dbtool readback | Roughly 2 GiB container memory; local-only while CI budget is frozen |
-| `./scripts/integration-data-roundtrip-test.sh` | Postgres, MySQL, Redis, MongoDB | dbtool-mediated logical export and restore of fixture rows, keys, and documents into independent target resources | Roughly 2 GiB container memory; local-only while CI budget is frozen |
+| `./scripts/integration-data-roundtrip-test.sh` | Postgres, MySQL, Redis, MongoDB | Public `dbtool export` / `dbtool import` logical roundtrip of fixture rows, keys, and documents into independent target resources | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-compat-test.sh` | MariaDB, Valkey | MySQL and Redis compatible databases | Extra KeyDB/Dragonfly via `DBTOOL_IT_COMPAT_EXTRA=1` |
 | `./scripts/integration-pg-compat-test.sh` | CockroachDB, TimescaleDB | PostgreSQL-family compatible databases | Roughly 1 GiB container memory |
+| `./scripts/integration-redshift-test.sh` | Externally supplied Redshift endpoint | Env-gated SQL lifecycle, typed values, result limiting, table listing, and schema inspection; no secrets are committed | Skips when `DBTOOL_IT_REDSHIFT_DSN` is not supplied |
 | `./scripts/integration-sqlserver-test.sh` | SQL Server | TDS SQL lifecycle, typed values, limiting, tables, and schema | Passed on GitHub Actions x86_64 runner; requires amd64-capable Docker locally; roughly 2 GiB container memory |
 | `./scripts/integration-cassandra-test.sh` | Cassandra | CQL lifecycle, keyspace-qualified tables, schema inspection, typed scalar and collection values | Roughly 2 GiB container memory; startup can be slow |
 | `./scripts/integration-cassandra-fixture-data-test.sh` | Cassandra | File-backed reusable CQL fixture loading, seeded row readback, table listing, and schema inspection | Roughly 2 GiB container memory; heavy/local-only while CI budget is frozen |
@@ -91,7 +95,11 @@ usable.
 | `./scripts/integration-mq-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Streams/PubSub, Kafka, AMQP, NATS | Roughly 2 GiB container memory |
 | `./scripts/integration-mq-tls-test.sh` | RabbitMQ TLS, NATS TLS | AMQPS and NATS TLS aliases | Roughly 768 MiB container memory |
 | `./scripts/integration-mq-native-test.sh` | Redis, Redpanda, RabbitMQ, NATS | Native Kafka backend plus messaging regression | Requires `full-native` build |
+| `./scripts/integration-kafka-vendor-test.sh` | Externally supplied AutoMQ, WarpStream, Confluent endpoints | Env-gated native Kafka smoke for ping, topics, produce, detail, and consume; no secrets are committed | Skips when no vendor DSN env vars are supplied |
 | `./scripts/integration-observability-test.sh` | OpenSearch, Dockerfile-built OpenSearch-compatible HTTPS harness, Prometheus | Search, seeded search TLS transport, and time-series workflows | Roughly 1.4 GiB container memory |
+| `./scripts/integration-opensearch-security-test.sh` | OpenSearch security plugin | Real OpenSearch HTTPS/basic-auth with generated local CA/node certs and `tls-ca` validation | Roughly 1.5 GiB container memory; opt-in heavy/local-only while CI budget is frozen |
+| `./scripts/integration-elasticsearch-test.sh` | Elasticsearch | Product-native `elasticsearch://` ping, write guard, single-document indexing, search, and index listing | Roughly 1.5 GiB container memory; opt-in heavy/local-only while CI budget is frozen |
+| `./scripts/integration-db2-test.sh` | IBM Db2 Community Edition | SQL lifecycle, schema inspection, write guard, alias verification, `db2` subcommand (sequences, routines, tablespaces, foreign-keys, ddl) | Requires IBM Data Server Driver for ODBC at runtime; roughly 4 GiB container memory; startup up to 10 min; opt-in heavy/local-only |
 
 ## Implemented CLI Operations
 
@@ -99,9 +107,12 @@ usable.
 | --- | --- | --- |
 | Connection | `conn list` | Read-only |
 | General | `ping`, `caps` | Read-only |
-| SQL | `sql query`, `sql exec`, `sql tables`, `sql schema` | `sql exec` and unsafe SQL require `--allow-write` and sometimes `--confirm` |
+| SQL | `sql query`, `sql exec`, `sql tables`, `sql schema`, `sql schemas` | `sql exec` and unsafe SQL require `--allow-write` and sometimes `--confirm` |
+| CQL | `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema` | `cql exec` requires `--allow-write` |
+| Db2 | `db2 schemas`, `db2 tables`, `db2 schema`, `db2 sequences`, `db2 routines`, `db2 tablespaces`, `db2 foreign-keys`, `db2 ddl` | All read-only; no `--allow-write` required |
 | KV | `kv get`, `kv set`, `kv scan`, `kv del`, `kv raw` | `set`, `del`, and mutating raw commands require `--allow-write` |
 | Document | `doc collections`, `doc find`, `doc insert`, `doc update`, `doc delete`, `doc aggregate` | insert/update/delete require `--allow-write`; delete refuses empty filters adapter-side |
+| Transfer | `export sql`, `export kv`, `export doc`, `import sql`, `import kv`, `import doc` | all import commands require `--allow-write` before DSN resolution, artifact reads, or connecting |
 | Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write` |
 | Search | `search indices`, `search search`, `search index` | `index` requires `--allow-write` |
 | Time series | `ts measurements`, `ts query`, `ts write` | Prometheus remote write is exposed through explicit `--allow-write`; remote write uses a minimal protobuf/snappy encoder with no new runtime dependency |
@@ -113,28 +124,17 @@ the stated dbtool objective.
 
 | Item | Boundary | Reason |
 | --- | --- | --- |
-| Real OpenSearch security-plugin TLS profile | Optional product-specific validation | TLS transport is live-tested against a compatible HTTPS harness; the heavier OpenSearch security plugin setup is not required for the shared HTTP/HTTPS adapter contract. |
-| Cassandra trait split | Optional protocol-specific refinement | Cassandra is usable through a constrained CQL-over-`SqlEngine` surface so the existing CLI safety/limit/output paths work. A dedicated `CqlEngine` can be added if CQL later needs prepared values, paging, or protocol-specific commands. |
 | Production TiDB HA | Outside the local dbtool harness | Local secure HA topology, SQL-node failover, PD single-node outage, PD leader outage, TiKV outage boundary, certificate regeneration cold restart, logical roundtrip, and TiProxy new-connection routing are covered. Production TiKV failover, online certificate rotation, product-native backup/restore, and upgrade drills remain product-readiness exercises beyond dbtool's connector objective. |
 | AMQP queue listing over pure AMQP | Not portable in AMQP 0.9.1 | RabbitMQ queue discovery is intentionally exposed through `rabbitmq+http://` management instead of pretending queue listing is portable AMQP behavior. |
 | Redis Pub/Sub durable listing | Not a durable catalog | Pub/Sub channels are live subscriptions, not durable topics; durable list/detail semantics stay on Redis Streams. |
 | NATS core subject listing | Not a durable catalog | Core NATS subjects are ephemeral routing names; durable list/detail/lag semantics stay on JetStream. |
+| IBM Db2 end-to-end live Docker run | Requires IBM ODBC runtime at the OS level | The adapter, Docker Compose profile, and integration script exist. Running them requires IBM Data Server Driver for ODBC installed outside the container — this is an explicit runtime boundary analogous to Redshift needing a supplied external endpoint. Service-free adapter tests pass in all environments. |
 
 ## Recommended Enhancement Candidates
 
-The project objective is complete, but these productization candidates would make
-the tool easier to operate in wider environments. They should stay separate from
-the completed core objective and be implemented one feature branch at a time.
-
-| Candidate | Why it helps | Concrete implementation path | Verification gate |
-| --- | --- | --- | --- |
-| CLI discoverability polish | Keeps the tool self-explanatory for humans and Claude Skill callers. | Add clap help text and examples to command variants and arguments without changing command behavior. | Targeted `--help` assertions plus `cargo test -p dbtool-cli --test cli_json`. |
-| Shell completions and manpage artifacts | Makes local installation via npm/pip/mise feel complete. | Add a packaging script that emits bash/zsh/fish completions and a manpage from clap metadata, then include them in release archives and wrapper packages. | Archive smoke checks verify completion/manpage files for every target. |
-| Dedicated CQL command surface | Cassandra works today through constrained SQL commands, but CQL has protocol-specific concepts such as keyspaces, paging, consistency, and prepared statements. | Add a `CqlEngine` trait, expose `dbtool cql query/exec/keyspaces/tables/schema`, and let `adapter-cassandra` implement it while keeping the existing SQL-compatible path. | Adapter unit tests plus Cassandra Docker lifecycle, keyspace/table/schema, paging, and write-safety coverage. |
-| Product-native Elasticsearch profile | The shared OpenSearch/Elasticsearch HTTP surface is covered, but a real Elasticsearch container would catch product-specific response drift. | Add an opt-in Elasticsearch Docker profile and an `integration-elasticsearch-test.sh` that exercises `elasticsearch://` and `elasticsearch+https://` aliases. | Compose config validation plus live index/search/index lifecycle against Elasticsearch. |
-| OpenSearch security-plugin TLS profile | Current HTTPS validation uses a compatible TLS harness; the full OpenSearch security plugin remains a heavier product setup. | Add a separate security-enabled OpenSearch profile with generated certs, credentials, and role setup, keeping it opt-in. | `search indices`, `search search`, and `search index` through authenticated TLS DSNs. |
-| Vendor Kafka-compatible smoke profiles | AutoMQ, WarpStream, and Confluent routes reuse the Kafka adapter but are not all live-tested against vendor deployments. | Add env-gated scripts that consume externally supplied broker URLs/credentials, without committing secrets or forcing CI usage. | Opt-in smoke proves ping/topics/produce/consume for each supplied vendor endpoint. |
-| Generic export/import CLI | Integration scripts prove logical roundtrips, but users do not yet have first-class `export`/`import` commands. | Add read-only export commands and write-gated import commands for SQL rows, Redis keys, MongoDB documents, and possibly search documents. | Service-free SQLite tests plus Docker-backed base DB roundtrip tests using only public CLI commands. |
+No open recommended enhancement candidates remain in this inventory. Future
+productization ideas should be added here only when they are intentionally kept
+outside the current completed objective and have a concrete verification gate.
 
 ## Completion Evidence
 

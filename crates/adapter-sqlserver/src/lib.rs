@@ -1,7 +1,9 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value},
+    model::{
+        ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind, TableSchema, Value,
+    },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, Connector, ConnectorKind},
@@ -173,34 +175,91 @@ impl SqlEngine for SqlServerAdapter {
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
         let table_ref = parse_table_ref(table)?;
         let schema = table_ref.schema.as_deref().unwrap_or("dbo");
-        let sql = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE \
-             FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
-             ORDER BY ORDINAL_POSITION",
-            schema, table_ref.name
-        );
-        let result = self.query(&sql, &[]).await?;
 
-        let columns = result
+        let col_sql = format!(
+            "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, \
+                    CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS is_pk \
+             FROM INFORMATION_SCHEMA.COLUMNS c \
+             LEFT JOIN ( \
+                 SELECT kcu.COLUMN_NAME \
+                 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
+                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
+                     ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
+                     AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA \
+                     AND tc.TABLE_NAME = kcu.TABLE_NAME \
+                 WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' \
+                   AND tc.TABLE_SCHEMA = '{schema}' AND tc.TABLE_NAME = '{name}' \
+             ) pk ON c.COLUMN_NAME = pk.COLUMN_NAME \
+             WHERE c.TABLE_SCHEMA = '{schema}' AND c.TABLE_NAME = '{name}' \
+             ORDER BY c.ORDINAL_POSITION",
+            schema = schema,
+            name = table_ref.name,
+        );
+        let col_result = self.query(&col_sql, &[]).await?;
+
+        let columns = col_result
             .rows
             .into_iter()
             .filter_map(|row| {
-                let name = value_text(row.first()?)?;
-                let data_type = value_text(row.get(1)?)?;
-                let nullable = value_text(row.get(2)?)?;
+                let name = value_text(row.first()?)?.to_owned();
+                let data_type = value_text(row.get(1)?)?.to_owned();
+                let nullable = value_text(row.get(2)?)? == "YES";
+                let default_value = match row.get(3)? {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                };
+                let primary_key = matches!(row.get(4)?, Value::Int(1));
                 Some(ColumnMeta {
-                    name: name.to_owned(),
-                    type_name: data_type.to_owned(),
-                    nullable: nullable == "YES",
+                    name,
+                    type_name: data_type,
+                    nullable,
+                    primary_key,
+                    default_value,
                 })
             })
             .collect();
 
+        let idx_sql = format!(
+            "SELECT i.name, i.is_unique, i.is_primary_key, c.name \
+             FROM sys.indexes i \
+             JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+             JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
+             JOIN sys.tables t ON i.object_id = t.object_id \
+             JOIN sys.schemas s ON t.schema_id = s.schema_id \
+             WHERE t.name = '{name}' AND s.name = '{schema}' AND i.type > 0 \
+             ORDER BY i.name, ic.key_ordinal",
+            schema = schema,
+            name = table_ref.name,
+        );
+        let idx_result = self.query(&idx_sql, &[]).await?;
+
+        let mut indexes: Vec<IndexInfo> = Vec::new();
+        for row in idx_result.rows {
+            let idx_name = match row.first() {
+                Some(Value::Text(s)) => s.clone(),
+                _ => continue,
+            };
+            let unique = matches!(row.get(1), Some(Value::Bool(true)));
+            let primary = matches!(row.get(2), Some(Value::Bool(true)));
+            let col = match row.get(3) {
+                Some(Value::Text(s)) => s.clone(),
+                _ => continue,
+            };
+            match indexes.last_mut() {
+                Some(idx) if idx.name == idx_name => idx.columns.push(col),
+                _ => indexes.push(IndexInfo {
+                    name: idx_name,
+                    columns: vec![col],
+                    unique,
+                    primary,
+                }),
+            }
+        }
+
         Ok(TableSchema {
             name: table_ref.name,
             columns,
-            indexes: vec![],
+            indexes,
         })
     }
 }
@@ -273,6 +332,8 @@ fn column_meta(column: &Column) -> ColumnMeta {
         name: column.name().to_owned(),
         type_name: format!("{:?}", column.column_type()).to_ascii_lowercase(),
         nullable: true,
+        primary_key: false,
+        default_value: None,
     }
 }
 

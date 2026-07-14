@@ -13,7 +13,7 @@ use dbtool_core::{
 use futures::{future::BoxFuture, StreamExt};
 use redis::{
     aio::MultiplexedConnection,
-    streams::{StreamId, StreamInfoStreamReply, StreamReadReply},
+    streams::{StreamId, StreamInfoGroupsReply, StreamInfoStreamReply, StreamReadReply},
     AsyncCommands, Client,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -205,14 +205,42 @@ impl AdminInspect for RedisAdapter {
     }
 
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>> {
-        Ok(vec![LagInfo {
-            topic: String::new(),
-            partition: 0,
-            group: group.to_owned(),
-            committed: 0,
-            latest: 0,
-            lag: 0,
-        }])
+        let streams = self.list_topics().await?;
+        let mut results = Vec::new();
+
+        for stream in streams {
+            let mut c = self.conn.lock().await;
+            let groups: StreamInfoGroupsReply = redis::cmd("XINFO")
+                .arg("GROUPS")
+                .arg(&stream.name)
+                .query_async(&mut *c)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+            let latest: i64 = redis::cmd("XLEN")
+                .arg(&stream.name)
+                .query_async(&mut *c)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+            drop(c);
+
+            for g in groups.groups {
+                if g.name != group {
+                    continue;
+                }
+                let committed = redis_stream_offset(&g.last_delivered_id);
+                let lag = g.lag.unwrap_or(g.pending) as i64;
+                results.push(LagInfo {
+                    topic: stream.name.clone(),
+                    partition: 0,
+                    group: group.to_owned(),
+                    committed,
+                    latest,
+                    lag,
+                });
+            }
+        }
+
+        Ok(results)
     }
 }
 

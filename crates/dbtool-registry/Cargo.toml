@@ -17,6 +17,7 @@ sqlite   = ["sql"]
 sql      = ["dep:adapter-sql"]
 sqlserver = ["dep:adapter-sqlserver"]
 cassandra = ["dep:adapter-cassandra"]
+db2       = ["dep:adapter-db2"]
 redis    = ["dep:adapter-redis"]
 mongodb  = ["dep:adapter-mongo"]
 search   = ["dep:adapter-search"]
@@ -30,7 +31,7 @@ kafka         = ["dep:adapter-kafka", "adapter-kafka/backend-pure"]
 kafka-native  = ["dep:adapter-kafka", "adapter-kafka/backend-native"]
 
 # ── Preset bundles ─────────────────────────────────────────────────────────────
-full        = ["sql", "sqlserver", "cassandra", "redis", "mongodb", "search", "timeseries", "mq", "kafka"]
+full        = ["sql", "sqlserver", "cassandra", "db2", "redis", "mongodb", "search", "timeseries", "mq", "kafka"]
 full-native = ["full", "kafka-native"]
 
 [dependencies]
@@ -38,6 +39,7 @@ dbtool-core   = { path = "../dbtool-core" }
 adapter-sql   = { path = "../adapter-sql",   optional = true }
 adapter-sqlserver = { path = "../adapter-sqlserver", optional = true }
 adapter-cassandra = { path = "../adapter-cassandra", optional = true }
+adapter-db2       = { path = "../adapter-db2",       optional = true }
 adapter-redis = { path = "../adapter-redis", optional = true }
 adapter-mongo = { path = "../adapter-mongo", optional = true }
 adapter-search = { path = "../adapter-search", optional = true }

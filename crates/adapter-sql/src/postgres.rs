@@ -11,6 +11,7 @@ use futures::future::BoxFuture;
 use sqlx::{Column, PgPool, Row};
 
 use crate::{
+    group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
     value::{column_type_name, postgres_value},
 };
@@ -81,6 +82,8 @@ impl SqlEngine for PostgresAdapter {
                 name: c.name().to_owned(),
                 type_name: column_type_name(c),
                 nullable: true,
+                primary_key: false,
+                default_value: None,
             })
             .collect();
 
@@ -142,9 +145,23 @@ impl SqlEngine for PostgresAdapter {
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
         let table_ref = parse_table_ref(table)?;
         let schema = table_ref.schema.as_deref().unwrap_or("public");
-        let rows = sqlx::query(
-            "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+
+        let col_rows = sqlx::query(
+            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
+                    (kcu.column_name IS NOT NULL) AS is_pk \
+             FROM information_schema.columns c \
+             LEFT JOIN ( \
+                 SELECT kcu.column_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                     ON tc.constraint_name = kcu.constraint_name \
+                     AND tc.table_schema = kcu.table_schema \
+                     AND tc.table_name = kcu.table_name \
+                 WHERE tc.constraint_type = 'PRIMARY KEY' \
+                   AND tc.table_schema = $1 AND tc.table_name = $2 \
+             ) kcu ON c.column_name = kcu.column_name \
+             WHERE c.table_schema = $1 AND c.table_name = $2 \
+             ORDER BY c.ordinal_position",
         )
         .bind(schema)
         .bind(&table_ref.name)
@@ -152,18 +169,45 @@ impl SqlEngine for PostgresAdapter {
         .await
         .map_err(|e| Error::Query(e.to_string()))?;
 
-        let columns = rows
+        let columns = col_rows
             .iter()
             .map(|r| ColumnMeta {
                 name: r.get(0),
                 type_name: r.get(1),
                 nullable: r.get::<String, _>(2) == "YES",
+                primary_key: r.get::<bool, _>(4),
+                default_value: r.get::<Option<String>, _>(3),
             })
             .collect();
+
+        let idx_rows = sqlx::query(
+            "SELECT i.relname, ix.indisunique, ix.indisprimary, a.attname \
+             FROM pg_class t \
+             JOIN pg_index ix ON t.oid = ix.indrelid \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkeys) \
+             WHERE t.relname = $1 AND n.nspname = $2 \
+             ORDER BY i.relname, array_position(ix.indkeys, a.attnum)",
+        )
+        .bind(&table_ref.name)
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?;
+
+        let indexes = group_index_rows(idx_rows.iter().map(|r| {
+            let name: String = r.get(0);
+            let unique: bool = r.get(1);
+            let primary: bool = r.get(2);
+            let col: String = r.get(3);
+            (name, unique, primary, col)
+        }));
+
         Ok(TableSchema {
             name: table_ref.name,
             columns,
-            indexes: vec![],
+            indexes,
         })
     }
 }

@@ -14,6 +14,7 @@ Use dbtool when you need to inspect SQL databases, key-value stores, document st
 2. Inspect structure before querying data:
 
    ```bash
+   dbtool --conn <name> sql schemas
    dbtool --conn <name> sql tables
    dbtool --conn <name> sql schema users
    dbtool --conn search-local search indices

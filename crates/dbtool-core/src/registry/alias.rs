@@ -4,6 +4,7 @@ pub const PROTOCOL_ALIASES: &[(&str, &[&str])] = &[
     ("mysql", &["mariadb", "tidb"]),
     ("sqlserver", &["mssql"]),
     ("cassandra", &["scylla"]),
+    ("db2", &["ibmdb2", "as400"]),
     (
         "postgres",
         &["postgresql", "cockroach", "timescale", "redshift"],
@@ -52,6 +53,8 @@ mod tests {
         assert_eq!(canonical_scheme("opensearch+https"), "opensearch");
         assert_eq!(canonical_scheme("elasticsearch+https"), "opensearch");
         assert_eq!(canonical_scheme("prometheus+http"), "prometheus");
+        assert_eq!(canonical_scheme("ibmdb2"), "db2");
+        assert_eq!(canonical_scheme("as400"), "db2");
     }
 
     #[test]

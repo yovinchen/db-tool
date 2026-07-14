@@ -1,11 +1,14 @@
 pub mod caps;
 pub mod conn;
+pub mod cql;
+pub mod db2;
 pub mod doc;
 pub mod kv;
 pub mod mq;
 pub mod ping;
 pub mod search;
 pub mod sql;
+pub mod transfer;
 pub mod ts;
 
 use dbtool_core::service::{formatter::Format, ThrottleConfig};

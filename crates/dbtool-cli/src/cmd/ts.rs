@@ -8,6 +8,10 @@ use dbtool_core::{
 use std::collections::HashMap;
 
 #[derive(Args)]
+#[command(
+    about = "Read and write Prometheus-compatible time-series data.",
+    long_about = "Time-series commands list metric names, run bounded range queries, and write single samples through Prometheus remote write behind --allow-write."
+)]
 pub struct TsCmd {
     #[command(subcommand)]
     pub action: TsAction,
@@ -19,18 +23,25 @@ pub enum TsAction {
     Measurements,
     /// Run a range query over the last N minutes.
     Query {
+        /// PromQL expression to evaluate over the requested range.
         query: String,
+        /// Number of minutes back from now to include in the range query.
         #[arg(long, default_value = "60")]
         last_minutes: i64,
     },
     /// Write one sample through Prometheus remote write.
     Write {
+        /// Metric name to write.
         measurement: String,
+        /// Numeric sample value.
         value: f64,
+        /// Field label used by dbtool's generic point model.
         #[arg(long, default_value = "value")]
         field: String,
+        /// Metric tag in key=value form. Repeat for multiple tags.
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Optional Unix timestamp in milliseconds; defaults to current time.
         #[arg(long = "timestamp-ms")]
         timestamp_ms: Option<i64>,
     },

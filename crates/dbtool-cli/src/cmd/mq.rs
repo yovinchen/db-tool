@@ -8,6 +8,10 @@ use dbtool_core::{
 use std::time::Duration;
 
 #[derive(Args)]
+#[command(
+    about = "Produce, consume, and inspect bounded message queue workflows.",
+    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write; consume is always bounded by --max and --timeout."
+)]
 pub struct MqCmd {
     #[command(subcommand)]
     pub action: MqAction,
@@ -17,24 +21,34 @@ pub struct MqCmd {
 pub enum MqAction {
     /// Produce messages to a topic/queue
     Produce {
+        /// Topic, stream, subject, or queue name.
         topic: String,
         /// JSON payload
         payload: String,
     },
     /// Consume messages (always bounded)
     Consume {
+        /// Topic, stream, subject, or queue name.
         topic: String,
+        /// Maximum messages to return.
         #[arg(long, default_value = "10")]
         max: usize,
+        /// Maximum time to wait, in seconds.
         #[arg(long, default_value = "5")]
         timeout: u64,
     },
     /// List topics
     Topics,
     /// Show topic/queue detail when the backend exposes admin metadata
-    Detail { topic: String },
+    Detail {
+        /// Topic, stream, subject, or queue name to inspect.
+        topic: String,
+    },
     /// Show consumer group lag
-    Lag { group: String },
+    Lag {
+        /// Consumer group, durable consumer, or queue name depending on backend.
+        group: String,
+    },
 }
 
 pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {

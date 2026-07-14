@@ -36,6 +36,14 @@ fn cassandra_enabled() -> bool {
     env::var("DBTOOL_RUN_CASSANDRA_INTEGRATION").as_deref() == Ok("1")
 }
 
+fn redshift_enabled() -> bool {
+    env::var("DBTOOL_RUN_REDSHIFT_INTEGRATION").as_deref() == Ok("1")
+}
+
+fn db2_enabled() -> bool {
+    env::var("DBTOOL_RUN_DB2_INTEGRATION").as_deref() == Ok("1")
+}
+
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args(args)
@@ -129,9 +137,19 @@ fn setup_sql_exec(dsn: &str, sql: &str) -> Value {
     ]))
 }
 
+fn cql_exec(dsn: &str, cql: &str) -> Value {
+    stdout_json(dbtool(&["--dsn", dsn, "--allow-write", "cql", "exec", cql]))
+}
+
 fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
     let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
     assert_eq!(ping["ok"], true);
+
+    let schemas = stdout_json(dbtool(&["--dsn", dsn, "sql", "schemas"]));
+    assert!(
+        schemas["data"].as_array().is_some(),
+        "sql schemas should return an array; output: {schemas}"
+    );
 
     confirmed_sql_exec(dsn, &create_sql);
 
@@ -175,8 +193,104 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
     let schema = stdout_json(dbtool(&["--dsn", dsn, "sql", "schema", table]));
     assert_eq!(schema["ok"], true);
     assert_eq!(schema["data"]["name"], expected_table_name);
+    let columns = schema["data"]["columns"]
+        .as_array()
+        .expect("schema should have a columns array");
+    assert!(
+        !columns.is_empty(),
+        "schema columns should not be empty; output: {schema}"
+    );
+    let id_col = columns
+        .iter()
+        .find(|c| c["name"] == "id")
+        .expect("id column should appear in schema");
+    assert_eq!(
+        id_col["nullable"], false,
+        "id column should not be nullable"
+    );
+
+    if create_sql.to_lowercase().contains("primary key") {
+        assert_eq!(
+            id_col["primary_key"], true,
+            "id should be detected as primary key; output: {schema}"
+        );
+        let has_pk_index = schema["data"]["indexes"]
+            .as_array()
+            .map(|idxs| idxs.iter().any(|i| i["primary"] == true))
+            .unwrap_or(false);
+        assert!(
+            has_pk_index,
+            "schema should include a primary-key index; output: {schema}"
+        );
+    }
 
     confirmed_sql_exec(dsn, &drop_sql);
+}
+
+fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
+    let qualified_table = format!("{keyspace}.{table}");
+    cql_exec(
+        dsn,
+        &format!("create table {qualified_table} (id int primary key, name text)"),
+    );
+
+    let tables = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "tables",
+        "--keyspace",
+        keyspace,
+    ]));
+    let table_found = tables["data"]
+        .as_array()
+        .expect("CQL tables output should be an array")
+        .iter()
+        .any(|entry| entry["name"].as_str() == Some(table));
+    assert!(
+        table_found,
+        "expected cql tables to include {table}; output: {tables}"
+    );
+
+    cql_exec(
+        dsn,
+        &format!("insert into {qualified_table} (id, name) values (1, 'alice')"),
+    );
+
+    let rows = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "query",
+        &format!("select id, name from {qualified_table} where id = 1"),
+    ]));
+    assert_eq!(rows["data"]["rows"][0][0], 1);
+    assert_eq!(rows["data"]["rows"][0][1], "alice");
+
+    let schema = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "schema",
+        table,
+        "--keyspace",
+        keyspace,
+    ]));
+    assert_eq!(schema["ok"], true);
+    assert_eq!(schema["data"]["name"], table);
+    let cql_columns = schema["data"]["columns"]
+        .as_array()
+        .expect("CQL schema should have columns");
+    let id_col = cql_columns
+        .iter()
+        .find(|c| c["name"] == "id")
+        .expect("id column should appear in CQL schema");
+    assert_eq!(
+        id_col["primary_key"], true,
+        "CQL id column should be detected as primary key; output: {schema}"
+    );
+
+    cql_exec(dsn, &format!("drop table {qualified_table}"));
 }
 
 fn mysql_family_typed_probe(dsn: &str, expected_kind: &str) {
@@ -294,15 +408,23 @@ fn cassandra_cql_probe(dsn: &str, expected_kind: &str) {
     let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
     assert_eq!(caps["kind"], expected_kind);
     assert_eq!(caps["data"]["sql"], true);
+    assert_eq!(caps["data"]["cql"], true);
 
     let local = stdout_json(dbtool(&[
         "--dsn",
         dsn,
-        "sql",
+        "cql",
         "query",
         "select release_version from system.local",
     ]));
     assert!(local["data"]["rows"][0][0].as_str().is_some());
+
+    let keyspaces = stdout_json(dbtool(&["--dsn", dsn, "cql", "keyspaces"]));
+    assert!(keyspaces["data"]
+        .as_array()
+        .expect("keyspaces should be an array")
+        .iter()
+        .any(|entry| entry.as_str() == Some("system")));
 }
 
 fn assert_mysql_tls_connection(dsn: &str) {
@@ -446,6 +568,7 @@ fn postgres_live_sql_lifecycle() {
     };
     let table = unique_name("dbtool_pg_users");
 
+    postgres_family_typed_probe(&dsn, "postgres");
     sql_lifecycle(
         &dsn,
         &table,
@@ -464,6 +587,7 @@ fn mysql_live_sql_lifecycle() {
     };
     let table = unique_name("dbtool_mysql_users");
 
+    mysql_family_typed_probe(&dsn, "mysql");
     sql_lifecycle(
         &dsn,
         &table,
@@ -541,6 +665,23 @@ fn timescale_pg_compat_live_sql_lifecycle_and_typed_values() {
         &dsn,
         &table,
         format!("create table {table} (id integer primary key, name text not null)"),
+        format!("drop table {table}"),
+    );
+}
+
+#[test]
+fn redshift_external_sql_lifecycle_and_typed_values() {
+    if !redshift_enabled() {
+        return;
+    }
+    let dsn = required_env("DBTOOL_IT_REDSHIFT_DSN");
+    let table = unique_name("dbtool_redshift_users");
+
+    postgres_family_typed_probe(&dsn, "redshift");
+    sql_lifecycle(
+        &dsn,
+        &table,
+        format!("create table {table} (id integer, name varchar(64) not null)"),
         format!("drop table {table}"),
     );
 }
@@ -720,6 +861,7 @@ fn cassandra_live_cql_lifecycle_and_typed_values() {
         format!("create table {qualified_table} (id int primary key, name text)"),
         format!("drop table {qualified_table}"),
     );
+    cql_lifecycle(&dsn, &keyspace, &unique_name("dbtool_cassandra_cql_users"));
 
     let typed_table = format!("{}.{}", keyspace, unique_name("dbtool_cassandra_typed"));
     confirmed_sql_exec(
@@ -1011,6 +1153,16 @@ fn mongo_live_document_lifecycle() {
     ]));
     assert_eq!(inserted["data"]["inserted"], 1);
 
+    let collections = stdout_json(dbtool(&["--dsn", &dsn, "doc", "collections"]));
+    assert!(
+        collections["data"]
+            .as_array()
+            .expect("doc collections should be an array")
+            .iter()
+            .any(|item| item["name"] == collection),
+        "expected doc collections to include {collection}; output: {collections}"
+    );
+
     let found = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
@@ -1057,4 +1209,213 @@ fn mongo_live_document_lifecycle() {
         r#"{"name":"alice"}"#,
     ]));
     assert_eq!(deleted["data"]["deleted"], 1);
+}
+
+// ── IBM Db2 live tests ────────────────────────────────────────────────────────
+
+#[test]
+fn db2_live_sql_lifecycle_and_schema_inspection() {
+    if !db2_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_DB2_DSN") else {
+        return;
+    };
+
+    // ping
+    let ping = stdout_json(dbtool(&["--dsn", &dsn, "ping"]));
+    assert_eq!(ping["status"], "ok", "DB2 ping failed: {ping}");
+
+    // caps — must include sql
+    let caps = stdout_json(dbtool(&["--dsn", &dsn, "caps"]));
+    assert_eq!(caps["data"]["sql"], true, "DB2 must expose sql capability");
+
+    // ibmdb2 alias resolves to the same adapter
+    let alias_dsn = dsn_with_scheme(&dsn, "ibmdb2");
+    let alias_ping = stdout_json(dbtool(&["--dsn", &alias_dsn, "ping"]));
+    assert_eq!(alias_ping["status"], "ok", "ibmdb2:// alias ping failed");
+
+    // list schemas — expect at least one non-system schema
+    let schemas = stdout_json(dbtool(&["--dsn", &dsn, "sql", "tables"]));
+    assert_eq!(schemas["status"], "ok", "sql tables failed: {schemas}");
+
+    // write guard — exec must be blocked without --allow-write
+    let table = format!(
+        "DB2INST1.{}",
+        unique_name("DBTOOL_DB2_TEST").to_ascii_uppercase()
+    );
+    let create_sql = format!("CREATE TABLE {table} (id INTEGER NOT NULL, name VARCHAR(64))");
+    let blocked = stdout_json(dbtool(&["--dsn", &dsn, "sql", "exec", &create_sql]));
+    assert_eq!(
+        blocked["error"]["code"], "WRITE_NOT_ALLOWED",
+        "exec without --allow-write must be blocked"
+    );
+
+    // create table
+    let created = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &create_sql,
+    ]));
+    assert_eq!(created["status"], "ok", "CREATE TABLE failed: {created}");
+
+    // insert row
+    let insert_sql = format!("INSERT INTO {table} VALUES (1, 'alice')");
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &insert_sql,
+    ]));
+
+    // query row back
+    let rows = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "sql",
+        "query",
+        &format!("SELECT id, name FROM {table}"),
+    ]));
+    assert_eq!(rows["status"], "ok", "SELECT failed: {rows}");
+    assert_eq!(rows["data"]["rows"][0][0], 1);
+    assert_eq!(rows["data"]["rows"][0][1], "alice");
+
+    // schema inspection
+    let schema_out = stdout_json(dbtool(&["--dsn", &dsn, "sql", "schema", &table]));
+    assert_eq!(
+        schema_out["status"], "ok",
+        "sql schema failed: {schema_out}"
+    );
+    let cols = &schema_out["data"]["columns"];
+    assert!(
+        cols.as_array().is_some_and(|c| !c.is_empty()),
+        "schema must return columns"
+    );
+
+    // drop table
+    let drop_sql = format!("DROP TABLE {table}");
+    let dropped = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &drop_sql,
+    ]));
+    assert_eq!(dropped["status"], "ok", "DROP TABLE failed: {dropped}");
+}
+
+#[test]
+fn db2_live_db2_subcommand_schema_inspection() {
+    if !db2_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_DB2_DSN") else {
+        return;
+    };
+
+    // ── db2 schemas ──────────────────────────────────────────────────────────
+    let schemas = stdout_json(dbtool(&["--dsn", &dsn, "db2", "schemas"]));
+    assert_eq!(schemas["status"], "ok", "db2 schemas failed: {schemas}");
+
+    // ── db2 tables ───────────────────────────────────────────────────────────
+    let tables = stdout_json(dbtool(&[
+        "--dsn", &dsn, "db2", "tables", "--schema", "DB2INST1",
+    ]));
+    assert_eq!(tables["status"], "ok", "db2 tables failed: {tables}");
+
+    // ── db2 tablespaces ──────────────────────────────────────────────────────
+    let tsp = stdout_json(dbtool(&["--dsn", &dsn, "db2", "tablespaces"]));
+    assert_eq!(tsp["status"], "ok", "db2 tablespaces failed: {tsp}");
+    assert!(
+        tsp["data"].as_array().is_some_and(|a| !a.is_empty()),
+        "every Db2 database has at least one tablespace"
+    );
+
+    // ── db2 sequences ────────────────────────────────────────────────────────
+    let seqs = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "db2",
+        "sequences",
+        "--schema",
+        "DB2INST1",
+    ]));
+    assert_eq!(seqs["status"], "ok", "db2 sequences failed: {seqs}");
+
+    // ── db2 routines ─────────────────────────────────────────────────────────
+    let rts = stdout_json(dbtool(&[
+        "--dsn", &dsn, "db2", "routines", "--schema", "DB2INST1",
+    ]));
+    assert_eq!(rts["status"], "ok", "db2 routines failed: {rts}");
+
+    // ── Set up a test table with a PK + FK for schema / fk / ddl tests ──────
+    let base = unique_name("DBTOOL_DB2_INSP").to_ascii_uppercase();
+    let parent = format!("DB2INST1.{base}_PARENT");
+    let child = format!("DB2INST1.{base}_CHILD");
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &format!("CREATE TABLE {parent} (id INTEGER NOT NULL, PRIMARY KEY (id))"),
+    ]));
+    stdout_json(dbtool(&[
+        "--dsn", &dsn, "--allow-write", "sql", "exec",
+        &format!("CREATE TABLE {child} (id INTEGER NOT NULL, parent_id INTEGER, PRIMARY KEY (id), FOREIGN KEY (parent_id) REFERENCES {parent}(id))"),
+    ]));
+
+    // db2 schema
+    let schema_out = stdout_json(dbtool(&["--dsn", &dsn, "db2", "schema", &child]));
+    assert_eq!(
+        schema_out["status"], "ok",
+        "db2 schema failed: {schema_out}"
+    );
+    let cols = &schema_out["data"]["columns"];
+    assert!(
+        cols.as_array().is_some_and(|c| !c.is_empty()),
+        "schema must return columns"
+    );
+
+    // db2 foreign-keys
+    let fks = stdout_json(dbtool(&["--dsn", &dsn, "db2", "foreign-keys", &child]));
+    assert_eq!(fks["status"], "ok", "db2 foreign-keys failed: {fks}");
+    assert!(
+        fks["data"].as_array().is_some_and(|a| !a.is_empty()),
+        "child table must have at least one FK"
+    );
+
+    // db2 ddl
+    let ddl_out = stdout_json(dbtool(&["--dsn", &dsn, "db2", "ddl", &parent]));
+    assert_eq!(ddl_out["status"], "ok", "db2 ddl failed: {ddl_out}");
+    let ddl_str = ddl_out["data"].as_str().unwrap_or("");
+    assert!(
+        ddl_str.contains("CREATE TABLE"),
+        "DDL must start with CREATE TABLE"
+    );
+
+    // cleanup
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &format!("DROP TABLE {child}"),
+    ]));
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &format!("DROP TABLE {parent}"),
+    ]));
 }

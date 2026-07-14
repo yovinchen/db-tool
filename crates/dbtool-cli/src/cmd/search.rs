@@ -3,6 +3,10 @@ use clap::{Args, Subcommand};
 use dbtool_core::{error::Error, model::Value, port::capability::SearchOptions, Result};
 
 #[derive(Args)]
+#[command(
+    about = "Inspect and query OpenSearch/Elasticsearch-compatible indices.",
+    long_about = "Search commands use JSON request bodies and the global --limit for hit count. Indexing a document is a write operation and requires --allow-write."
+)]
 pub struct SearchCmd {
     #[command(subcommand)]
     pub action: SearchAction,
@@ -14,16 +18,25 @@ pub enum SearchAction {
     Indices,
     /// Run a JSON search query against one index.
     Search {
+        /// Index name to query.
         index: String,
+        /// JSON query object, for example '{"query":{"match_all":{}}}'.
         #[arg(long)]
         q: String,
+        /// Offset into the result set.
         #[arg(long)]
         from: Option<usize>,
+        /// Include original _source payloads in hits when supported.
         #[arg(long)]
         source: bool,
     },
     /// Index one JSON document into one index.
-    Index { index: String, doc: String },
+    Index {
+        /// Index name to write to.
+        index: String,
+        /// JSON document object to index; requires --allow-write.
+        doc: String,
+    },
 }
 
 pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
