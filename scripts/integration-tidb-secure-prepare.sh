@@ -13,7 +13,49 @@ export DBTOOL_IT_TIDB_SECURE_DIR
 CERT_DIR="$DBTOOL_IT_TIDB_SECURE_DIR/certs"
 mkdir -p "$CERT_DIR"
 
-if [[ "${DBTOOL_IT_TIDB_SECURE_REGENERATE_CERTS:-0}" == "1" ]]; then
+cert_min_valid_secs="${DBTOOL_IT_TIDB_SECURE_CERT_MIN_VALID_SECS:-86400}"
+regenerate_certs="${DBTOOL_IT_TIDB_SECURE_REGENERATE_CERTS:-0}"
+regeneration_reasons=()
+
+required_cert_files=(
+  ca.pem
+  ca-key.pem
+  server.pem
+  server-key.pem
+  client.pem
+  client-key.pem
+)
+for cert_file in "${required_cert_files[@]}"; do
+  if [[ ! -f "$CERT_DIR/$cert_file" ]]; then
+    regenerate_certs=1
+    regeneration_reasons+=("missing $cert_file")
+  fi
+done
+
+if [[ "$regenerate_certs" != "1" ]]; then
+  for cert_file in ca.pem server.pem client.pem; do
+    if ! openssl x509 \
+      -in "$CERT_DIR/$cert_file" \
+      -checkend "$cert_min_valid_secs" \
+      -noout >/dev/null 2>&1; then
+      regenerate_certs=1
+      regeneration_reasons+=("expired or near-expiry $cert_file")
+    fi
+  done
+fi
+
+if [[ "$regenerate_certs" != "1" ]] &&
+  ! openssl x509 -in "$CERT_DIR/server.pem" -noout -text |
+    grep -Fq 'DNS:tidb-secure-tiproxy'; then
+  regenerate_certs=1
+  regeneration_reasons+=("server certificate lacks TiProxy SAN")
+fi
+
+if [[ "$regenerate_certs" == "1" ]]; then
+  if ((${#regeneration_reasons[@]} == 0)); then
+    regeneration_reasons+=("explicit regeneration requested")
+  fi
+  echo "TiDB secure certificates: regenerating (${regeneration_reasons[*]})"
   rm -f "$CERT_DIR"/*
 fi
 
@@ -108,6 +150,13 @@ EOF
     -extfile "$CERT_DIR/client-openssl.cnf" \
     -out "$CERT_DIR/client.pem" >/dev/null 2>&1
 fi
+
+openssl verify -CAfile "$CERT_DIR/ca.pem" "$CERT_DIR/server.pem" "$CERT_DIR/client.pem" \
+  >/dev/null
+openssl x509 -in "$CERT_DIR/server.pem" -checkend "$cert_min_valid_secs" -noout \
+  >/dev/null
+openssl x509 -in "$CERT_DIR/client.pem" -checkend "$cert_min_valid_secs" -noout \
+  >/dev/null
 
 chmod 0644 "$CERT_DIR"/*.pem "$CERT_DIR"/*-key.pem
 
