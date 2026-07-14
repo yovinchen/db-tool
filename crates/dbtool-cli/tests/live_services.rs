@@ -142,8 +142,13 @@ fn cql_exec(dsn: &str, cql: &str) -> Value {
 }
 
 fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
+    eprintln!("dbtool test resource: sql table={table}");
+
     let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
     assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
+    assert_eq!(caps["data"]["sql"], true);
 
     let schemas = stdout_json(dbtool(&["--dsn", dsn, "sql", "schemas"]));
     assert!(
@@ -153,10 +158,10 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
 
     confirmed_sql_exec(dsn, &create_sql);
 
-    let (schema, expected_table_name) = table
+    let (table_schema, expected_table_name) = table
         .split_once('.')
         .map_or((None, table), |(schema, name)| (Some(schema), name));
-    let tables = if let Some(schema) = schema {
+    let tables = if let Some(schema) = table_schema {
         stdout_json(dbtool(&["--dsn", dsn, "sql", "tables", "--schema", schema]))
     } else {
         stdout_json(dbtool(&["--dsn", dsn, "sql", "tables"]))
@@ -170,6 +175,15 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
         table_found,
         "expected sql tables to include {expected_table_name}; output: {tables}"
     );
+
+    let blocked_insert = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "exec",
+        &format!("insert into {table} (id, name) values (99, 'blocked')"),
+    ]));
+    assert_eq!(blocked_insert["error"]["code"], "WRITE_NOT_ALLOWED");
 
     stdout_json(dbtool(&[
         "--dsn",
@@ -193,10 +207,18 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
         dsn,
         "sql",
         "query",
-        &format!("select id, name from {table} where id = 1"),
+        &format!("select id, name from {table}"),
     ]));
-    assert_eq!(rows["data"]["rows"][0][0], 1);
-    assert_eq!(rows["data"]["rows"][0][1], "alice");
+    let mut all_rows = rows["data"]["rows"]
+        .as_array()
+        .expect("SQL rows should be an array")
+        .clone();
+    all_rows.sort_by_key(|row| row[0].as_i64().unwrap_or_default());
+    assert_eq!(
+        Value::Array(all_rows),
+        serde_json::json!([[1, "alice"], [2, "bob"]]),
+        "all fixture rows must be read back exactly"
+    );
 
     stdout_json(dbtool(&[
         "--dsn",
@@ -216,6 +238,16 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
     assert_eq!(updated["data"]["rows"][0][0], 1);
     assert_eq!(updated["data"]["rows"][0][1], "alice-updated");
 
+    let unbounded_delete = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &format!("delete from {table}"),
+    ]));
+    assert_eq!(unbounded_delete["error"]["code"], "CONFIRM_REQUIRED");
+
     stdout_json(dbtool(&[
         "--dsn",
         dsn,
@@ -232,6 +264,19 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
         &format!("select id, name from {table} where id = 2"),
     ]));
     assert_eq!(deleted["data"]["rows"], serde_json::json!([]));
+
+    let remaining = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        &format!("select id, name from {table}"),
+    ]));
+    assert_eq!(
+        remaining["data"]["rows"],
+        serde_json::json!([[1, "alice-updated"]]),
+        "targeted delete must leave only the updated fixture row"
+    );
 
     let schema = stdout_json(dbtool(&["--dsn", dsn, "sql", "schema", table]));
     assert_eq!(schema["ok"], true);
@@ -268,6 +313,21 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
     }
 
     confirmed_sql_exec(dsn, &drop_sql);
+
+    let tables_after_drop = if let Some(schema) = table_schema {
+        stdout_json(dbtool(&["--dsn", dsn, "sql", "tables", "--schema", schema]))
+    } else {
+        stdout_json(dbtool(&["--dsn", dsn, "sql", "tables"]))
+    };
+    let table_still_present = tables_after_drop["data"]
+        .as_array()
+        .expect("tables output should be an array")
+        .iter()
+        .any(|entry| entry["name"].as_str() == Some(expected_table_name));
+    assert!(
+        !table_still_present,
+        "dropped table must be absent; output: {tables_after_drop}"
+    );
 }
 
 fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
@@ -554,9 +614,9 @@ fn mysql_password(password: &str) -> String {
 }
 
 fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
-    let key = unique_name(&format!("dbtool_{prefix}_key"));
-    let ttl_key = unique_name(&format!("dbtool_{prefix}_ttl"));
-    let raw_key = unique_name(&format!("dbtool_{prefix}_raw"));
+    let key = unique_name(&format!("dbtool_it_{prefix}_key"));
+    let ttl_key = unique_name(&format!("dbtool_it_{prefix}_ttl"));
+    let raw_key = unique_name(&format!("dbtool_it_{prefix}_raw"));
 
     let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
     assert_eq!(ping["kind"], expected_kind);
@@ -637,7 +697,7 @@ fn postgres_live_sql_lifecycle() {
     let Some(dsn) = dsn("DBTOOL_IT_POSTGRES_DSN") else {
         return;
     };
-    let table = unique_name("dbtool_pg_users");
+    let table = unique_name("dbtool_it_postgres_users");
 
     postgres_family_typed_probe(&dsn, "postgres");
     sql_lifecycle(
@@ -656,7 +716,7 @@ fn mysql_live_sql_lifecycle() {
     let Some(dsn) = dsn("DBTOOL_IT_MYSQL_DSN") else {
         return;
     };
-    let table = unique_name("dbtool_mysql_users");
+    let table = unique_name("dbtool_it_mysql_users");
 
     mysql_family_typed_probe(&dsn, "mysql");
     sql_lifecycle(
@@ -691,7 +751,7 @@ fn mariadb_compat_live_sql_lifecycle_and_typed_values() {
     let Some(dsn) = dsn("DBTOOL_IT_MARIADB_DSN") else {
         return;
     };
-    let table = unique_name("dbtool_mariadb_users");
+    let table = unique_name("dbtool_it_mariadb_users");
 
     mysql_family_typed_probe(&dsn, "mariadb");
     sql_lifecycle(
@@ -710,7 +770,7 @@ fn cockroach_pg_compat_live_sql_lifecycle_and_typed_values() {
     let Some(dsn) = dsn("DBTOOL_IT_COCKROACH_DSN") else {
         return;
     };
-    let table = unique_name("dbtool_cockroach_users");
+    let table = unique_name("dbtool_it_cockroach_users");
 
     postgres_family_typed_probe(&dsn, "cockroach");
     sql_lifecycle(
@@ -729,7 +789,7 @@ fn timescale_pg_compat_live_sql_lifecycle_and_typed_values() {
     let Some(dsn) = dsn("DBTOOL_IT_TIMESCALE_DSN") else {
         return;
     };
-    let table = unique_name("dbtool_timescale_users");
+    let table = unique_name("dbtool_it_timescale_users");
 
     postgres_family_typed_probe(&dsn, "timescale");
     sql_lifecycle(
@@ -746,7 +806,7 @@ fn redshift_external_sql_lifecycle_and_typed_values() {
         return;
     }
     let dsn = required_env("DBTOOL_IT_REDSHIFT_DSN");
-    let table = unique_name("dbtool_redshift_users");
+    let table = unique_name("dbtool_it_redshift_users");
 
     postgres_family_typed_probe(&dsn, "redshift");
     sql_lifecycle(
@@ -766,7 +826,7 @@ fn tidb_compat_live_sql_lifecycle_and_typed_values() {
         return;
     };
     let database = env::var("DBTOOL_IT_TIDB_DB").unwrap_or_else(|_| "dbtool_it_tidb".to_owned());
-    let table = unique_name("dbtool_tidb_users");
+    let table = unique_name("dbtool_it_tidb_users");
     let qualified_table = format!("{database}.{table}");
 
     mysql_family_typed_probe(&dsn, "tidb");
@@ -854,7 +914,11 @@ fn tidb_secure_auth_tls_and_ha_live_sql_lifecycle() {
 
     mysql_family_typed_probe(&secure_dsn_1, "tidb");
     assert_mysql_tls_connection(&secure_dsn_1);
-    let table_1 = format!("{}.{}", database, unique_name("dbtool_tidb_secure_node1"));
+    let table_1 = format!(
+        "{}.{}",
+        database,
+        unique_name("dbtool_it_tidb_secure_node1")
+    );
     sql_lifecycle(
         &secure_dsn_1,
         &table_1,
@@ -864,7 +928,11 @@ fn tidb_secure_auth_tls_and_ha_live_sql_lifecycle() {
 
     mysql_family_typed_probe(&secure_dsn_2, "tidb");
     assert_mysql_tls_connection(&secure_dsn_2);
-    let table_2 = format!("{}.{}", database, unique_name("dbtool_tidb_secure_node2"));
+    let table_2 = format!(
+        "{}.{}",
+        database,
+        unique_name("dbtool_it_tidb_secure_node2")
+    );
     sql_lifecycle(
         &secure_dsn_2,
         &table_2,
@@ -874,7 +942,7 @@ fn tidb_secure_auth_tls_and_ha_live_sql_lifecycle() {
 
     mysql_family_typed_probe(&x509_dsn, "tidb");
     assert_mysql_tls_connection(&x509_dsn);
-    let table_x509 = format!("{}.{}", database, unique_name("dbtool_tidb_x509"));
+    let table_x509 = format!("{}.{}", database, unique_name("dbtool_it_tidb_x509"));
     sql_lifecycle(
         &x509_dsn,
         &table_x509,
@@ -891,7 +959,7 @@ fn sqlserver_live_sql_lifecycle_and_typed_values() {
     let Some(dsn) = dsn("DBTOOL_IT_SQLSERVER_DSN") else {
         return;
     };
-    let table = unique_name("dbtool_sqlserver_users");
+    let table = unique_name("dbtool_it_sqlserver_users");
     let qualified_table = format!("dbo.{table}");
 
     sqlserver_typed_probe(&dsn, "sqlserver");
@@ -913,7 +981,7 @@ fn cassandra_live_cql_lifecycle_and_typed_values() {
     };
     let keyspace = env::var("DBTOOL_IT_CASSANDRA_KEYSPACE")
         .unwrap_or_else(|_| "dbtool_it_cassandra".to_owned());
-    let table = unique_name("dbtool_cassandra_users");
+    let table = unique_name("dbtool_it_cassandra_users");
     let qualified_table = format!("{keyspace}.{table}");
 
     cassandra_cql_probe(&dsn, "cassandra");
@@ -932,9 +1000,13 @@ fn cassandra_live_cql_lifecycle_and_typed_values() {
         format!("create table {qualified_table} (id int primary key, name text)"),
         format!("drop table {qualified_table}"),
     );
-    cql_lifecycle(&dsn, &keyspace, &unique_name("dbtool_cassandra_cql_users"));
+    cql_lifecycle(
+        &dsn,
+        &keyspace,
+        &unique_name("dbtool_it_cassandra_cql_users"),
+    );
 
-    let typed_table = format!("{}.{}", keyspace, unique_name("dbtool_cassandra_typed"));
+    let typed_table = format!("{}.{}", keyspace, unique_name("dbtool_it_cassandra_typed"));
     confirmed_sql_exec(
         &dsn,
         &format!(
@@ -979,16 +1051,35 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let Some(dsn) = dsn("DBTOOL_IT_REDIS_DSN") else {
         return;
     };
-    let key = unique_name("dbtool_redis_key");
-    let ttl_key = unique_name("dbtool_redis_ttl");
-    let raw_key = unique_name("dbtool_redis_raw");
-    let counter_key = unique_name("dbtool_redis_counter");
-    let scan_prefix = unique_name("dbtool_redis_scan");
+    let key = unique_name("dbtool_it_redis_key");
+    let ttl_key = unique_name("dbtool_it_redis_ttl");
+    let raw_key = unique_name("dbtool_it_redis_raw");
+    let counter_key = unique_name("dbtool_it_redis_counter");
+    let scan_prefix = unique_name("dbtool_it_redis_scan");
     let scan_keys = [
         format!("{scan_prefix}:1"),
         format!("{scan_prefix}:2"),
         format!("{scan_prefix}:3"),
     ];
+    eprintln!(
+        "dbtool test resources: redis keys={}",
+        [
+            key.as_str(),
+            ttl_key.as_str(),
+            raw_key.as_str(),
+            counter_key.as_str(),
+            scan_keys[0].as_str(),
+            scan_keys[1].as_str(),
+            scan_keys[2].as_str(),
+        ]
+        .join(",")
+    );
+
+    let ping = stdout_json(dbtool(&["--dsn", &dsn, "ping"]));
+    assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json(dbtool(&["--dsn", &dsn, "caps"]));
+    assert_eq!(caps["data"]["key_value"], true);
 
     let blocked_set = stderr_json(dbtool(&["--dsn", &dsn, "kv", "set", &key, "alice"]));
     assert_eq!(blocked_set["error"]["code"], "WRITE_NOT_ALLOWED");
@@ -1005,6 +1096,18 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
 
     let value = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", &key]));
     assert_eq!(value["data"]["value"], "alice");
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &key,
+        "alice-updated",
+    ]));
+    let overwritten = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", &key]));
+    assert_eq!(overwritten["data"]["value"], "alice-updated");
 
     let keys = stdout_json(dbtool(&["--dsn", &dsn, "kv", "scan", &format!("{key}*")]));
     assert_eq!(keys["data"][0], key);
@@ -1049,7 +1152,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let multi_get = stdout_json(dbtool(&[
         "--dsn", &dsn, "kv", "raw", "MGET", &key, &raw_key,
     ]));
-    assert_eq!(multi_get["data"][0], "alice");
+    assert_eq!(multi_get["data"][0], "alice-updated");
     assert_eq!(multi_get["data"][1], "raw-value");
 
     stdout_json(dbtool(&[
@@ -1090,6 +1193,23 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     assert_eq!(scan["data"].as_array().unwrap().len(), 2);
     assert_eq!(scan["meta"]["truncated"], true);
 
+    let fixture_values = [
+        (&key, "alice-updated"),
+        (&ttl_key, "short-lived"),
+        (&raw_key, "raw-value"),
+        (&counter_key, "1"),
+        (&scan_keys[0], "scan-value"),
+        (&scan_keys[1], "scan-value"),
+        (&scan_keys[2], "scan-value"),
+    ];
+    for (fixture_key, expected) in fixture_values {
+        let value = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", fixture_key]));
+        assert_eq!(
+            value["data"]["value"], expected,
+            "fixture key {fixture_key} must retain its exact value"
+        );
+    }
+
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "kv", "raw", "FLUSHALL"]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
 
@@ -1110,8 +1230,22 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let deleted = stdout_json(dbtool(&delete_args));
     assert_eq!(deleted["data"]["deleted"], 7);
 
-    let missing = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", &key]));
-    assert_eq!(missing["data"]["value"], Value::Null);
+    for (fixture_key, _) in fixture_values {
+        let missing = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", fixture_key]));
+        assert_eq!(
+            missing["data"]["value"],
+            Value::Null,
+            "deleted fixture key {fixture_key} must be absent"
+        );
+    }
+    let empty_scan = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "kv",
+        "scan",
+        &format!("{scan_prefix}:*"),
+    ]));
+    assert_eq!(empty_scan["data"], serde_json::json!([]));
 }
 
 #[test]
@@ -1125,7 +1259,7 @@ fn redis_live_protocol_aliases_resolve_to_same_adapter() {
 
     for alias in ["valkey", "keydb", "dragonfly"] {
         let alias_dsn = dsn_with_scheme(&dsn, alias);
-        let key = unique_name(&format!("dbtool_{alias}_key"));
+        let key = unique_name(&format!("dbtool_it_{alias}_key"));
 
         let ping = stdout_json(dbtool(&["--dsn", &alias_dsn, "ping"]));
         assert_eq!(ping["kind"], alias);
@@ -1201,10 +1335,14 @@ fn mongo_live_document_lifecycle() {
     let Some(dsn) = dsn("DBTOOL_IT_MONGO_DSN") else {
         return;
     };
-    let collection = unique_name("dbtool_mongo_users");
+    let collection = unique_name("dbtool_it_mongo_users");
+    eprintln!("dbtool test resource: mongodb collection={collection}");
 
     let ping = stdout_json(dbtool(&["--dsn", &dsn, "ping"]));
     assert_eq!(ping["ok"], true);
+
+    let caps = stdout_json(dbtool(&["--dsn", &dsn, "caps"]));
+    assert_eq!(caps["data"]["document"], true);
 
     let blocked_insert = stderr_json(dbtool(&[
         "--dsn",
@@ -1212,7 +1350,7 @@ fn mongo_live_document_lifecycle() {
         "doc",
         "insert",
         &collection,
-        r#"{"name":"alice","visits":1}"#,
+        r#"{"_id":"alice","name":"alice","visits":1}"#,
     ]));
     assert_eq!(blocked_insert["error"]["code"], "WRITE_NOT_ALLOWED");
 
@@ -1223,7 +1361,7 @@ fn mongo_live_document_lifecycle() {
         "doc",
         "insert",
         &collection,
-        r#"{"name":"alice","visits":1}"#,
+        r#"{"_id":"alice","name":"alice","visits":1}"#,
     ]));
     assert_eq!(inserted["data"]["inserted"], 1);
     let inserted_bob = stdout_json(dbtool(&[
@@ -1233,7 +1371,7 @@ fn mongo_live_document_lifecycle() {
         "doc",
         "insert",
         &collection,
-        r#"{"name":"bob","visits":3}"#,
+        r#"{"_id":"bob","name":"bob","visits":3}"#,
     ]));
     assert_eq!(inserted_bob["data"]["inserted"], 1);
 
@@ -1243,9 +1381,29 @@ fn mongo_live_document_lifecycle() {
             .as_array()
             .expect("doc collections should be an array")
             .iter()
-            .any(|item| item["name"] == collection),
+            .any(|item| item.as_str() == Some(collection.as_str())),
         "expected doc collections to include {collection}; output: {collections}"
     );
+
+    let all = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &collection,
+        "--filter",
+        "{}",
+    ]));
+    let mut all_docs = all["data"]
+        .as_array()
+        .expect("document find should return an array")
+        .clone();
+    all_docs.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    assert_eq!(all_docs.len(), 2);
+    assert_eq!(all_docs[0]["_id"], "alice");
+    assert_eq!(all_docs[0]["visits"], 1);
+    assert_eq!(all_docs[1]["_id"], "bob");
+    assert_eq!(all_docs[1]["visits"], 3);
 
     let found = stdout_json(dbtool(&[
         "--dsn",
@@ -1271,6 +1429,28 @@ fn mongo_live_document_lifecycle() {
         r#"{"visits":2}"#,
     ]));
     assert_eq!(updated["data"]["matched"], 1);
+    assert_eq!(updated["data"]["modified"], 1);
+
+    let updated_doc = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &collection,
+        "--filter",
+        r#"{"_id":"alice"}"#,
+    ]));
+    assert_eq!(updated_doc["data"][0]["visits"], 2);
+
+    let blocked_out = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "aggregate",
+        &collection,
+        &format!(r#"[{{"$out":"{collection}_archive"}}]"#),
+    ]));
+    assert_eq!(blocked_out["error"]["code"], "WRITE_NOT_ALLOWED");
 
     let aggregated = stdout_json(dbtool(&[
         "--dsn",
@@ -1281,6 +1461,18 @@ fn mongo_live_document_lifecycle() {
         r#"[{"$match":{"name":"alice"}},{"$project":{"_id":0,"name":1,"visits":1}}]"#,
     ]));
     assert_eq!(aggregated["data"][0]["visits"], 2);
+
+    let unbounded_delete = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "delete",
+        &collection,
+        "--filter",
+        "{}",
+    ]));
+    assert_eq!(unbounded_delete["error"]["code"], "QUERY_ERROR");
 
     let deleted_bob = stdout_json(dbtool(&[
         "--dsn",
