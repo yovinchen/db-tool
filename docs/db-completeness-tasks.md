@@ -52,7 +52,7 @@ being created and is normalized in the final campaign summary.
 | DB-POSTGRES-001 | SQL | PostgreSQL `postgres://` | Docker base | Ready | COMPLETE | `docs/test-evidence/postgresql.md` | this commit |
 | DB-MYSQL-001 | SQL | MySQL `mysql://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mysql.md` | this commit |
 | DB-MARIADB-001 | SQL | MariaDB `mariadb://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/mariadb.md` | this commit |
-| DB-TIDB-001 | SQL | TiDB `tidb://` | Docker tidb | Ready | LIVE_PASS | `docs/test-evidence/tidb.md` | basic v8.5.6 SQL passed; secure/resilience phases pending |
+| DB-TIDB-001 | SQL | TiDB `tidb://` | Docker tidb | Ready | LIVE_PASS | `docs/test-evidence/tidb.md` | basic + secure SQL passed; roundtrip/proxy/resilience pending |
 | DB-COCKROACH-001 | SQL | CockroachDB `cockroach://` | Docker pg-compat | Ready | COMPLETE | `docs/test-evidence/cockroachdb.md` | this commit; single-node insecure SQL surface |
 | DB-TIMESCALE-001 | SQL | TimescaleDB `timescale://` | Docker pg-compat | Ready | COMPLETE | `docs/test-evidence/timescaledb.md` | this commit; generic SQL surface only |
 | DB-SQLSERVER-001 | SQL | SQL Server `sqlserver://` | Docker sqlserver | Ready | BLOCKED | - | local host is arm64; image gate requires x86_64 |
