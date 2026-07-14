@@ -743,7 +743,7 @@ services:
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-opensearch-security
     environment:
       discovery.type: single-node
-      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${DBTOOL_IT_OPENSEARCH_SECURITY_ADMIN_PASSWORD:-DbtoolAdmin1!}
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${DBTOOL_IT_OPENSEARCH_SECURITY_ADMIN_PASSWORD:-S7!k9Vx2Qp4Lm8Nz}
       OPENSEARCH_JAVA_OPTS: ${DBTOOL_IT_OPENSEARCH_SECURITY_JAVA_OPTS:--Xms512m -Xmx512m}
       plugins.security.allow_default_init_securityindex: "true"
       plugins.security.nodes_dn: '["CN=dbtool-it-opensearch-security"]'
@@ -758,12 +758,12 @@ services:
     volumes:
       - ${DBTOOL_IT_OPENSEARCH_SECURITY_DIR:-.tmp/dbtool-it-opensearch-security}/certs:/usr/share/opensearch/config/dbtool-certs:ro
     ports:
-      - "${DBTOOL_IT_OPENSEARCH_SECURITY_PORT:-19203}:9200"
+      - "127.0.0.1:${DBTOOL_IT_OPENSEARCH_SECURITY_PORT:-19203}:9200"
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "curl -fsSk -u admin:${DBTOOL_IT_OPENSEARCH_SECURITY_ADMIN_PASSWORD:-DbtoolAdmin1!} https://127.0.0.1:9200/_cluster/health >/dev/null || exit 1",
+          "curl -fsSk -u admin:${DBTOOL_IT_OPENSEARCH_SECURITY_ADMIN_PASSWORD:-S7!k9Vx2Qp4Lm8Nz} https://127.0.0.1:9200/_cluster/health >/dev/null || exit 1",
         ]
       interval: 5s
       timeout: 10s

@@ -11,10 +11,26 @@ esac
 export DBTOOL_IT_OPENSEARCH_SECURITY_DIR
 
 CERT_DIR="$DBTOOL_IT_OPENSEARCH_SECURITY_DIR/certs"
-mkdir -p "$CERT_DIR"
+PRIVATE_DIR="$DBTOOL_IT_OPENSEARCH_SECURITY_DIR/private"
+mkdir -p "$CERT_DIR" "$PRIVATE_DIR"
 
-if [[ "${DBTOOL_IT_OPENSEARCH_SECURITY_REGENERATE_CERTS:-0}" == "1" ]]; then
+CERT_RENEWAL_SECONDS="${DBTOOL_IT_OPENSEARCH_SECURITY_CERT_RENEWAL_SECONDS:-3600}"
+
+cert_is_current() {
+  local cert="$1"
+  [[ -f "$cert" ]] && openssl x509 \
+    -checkend "$CERT_RENEWAL_SECONDS" \
+    -noout \
+    -in "$cert" >/dev/null 2>&1
+}
+
+if [[ "${DBTOOL_IT_OPENSEARCH_SECURITY_REGENERATE_CERTS:-0}" == "1" ]] \
+  || [[ ! -f "$PRIVATE_DIR/ca-key.pem" ]] \
+  || [[ ! -f "$CERT_DIR/node-key.pem" ]] \
+  || ! cert_is_current "$CERT_DIR/ca.pem" \
+  || ! cert_is_current "$CERT_DIR/node.pem"; then
   rm -f "$CERT_DIR"/*
+  rm -f "$PRIVATE_DIR"/*
 fi
 
 if [[ ! -f "$CERT_DIR/ca.pem" ]]; then
@@ -24,7 +40,7 @@ if [[ ! -f "$CERT_DIR/ca.pem" ]]; then
     -nodes \
     -days "${DBTOOL_IT_OPENSEARCH_SECURITY_CERT_DAYS:-7}" \
     -subj "/CN=dbtool-it-opensearch-security-ca" \
-    -keyout "$CERT_DIR/ca-key.pem" \
+    -keyout "$PRIVATE_DIR/ca-key.pem" \
     -out "$CERT_DIR/ca.pem" >/dev/null 2>&1
 fi
 
@@ -60,7 +76,7 @@ EOF
     -req \
     -in "$CERT_DIR/node.csr" \
     -CA "$CERT_DIR/ca.pem" \
-    -CAkey "$CERT_DIR/ca-key.pem" \
+    -CAkey "$PRIVATE_DIR/ca-key.pem" \
     -CAcreateserial \
     -days "${DBTOOL_IT_OPENSEARCH_SECURITY_CERT_DAYS:-7}" \
     -extensions v3_req \
@@ -68,7 +84,8 @@ EOF
     -out "$CERT_DIR/node.pem" >/dev/null 2>&1
 fi
 
-chmod 0644 "$CERT_DIR"/*.pem "$CERT_DIR"/*-key.pem
+chmod 0644 "$CERT_DIR"/*.pem
+chmod 0600 "$PRIVATE_DIR/ca-key.pem"
 
 export DBTOOL_IT_OPENSEARCH_SECURITY_CA="$CERT_DIR/ca.pem"
 export DBTOOL_IT_OPENSEARCH_SECURITY_DSN="${DBTOOL_IT_OPENSEARCH_SECURITY_DSN:-opensearch+https://admin:${DBTOOL_IT_OPENSEARCH_SECURITY_ADMIN_PASSWORD}@127.0.0.1:${DBTOOL_IT_OPENSEARCH_SECURITY_PORT}?tls-ca=$DBTOOL_IT_OPENSEARCH_SECURITY_CA}"
