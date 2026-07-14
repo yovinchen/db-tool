@@ -1,5 +1,5 @@
 # id|family|product|schemes|feature|environment|runner|status|evidence|boundary
-DB-SQLITE-001|sql|SQLite|sqlite|default|service-free|cargo test -p dbtool-cli --test db_completeness sqlite_full_crud|HARNESS_READY|-|local file-backed fixture
+DB-SQLITE-001|sql|SQLite|sqlite|default|service-free|cargo test -p dbtool-cli --test db_completeness sqlite_full_crud|COMPLETE|docs/test-evidence/sqlite.md|local file-backed fixture
 DB-POSTGRES-001|sql|PostgreSQL|postgres|default|docker-base|./scripts/integration-test.sh|HARNESS_READY|-|-
 DB-MYSQL-001|sql|MySQL|mysql|default|docker-base|./scripts/integration-test.sh|HARNESS_READY|-|-
 DB-MARIADB-001|sql|MariaDB|mariadb|default|docker-compat|./scripts/integration-compat-test.sh|HARNESS_READY|-|-

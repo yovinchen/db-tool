@@ -48,7 +48,7 @@ being created and is normalized in the final campaign summary.
 
 | Task | Family | Product / scheme | Environment | Harness | Live result | Evidence | Commit / boundary |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DB-SQLITE-001 | SQL | SQLite `sqlite:` | service-free | Ready | NOT_RUN | - | - |
+| DB-SQLITE-001 | SQL | SQLite `sqlite:` | service-free | Ready | COMPLETE | `docs/test-evidence/sqlite.md` | this commit |
 | DB-POSTGRES-001 | SQL | PostgreSQL `postgres://` | Docker base | Ready | NOT_RUN | - | - |
 | DB-MYSQL-001 | SQL | MySQL `mysql://` | Docker base | Ready | NOT_RUN | - | - |
 | DB-MARIADB-001 | SQL | MariaDB `mariadb://` | Docker compat | Ready | NOT_RUN | - | - |
