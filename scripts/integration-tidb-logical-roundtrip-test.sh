@@ -15,27 +15,6 @@ dbtool_cli() {
     "$@"
 }
 
-json_field() {
-  python3 -c 'import json,sys; data=json.load(sys.stdin); cur=data
-for part in sys.argv[1].split("."):
-    cur = cur[int(part)] if isinstance(cur, list) else cur[part]
-print(cur)' "$1"
-}
-
-assert_json_field() {
-  local json="$1"
-  local path="$2"
-  local expected="$3"
-  local actual
-
-  actual="$(printf '%s' "$json" | json_field "$path")"
-  if [[ "$actual" != "$expected" ]]; then
-    echo "TiDB logical roundtrip: expected $path to be $expected, got $actual" >&2
-    echo "$json" >&2
-    exit 1
-  fi
-}
-
 assert_json_predicate() {
   local json="$1"
   local expression="$2"
@@ -79,27 +58,12 @@ assert_identifier() {
   fi
 }
 
-restore_sql_export() {
+prepare_restore_table() {
   local dsn="$1"
-  local export_file="$2"
-  local table="$3"
+  local table="$2"
 
   sql_exec "$dsn" "drop table if exists $table"
   sql_exec "$dsn" "create table $table (id bigint primary key, note varchar(96) not null, priority integer not null)"
-
-  while IFS= read -r statement || [[ -n "$statement" ]]; do
-    [[ -z "$statement" ]] && continue
-    sql_exec "$dsn" "$statement"
-  done < <(
-    python3 -c 'import json,sys
-def quote(value):
-    return "'"'"'" + str(value).replace("'"'"'", "'"'"''"'"'") + "'"'"'"
-data=json.load(open(sys.argv[1]))
-table=sys.argv[2]
-for row in data["data"]["rows"]:
-    print(f"insert into {table} (id, note, priority) values ({int(row[0])}, {quote(row[1])}, {int(row[2])})")
-' "$export_file" "$table"
-  )
 }
 
 cleanup() {
@@ -135,8 +99,9 @@ suffix="$(date +%s)_$$"
 export_dir="$ROOT/.tmp/dbtool-tidb-logical-roundtrip-$suffix"
 mkdir -p "$export_dir"
 
-source_table="$database.dbtool_tidb_roundtrip_src_$suffix"
-restore_table="$database.dbtool_tidb_roundtrip_restore_$suffix"
+source_table="$database.dbtool_it_tidb_roundtrip_src_$suffix"
+restore_table="$database.dbtool_it_tidb_roundtrip_restore_$suffix"
+echo "TiDB logical roundtrip resources: source=$source_table restore=$restore_table"
 
 echo "TiDB logical roundtrip: preparing source table through SQL node 1"
 sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "create database if not exists $database"
@@ -150,30 +115,35 @@ echo "TiDB logical roundtrip: exporting source rows through SQL node 1"
 dbtool_cli \
   --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" \
   --limit 10 \
-  sql query "select id, note, priority from $source_table order by id" \
-  >"$export_dir/tidb-source.json"
+  export sql \
+  --query "select id, note, priority from $source_table order by id" \
+  --out "$export_dir/tidb-source.json" >/dev/null
 
-assert_json_predicate "$(cat "$export_dir/tidb-source.json")" 'len(data["data"]["rows"]) == 3'
+assert_json_predicate "$(cat "$export_dir/tidb-source.json")" 'data["kind"] == "sql-rows" and data["columns"] == ["id","note","priority"] and data["rows"] == [[1,"tls-node1-export",10],[2,"restore-through-node2",20],[3,"cross-node-readback",30]]'
 
 echo "TiDB logical roundtrip: restoring rows through SQL node 2"
-restore_sql_export "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" "$export_dir/tidb-source.json" "$restore_table"
+prepare_restore_table "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" "$restore_table"
+dbtool_cli \
+  --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" \
+  --allow-write \
+  import sql \
+  --table "$restore_table" \
+  --input "$export_dir/tidb-source.json" >/dev/null
 
 node2_roundtrip="$(
   dbtool_cli \
     --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" \
     --limit 3 \
-    sql query "select note, priority from $restore_table order by id"
+    sql query "select id, note, priority from $restore_table order by id"
 )"
-assert_json_field "$node2_roundtrip" "data.rows.0.0" "tls-node1-export"
-assert_json_field "$node2_roundtrip" "data.rows.1.1" "20"
-assert_json_field "$node2_roundtrip" "data.rows.2.0" "cross-node-readback"
+assert_json_predicate "$node2_roundtrip" 'data["data"]["rows"] == [[1,"tls-node1-export",10],[2,"restore-through-node2",20],[3,"cross-node-readback",30]]'
 
 node1_readback="$(
   dbtool_cli \
     --dsn "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" \
     --limit 3 \
-    sql query "select note from $restore_table where id = 2"
+    sql query "select id, note, priority from $restore_table order by id"
 )"
-assert_json_field "$node1_readback" "data.rows.0.0" "restore-through-node2"
+assert_json_predicate "$node1_readback" 'data["data"]["rows"] == [[1,"tls-node1-export",10],[2,"restore-through-node2",20],[3,"cross-node-readback",30]]'
 
 echo "TiDB logical roundtrip passed"
