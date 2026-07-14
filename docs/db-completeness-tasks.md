@@ -60,10 +60,10 @@ being created and is normalized in the final campaign summary.
 | DB-CASSANDRA-001 | CQL | Cassandra `cassandra://` | Docker cassandra | Ready | COMPLETE | `docs/test-evidence/cassandra.md` | this commit; SQL/CQL CRUD, types, full fixture, safety, limit, metadata, and cleanup passed |
 | DB-SCYLLA-001 | CQL | ScyllaDB `scylla://` | compatible alias only | Ready | PARTIAL | - | no real ScyllaDB product profile |
 | DB-DB2-001 | SQL/Db2 | IBM Db2 `db2://` | Docker db2 + host ODBC | Ready | BLOCKED | - | IBM Db2 ODBC driver is not registered on the host |
-| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | this commit |
-| DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | this commit |
-| DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | this commit |
-| DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | this commit |
+| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | this commit; atomic NX+TTL refreshed |
+| DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | this commit; atomic NX+TTL refreshed |
+| DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | this commit; atomic NX+TTL refreshed |
+| DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | this commit; atomic NX+TTL refreshed |
 | DB-MONGO-001 | Document | MongoDB `mongodb://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mongodb.md` | this commit; public API empties collections and volume teardown drops them |
 | DB-OPENSEARCH-001 | Search | OpenSearch `opensearch://` | Docker observability | Ready | NOT_RUN | - | public API has no update/delete |
 | DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | NOT_RUN | - | public API has no update/delete |

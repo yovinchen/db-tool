@@ -11,10 +11,10 @@ DB-REDSHIFT-001|sql|Amazon Redshift|redshift|default|external|./scripts/integrat
 DB-CASSANDRA-001|cql|Apache Cassandra|cassandra|full|docker-cassandra|./scripts/integration-cassandra-test.sh + fixture|COMPLETE|docs/test-evidence/cassandra.md|Cassandra 5.0 single-node RF1; Scylla remains a separate alias-only task
 DB-SCYLLA-001|cql|ScyllaDB|scylla|full|alias-only|cargo test -p dbtool-core registry::alias|PARTIAL|-|no real ScyllaDB product profile
 DB-DB2-001|sql|IBM Db2|db2,ibmdb2,as400|full|docker-db2-and-host-odbc|./scripts/integration-db2-test.sh|BLOCKED|-|IBM Db2 ODBC driver is not registered on the host
-DB-REDIS-001|kv|Redis|redis|default|docker-base|./scripts/integration-test.sh + roundtrip|COMPLETE|docs/test-evidence/redis.md|Redis 7.4.9 on arm64 Docker
-DB-VALKEY-001|kv|Valkey|valkey|default|docker-compat|./scripts/integration-compat-test.sh|COMPLETE|docs/test-evidence/valkey.md|Valkey 8.1.8 on arm64 Docker
-DB-KEYDB-001|kv|KeyDB|keydb|default|docker-compat-extra|DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh|COMPLETE|docs/test-evidence/keydb.md|KeyDB 6.3.4 on arm64 Docker
-DB-DRAGONFLY-001|kv|Dragonfly|dragonfly|default|docker-compat-extra|DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh|COMPLETE|docs/test-evidence/dragonfly.md|Dragonfly 1.39.0 on arm64 Docker
+DB-REDIS-001|kv|Redis|redis|default|docker-base|./scripts/integration-test.sh + roundtrip|COMPLETE|docs/test-evidence/redis.md|Redis 7.4.9 arm64 including atomic NX+TTL
+DB-VALKEY-001|kv|Valkey|valkey|default|docker-compat|./scripts/integration-compat-test.sh|COMPLETE|docs/test-evidence/valkey.md|Valkey 8.1.8 arm64 including atomic NX+TTL
+DB-KEYDB-001|kv|KeyDB|keydb|default|docker-compat-extra|DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh|COMPLETE|docs/test-evidence/keydb.md|KeyDB 6.3.4 arm64 including atomic NX+TTL
+DB-DRAGONFLY-001|kv|Dragonfly|dragonfly|default|docker-compat-extra|DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh|COMPLETE|docs/test-evidence/dragonfly.md|Dragonfly 1.39.0 arm64 including atomic NX+TTL
 DB-MONGO-001|document|MongoDB|mongodb|default|docker-base|./scripts/integration-test.sh + roundtrip|COMPLETE|docs/test-evidence/mongodb.md|public API empties collections; Docker volume teardown drops them
 DB-OPENSEARCH-001|search|OpenSearch|opensearch|default|docker-observability|./scripts/integration-observability-test.sh|HARNESS_READY|-|public API has no update/delete
 DB-OPENSEARCH-TLS-001|search|OpenSearch security HTTPS|opensearch+https|default|docker-opensearch-security|./scripts/integration-opensearch-security-test.sh|HARNESS_READY|-|public API has no update/delete
