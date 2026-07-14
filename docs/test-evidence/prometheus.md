@@ -25,4 +25,4 @@ uses one sample budget across all returned series rather than once per series.
 
 Cleanup: PASS by disposable Docker teardown; public series deletion is N/A
 
-Commits: `7a6bbdd`, `932655d`, this commit
+Commits: `7a6bbdd`, `932655d`, `b9dd9fd`

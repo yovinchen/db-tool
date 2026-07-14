@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T20:13:29Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; KeyDB 6.3.4
 
+Product version: KeyDB 6.3.4
+
 Command: `DBTOOL_IT_COMPAT_EXTRA=1 ./scripts/integration-compat-test.sh`
 
 Resource operations:
@@ -25,4 +27,4 @@ exact deletion count, and complete post-delete absence all passed.
 
 Cleanup: PASS
 
-Commits: `f1be977`, `74a4907`, `19a3527`, this commit
+Commits: `f1be977`, `74a4907`, `19a3527`, `1ceffc8`

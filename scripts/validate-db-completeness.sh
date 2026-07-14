@@ -12,6 +12,7 @@ fail() {
 
 [[ -f "$MANIFEST" ]] || fail "missing manifest"
 [[ -f "$TASKS" ]] || fail "missing task ledger"
+grep -Fq "this commit" "$TASKS" && fail "task ledger contains unresolved commit placeholders"
 
 seen_ids="|"
 count=0
@@ -54,9 +55,13 @@ while IFS='|' read -r id family product schemes feature environment runner statu
       [[ -f "$evidence_path" ]] || fail "$id evidence does not exist: $evidence"
       grep -Fq "Task ID: $id" "$evidence_path" || fail "$id evidence has wrong Task ID"
       grep -Fq "Result: LIVE_PASS" "$evidence_path" || fail "$id evidence is not LIVE_PASS"
-      grep -Fq "Run at (UTC):" "$evidence_path" || fail "$id evidence lacks UTC time"
-      grep -Fq "Command:" "$evidence_path" || fail "$id evidence lacks command"
+      grep -Eq '^Run at \(UTC\): .+' "$evidence_path" || fail "$id evidence lacks UTC time"
+      grep -Eq '^Environment: .+' "$evidence_path" || fail "$id evidence lacks environment"
+      grep -Eq '^Product version: .+' "$evidence_path" || fail "$id evidence lacks product version"
+      grep -Eq '^Command: .+' "$evidence_path" || fail "$id evidence lacks command"
+      grep -Fq "Resource operations:" "$evidence_path" || fail "$id evidence lacks resource operations"
       grep -Eq '^Cleanup: (PASS|UNSUPPORTED)' "$evidence_path" || fail "$id evidence lacks cleanup result"
+      grep -Fq "this commit" "$evidence_path" && fail "$id evidence contains an unresolved commit placeholder"
       ;;
     BLOCKED|EXTERNAL|PARTIAL)
       [[ "$boundary" != "-" ]] || fail "$id $status requires a concrete boundary"

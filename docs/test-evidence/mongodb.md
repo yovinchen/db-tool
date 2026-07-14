@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T19:08:56Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; MongoDB 7.0.37 aarch64
 
+Product version: MongoDB 7.0.37
+
 Command: `DBTOOL_RUN_INTEGRATION=1 cargo test -p dbtool-cli --test live_services mongo_live_document_lifecycle -- --exact --nocapture`; `./scripts/integration-fixture-data-test.sh`; `./scripts/integration-data-roundtrip-test.sh`
 
 Resource operations:
@@ -28,4 +30,4 @@ Cleanup: PASS
 Unsupported boundary: the public `DocumentStore` can empty a collection but
 does not expose drop-collection; the disposable Docker volume was removed.
 
-Commits: `1cd4ed4`, `974886f`, `561ea93`, `bea6bed`, this commit
+Commits: `1cd4ed4`, `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`

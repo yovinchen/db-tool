@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T20:08:29Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; `cassandra:5.0`; single node; `SimpleStrategy` replication factor 1
 
+Product version: Apache Cassandra 5.0
+
 Command: `./scripts/integration-cassandra-test.sh`; `./scripts/integration-cassandra-fixture-data-test.sh`
 
 Resource operations:
@@ -49,4 +51,4 @@ multi-node consistency, repair, replication, or failover.
 
 Cleanup: PASS
 
-Commits: `cd259b2`, `497b704`, `e6a1f9a`, `8ca3908`, this commit
+Commits: `cd259b2`, `497b704`, `e6a1f9a`, `8ca3908`, `f3712b3`

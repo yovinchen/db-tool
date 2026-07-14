@@ -24,4 +24,4 @@ coverage, but no product-native Elasticsearch security/TLS profile was run.
 
 Cleanup: PASS by disposable Docker teardown; public search delete is UNSUPPORTED
 
-Commits: `2e93c35`, `932655d`, this commit
+Commits: `2e93c35`, `932655d`, `b9dd9fd`

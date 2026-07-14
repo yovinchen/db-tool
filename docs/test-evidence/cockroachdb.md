@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T19:15:20Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; CockroachDB CCL v24.3.8 linux arm64
 
+Product version: CockroachDB CCL v24.3.8
+
 Command: `DBTOOL_RUN_PG_COMPAT_INTEGRATION=1 DBTOOL_RUN_COCKROACH_COMPAT=1 cargo test -p dbtool-cli --test live_services cockroach_pg_compat_live_sql_lifecycle_and_typed_values -- --exact --nocapture`
 
 Resource operations:
@@ -26,4 +28,4 @@ capability and were not claimed.
 
 Cleanup: PASS
 
-Commits: `642bfd9`, `974886f`, this commit
+Commits: `642bfd9`, `974886f`, `a776d20`

@@ -24,4 +24,4 @@ the CA signing key remains outside the mounted service directory with mode
 
 Cleanup: PASS by disposable Docker teardown; public search delete is UNSUPPORTED
 
-Commits: `2e93c35`, `bbb6323`, `932655d`, this commit
+Commits: `2e93c35`, `bbb6323`, `932655d`, `b9dd9fd`

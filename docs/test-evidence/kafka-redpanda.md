@@ -26,4 +26,4 @@ return a misleading successful empty list and does not claim offset commits.
 
 Cleanup: PASS by disposable Docker volume; protocol-level topic delete is UNSUPPORTED
 
-Commits: `e24fb79`, `85c7954`, `acff12b`, `1279cbd`, `300e94b`, this commit
+Commits: `e24fb79`, `85c7954`, `acff12b`, `1279cbd`, `300e94b`, `d2c88a2`

@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T19:13:16Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; MariaDB 11.4.12 aarch64
 
+Product version: MariaDB 11.4.12
+
 Command: `DBTOOL_RUN_COMPAT_INTEGRATION=1 DBTOOL_RUN_MARIADB_COMPAT=1 cargo test -p dbtool-cli --test live_services mariadb_compat_live_sql_lifecycle_and_typed_values -- --exact --nocapture`
 
 Resource operations:
@@ -26,4 +28,4 @@ proves the named MariaDB product's database-facing capability checklist.
 
 Cleanup: PASS
 
-Commits: `974886f`, this commit
+Commits: `974886f`, `6f423fb`

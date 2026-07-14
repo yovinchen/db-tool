@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T19:15:20Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; TimescaleDB 2.17.2 on PostgreSQL 16.6
 
+Product version: TimescaleDB 2.17.2 on PostgreSQL 16.6
+
 Command: `DBTOOL_RUN_PG_COMPAT_INTEGRATION=1 DBTOOL_RUN_TIMESCALE_COMPAT=1 cargo test -p dbtool-cli --test live_services timescale_pg_compat_live_sql_lifecycle_and_typed_values -- --exact --nocapture`
 
 Resource operations:
@@ -26,4 +28,4 @@ rerun are therefore not claimed by this completion record.
 
 Cleanup: PASS
 
-Commits: `642bfd9`, `974886f`, this commit
+Commits: `642bfd9`, `974886f`, `c2a77fe`

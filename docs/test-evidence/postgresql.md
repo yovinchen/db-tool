@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T19:08:56Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; PostgreSQL 16.14
 
+Product version: PostgreSQL 16.14
+
 Command: `DBTOOL_RUN_INTEGRATION=1 cargo test -p dbtool-cli --test live_services postgres_live_sql_lifecycle -- --exact --nocapture`; `./scripts/integration-fixture-data-test.sh`; `./scripts/integration-data-roundtrip-test.sh`
 
 Resource operations:
@@ -25,4 +27,4 @@ export/import all passed.
 
 Cleanup: PASS
 
-Commits: `642bfd9`, `974886f`, `561ea93`, `bea6bed`, this commit
+Commits: `642bfd9`, `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`

@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T20:13:29Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; Redis 7.4.9
 
+Product version: Redis 7.4.9
+
 Command: `./scripts/integration-test.sh`; `./scripts/integration-fixture-data-test.sh`; `./scripts/integration-data-roundtrip-test.sh`
 
 Resource operations:
@@ -25,4 +27,4 @@ verification, and public export/import all passed.
 
 Cleanup: PASS
 
-Commits: `974886f`, `561ea93`, `bea6bed`, `74a4907`, `19a3527`, this commit
+Commits: `974886f`, `561ea93`, `bea6bed`, `74a4907`, `19a3527`, `1ceffc8`

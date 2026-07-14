@@ -26,4 +26,4 @@ a real OpenSearch security product run; that is tracked separately.
 
 Cleanup: PASS by disposable Docker teardown; public search delete is UNSUPPORTED
 
-Commits: `2e93c35`, `7a6bbdd`, `926be55`, `932655d`, this commit
+Commits: `2e93c35`, `7a6bbdd`, `926be55`, `932655d`, `b9dd9fd`

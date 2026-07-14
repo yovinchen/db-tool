@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T19:54:57Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; TiDB/PD/TiKV Community 8.5.6; TiProxy 1.3.2
 
+Product version: TiDB, PD, and TiKV Community 8.5.6; TiProxy 1.3.2
+
 Command: `DBTOOL_RUN_TIDB_INTEGRATION=1 cargo test -p dbtool-cli --test live_services tidb_compat_live_sql_lifecycle_and_typed_values -- --exact --nocapture`; `./scripts/integration-tidb-secure-test.sh`; `./scripts/integration-tidb-logical-roundtrip-test.sh`; `./scripts/integration-tidb-tiproxy-test.sh`; `./scripts/integration-tidb-ha-drill.sh`; `./scripts/integration-tidb-pd-drill.sh`; `./scripts/integration-tidb-pd-leader-drill.sh`; `./scripts/integration-tidb-tikv-outage-boundary.sh`; `./scripts/integration-tidb-cert-regeneration-test.sh`
 
 Resource operations:
@@ -75,4 +77,4 @@ load behavior, or online certificate rotation.
 
 Cleanup: PASS
 
-Commits: `974886f`, `c2fc4ec`, `5edf95a`, `b8fa88c`, `0aae9a3`, `5469d52`, `a8388ae`, `d7b18cc`, `2e38e41`, `961b173`, this commit
+Commits: `974886f`, `c2fc4ec`, `5edf95a`, `b8fa88c`, `0aae9a3`, `5469d52`, `a8388ae`, `d7b18cc`, `2e38e41`, `961b173`, `4c2faa8`

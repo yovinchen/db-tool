@@ -8,6 +8,8 @@ Run at (UTC): 2026-07-14T19:08:56Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; MySQL Community Server 8.4.9 aarch64
 
+Product version: MySQL Community Server 8.4.9
+
 Command: `DBTOOL_RUN_INTEGRATION=1 cargo test -p dbtool-cli --test live_services mysql_live_sql_lifecycle -- --exact --nocapture`; `./scripts/integration-fixture-data-test.sh`; `./scripts/integration-data-roundtrip-test.sh`
 
 Resource operations:
@@ -25,4 +27,4 @@ and public export/import all passed.
 
 Cleanup: PASS
 
-Commits: `974886f`, `561ea93`, `bea6bed`, this commit
+Commits: `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`
