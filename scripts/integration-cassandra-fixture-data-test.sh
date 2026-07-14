@@ -4,11 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/integration-env.sh"
 
-"$ROOT/scripts/integration-cassandra-up.sh"
-
-if [[ "${DBTOOL_IT_KEEP_SERVICES:-0}" != "1" ]]; then
-  trap '"$ROOT/scripts/integration-down.sh"' EXIT
-fi
+cassandra_seed="$ROOT/testdata/base-cassandra-seed.cql"
+cassandra_table_name="dbtool_it_cassandra_fixture_people"
+cassandra_table="$DBTOOL_IT_CASSANDRA_KEYSPACE.$cassandra_table_name"
+fixture_touched=0
 
 run_dbtool() {
   cargo run -q -p dbtool-cli --features full -- "$@"
@@ -42,15 +41,15 @@ assert_json_predicate() {
   printf '%s' "$json" | python3 -c "import json,sys; data=json.load(sys.stdin); assert $expression, data"
 }
 
-sql_exec() {
+cql_exec() {
   local dsn="$1"
-  local sql="$2"
+  local cql="$2"
   local output
   local status
   local token
 
   set +e
-  output="$(run_dbtool --dsn "$dsn" --allow-write sql exec "$sql" 2>&1)"
+  output="$(run_dbtool --dsn "$dsn" --allow-write cql exec "$cql" 2>&1)"
   status=$?
   set -e
 
@@ -60,13 +59,29 @@ sql_exec() {
 
   if [[ "$(printf '%s' "$output" | json_field "error.code")" == "CONFIRM_REQUIRED" ]]; then
     token="$(printf '%s' "$output" | json_field "error.confirm_token")"
-    run_dbtool --dsn "$dsn" --allow-write --confirm "$token" sql exec "$sql" >/dev/null
+    run_dbtool --dsn "$dsn" --allow-write --confirm "$token" cql exec "$cql" >/dev/null
     return 0
   fi
 
   echo "$output" >&2
   return "$status"
 }
+
+cleanup() {
+  local status=$?
+
+  trap - EXIT
+  set +e
+  if [[ "$fixture_touched" == "1" ]]; then
+    cql_exec "$DBTOOL_IT_CASSANDRA_DSN" "drop table if exists $cassandra_table" >/dev/null 2>&1
+  fi
+  if [[ "${DBTOOL_IT_KEEP_SERVICES:-0}" != "1" ]]; then
+    "$ROOT/scripts/integration-down.sh" >/dev/null 2>&1
+  fi
+  return "$status"
+}
+
+trap cleanup EXIT
 
 seed_cql_file() {
   local dsn="$1"
@@ -77,44 +92,59 @@ seed_cql_file() {
     [[ -z "$statement" || "$statement" == \#* ]] && continue
     statement="${statement//__KEYSPACE__/$DBTOOL_IT_CASSANDRA_KEYSPACE}"
     statement="${statement%;}"
-    sql_exec "$dsn" "$statement"
+    cql_exec "$dsn" "$statement"
   done <"$file"
 }
 
-cassandra_seed="$ROOT/testdata/base-cassandra-seed.cql"
-cassandra_table="$DBTOOL_IT_CASSANDRA_KEYSPACE.dbtool_fixture_people"
+"$ROOT/scripts/integration-cassandra-up.sh"
 
 echo "dbtool Cassandra fixture smoke: seeding CQL from $cassandra_seed"
 run_dbtool --dsn "$DBTOOL_IT_CASSANDRA_DSN" ping >/dev/null
+fixture_touched=1
 seed_cql_file "$DBTOOL_IT_CASSANDRA_DSN" "$cassandra_seed"
+echo "dbtool Cassandra fixture resource: table=$cassandra_table"
 
-echo "dbtool Cassandra fixture smoke: verifying seeded rows"
-alice="$(
+echo "dbtool Cassandra fixture smoke: verifying every field in every seeded row"
+all_rows="$(
   run_dbtool \
     --dsn "$DBTOOL_IT_CASSANDRA_DSN" \
-    sql query "select name, role, active, tags from $cassandra_table where id = 1"
+    cql query "select id, name, role, active, tags from $cassandra_table"
 )"
-assert_json_field "$alice" "data.rows.0.0" "alice"
-assert_json_field "$alice" "data.rows.0.1" "reader"
-assert_json_field "$alice" "data.rows.0.2" "True"
-assert_json_predicate "$alice" '"fixture" in data["data"]["rows"][0][3]'
-
-carol="$(
-  run_dbtool \
-    --dsn "$DBTOOL_IT_CASSANDRA_DSN" \
-    sql query "select name, role from $cassandra_table where id = 3"
-)"
-assert_json_field "$carol" "data.rows.0.0" "carol"
-assert_json_field "$carol" "data.rows.0.1" "reviewer"
+printf '%s' "$all_rows" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+rows=sorted(data["data"]["rows"], key=lambda row: row[0])
+assert rows == [
+    [1, "alice", "reader", True, ["cql", "fixture"]],
+    [2, "bob", "writer", False, ["cql", "seed"]],
+    [3, "carol", "reviewer", True, ["cql", "verify"]],
+], data
+'
 
 echo "dbtool Cassandra fixture smoke: verifying table listing and schema"
-tables="$(run_dbtool --dsn "$DBTOOL_IT_CASSANDRA_DSN" sql tables --schema "$DBTOOL_IT_CASSANDRA_KEYSPACE")"
-assert_json_predicate "$tables" 'any(item["name"] == "dbtool_fixture_people" for item in data["data"])'
+tables="$(run_dbtool --dsn "$DBTOOL_IT_CASSANDRA_DSN" cql tables --keyspace "$DBTOOL_IT_CASSANDRA_KEYSPACE")"
+assert_json_predicate "$tables" 'any(item["name"] == "dbtool_it_cassandra_fixture_people" for item in data["data"])'
 
-schema="$(run_dbtool --dsn "$DBTOOL_IT_CASSANDRA_DSN" sql schema "$cassandra_table")"
-assert_json_field "$schema" "data.name" "dbtool_fixture_people"
-assert_json_predicate "$schema" 'any(column["name"] == "tags" and "list" in column["type_name"] for column in data["data"]["columns"])'
+schema="$(run_dbtool --dsn "$DBTOOL_IT_CASSANDRA_DSN" cql schema "$cassandra_table_name" --keyspace "$DBTOOL_IT_CASSANDRA_KEYSPACE")"
+assert_json_field "$schema" "data.name" "$cassandra_table_name"
+printf '%s' "$schema" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)["data"]
+columns={column["name"]: column for column in data["columns"]}
+assert set(columns) == {"id", "name", "role", "active", "tags"}, data
+assert columns["id"]["type_name"] == "int" and columns["id"]["primary_key"] is True, data
+assert columns["id"]["nullable"] is False, data
+assert columns["name"]["type_name"] == "text", data
+assert columns["role"]["type_name"] == "text", data
+assert columns["active"]["type_name"] == "boolean", data
+assert columns["tags"]["type_name"].replace(" ", "") == "list<text>", data
+assert any(index["primary"] is True and index["unique"] is True and index["columns"] == ["id"] for index in data["indexes"]), data
+'
 
-sql_exec "$DBTOOL_IT_CASSANDRA_DSN" "drop table if exists $cassandra_table" || true
+cql_exec "$DBTOOL_IT_CASSANDRA_DSN" "drop table if exists $cassandra_table"
+fixture_touched=0
+
+tables_after_drop="$(run_dbtool --dsn "$DBTOOL_IT_CASSANDRA_DSN" cql tables --keyspace "$DBTOOL_IT_CASSANDRA_KEYSPACE")"
+assert_json_predicate "$tables_after_drop" 'all(item["name"] != "dbtool_it_cassandra_fixture_people" for item in data["data"])'
 
 echo "dbtool Cassandra fixture smoke passed"

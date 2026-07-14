@@ -138,7 +138,27 @@ fn setup_sql_exec(dsn: &str, sql: &str) -> Value {
 }
 
 fn cql_exec(dsn: &str, cql: &str) -> Value {
-    stdout_json(dbtool(&["--dsn", dsn, "--allow-write", "cql", "exec", cql]))
+    let first = dbtool(&["--dsn", dsn, "--allow-write", "cql", "exec", cql]);
+    if first.status.success() {
+        return stdout_json(first);
+    }
+
+    let first = stderr_json(first);
+    assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
+    let token = first["error"]["confirm_token"]
+        .as_str()
+        .expect("CQL confirm token should be a string");
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "--confirm",
+        token,
+        "cql",
+        "exec",
+        cql,
+    ]))
 }
 
 fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
@@ -332,6 +352,7 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
 
 fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
     let qualified_table = format!("{keyspace}.{table}");
+    eprintln!("dbtool test resource: cql table={qualified_table}");
     cql_exec(
         dsn,
         &format!("create table {qualified_table} (id int primary key, name text)"),
@@ -355,6 +376,24 @@ fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
         "expected cql tables to include {table}; output: {tables}"
     );
 
+    let blocked_exec = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "exec",
+        &format!("insert into {qualified_table} (id, name) values (99, 'blocked')"),
+    ]));
+    assert_eq!(blocked_exec["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let blocked_query = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "query",
+        &format!("insert into {qualified_table} (id, name) values (99, 'blocked')"),
+    ]));
+    assert_eq!(blocked_query["error"]["code"], "WRITE_NOT_ALLOWED");
+
     cql_exec(
         dsn,
         &format!("insert into {qualified_table} (id, name) values (1, 'alice')"),
@@ -363,6 +402,36 @@ fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
         dsn,
         &format!("insert into {qualified_table} (id, name) values (2, 'bob')"),
     );
+
+    let all_rows = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "query",
+        &format!("select id, name from {qualified_table}"),
+    ]));
+    let mut exact_rows = all_rows["data"]["rows"]
+        .as_array()
+        .expect("CQL rows should be an array")
+        .clone();
+    exact_rows.sort_by_key(|row| row[0].as_i64().unwrap_or_default());
+    assert_eq!(
+        Value::Array(exact_rows),
+        serde_json::json!([[1, "alice"], [2, "bob"]]),
+        "CQL must read the complete fixture"
+    );
+
+    let limited = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--limit",
+        "1",
+        "cql",
+        "query",
+        &format!("select id, name from {qualified_table}"),
+    ]));
+    assert_eq!(limited["data"]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["meta"]["truncated"], true);
 
     let rows = stdout_json(dbtool(&[
         "--dsn",
@@ -387,6 +456,16 @@ fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
     ]));
     assert_eq!(updated["data"]["rows"][0][0], 1);
     assert_eq!(updated["data"]["rows"][0][1], "alice-updated");
+
+    let unbounded_delete = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "cql",
+        "exec",
+        &format!("delete from {qualified_table}"),
+    ]));
+    assert_eq!(unbounded_delete["error"]["code"], "CONFIRM_REQUIRED");
 
     cql_exec(dsn, &format!("delete from {qualified_table} where id = 2"));
     let deleted = stdout_json(dbtool(&[
@@ -420,8 +499,31 @@ fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
         id_col["primary_key"], true,
         "CQL id column should be detected as primary key; output: {schema}"
     );
+    assert!(
+        schema["data"]["indexes"]
+            .as_array()
+            .is_some_and(|indexes| indexes.iter().any(|index| index["primary"] == true)),
+        "CQL schema should expose a primary index; output: {schema}"
+    );
 
     cql_exec(dsn, &format!("drop table {qualified_table}"));
+
+    let tables_after_drop = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "tables",
+        "--keyspace",
+        keyspace,
+    ]));
+    assert!(
+        tables_after_drop["data"]
+            .as_array()
+            .expect("CQL tables output should be an array")
+            .iter()
+            .all(|entry| entry["name"].as_str() != Some(table)),
+        "dropped CQL table must be absent; output: {tables_after_drop}"
+    );
 }
 
 fn mysql_family_typed_probe(dsn: &str, expected_kind: &str) {
@@ -1065,32 +1167,39 @@ fn cassandra_live_cql_lifecycle_and_typed_values() {
         &unique_name("dbtool_it_cassandra_cql_users"),
     );
 
-    let typed_table = format!("{}.{}", keyspace, unique_name("dbtool_it_cassandra_typed"));
-    confirmed_sql_exec(
+    let typed_table_name = unique_name("dbtool_it_cassandra_typed");
+    let typed_table = format!("{keyspace}.{typed_table_name}");
+    eprintln!("dbtool test resource: cql typed table={typed_table}");
+    cql_exec(
         &dsn,
         &format!(
             "create table {typed_table} \
-             (id int primary key, name text, score double, active boolean, tags list<text>)"
+             (id int primary key, name text, score double, active boolean, \
+              tags list<text>, labels set<text>, attrs map<text, int>, \
+              pair tuple<int, text>, payload blob, external_id uuid, \
+              occurred_at timestamp, optional text)"
         ),
     );
-    stdout_json(dbtool(&[
-        "--dsn",
+    cql_exec(
         &dsn,
-        "--allow-write",
-        "sql",
-        "exec",
         &format!(
-            "insert into {typed_table} (id, name, score, active, tags) \
-             values (1, 'alice', 3.5, true, ['core', 'cql'])"
+            "insert into {typed_table} \
+             (id, name, score, active, tags, labels, attrs, pair, payload, external_id, occurred_at) \
+             values (1, 'alice', 3.5, true, ['core', 'cql'], {{'green', 'blue'}}, \
+                     {{'attempts': 2, 'level': 7}}, (9, 'nine'), 0x6869, \
+                     550e8400-e29b-41d4-a716-446655440000, '2026-07-14T00:00:00Z')"
         ),
-    ]));
+    );
 
     let typed = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
-        "sql",
+        "cql",
         "query",
-        &format!("select id, name, score, active, tags from {typed_table} where id = 1"),
+        &format!(
+            "select id, name, score, active, tags, labels, attrs, pair, payload, \
+             external_id, occurred_at, optional from {typed_table} where id = 1"
+        ),
     ]));
     let row = &typed["data"]["rows"][0];
     assert_eq!(row[0], 1);
@@ -1098,8 +1207,70 @@ fn cassandra_live_cql_lifecycle_and_typed_values() {
     assert_eq!(row[2].as_f64().expect("score should decode"), 3.5);
     assert_eq!(row[3], true);
     assert_eq!(row[4], serde_json::json!(["core", "cql"]));
+    let mut labels = row[5]
+        .as_array()
+        .expect("set should decode as an array")
+        .clone();
+    labels.sort_by_key(|value| value.as_str().unwrap_or_default().to_owned());
+    assert_eq!(Value::Array(labels), serde_json::json!(["blue", "green"]));
+    assert_eq!(row[6], serde_json::json!({"attempts": 2, "level": 7}));
+    assert_eq!(row[7], serde_json::json!([9, "nine"]));
+    assert_eq!(row[8], serde_json::json!([104, 105]));
+    assert_eq!(row[9], "550e8400-e29b-41d4-a716-446655440000");
+    assert_eq!(row[10], 1_783_987_200_000_i64);
+    assert_eq!(row[11], Value::Null);
 
-    confirmed_sql_exec(&dsn, &format!("drop table {typed_table}"));
+    let typed_schema = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "cql",
+        "schema",
+        &typed_table_name,
+        "--keyspace",
+        &keyspace,
+    ]));
+    let typed_columns = typed_schema["data"]["columns"]
+        .as_array()
+        .expect("typed CQL schema should have columns");
+    for expected in [
+        "id",
+        "name",
+        "score",
+        "active",
+        "tags",
+        "labels",
+        "attrs",
+        "pair",
+        "payload",
+        "external_id",
+        "occurred_at",
+        "optional",
+    ] {
+        assert!(
+            typed_columns
+                .iter()
+                .any(|column| column["name"] == expected),
+            "typed schema is missing {expected}; output: {typed_schema}"
+        );
+    }
+
+    cql_exec(&dsn, &format!("drop table {typed_table}"));
+    let typed_tables_after_drop = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "cql",
+        "tables",
+        "--keyspace",
+        &keyspace,
+    ]));
+    assert!(
+        typed_tables_after_drop["data"]
+            .as_array()
+            .expect("CQL tables output should be an array")
+            .iter()
+            .all(|entry| entry["name"].as_str() != Some(&typed_table_name)),
+        "typed CQL table must be absent after drop; output: {typed_tables_after_drop}"
+    );
 }
 
 #[test]
