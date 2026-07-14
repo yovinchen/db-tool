@@ -827,7 +827,7 @@ The live tests cover:
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
 - AMQPS queue publish/detail/consume and NATS TLS publish/subscribe plus JetStream topics/detail/lag through local CA-backed TLS services.
 - OpenSearch ping, write guard, single-document indexing, search, and index listing over plain HTTP plus TLS transport through `opensearch+https://`.
-- OpenSearch TLS harness fixture loading by searching the seeded `dbtool_seed` index from the Dockerfile-built image.
+- OpenSearch TLS harness fixture loading by searching the seeded `dbtool_it_seed` index from the Dockerfile-built image.
 - OpenSearch security-plugin HTTPS/basic-auth through generated local CA/node certificates and `tls-ca` validation.
 - Elasticsearch ping, write guard, single-document indexing, search, and index listing against the product-native Elasticsearch image.
 - Prometheus ping, metric listing, and range query through `ts`.
