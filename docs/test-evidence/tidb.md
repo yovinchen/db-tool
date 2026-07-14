@@ -4,11 +4,11 @@ Task ID: DB-TIDB-001
 
 Result: LIVE_PASS
 
-Run at (UTC): 2026-07-14T19:28:01Z
+Run at (UTC): 2026-07-14T19:34:01Z
 
 Environment: Docker on macOS arm64; Rust 1.96.0; TiDB/PD/TiKV Community 8.5.6
 
-Command: `DBTOOL_RUN_TIDB_INTEGRATION=1 cargo test -p dbtool-cli --test live_services tidb_compat_live_sql_lifecycle_and_typed_values -- --exact --nocapture`; `./scripts/integration-tidb-secure-test.sh`
+Command: `DBTOOL_RUN_TIDB_INTEGRATION=1 cargo test -p dbtool-cli --test live_services tidb_compat_live_sql_lifecycle_and_typed_values -- --exact --nocapture`; `./scripts/integration-tidb-secure-test.sh`; `./scripts/integration-tidb-logical-roundtrip-test.sh`
 
 Resource operations:
 
@@ -18,6 +18,8 @@ Resource operations:
 | `dbtool_it_tidb_secure.dbtool_it_tidb_secure_node1_51191_1784057225492` | TLS node-1 table + PK PASS | 2/2 rows PASS | all rows exact PASS | ID 1 updated PASS | ID 2 removed PASS | schema/PK/index PASS | wrong/no TLS rejected; write and confirmation guards PASS | typed values and truncation PASS | table absent; secure volume removed PASS |
 | `dbtool_it_tidb_secure.dbtool_it_tidb_secure_node2_51191_1784057226283` | TLS node-2 table + PK PASS | 2/2 rows PASS | all rows exact PASS | ID 1 updated PASS | ID 2 removed PASS | schema/PK/index PASS | password-authenticated TLS; write/confirmation guards PASS | typed values and truncation PASS | table absent; secure volume removed PASS |
 | `dbtool_it_tidb_secure.dbtool_it_tidb_x509_51191_1784057227836` | X.509 user table + PK PASS | 2/2 rows PASS | all rows exact PASS | ID 1 updated PASS | ID 2 removed PASS | schema/PK/index PASS | client certificate required; write/confirmation guards PASS | typed values and truncation PASS | table absent; secure volume removed PASS |
+| `dbtool_it_tidb_secure.dbtool_it_tidb_roundtrip_src_1784057567_57716` | source table + PK through TLS node 1 PASS | 3/3 rows PASS | IDs `1,2,3`, notes and priorities exact in versioned export artifact PASS | N/A | N/A | export columns `id,note,priority` exact PASS | export remained read-only | public `export sql` PASS | source table and artifact removed PASS |
+| `dbtool_it_tidb_secure.dbtool_it_tidb_roundtrip_restore_1784057567_57716` | restore table + PK through TLS node 2 PASS | public import inserted 3/3 PASS | all fields exact through node 2 and again through node 1 PASS | N/A | N/A | destination schema accepted artifact PASS | import required `--allow-write` | public `import sql` cross-node PASS | restore table and volume removed PASS |
 
 Assertions: the real three-component TiDB stack accepted `tidb://`, exposed the
 SQL capability, and passed the complete basic MySQL-protocol SQL checklist.
@@ -32,10 +34,14 @@ Secure phase: the regenerated CA/server/client chain was validated, both TLS
 SQL nodes passed full lifecycles, password and X.509 users were accepted, and
 missing/incorrect TLS identity paths were rejected.
 
-Pending before campaign COMPLETE: cross-node logical roundtrip, TiProxy, and
-configured resilience drills. Basic and secure SQL are LIVE_PASS and are not
-presented as those remaining higher-level guarantees.
+Cross-node transfer phase: node 1 exported the complete three-row artifact,
+node 2 imported it through the public CLI, and both nodes returned the same
+three IDs, notes, and priorities.
+
+Pending before campaign COMPLETE: TiProxy and configured resilience drills.
+Basic, secure, and logical transfer are LIVE_PASS and are not presented as
+those remaining higher-level guarantees.
 
 Cleanup: PASS
 
-Commits: `974886f`, `c2fc4ec`, `5edf95a`, this commit
+Commits: `974886f`, `c2fc4ec`, `5edf95a`, `b8fa88c`, this commit
