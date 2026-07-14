@@ -366,15 +366,23 @@ fn search_body(query: Value, options: &SearchOptions) -> Result<JsonValue> {
     let object = body
         .as_object_mut()
         .ok_or_else(|| Error::Serialization("search body must be a JSON object".into()))?;
-    if let Some(size) = options.size {
-        object
-            .entry("size".to_owned())
-            .or_insert_with(|| JsonValue::Number(size.into()));
+    if let Some(limit) = options.size {
+        let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+        let size = match object.get("size") {
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| {
+                    Error::Serialization("search body size must be a non-negative integer".into())
+                })?
+                .min(limit_u64)
+                .try_into()
+                .unwrap_or(limit),
+            None => limit,
+        };
+        object.insert("size".to_owned(), JsonValue::Number(size.into()));
     }
     if let Some(from) = options.from {
-        object
-            .entry("from".to_owned())
-            .or_insert_with(|| JsonValue::Number(from.into()));
+        object.insert("from".to_owned(), JsonValue::Number(from.into()));
     }
     if options.source {
         object
@@ -576,6 +584,65 @@ mod tests {
 
         assert_eq!(body["query"]["match_all"], json!({}));
         assert_eq!(body["size"], 5);
+    }
+
+    #[test]
+    fn clamps_body_size_to_the_option_limit() {
+        let body = search_body(
+            Value::Json(json!({ "query": { "match_all": {} }, "size": 500 })),
+            &SearchOptions {
+                size: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(body["size"], 5);
+    }
+
+    #[test]
+    fn preserves_body_size_below_the_option_limit() {
+        let body = search_body(
+            Value::Json(json!({ "query": { "match_all": {} }, "size": 3 })),
+            &SearchOptions {
+                size: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(body["size"], 3);
+    }
+
+    #[test]
+    fn explicit_from_option_overrides_body_offset() {
+        let body = search_body(
+            Value::Json(json!({ "query": { "match_all": {} }, "from": 20 })),
+            &SearchOptions {
+                from: Some(7),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(body["from"], 7);
+    }
+
+    #[test]
+    fn rejects_non_integer_body_size_when_a_limit_is_applied() {
+        let error = search_body(
+            Value::Json(json!({ "query": { "match_all": {} }, "size": -1 })),
+            &SearchOptions {
+                size: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Serialization(message) if message.contains("non-negative")
+        ));
     }
 
     #[test]
