@@ -719,8 +719,9 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
     let resource_prefix = unique_name(&format!("dbtool_it_{prefix}"));
     let key = format!("{resource_prefix}:value");
     let ttl_key = format!("{resource_prefix}:ttl");
+    let nx_key = format!("{resource_prefix}:nx");
     let raw_key = format!("{resource_prefix}:raw");
-    eprintln!("dbtool test resources: {expected_kind} keys={key},{ttl_key},{raw_key}");
+    eprintln!("dbtool test resources: {expected_kind} keys={key},{ttl_key},{nx_key},{raw_key}");
 
     let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
     assert_eq!(ping["kind"], expected_kind);
@@ -799,6 +800,38 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
     let ttl = ttl["data"].as_i64().expect("TTL should be numeric");
     assert!((1..=30).contains(&ttl), "unexpected TTL value: {ttl}");
 
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &nx_key,
+        "created-once",
+        "--ttl",
+        "30",
+        "--nx",
+    ]));
+    let nx_conflict = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &nx_key,
+        "must-not-overwrite",
+        "--nx",
+    ]));
+    assert_eq!(nx_conflict["error"]["code"], "QUERY_ERROR");
+    assert!(nx_conflict["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("NX condition not met")));
+    let nx_value = stdout_json(dbtool(&["--dsn", dsn, "kv", "get", &nx_key]));
+    assert_eq!(nx_value["data"]["value"], "created-once");
+    let nx_ttl = stdout_json(dbtool(&["--dsn", dsn, "kv", "raw", "TTL", &nx_key]));
+    let nx_ttl = nx_ttl["data"].as_i64().expect("NX TTL should be numeric");
+    assert!((1..=30).contains(&nx_ttl), "unexpected NX TTL: {nx_ttl}");
+
     let scan = stdout_json(dbtool(&[
         "--dsn",
         dsn,
@@ -814,6 +847,7 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
     let fixture_values = [
         (&key, updated_value.as_str()),
         (&ttl_key, "short-lived"),
+        (&nx_key, "created-once"),
         (&raw_key, "raw-value"),
     ];
     for (fixture_key, expected) in fixture_values {
@@ -832,9 +866,10 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
         "del",
         &key,
         &ttl_key,
+        &nx_key,
         &raw_key,
     ]));
-    assert_eq!(deleted["data"]["deleted"], 3);
+    assert_eq!(deleted["data"]["deleted"], 4);
 
     for (fixture_key, _) in fixture_values {
         let missing = stdout_json(dbtool(&["--dsn", dsn, "kv", "get", fixture_key]));
@@ -1283,6 +1318,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     };
     let key = unique_name("dbtool_it_redis_key");
     let ttl_key = unique_name("dbtool_it_redis_ttl");
+    let nx_key = unique_name("dbtool_it_redis_nx");
     let raw_key = unique_name("dbtool_it_redis_raw");
     let counter_key = unique_name("dbtool_it_redis_counter");
     let scan_prefix = unique_name("dbtool_it_redis_scan");
@@ -1296,6 +1332,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
         [
             key.as_str(),
             ttl_key.as_str(),
+            nx_key.as_str(),
             raw_key.as_str(),
             counter_key.as_str(),
             scan_keys[0].as_str(),
@@ -1400,6 +1437,38 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let ttl = ttl["data"].as_i64().expect("TTL should be numeric");
     assert!((1..=30).contains(&ttl), "unexpected TTL value: {ttl}");
 
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &nx_key,
+        "created-once",
+        "--ttl",
+        "30",
+        "--nx",
+    ]));
+    let nx_conflict = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &nx_key,
+        "must-not-overwrite",
+        "--nx",
+    ]));
+    assert_eq!(nx_conflict["error"]["code"], "QUERY_ERROR");
+    assert!(nx_conflict["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("NX condition not met")));
+    let nx_value = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", &nx_key]));
+    assert_eq!(nx_value["data"]["value"], "created-once");
+    let nx_ttl = stdout_json(dbtool(&["--dsn", &dsn, "kv", "raw", "TTL", &nx_key]));
+    let nx_ttl = nx_ttl["data"].as_i64().expect("NX TTL should be numeric");
+    assert!((1..=30).contains(&nx_ttl), "unexpected NX TTL: {nx_ttl}");
+
     for scan_key in &scan_keys {
         stdout_json(dbtool(&[
             "--dsn",
@@ -1426,6 +1495,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let fixture_values = [
         (&key, "alice-updated"),
         (&ttl_key, "short-lived"),
+        (&nx_key, "created-once"),
         (&raw_key, "raw-value"),
         (&counter_key, "1"),
         (&scan_keys[0], "scan-value"),
@@ -1451,6 +1521,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
         "del",
         &key,
         &ttl_key,
+        &nx_key,
         &raw_key,
         &counter_key,
     ];
@@ -1458,7 +1529,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
         delete_args.push(scan_key);
     }
     let deleted = stdout_json(dbtool(&delete_args));
-    assert_eq!(deleted["data"]["deleted"], 7);
+    assert_eq!(deleted["data"]["deleted"], 8);
 
     for (fixture_key, _) in fixture_values {
         let missing = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", fixture_key]));
