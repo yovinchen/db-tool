@@ -260,7 +260,7 @@ impl SqlEngine for CassandraAdapter {
         let idx_result = self
             .query(
                 &format!(
-                    "SELECT index_name, column_name FROM system_schema.indexes \
+                    "SELECT index_name, options FROM system_schema.indexes \
                      WHERE keyspace_name = '{}' AND table_name = '{}'",
                     keyspace, table_ref.name
                 ),
@@ -271,7 +271,7 @@ impl SqlEngine for CassandraAdapter {
         let mut indexes = primary_index(&columns).into_iter().collect::<Vec<_>>();
         indexes.extend(idx_result.rows.into_iter().filter_map(|row| {
             let name = row.first().and_then(value_text)?.to_owned();
-            let col = row.get(1).and_then(value_text)?.to_owned();
+            let col = row.get(1).and_then(cassandra_index_column)?;
             Some(IndexInfo {
                 name,
                 columns: vec![col],
@@ -330,6 +330,32 @@ fn primary_index(columns: &[DescribedColumn]) -> Option<IndexInfo> {
         unique: true,
         primary: true,
     })
+}
+
+fn cassandra_index_column(options: &Value) -> Option<String> {
+    let Value::Map(options) = options else {
+        return None;
+    };
+    let target = options.get("target").and_then(value_text)?.trim();
+
+    if let Some(open) = target.find('(') {
+        let function = &target[..open];
+        if target.ends_with(')')
+            && matches!(
+                function.to_ascii_lowercase().as_str(),
+                "keys" | "values" | "entries" | "full"
+            )
+        {
+            return Some(
+                target[open + 1..target.len() - 1]
+                    .trim()
+                    .trim_matches('"')
+                    .to_owned(),
+            );
+        }
+    }
+
+    Some(target.trim_matches('"').to_owned())
 }
 
 struct TableRef {
@@ -751,5 +777,23 @@ mod tests {
         assert_eq!(index.columns, vec!["tenant_id", "created_at"]);
         assert!(index.unique);
         assert!(index.primary);
+    }
+
+    #[test]
+    fn reads_secondary_index_target_from_cassandra_options() {
+        let options = Value::Map(BTreeMap::from([(
+            "target".to_owned(),
+            Value::Text("values(\"tags\")".to_owned()),
+        )]));
+
+        assert_eq!(cassandra_index_column(&options).as_deref(), Some("tags"));
+        assert_eq!(
+            cassandra_index_column(&Value::Map(BTreeMap::from([(
+                "target".to_owned(),
+                Value::Text("email".to_owned()),
+            )])))
+            .as_deref(),
+            Some("email")
+        );
     }
 }
