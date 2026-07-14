@@ -268,20 +268,17 @@ impl SqlEngine for CassandraAdapter {
             )
             .await?;
 
-        let indexes = idx_result
-            .rows
-            .into_iter()
-            .filter_map(|row| {
-                let name = row.first().and_then(value_text)?.to_owned();
-                let col = row.get(1).and_then(value_text)?.to_owned();
-                Some(IndexInfo {
-                    name,
-                    columns: vec![col],
-                    unique: false,
-                    primary: false,
-                })
+        let mut indexes = primary_index(&columns).into_iter().collect::<Vec<_>>();
+        indexes.extend(idx_result.rows.into_iter().filter_map(|row| {
+            let name = row.first().and_then(value_text)?.to_owned();
+            let col = row.get(1).and_then(value_text)?.to_owned();
+            Some(IndexInfo {
+                name,
+                columns: vec![col],
+                unique: false,
+                primary: false,
             })
-            .collect();
+        }));
 
         Ok(TableSchema {
             name: table_ref.name,
@@ -318,6 +315,21 @@ struct DescribedColumn {
     meta: ColumnMeta,
     kind_rank: u8,
     position: i64,
+}
+
+fn primary_index(columns: &[DescribedColumn]) -> Option<IndexInfo> {
+    let primary_columns = columns
+        .iter()
+        .filter(|column| column.meta.primary_key)
+        .map(|column| column.meta.name.clone())
+        .collect::<Vec<_>>();
+
+    (!primary_columns.is_empty()).then(|| IndexInfo {
+        name: "PRIMARY".to_owned(),
+        columns: primary_columns,
+        unique: true,
+        primary: true,
+    })
 }
 
 struct TableRef {
@@ -694,5 +706,50 @@ mod tests {
             cql_value_to_value(CqlValue::List(vec![CqlValue::Boolean(true)])),
             Value::Array(vec![Value::Bool(true)])
         );
+    }
+
+    #[test]
+    fn synthesizes_primary_index_in_partition_and_clustering_order() {
+        let columns = vec![
+            DescribedColumn {
+                meta: ColumnMeta {
+                    name: "tenant_id".to_owned(),
+                    type_name: "uuid".to_owned(),
+                    nullable: false,
+                    primary_key: true,
+                    default_value: None,
+                },
+                kind_rank: 0,
+                position: 0,
+            },
+            DescribedColumn {
+                meta: ColumnMeta {
+                    name: "created_at".to_owned(),
+                    type_name: "timestamp".to_owned(),
+                    nullable: false,
+                    primary_key: true,
+                    default_value: None,
+                },
+                kind_rank: 1,
+                position: 0,
+            },
+            DescribedColumn {
+                meta: ColumnMeta {
+                    name: "payload".to_owned(),
+                    type_name: "text".to_owned(),
+                    nullable: true,
+                    primary_key: false,
+                    default_value: None,
+                },
+                kind_rank: 3,
+                position: -1,
+            },
+        ];
+
+        let index = primary_index(&columns).expect("primary index");
+        assert_eq!(index.name, "PRIMARY");
+        assert_eq!(index.columns, vec!["tenant_id", "created_at"]);
+        assert!(index.unique);
+        assert!(index.primary);
     }
 }
