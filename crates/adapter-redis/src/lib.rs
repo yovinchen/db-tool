@@ -97,12 +97,19 @@ impl KeyValueStore for RedisAdapter {
 
     async fn set(&self, key: &str, value: &[u8], options: SetOptions) -> Result<()> {
         let mut c = self.conn.lock().await;
-        if let Some(ttl) = options.ttl_secs {
-            c.set_ex::<_, _, ()>(key, value, ttl).await
-        } else {
-            c.set::<_, _, ()>(key, value).await
+        let nx = options.nx;
+        let response: Option<String> = redis_set_command(key, value, options)
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        if nx && response.is_none() {
+            return Err(Error::Query(
+                "SET NX condition not met because the key already exists".to_owned(),
+            ));
         }
-        .map_err(|e| Error::Query(e.to_string()))
+
+        Ok(())
     }
 
     async fn delete(&self, keys: &[String]) -> Result<u64> {
@@ -141,6 +148,18 @@ impl KeyValueStore for RedisAdapter {
             .map_err(|e| Error::Query(e.to_string()))?;
         Ok(redis_value_to_core(val))
     }
+}
+
+fn redis_set_command(key: &str, value: &[u8], options: SetOptions) -> redis::Cmd {
+    let mut command = redis::cmd("SET");
+    command.arg(key).arg(value);
+    if let Some(ttl) = options.ttl_secs {
+        command.arg("EX").arg(ttl);
+    }
+    if options.nx {
+        command.arg("NX");
+    }
+    command
 }
 
 #[async_trait::async_trait]
@@ -600,6 +619,24 @@ mod tests {
             Err(Error::WriteNotAllowed)
         ));
         assert!(validate_raw_command(&["XLEN".to_owned(), "stream".to_owned()]).is_ok());
+    }
+
+    #[test]
+    fn set_command_combines_expiry_and_nx_atomically() {
+        let command = redis_set_command(
+            "user:1",
+            b"alice",
+            SetOptions {
+                ttl_secs: Some(30),
+                nx: true,
+            },
+        );
+        let packed = String::from_utf8(command.get_packed_command()).unwrap();
+
+        assert_eq!(
+            packed,
+            "*6\r\n$3\r\nSET\r\n$6\r\nuser:1\r\n$5\r\nalice\r\n$2\r\nEX\r\n$2\r\n30\r\n$2\r\nNX\r\n"
+        );
     }
 
     #[test]

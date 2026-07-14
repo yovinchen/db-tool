@@ -125,6 +125,8 @@ fn cli_help_documents_core_command_families() {
     assert!(kv_help.contains("Write one string value"));
     assert!(kv_help.contains("Scan keys matching a pattern"));
     assert!(kv_help.contains("Delete one or more keys"));
+    let kv_set_help = stdout_text(&dbtool(&["kv", "set", "--help"]));
+    assert!(kv_set_help.contains("--nx"));
 
     let doc_help = stdout_text(&dbtool(&["doc", "--help"]));
     assert!(doc_help.contains("List document collections"));

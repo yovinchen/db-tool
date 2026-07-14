@@ -15,7 +15,7 @@ pub enum KvAction {
         /// Key name to read.
         key: String,
     },
-    /// Write one string value, optionally with a TTL in seconds.
+    /// Write one string value, optionally with a TTL or only when absent.
     Set {
         /// Key name to write.
         key: String,
@@ -24,6 +24,9 @@ pub enum KvAction {
         /// Expiration time in seconds.
         #[arg(long)]
         ttl: Option<u64>,
+        /// Set only when the key does not already exist.
+        #[arg(long)]
+        nx: bool,
     },
     /// Scan keys matching a pattern, bounded by the global --limit.
     Scan {
@@ -81,16 +84,14 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
                 false,
             )
         }
-        KvAction::Set { key, value, ttl } => {
-            kv.set(
-                &key,
-                value.as_bytes(),
-                SetOptions {
-                    ttl_secs: ttl,
-                    nx: false,
-                },
-            )
-            .await?;
+        KvAction::Set {
+            key,
+            value,
+            ttl,
+            nx,
+        } => {
+            kv.set(&key, value.as_bytes(), SetOptions { ttl_secs: ttl, nx })
+                .await?;
             ctx.render_success(&kind, serde_json::json!({"ok": true}), elapsed(), false)
         }
         KvAction::Scan { pattern } => {
