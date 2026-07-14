@@ -320,6 +320,22 @@ fn kafka_live_topic_produce_detail_and_consume() {
 }
 
 #[test]
+fn redpanda_alias_live_topic_produce_detail_and_consume() {
+    if !integration_enabled() {
+        return;
+    }
+    let Some(dsn) = dsn("DBTOOL_IT_REDPANDA_DSN") else {
+        return;
+    };
+    run_kafka_smoke(
+        &dsn,
+        "redpanda",
+        "dbtool_it_redpanda_topic",
+        "redpanda-payload",
+    );
+}
+
+#[test]
 fn vendor_kafka_compatible_smoke_profiles() {
     if !vendor_kafka_integration_enabled() {
         return;
