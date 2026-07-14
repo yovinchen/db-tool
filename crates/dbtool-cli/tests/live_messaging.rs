@@ -63,7 +63,8 @@ fn stdout_json_retry_until(args: &[&str], matches: impl Fn(&Value) -> bool) -> V
         thread::sleep(Duration::from_secs(1));
     }
 
-    last_value.expect("command should have produced JSON")
+    let last_value = last_value.expect("command should have produced JSON");
+    panic!("retry condition was not met for args {args:?}; last JSON response: {last_value}");
 }
 
 fn stderr_json(output: Output) -> Value {
@@ -213,6 +214,39 @@ fn redis_live_stream_produce_detail_and_consume() {
             .any(|item| item["topic"] == stream && item["lag"].as_i64().unwrap_or_default() >= 1),
         "expected lag >= 1 for group {group} on stream {stream}; output: {lag}"
     );
+
+    let group_destroyed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "raw",
+        "XGROUP",
+        "DESTROY",
+        &stream,
+        &group,
+    ]));
+    assert_eq!(group_destroyed["data"], 1);
+
+    let deleted = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "del",
+        &stream,
+    ]));
+    assert_eq!(deleted["data"]["deleted"], 1);
+
+    let missing = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", &stream]));
+    assert_eq!(missing["data"]["value"], Value::Null);
+
+    let topics_after_cleanup = stdout_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
+    assert!(!topics_after_cleanup["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == stream));
 }
 
 #[test]
@@ -367,6 +401,8 @@ fn run_kafka_smoke(dsn: &str, expected_kind: &str, prefix: &str, payload: &str) 
     ]));
     assert_eq!(payload_text(&consumed["data"][0]), payload);
 
+    // The public MQ API has no topic-delete operation. Keep that boundary explicit instead of
+    // claiming cleanup; local integration environments remove the broker volume on teardown.
     let lag = stderr_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
     assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
 }
@@ -416,6 +452,11 @@ fn amqp_live_queue_produce_detail_and_consume() {
         "5",
     ]);
     assert_eq!(payload_text(&consumed["data"][0]), "amqp-payload");
+
+    let drained = stdout_json_retry_until(&["--dsn", &dsn, "mq", "detail", &queue], |value| {
+        value["data"]["config"]["message_count"] == "0"
+    });
+    assert_eq!(drained["data"]["config"]["message_count"], "0");
 }
 
 #[test]
@@ -498,6 +539,19 @@ fn rabbitmq_management_live_lists_detail_and_queue_lag() {
         payload_text(&consumed["data"][0]),
         "rabbitmq-management-payload"
     );
+
+    let drained_detail = stdout_json_retry_until(
+        &["--dsn", &management_dsn, "mq", "detail", &queue],
+        |value| value["data"]["config"]["message_count"] == "0",
+    );
+    assert_eq!(drained_detail["data"]["config"]["message_count"], "0");
+
+    let drained_lag =
+        stdout_json_retry_until(&["--dsn", &management_dsn, "mq", "lag", &queue], |value| {
+            value["data"][0]["latest"] == 0 && value["data"][0]["lag"] == 0
+        });
+    assert_eq!(drained_lag["data"][0]["latest"], 0);
+    assert_eq!(drained_lag["data"][0]["lag"], 0);
 }
 
 #[test]
@@ -532,6 +586,11 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
     assert_eq!(detail["data"]["info"]["name"], queue);
     assert_eq!(detail["data"]["config"]["message_count"], "1");
 
+    let topics = stderr_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
+    assert_eq!(topics["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    let lag = stderr_json(dbtool(&["--dsn", &dsn, "mq", "lag", &queue]));
+    assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
+
     let consumed = stdout_json_retry(&[
         "--dsn",
         &dsn,
@@ -544,6 +603,11 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
         "5",
     ]);
     assert_eq!(payload_text(&consumed["data"][0]), "amqps-payload");
+
+    let drained = stdout_json_retry_until(&["--dsn", &dsn, "mq", "detail", &queue], |value| {
+        value["data"]["config"]["message_count"] == "0"
+    });
+    assert_eq!(drained["data"]["config"]["message_count"], "0");
 }
 
 #[test]
@@ -663,12 +727,28 @@ fn nats_live_jetstream_admin_lists_detail_and_lag() {
         .any(|item| item["topic"] == stream && item["group"] == consumer && item["lag"] == 1));
 
     rt.block_on(async {
-        let client = async_nats::connect(dsn)
+        let client = async_nats::connect(dsn.clone())
             .await
             .expect("NATS client should reconnect for cleanup");
         let jetstream = async_nats::jetstream::new(client);
-        let _ = jetstream.delete_stream(stream).await;
+        jetstream
+            .delete_stream(stream.clone())
+            .await
+            .expect("JetStream stream cleanup should succeed");
     });
+
+    let topics_after_cleanup = stdout_json_retry_until(&["--dsn", &dsn, "mq", "topics"], |value| {
+        !value["data"]
+            .as_array()
+            .expect("topics should be an array")
+            .iter()
+            .any(|item| item["name"] == stream)
+    });
+    assert!(!topics_after_cleanup["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == stream));
 }
 
 #[test]
@@ -785,6 +865,22 @@ fn nats_mq_tls_live_publish_subscribe_and_jetstream_admin() {
     rt.block_on(async {
         let client = nats_client_for_test(&dsn).await;
         let jetstream = async_nats::jetstream::new(client);
-        let _ = jetstream.delete_stream(stream).await;
+        jetstream
+            .delete_stream(stream.clone())
+            .await
+            .expect("NATS TLS JetStream stream cleanup should succeed");
     });
+
+    let topics_after_cleanup = stdout_json_retry_until(&["--dsn", &dsn, "mq", "topics"], |value| {
+        !value["data"]
+            .as_array()
+            .expect("topics should be an array")
+            .iter()
+            .any(|item| item["name"] == stream)
+    });
+    assert!(!topics_after_cleanup["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == stream));
 }
