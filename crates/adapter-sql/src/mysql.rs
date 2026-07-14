@@ -198,7 +198,7 @@ impl SqlEngine for MySqlAdapter {
 
         let idx_rows = if let Some(s) = schema {
             sqlx::query(
-                "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME \
+                "SELECT INDEX_NAME, CAST(NON_UNIQUE AS CHAR), COLUMN_NAME \
                  FROM information_schema.STATISTICS \
                  WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                  ORDER BY INDEX_NAME, SEQ_IN_INDEX",
@@ -209,7 +209,7 @@ impl SqlEngine for MySqlAdapter {
             .await
         } else {
             sqlx::query(
-                "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME \
+                "SELECT INDEX_NAME, CAST(NON_UNIQUE AS CHAR), COLUMN_NAME \
                  FROM information_schema.STATISTICS \
                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
                  ORDER BY INDEX_NAME, SEQ_IN_INDEX",
@@ -220,14 +220,20 @@ impl SqlEngine for MySqlAdapter {
         }
         .map_err(|e| Error::Query(e.to_string()))?;
 
-        let indexes = group_index_rows(idx_rows.iter().filter_map(|r| {
-            let name = mysql_text(r, 0).ok()?;
-            let non_unique: i64 = r.try_get(1).ok()?;
-            let col = mysql_text(r, 2).ok()?;
-            let unique = non_unique == 0;
-            let primary = name == "PRIMARY";
-            Some((name, unique, primary, col))
-        }));
+        let index_rows = idx_rows
+            .iter()
+            .map(|r| {
+                let name = mysql_text(r, 0)?;
+                let non_unique = mysql_text(r, 1)?
+                    .parse::<u64>()
+                    .map_err(|e| Error::Query(format!("invalid NON_UNIQUE metadata value: {e}")))?;
+                let col = mysql_text(r, 2)?;
+                let unique = non_unique == 0;
+                let primary = name == "PRIMARY";
+                Ok((name, unique, primary, col))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let indexes = group_index_rows(index_rows.into_iter());
 
         Ok(TableSchema {
             name: table_ref.name,
