@@ -133,6 +133,23 @@ assert_query_contains() {
   fi
 }
 
+assert_complete_fixture() {
+  local dsn="$1"
+  local table="$2"
+  local output
+
+  output="$(dbtool_cli --dsn "$dsn" sql query "select id, note from $table order by id")"
+  printf '%s' "$output" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+assert data["data"]["rows"] == [
+    [1, "node1-before-stop"],
+    [2, "node2-while-node1-down"],
+    [3, "node1-while-node2-down"],
+], data
+'
+}
+
 assert_identifier() {
   local value="$1"
   local label="$2"
@@ -161,8 +178,9 @@ start_service() {
 database="$DBTOOL_IT_TIDB_SECURE_DB"
 assert_identifier "$database" "database"
 
-table="dbtool_tidb_ha_drill_$(date +%s)_$$"
+table="dbtool_it_tidb_ha_drill_$(date +%s)_$$"
 qualified_table="$database.$table"
+echo "TiDB HA drill resource: table=$qualified_table"
 
 echo "TiDB HA drill: preparing $qualified_table through SQL node 1"
 sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "create database if not exists $database"
@@ -193,5 +211,8 @@ echo "TiDB HA drill: restarting SQL node 2"
 start_service tidb-secure-2
 wait_for_ping "SQL node 2 after restart" "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2"
 assert_query_contains "node 2 read after restart" "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" "select note from $qualified_table where id = 3" "node1-while-node2-down"
+assert_complete_fixture "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2" "$qualified_table"
+
+sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "drop table $qualified_table"
 
 echo "TiDB secure HA failover drill passed"
