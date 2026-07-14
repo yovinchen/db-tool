@@ -244,7 +244,10 @@ impl AdminInspect for RskafkaAdapter {
     }
 
     async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
-        Ok(vec![])
+        Err(Error::UnsupportedCapability {
+            kind: self.kind.0.clone(),
+            needed: "ConsumerLag",
+        })
     }
 }
 

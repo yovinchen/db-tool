@@ -9,7 +9,10 @@ use dbtool_core::{
 };
 use futures::future::BoxFuture;
 use lapin::{
-    options::{BasicAckOptions, BasicGetOptions, BasicPublishOptions, QueueDeclareOptions},
+    options::{
+        BasicAckOptions, BasicGetOptions, BasicPublishOptions, ConfirmSelectOptions,
+        QueueDeclareOptions,
+    },
     publisher_confirm::Confirmation,
     tcp::OwnedTLSConfig,
     types::FieldTable,
@@ -100,6 +103,10 @@ impl MessageProducer for AmqpAdapter {
 
         let channel = self.channel().await?;
         declare_queue(&channel, target, false).await?;
+        channel
+            .confirm_select(ConfirmSelectOptions::default())
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
 
         let mut produced = 0;
         for message in messages {
@@ -115,12 +122,19 @@ impl MessageProducer for AmqpAdapter {
                 .map_err(|e| Error::Query(e.to_string()))?
                 .await
                 .map_err(|e| Error::Query(e.to_string()))?;
-            if matches!(confirm, Confirmation::Nack(_)) {
-                return Err(Error::Query(
-                    "AMQP broker rejected published message".into(),
-                ));
+            match confirm {
+                Confirmation::Ack(_) => produced += 1,
+                Confirmation::Nack(_) => {
+                    return Err(Error::Query(
+                        "AMQP broker rejected published message".into(),
+                    ));
+                }
+                Confirmation::NotRequested => {
+                    return Err(Error::Query(
+                        "AMQP publisher confirmation was not requested".into(),
+                    ));
+                }
             }
-            produced += 1;
         }
 
         Ok(ProduceOutcome {
@@ -177,7 +191,10 @@ impl MessageConsumer for AmqpAdapter {
 #[async_trait::async_trait]
 impl AdminInspect for AmqpAdapter {
     async fn list_topics(&self) -> Result<Vec<TopicInfo>> {
-        Ok(vec![])
+        Err(Error::UnsupportedCapability {
+            kind: self.kind.0.clone(),
+            needed: "TopicListing (use rabbitmq+http)",
+        })
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -206,8 +223,10 @@ impl AdminInspect for AmqpAdapter {
     }
 
     async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
-        // AMQP 0-9-1 has no consumer-group lag concept; use the RabbitMQ management adapter.
-        Ok(vec![])
+        Err(Error::UnsupportedCapability {
+            kind: self.kind.0.clone(),
+            needed: "ConsumerLag (use rabbitmq+http)",
+        })
     }
 }
 

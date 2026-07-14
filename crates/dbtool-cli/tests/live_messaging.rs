@@ -367,11 +367,8 @@ fn run_kafka_smoke(dsn: &str, expected_kind: &str, prefix: &str, payload: &str) 
     ]));
     assert_eq!(payload_text(&consumed["data"][0]), payload);
 
-    let lag = stdout_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
-    assert!(
-        lag["data"].as_array().is_some(),
-        "mq lag should return a JSON array; output: {lag}"
-    );
+    let lag = stderr_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
+    assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
 }
 
 #[test]
@@ -402,11 +399,10 @@ fn amqp_live_queue_produce_detail_and_consume() {
     assert_eq!(detail["data"]["info"]["name"], queue);
     assert_eq!(detail["data"]["config"]["message_count"], "1");
 
-    let lag = stdout_json_retry(&["--dsn", &dsn, "mq", "lag", &queue]);
-    assert!(
-        lag["data"].as_array().is_some(),
-        "mq lag should return a JSON array; output: {lag}"
-    );
+    let topics = stderr_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
+    assert_eq!(topics["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    let lag = stderr_json(dbtool(&["--dsn", &dsn, "mq", "lag", &queue]));
+    assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
 
     let consumed = stdout_json_retry(&[
         "--dsn",
