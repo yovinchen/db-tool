@@ -1,3 +1,3 @@
-SET dbtool:fixture:user:1 alice
-SET dbtool:fixture:user:2 bob
-SET dbtool:fixture:user:3 carol
+SET dbtool_it_fixture:user:1 alice
+SET dbtool_it_fixture:user:2 bob
+SET dbtool_it_fixture:user:3 carol

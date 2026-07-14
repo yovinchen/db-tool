@@ -82,9 +82,9 @@ seed_redis_commands() {
   local command
 
   run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --allow-write kv del \
-    dbtool:fixture:user:1 \
-    dbtool:fixture:user:2 \
-    dbtool:fixture:user:3 >/dev/null || true
+    dbtool_it_fixture:user:1 \
+    dbtool_it_fixture:user:2 \
+    dbtool_it_fixture:user:3 >/dev/null || true
 
   while IFS= read -r command || [[ -n "$command" ]]; do
     [[ -z "$command" || "$command" == \#* ]] && continue
@@ -99,7 +99,7 @@ seed_mongo_ndjson() {
   local doc
 
   run_dbtool --dsn "$DBTOOL_IT_MONGO_DSN" --allow-write doc delete \
-    --filter '{"kind":"dbtool-fixture"}' \
+    --filter '{"kind":"dbtool-it-fixture"}' \
     "$collection" >/dev/null || true
 
   while IFS= read -r doc || [[ -n "$doc" ]]; do
@@ -112,7 +112,7 @@ postgres_seed="$ROOT/testdata/base-postgres-seed.sql"
 mysql_seed="$ROOT/testdata/base-mysql-seed.sql"
 redis_seed="$ROOT/testdata/base-redis-seed.commands"
 mongo_seed="$ROOT/testdata/base-mongo-seed.ndjson"
-mongo_collection="dbtool_fixture_people"
+mongo_collection="dbtool_it_fixture_people"
 
 echo "dbtool fixture smoke: seeding PostgreSQL from $postgres_seed"
 seed_sql_file "$DBTOOL_IT_POSTGRES_DSN" "$postgres_seed"
@@ -120,10 +120,9 @@ postgres_people="$(
   run_dbtool \
     --dsn "$DBTOOL_IT_POSTGRES_DSN" \
     --limit 3 \
-    sql query "select name, role from dbtool_fixture_people order by id"
+    sql query "select id, name, role, active from dbtool_it_fixture_people order by id"
 )"
-assert_json_field "$postgres_people" "data.rows.0.0" "alice"
-assert_json_field "$postgres_people" "data.rows.2.1" "reviewer"
+assert_json_predicate "$postgres_people" 'data["data"]["rows"] == [[1,"alice","reader",True],[2,"bob","writer",False],[3,"carol","reviewer",True]]'
 
 echo "dbtool fixture smoke: seeding MySQL from $mysql_seed"
 seed_sql_file "$DBTOOL_IT_MYSQL_DSN" "$mysql_seed"
@@ -131,16 +130,15 @@ mysql_people="$(
   run_dbtool \
     --dsn "$DBTOOL_IT_MYSQL_DSN" \
     --limit 3 \
-    sql query "select name, role from dbtool_fixture_people order by id"
+    sql query "select id, name, role, active from dbtool_it_fixture_people order by id"
 )"
-assert_json_field "$mysql_people" "data.rows.0.0" "alice"
-assert_json_field "$mysql_people" "data.rows.2.1" "reviewer"
+assert_json_predicate "$mysql_people" 'data["data"]["rows"] == [[1,"alice","reader",True],[2,"bob","writer",False],[3,"carol","reviewer",True]]'
 
 echo "dbtool fixture smoke: seeding Redis from $redis_seed"
 seed_redis_commands "$redis_seed"
-redis_user="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" kv get dbtool:fixture:user:1)"
-assert_json_field "$redis_user" "data.value" "alice"
-redis_keys="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --limit 3 kv scan "dbtool:fixture:user:*")"
+redis_values="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" kv raw MGET dbtool_it_fixture:user:1 dbtool_it_fixture:user:2 dbtool_it_fixture:user:3)"
+assert_json_predicate "$redis_values" 'data["data"] == ["alice","bob","carol"]'
+redis_keys="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --limit 3 kv scan "dbtool_it_fixture:user:*")"
 assert_json_predicate "$redis_keys" 'len(data["data"]) == 3'
 
 echo "dbtool fixture smoke: seeding MongoDB from $mongo_seed"
@@ -149,9 +147,18 @@ mongo_people="$(
   run_dbtool \
     --dsn "$DBTOOL_IT_MONGO_DSN" \
     --limit 3 \
-    doc find --filter '{"kind":"dbtool-fixture"}' "$mongo_collection"
+    doc find --filter '{"kind":"dbtool-it-fixture"}' "$mongo_collection"
 )"
-assert_json_predicate "$mongo_people" 'len(data["data"]) == 3'
-assert_json_predicate "$mongo_people" 'any(doc.get("name") == "alice" and doc.get("role") == "reader" for doc in data["data"])'
+assert_json_predicate "$mongo_people" 'sorted((doc["id"],doc["name"],doc["role"],doc["active"]) for doc in data["data"]) == [(1,"alice","reader",True),(2,"bob","writer",False),(3,"carol","reviewer",True)]'
+
+sql_exec "$DBTOOL_IT_POSTGRES_DSN" "drop table if exists dbtool_it_fixture_people"
+sql_exec "$DBTOOL_IT_MYSQL_DSN" "drop table if exists dbtool_it_fixture_people"
+run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --allow-write kv del \
+  dbtool_it_fixture:user:1 \
+  dbtool_it_fixture:user:2 \
+  dbtool_it_fixture:user:3 >/dev/null
+run_dbtool --dsn "$DBTOOL_IT_MONGO_DSN" --allow-write doc delete \
+  --filter '{"kind":"dbtool-it-fixture"}' \
+  "$mongo_collection" >/dev/null
 
 echo "dbtool fixture smoke passed"
