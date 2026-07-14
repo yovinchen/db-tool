@@ -494,7 +494,7 @@ fn document_aggregate_write_stage_requires_write_flag_before_connecting() {
 }
 
 #[test]
-fn readonly_named_connection_blocks_sql_and_kv_writes() {
+fn readonly_named_connection_blocks_sql_kv_and_cql_writes() {
     let config = r#"
 [connections.locked]
 dsn = "sqlite::memory:"
@@ -527,6 +527,19 @@ readonly = true
         config,
     ));
     assert_eq!(kv["error"]["code"], "READ_ONLY");
+
+    let cql = stderr_json(&dbtool_with_config(
+        &[
+            "--conn",
+            "locked",
+            "--allow-write",
+            "cql",
+            "exec",
+            "insert into users (id) values (1)",
+        ],
+        config,
+    ));
+    assert_eq!(cql["error"]["code"], "READ_ONLY");
 }
 
 #[test]

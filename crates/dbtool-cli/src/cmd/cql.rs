@@ -12,7 +12,7 @@ use dbtool_core::{
 #[derive(Args)]
 #[command(
     about = "Run Cassandra/ScyllaDB CQL commands.",
-    long_about = "CQL commands expose Cassandra-specific keyspace/table wording while reusing dbtool's JSON output, result limits, timeouts, and write gate. CQL writes and DDL use cql exec and require --allow-write."
+    long_about = "CQL commands expose Cassandra-specific keyspace/table wording while reusing dbtool's JSON output, result limits, timeouts, and safety path. CQL writes and DDL use cql exec, require --allow-write, and destructive statements require target-bound confirmation."
 )]
 pub struct CqlCmd {
     #[command(subcommand)]
@@ -50,13 +50,15 @@ pub enum CqlAction {
 }
 
 pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
+    let dsn = ctx.resolve_dsn()?;
+    let target = ctx.safety_target(&dsn);
+
     match &cmd.action {
         CqlAction::Query { cql } => ensure_readonly_query(cql)?,
-        CqlAction::Exec { .. } => ensure_write_allowed(ctx)?,
+        CqlAction::Exec { cql } => ensure_exec_allowed(ctx, cql, &target)?,
         CqlAction::Keyspaces | CqlAction::Tables { .. } | CqlAction::Schema { .. } => {}
     }
 
-    let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
     let cql = conn.as_cql().ok_or_else(|| Error::UnsupportedCapability {
         kind: conn.kind().0.clone(),
@@ -107,8 +109,10 @@ fn cql_table_ref(table: &str, keyspace: Option<&str>) -> Result<String> {
     Ok(format!("{keyspace}.{table}"))
 }
 
-fn ensure_write_allowed(ctx: &Context) -> Result<()> {
-    ctx.ensure_write_allowed()
+fn ensure_exec_allowed(ctx: &Context, cql: &str, target: &str) -> Result<()> {
+    ctx.ensure_write_allowed()?;
+    SafetyGuard::check_with_target(cql, target, ctx.allow_write, ctx.confirm.as_deref())?;
+    Ok(())
 }
 
 fn ensure_readonly_query(cql: &str) -> Result<()> {
@@ -139,10 +143,36 @@ mod tests {
     #[test]
     fn cql_exec_requires_write_flag() {
         assert!(matches!(
-            ensure_write_allowed(&test_context(false)),
+            ensure_exec_allowed(
+                &test_context(false),
+                "insert into app.users (id) values (1)",
+                "dsn:cassandra://localhost/app"
+            ),
             Err(Error::WriteNotAllowed)
         ));
-        assert!(ensure_write_allowed(&test_context(true)).is_ok());
+        assert!(ensure_exec_allowed(
+            &test_context(true),
+            "insert into app.users (id) values (1)",
+            "dsn:cassandra://localhost/app"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cql_destructive_exec_requires_target_bound_confirmation() {
+        let target = "dsn:cassandra://localhost/app";
+        let mut ctx = test_context(true);
+        let token = match ensure_exec_allowed(&ctx, "drop table app.users", target).unwrap_err() {
+            Error::ConfirmRequired { confirm_token, .. } => confirm_token,
+            other => panic!("expected confirmation requirement, got {other:?}"),
+        };
+
+        ctx.confirm = Some(token);
+        assert!(ensure_exec_allowed(&ctx, "drop table app.users", target).is_ok());
+        assert!(matches!(
+            ensure_exec_allowed(&ctx, "drop table app.users", "dsn:cassandra://other/app"),
+            Err(Error::Internal(_))
+        ));
     }
 
     #[test]
