@@ -54,7 +54,7 @@ being created and is normalized in the final campaign summary.
 | DB-MARIADB-001 | SQL | MariaDB `mariadb://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/mariadb.md` | this commit |
 | DB-TIDB-001 | SQL | TiDB `tidb://` | Docker tidb | Ready | NOT_RUN | - | - |
 | DB-COCKROACH-001 | SQL | CockroachDB `cockroach://` | Docker pg-compat | Ready | COMPLETE | `docs/test-evidence/cockroachdb.md` | this commit; single-node insecure SQL surface |
-| DB-TIMESCALE-001 | SQL | TimescaleDB `timescale://` | Docker pg-compat | Ready | NOT_RUN | - | - |
+| DB-TIMESCALE-001 | SQL | TimescaleDB `timescale://` | Docker pg-compat | Ready | COMPLETE | `docs/test-evidence/timescaledb.md` | this commit; generic SQL surface only |
 | DB-SQLSERVER-001 | SQL | SQL Server `sqlserver://` | Docker sqlserver | Ready | BLOCKED | - | local host is arm64; image gate requires x86_64 |
 | DB-REDSHIFT-001 | SQL | Redshift `redshift://` | external | Ready | EXTERNAL | - | `DBTOOL_IT_REDSHIFT_DSN` is not supplied |
 | DB-CASSANDRA-001 | CQL | Cassandra `cassandra://` | Docker cassandra | Ready | NOT_RUN | - | - |

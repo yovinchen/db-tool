@@ -5,7 +5,7 @@ DB-MYSQL-001|sql|MySQL|mysql|default|docker-base|./scripts/integration-test.sh +
 DB-MARIADB-001|sql|MariaDB|mariadb|default|docker-compat|./scripts/integration-compat-test.sh|COMPLETE|docs/test-evidence/mariadb.md|MariaDB 11.4.12 on arm64 Docker
 DB-TIDB-001|sql|TiDB|tidb|default|docker-tidb|./scripts/integration-tidb-test.sh|HARNESS_READY|-|-
 DB-COCKROACH-001|sql|CockroachDB|cockroach|default|docker-pg-compat|./scripts/integration-pg-compat-test.sh|COMPLETE|docs/test-evidence/cockroachdb.md|v24.3.8 single-node insecure arm64 profile
-DB-TIMESCALE-001|sql|TimescaleDB|timescale|default|docker-pg-compat|./scripts/integration-pg-compat-test.sh|HARNESS_READY|-|-
+DB-TIMESCALE-001|sql|TimescaleDB|timescale|default|docker-pg-compat|./scripts/integration-pg-compat-test.sh|COMPLETE|docs/test-evidence/timescaledb.md|TimescaleDB 2.17.2 on PostgreSQL 16.6 arm64
 DB-SQLSERVER-001|sql|SQL Server|sqlserver,mssql|full|docker-sqlserver|./scripts/integration-sqlserver-test.sh|BLOCKED|-|arm64 host; local image gate requires x86_64
 DB-REDSHIFT-001|sql|Amazon Redshift|redshift|default|external|./scripts/integration-redshift-test.sh|EXTERNAL|-|DBTOOL_IT_REDSHIFT_DSN is not supplied
 DB-CASSANDRA-001|cql|Apache Cassandra|cassandra|full|docker-cassandra|./scripts/integration-cassandra-test.sh|HARNESS_READY|-|-
