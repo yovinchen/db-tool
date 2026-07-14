@@ -40,6 +40,7 @@ pub fn connect(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
         let brokers = brokers_from_dsn(&dsn);
         let producer = kafka_config(&dsn, &brokers)
+            .set("message.timeout.ms", "5000")
             .create::<FutureProducer>()
             .map_err(kafka_connection_error)?;
         let consumer = kafka_config(&dsn, &brokers)
@@ -284,7 +285,6 @@ fn kafka_config(dsn: &Dsn, brokers: &str) -> ClientConfig {
     config
         .set("bootstrap.servers", brokers)
         .set("client.id", "dbtool")
-        .set("message.timeout.ms", "5000")
         .set("socket.timeout.ms", "5000");
     apply_client_params(&mut config, dsn);
     config
