@@ -23,6 +23,7 @@ HEAVY_PHASES=(
   dbtool-image
   compat-extra
   sqlserver
+  db2
   cassandra
   cassandra-fixture
   tidb-secure
@@ -33,6 +34,9 @@ HEAVY_PHASES=(
   tidb-cert
   tidb-logical-roundtrip
   tidb-tiproxy
+  messaging
+  messaging-native
+  messaging-tls
   observability
   opensearch-security
   elasticsearch
@@ -62,10 +66,10 @@ Default phases:
   custom-env fixture-data fixture-images data-roundtrip compat pg-compat tidb
 
 Heavy phases:
-  dbtool-image compat-extra sqlserver cassandra cassandra-fixture tidb-secure
+  dbtool-image compat-extra sqlserver db2 cassandra cassandra-fixture tidb-secure
   tidb-ha tidb-pd tidb-pd-leader tidb-tikv-boundary tidb-cert
-  tidb-logical-roundtrip tidb-tiproxy observability opensearch-security
-  elasticsearch kafka-vendors redshift
+  tidb-logical-roundtrip tidb-tiproxy messaging messaging-native messaging-tls
+  observability opensearch-security elasticsearch kafka-vendors redshift
 EOF
 }
 
@@ -99,8 +103,12 @@ phase_description() {
     tidb-logical-roundtrip) echo "TiDB secure HA logical data roundtrip" ;;
     tidb-tiproxy) echo "TiDB secure HA TiProxy routing drill" ;;
     sqlserver) echo "SQL Server live SQL lifecycle" ;;
+    db2) echo "IBM Db2 live SQL and native admin lifecycle" ;;
     cassandra) echo "Cassandra CQL live lifecycle" ;;
     cassandra-fixture) echo "Cassandra CQL file-backed fixture data" ;;
+    messaging) echo "Redis, Kafka API, AMQP/RabbitMQ, and NATS workflows" ;;
+    messaging-native) echo "native librdkafka plus messaging regression workflows" ;;
+    messaging-tls) echo "AMQPS and NATS TLS workflows" ;;
     observability) echo "OpenSearch/TLS search and Prometheus workflows" ;;
     opensearch-security) echo "OpenSearch security-plugin HTTPS/basic-auth workflows" ;;
     elasticsearch) echo "product-native Elasticsearch search workflows" ;;
@@ -181,8 +189,12 @@ run_phase() {
     tidb-logical-roundtrip) "$ROOT/scripts/integration-tidb-logical-roundtrip-test.sh" ;;
     tidb-tiproxy) "$ROOT/scripts/integration-tidb-tiproxy-test.sh" ;;
     sqlserver) "$ROOT/scripts/integration-sqlserver-test.sh" ;;
+    db2) "$ROOT/scripts/integration-db2-test.sh" ;;
     cassandra) "$ROOT/scripts/integration-cassandra-test.sh" ;;
     cassandra-fixture) "$ROOT/scripts/integration-cassandra-fixture-data-test.sh" ;;
+    messaging) "$ROOT/scripts/integration-mq-test.sh" ;;
+    messaging-native) "$ROOT/scripts/integration-mq-native-test.sh" ;;
+    messaging-tls) "$ROOT/scripts/integration-mq-tls-test.sh" ;;
     observability) "$ROOT/scripts/integration-observability-test.sh" ;;
     opensearch-security) "$ROOT/scripts/integration-opensearch-security-test.sh" ;;
     elasticsearch) "$ROOT/scripts/integration-elasticsearch-test.sh" ;;

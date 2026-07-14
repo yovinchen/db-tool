@@ -49,8 +49,10 @@ DBTOOL_IT_DB_SUITE_DRY_RUN=1 DBTOOL_IT_DB_SUITE_PHASES=all ./scripts/integration
 `quick` means Compose config validation, service-free verification, plus the
 base database and flow-control live checks. `heavy` adds opt-in phases such as
 the dbtool Docker image smoke, SQL Server, Cassandra, TiDB secure HA drills,
-TiDB TiProxy, and observability. `DBTOOL_IT_DB_SUITE_CONTINUE=1` keeps running
-after a failed phase and reports all failed phase names at the end.
+TiDB TiProxy, Db2, plain/native/TLS messaging, and observability. `all` is the
+union of the default and heavy lists; it no longer omits protocol backends.
+`DBTOOL_IT_DB_SUITE_CONTINUE=1` keeps running after a failed phase and reports
+all failed phase names at the end.
 
 Run the live connection-config smoke when you need to verify
 `connections.toml` named connections against real Docker services:

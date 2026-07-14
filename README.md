@@ -222,7 +222,7 @@ names/credentials/ports smoke, fixture data/image checks, logical roundtrip
 checks, MariaDB/Valkey compatibility, PostgreSQL-family compatibility, and the
 single-topology TiDB compatibility script. Heavy phases such as the dbtool
 Docker image smoke, SQL Server, Cassandra, Cassandra fixture data, TiDB secure
-HA drills, and observability can be selected with
+HA drills, Db2, plain/native/TLS messaging, and observability can be selected with
 `DBTOOL_IT_DB_SUITE_PHASES=heavy` or `all`.
 
 Run the server-timeout smoke when you need to prove database-side execution
