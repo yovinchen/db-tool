@@ -134,6 +134,23 @@ assert_query_contains() {
   fi
 }
 
+assert_complete_fixture() {
+  local dsn="$1"
+  local table="$2"
+  local output
+
+  output="$(dbtool_cli --dsn "$dsn" sql query "select id, note from $table order by id")"
+  printf '%s' "$output" | python3 -c '
+import json,sys
+data=json.load(sys.stdin)
+assert data["data"]["rows"] == [
+    [1, "proxy-before-stop"],
+    [2, "proxy-while-node1-down"],
+    [3, "proxy-while-node2-down"],
+], data
+'
+}
+
 assert_identifier() {
   local value="$1"
   local label="$2"
@@ -184,13 +201,14 @@ compose ps tidb-secure-tiproxy
 database="$DBTOOL_IT_TIDB_SECURE_DB"
 assert_identifier "$database" "database"
 
-table="dbtool_tidb_tiproxy_$(date +%s)_$$"
+table="dbtool_it_tidb_tiproxy_$(date +%s)_$$"
 qualified_table="$database.$table"
-proxy_user="dbtool_proxy_ssl_$$"
+proxy_user="dbtool_it_proxy_ssl_$$"
 proxy_password="dbtool_proxy_ssl"
 proxy_user_account="$(mysql_account "$proxy_user")"
 proxy_user_password="$(mysql_password "$proxy_password")"
 proxy_user_dsn="tidb://$proxy_user:$proxy_password@127.0.0.1:${DBTOOL_IT_TIDB_TIPROXY_PORT}/${database}?ssl-mode=VERIFY_CA&ssl-ca=$DBTOOL_IT_TIDB_SECURE_CA"
+echo "TiDB TiProxy resources: table=$qualified_table user=$proxy_user"
 
 echo "TiDB TiProxy drill: preparing $qualified_table through direct secure SQL"
 sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "create database if not exists $database"
@@ -227,5 +245,10 @@ assert_query_contains "proxy user read after failover" "$proxy_user_dsn" "select
 echo "TiDB TiProxy drill: restarting SQL node 2"
 start_service tidb-secure-2
 wait_for_ping "SQL node 2 after restart" "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_2"
+wait_for_ping "TiProxy after SQL node 2 restart" "$proxy_user_dsn"
+assert_complete_fixture "$proxy_user_dsn" "$qualified_table"
+
+sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "drop table $qualified_table"
+sql_exec "$DBTOOL_IT_TIDB_SECURE_ROOT_DSN_1" "drop user $proxy_user_account"
 
 echo "TiDB TiProxy failover drill passed"
