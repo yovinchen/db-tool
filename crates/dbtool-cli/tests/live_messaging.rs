@@ -142,7 +142,7 @@ fn redis_live_stream_produce_detail_and_consume() {
     let Some(dsn) = dsn("DBTOOL_IT_REDIS_DSN") else {
         return;
     };
-    let stream = unique_name("dbtool_redis_stream");
+    let stream = unique_name("dbtool_it_redis_stream");
 
     let blocked = stderr_json(dbtool(&[
         "--dsn", &dsn, "mq", "produce", &stream, "blocked",
@@ -190,7 +190,7 @@ fn redis_live_stream_produce_detail_and_consume() {
         .contains('-'));
 
     // Create a consumer group at offset 0 so it sees the already-produced message as undelivered.
-    let group = unique_name("dbtool_redis_group");
+    let group = unique_name("dbtool_it_redis_group");
     stdout_json(dbtool(&[
         "--dsn",
         &dsn,
@@ -257,7 +257,7 @@ fn redis_live_pubsub_publish_and_subscribe_round_trip() {
     let Some(dsn) = dsn("DBTOOL_IT_REDIS_DSN") else {
         return;
     };
-    let channel = format!("pubsub:{}", unique_name("dbtool_redis_channel"));
+    let channel = format!("pubsub:{}", unique_name("dbtool_it_redis_channel"));
 
     let consumer = Command::new(env!("CARGO_BIN_EXE_dbtool"))
         .args([
@@ -316,7 +316,7 @@ fn kafka_live_topic_produce_detail_and_consume() {
     let Some(dsn) = dsn("DBTOOL_IT_KAFKA_DSN") else {
         return;
     };
-    run_kafka_smoke(&dsn, "kafka", "dbtool_kafka_topic", "kafka-payload");
+    run_kafka_smoke(&dsn, "kafka", "dbtool_it_kafka_topic", "kafka-payload");
 }
 
 #[test]
@@ -329,19 +329,19 @@ fn vendor_kafka_compatible_smoke_profiles() {
         (
             "DBTOOL_IT_AUTOMQ_DSN",
             "automq",
-            "dbtool_automq_topic",
+            "dbtool_it_automq_topic",
             "automq-payload",
         ),
         (
             "DBTOOL_IT_WARPSTREAM_DSN",
             "warpstream",
-            "dbtool_warpstream_topic",
+            "dbtool_it_warpstream_topic",
             "warpstream-payload",
         ),
         (
             "DBTOOL_IT_CONFLUENT_DSN",
             "confluent",
-            "dbtool_confluent_topic",
+            "dbtool_it_confluent_topic",
             "confluent-payload",
         ),
     ];
@@ -415,7 +415,7 @@ fn amqp_live_queue_produce_detail_and_consume() {
     let Some(dsn) = dsn("DBTOOL_IT_AMQP_DSN") else {
         return;
     };
-    let queue = unique_name("dbtool_amqp_queue");
+    let queue = unique_name("dbtool_it_amqp_queue");
 
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "mq", "produce", &queue, "blocked"]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
@@ -470,7 +470,7 @@ fn rabbitmq_management_live_lists_detail_and_queue_lag() {
     let Some(management_dsn) = dsn("DBTOOL_IT_RABBITMQ_MANAGEMENT_DSN") else {
         return;
     };
-    let queue = unique_name("dbtool_rabbitmq_mgmt_queue");
+    let queue = unique_name("dbtool_it_rabbitmq_mgmt_queue");
 
     let produced = stdout_json_retry(&[
         "--dsn",
@@ -562,7 +562,7 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
     let Some(dsn) = dsn("DBTOOL_IT_AMQPS_DSN") else {
         return;
     };
-    let queue = unique_name("dbtool_amqps_queue");
+    let queue = unique_name("dbtool_it_amqps_queue");
 
     let ping = stdout_json_retry(&["--dsn", &dsn, "ping"]);
     assert_eq!(ping["kind"], "amqps");
@@ -618,7 +618,7 @@ fn nats_live_publish_and_subscribe_round_trip() {
     let Some(dsn) = dsn("DBTOOL_IT_NATS_DSN") else {
         return;
     };
-    let subject = unique_subject("dbtool_nats_subject");
+    let subject = unique_subject("dbtool_it_nats_subject");
 
     let blocked = stderr_json(dbtool(&[
         "--dsn", &dsn, "mq", "produce", &subject, "blocked",
@@ -669,7 +669,7 @@ fn nats_live_jetstream_admin_lists_detail_and_lag() {
     let Some(dsn) = dsn("DBTOOL_IT_NATS_DSN") else {
         return;
     };
-    let stream = unique_name("DBTOOLNATSSTREAM").to_ascii_uppercase();
+    let stream = unique_name("DBTOOL_IT_NATS_STREAM").to_ascii_uppercase();
     let subject = format!("{}.events", stream.to_ascii_lowercase());
     let consumer = "DBTOOLCONSUMER";
 
@@ -759,7 +759,7 @@ fn nats_mq_tls_live_publish_subscribe_and_jetstream_admin() {
     let Some(dsn) = dsn("DBTOOL_IT_NATS_TLS_DSN") else {
         return;
     };
-    let subject = unique_subject("dbtool_nats_tls_subject");
+    let subject = unique_subject("dbtool_it_nats_tls_subject");
 
     let ping = stdout_json_retry(&["--dsn", &dsn, "ping"]);
     assert_eq!(ping["kind"], "nats+tls");
@@ -805,7 +805,7 @@ fn nats_mq_tls_live_publish_subscribe_and_jetstream_admin() {
     let consumed = stdout_json(output);
     assert_eq!(payload_text(&consumed["data"][0]), "nats-tls-payload");
 
-    let stream = unique_name("DBTOOLNATSTLSSTREAM").to_ascii_uppercase();
+    let stream = unique_name("DBTOOL_IT_NATS_TLS_STREAM").to_ascii_uppercase();
     let stream_subject = format!("{}.events", stream.to_ascii_lowercase());
     let jetstream_consumer = "DBTOOLTLSCONSUMER";
 
