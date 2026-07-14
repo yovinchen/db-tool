@@ -60,9 +60,9 @@ usable.
 | AMQP/RabbitMQ | `amqp://`, `amqps://` | AMQP | produce, consume, queue detail | RabbitMQ plain and AMQPS TLS live tests |
 | RabbitMQ management | `rabbitmq+http://` | RabbitMQ HTTP admin | queue list, detail, lag | RabbitMQ management live test |
 | NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS plain and TLS live tests |
-| OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list, search, single-document index | Service-free HTTP/TLS mapping tests, real OpenSearch plain HTTP live profile, HTTPS compatible harness, and opt-in OpenSearch security-plugin HTTPS/basic-auth profile |
-| Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | Routed to OpenSearch-compatible HTTP adapter | Service-free HTTP/TLS mapping tests plus product-native Elasticsearch Docker live profile for `elasticsearch://` |
-| Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list, range query, and remote write | Service-free adapter tests plus Prometheus live profile |
+| OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list, search, document index, hard limit/pagination | Exact three-document real HTTP run, HTTPS fixture, and real security-plugin HTTPS/basic-auth plus negative auth/trust checks |
+| Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | OpenSearch-compatible index/search/list/limit surface | Exact three-document product-native HTTP run; product-native HTTPS remains explicit boundary |
+| Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list, bounded range query, and remote write | Exact two-series tagged/timestamped remote-write readback against Prometheus 2.55.1 |
 
 ## Docker Service Profiles
 
@@ -98,7 +98,7 @@ usable.
 | `./scripts/integration-kafka-vendor-test.sh` | Externally supplied AutoMQ, WarpStream, Confluent endpoints | Env-gated native Kafka smoke for ping, topics, produce, detail, and consume; no secrets are committed | Skips when no vendor DSN env vars are supplied |
 | `./scripts/integration-observability-test.sh` | OpenSearch, Dockerfile-built OpenSearch-compatible HTTPS harness, Prometheus | Search, seeded search TLS transport, and time-series workflows | Roughly 1.4 GiB container memory |
 | `./scripts/integration-opensearch-security-test.sh` | OpenSearch security plugin | Real OpenSearch HTTPS/basic-auth with generated local CA/node certs and `tls-ca` validation | Roughly 1.5 GiB container memory; opt-in heavy/local-only while CI budget is frozen |
-| `./scripts/integration-elasticsearch-test.sh` | Elasticsearch | Product-native `elasticsearch://` ping, write guard, single-document indexing, search, and index listing | Roughly 1.5 GiB container memory; opt-in heavy/local-only while CI budget is frozen |
+| `./scripts/integration-elasticsearch-test.sh` | Elasticsearch | Product-native `elasticsearch://` ping/caps, write guard, exact three-document indexing/readback, pagination, limit, truncation, and index listing | Roughly 1.5 GiB container memory; opt-in heavy/local-only while CI budget is frozen |
 | `./scripts/integration-db2-test.sh` | IBM Db2 Community Edition | SQL lifecycle, schema inspection, write guard, alias verification, `db2` subcommand (sequences, routines, tablespaces, foreign-keys, ddl) | Requires IBM Data Server Driver for ODBC at runtime; roughly 4 GiB container memory; startup up to 10 min; opt-in heavy/local-only |
 
 ## Implemented CLI Operations

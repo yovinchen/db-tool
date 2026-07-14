@@ -422,7 +422,7 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, TiDB TiProxy, Valkey, KeyDB, and Dragonfly compatibility profiles.
-- OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, search, and single-document indexing; covered by service-free HTTP/TLS mapping tests, plain HTTP OpenSearch live tests, and HTTPS live transport tests.
+- OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, document indexing, search, hard result limits, pagination, and truncation; covered by exact real-product HTTP runs, TLS transport fixtures, and OpenSearch security-plugin auth/trust checks.
 - Prometheus HTTP time-series adapter: implemented for metric listing and range queries, with read-only semantics.
 - SQL Server and Cassandra/ScyllaDB adapters: implemented and registered, with service-free adapter coverage plus opt-in Docker integration profiles; Cassandra has passed local live coverage, and SQL Server has passed live coverage on GitHub Actions x86_64 runners.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.

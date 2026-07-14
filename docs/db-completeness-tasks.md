@@ -65,10 +65,10 @@ being created and is normalized in the final campaign summary.
 | DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | this commit; atomic NX+TTL refreshed |
 | DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | this commit; atomic NX+TTL refreshed |
 | DB-MONGO-001 | Document | MongoDB `mongodb://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mongodb.md` | this commit; public API empties collections and volume teardown drops them |
-| DB-OPENSEARCH-001 | Search | OpenSearch `opensearch://` | Docker observability | Ready | NOT_RUN | - | public API has no update/delete |
-| DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | NOT_RUN | - | public API has no update/delete |
-| DB-ELASTICSEARCH-001 | Search | Elasticsearch `elasticsearch://` | Docker elasticsearch | Ready | NOT_RUN | - | product-native HTTPS is not covered |
-| DB-PROMETHEUS-001 | Time series | Prometheus `prometheus://` | Docker observability | Ready | NOT_RUN | - | delete/update are not applicable |
+| DB-OPENSEARCH-001 | Search | OpenSearch `opensearch://` | Docker observability | Ready | COMPLETE | `docs/test-evidence/opensearch.md` | this commit; exact three-document and pagination run; update/delete unsupported |
+| DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | COMPLETE | `docs/test-evidence/opensearch-security.md` | this commit; real plugin, CA/auth positive and negative checks |
+| DB-ELASTICSEARCH-001 | Search | Elasticsearch `elasticsearch://` | Docker elasticsearch | Ready | COMPLETE | `docs/test-evidence/elasticsearch.md` | this commit; exact plain HTTP run; product-native HTTPS not covered |
+| DB-PROMETHEUS-001 | Time series | Prometheus `prometheus://` | Docker observability | Ready | COMPLETE | `docs/test-evidence/prometheus.md` | this commit; exact remote-write/readback/global-limit run |
 | DB-REDIS-MQ-001 | Messaging | Redis Streams/PubSub | Docker messaging | Ready | COMPLETE | `docs/test-evidence/redis-messaging.md` | this commit; Streams deleted, Pub/Sub ephemeral |
 | DB-KAFKA-001 | Messaging | Kafka API on Redpanda | Docker messaging | Ready | COMPLETE | `docs/test-evidence/kafka-redpanda.md` | this commit; pure/native and `kafka://`/`redpanda://`; lag/delete unsupported |
 | DB-RABBITMQ-001 | Messaging | AMQP + RabbitMQ management | Docker messaging | Ready | COMPLETE | `docs/test-evidence/rabbitmq.md` | this commit; confirms/acks/drain and management lag passed |

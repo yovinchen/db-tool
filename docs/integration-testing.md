@@ -430,8 +430,9 @@ OpenSearch security-plugin TLS coverage uses a separate heavier profile:
 
 The script generates a short-lived local CA and OpenSearch node certificate,
 starts the real OpenSearch security plugin with HTTPS/basic auth, then validates
-`opensearch+https://admin:...?...tls-ca=...` ping, write guard,
-single-document indexing, search, and index listing through dbtool.
+`opensearch+https://admin:...?...tls-ca=...` ping/caps, write guard, exact
+three-document indexing/readback, limit, pagination/truncation, index listing,
+wrong-password rejection, and missing-CA rejection through dbtool.
 
 Product-native Elasticsearch uses a separate opt-in profile so the shared
 OpenSearch-compatible adapter can be checked against Elasticsearch response
@@ -442,8 +443,9 @@ drift without making the observability suite heavier:
 ```
 
 The script starts Elasticsearch with security disabled for the disposable local
-profile, then validates `elasticsearch://` ping, write guard, single-document
-indexing, search, and index listing through dbtool.
+profile, then validates `elasticsearch://` ping/caps, write guard, exact
+three-document indexing/readback, limit, pagination/truncation, and index
+listing through dbtool.
 
 ## Custom Names And Ports
 
@@ -826,10 +828,10 @@ The live tests cover:
 - RabbitMQ queue publish, passive detail/message count, acked consume, write guard, and HTTP management queue listing/detail/lag.
 - NATS live subscribe/publish round trip, JetStream topics/detail/lag, and write guard.
 - AMQPS queue publish/detail/consume and NATS TLS publish/subscribe plus JetStream topics/detail/lag through local CA-backed TLS services.
-- OpenSearch ping, write guard, single-document indexing, search, and index listing over plain HTTP plus TLS transport through `opensearch+https://`.
+- OpenSearch ping/caps, write guard, exact three-document indexing/readback, hard limit, pagination/truncation, and index listing over plain HTTP plus TLS transport through `opensearch+https://`.
 - OpenSearch TLS harness fixture loading by searching the seeded `dbtool_it_seed` index from the Dockerfile-built image.
 - OpenSearch security-plugin HTTPS/basic-auth through generated local CA/node certificates and `tls-ca` validation.
-- Elasticsearch ping, write guard, single-document indexing, search, and index listing against the product-native Elasticsearch image.
-- Prometheus ping, metric listing, and range query through `ts`.
+- Elasticsearch ping/caps, write guard, exact three-document indexing/readback, hard limit, pagination/truncation, and index listing against the product-native Elasticsearch image.
+- Prometheus ping/caps, guarded remote write, dynamic metric listing, exact tagged/timestamped two-series readback, invalid-window rejection, and global sample limiting through `ts`.
 
 Core NATS and Redis Pub/Sub do not expose durable subject/channel listing, and AMQP 0.9.1 does not expose queue listing without RabbitMQ management APIs; use an explicit `rabbitmq+http://` management DSN for RabbitMQ queue discovery.
