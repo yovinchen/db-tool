@@ -186,9 +186,9 @@ impl SqlEngine for PostgresAdapter {
              JOIN pg_index ix ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
-             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkeys) \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) \
              WHERE t.relname = $1 AND n.nspname = $2 \
-             ORDER BY i.relname, array_position(ix.indkeys, a.attnum)",
+             ORDER BY i.relname, array_position(ix.indkey, a.attnum)",
         )
         .bind(&table_ref.name)
         .bind(schema)
