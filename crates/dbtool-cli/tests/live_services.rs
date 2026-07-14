@@ -614,9 +614,11 @@ fn mysql_password(password: &str) -> String {
 }
 
 fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
-    let key = unique_name(&format!("dbtool_it_{prefix}_key"));
-    let ttl_key = unique_name(&format!("dbtool_it_{prefix}_ttl"));
-    let raw_key = unique_name(&format!("dbtool_it_{prefix}_raw"));
+    let resource_prefix = unique_name(&format!("dbtool_it_{prefix}"));
+    let key = format!("{resource_prefix}:value");
+    let ttl_key = format!("{resource_prefix}:ttl");
+    let raw_key = format!("{resource_prefix}:raw");
+    eprintln!("dbtool test resources: {expected_kind} keys={key},{ttl_key},{raw_key}");
 
     let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
     assert_eq!(ping["kind"], expected_kind);
@@ -625,6 +627,9 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
     let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
     assert_eq!(caps["kind"], expected_kind);
     assert_eq!(caps["data"]["key_value"], true);
+
+    let blocked_set = stderr_json(dbtool(&["--dsn", dsn, "kv", "set", &key, "blocked"]));
+    assert_eq!(blocked_set["error"]["code"], "WRITE_NOT_ALLOWED");
 
     stdout_json(dbtool(&[
         "--dsn",
@@ -637,6 +642,22 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
     ]));
     let value = stdout_json(dbtool(&["--dsn", dsn, "kv", "get", &key]));
     assert_eq!(value["data"]["value"], expected_kind);
+
+    let updated_value = format!("{expected_kind}-updated");
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &key,
+        &updated_value,
+    ]));
+    let overwritten = stdout_json(dbtool(&["--dsn", dsn, "kv", "get", &key]));
+    assert_eq!(overwritten["data"]["value"], updated_value);
+
+    let pong = stdout_json(dbtool(&["--dsn", dsn, "kv", "raw", "PING"]));
+    assert_eq!(pong["data"], "PONG");
 
     let blocked_raw_set = stderr_json(dbtool(&[
         "--dsn",
@@ -676,6 +697,31 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
     let ttl = ttl["data"].as_i64().expect("TTL should be numeric");
     assert!((1..=30).contains(&ttl), "unexpected TTL value: {ttl}");
 
+    let scan = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--limit",
+        "2",
+        "kv",
+        "scan",
+        &format!("{resource_prefix}:*"),
+    ]));
+    assert_eq!(scan["data"].as_array().unwrap().len(), 2);
+    assert_eq!(scan["meta"]["truncated"], true);
+
+    let fixture_values = [
+        (&key, updated_value.as_str()),
+        (&ttl_key, "short-lived"),
+        (&raw_key, "raw-value"),
+    ];
+    for (fixture_key, expected) in fixture_values {
+        let value = stdout_json(dbtool(&["--dsn", dsn, "kv", "get", fixture_key]));
+        assert_eq!(value["data"]["value"], expected);
+    }
+
+    let blocked_flush = stderr_json(dbtool(&["--dsn", dsn, "kv", "raw", "FLUSHALL"]));
+    assert_eq!(blocked_flush["error"]["code"], "WRITE_NOT_ALLOWED");
+
     let deleted = stdout_json(dbtool(&[
         "--dsn",
         dsn,
@@ -687,6 +733,19 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
         &raw_key,
     ]));
     assert_eq!(deleted["data"]["deleted"], 3);
+
+    for (fixture_key, _) in fixture_values {
+        let missing = stdout_json(dbtool(&["--dsn", dsn, "kv", "get", fixture_key]));
+        assert_eq!(missing["data"]["value"], Value::Null);
+    }
+    let empty_scan = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "kv",
+        "scan",
+        &format!("{resource_prefix}:*"),
+    ]));
+    assert_eq!(empty_scan["data"], serde_json::json!([]));
 }
 
 #[test]
