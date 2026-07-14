@@ -179,6 +179,14 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
         "exec",
         &format!("insert into {table} (id, name) values (1, 'alice')"),
     ]));
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &format!("insert into {table} (id, name) values (2, 'bob')"),
+    ]));
 
     let rows = stdout_json(dbtool(&[
         "--dsn",
@@ -189,6 +197,41 @@ fn sql_lifecycle(dsn: &str, table: &str, create_sql: String, drop_sql: String) {
     ]));
     assert_eq!(rows["data"]["rows"][0][0], 1);
     assert_eq!(rows["data"]["rows"][0][1], "alice");
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &format!("update {table} set name = 'alice-updated' where id = 1"),
+    ]));
+    let updated = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        &format!("select id, name from {table} where id = 1"),
+    ]));
+    assert_eq!(updated["data"]["rows"][0][0], 1);
+    assert_eq!(updated["data"]["rows"][0][1], "alice-updated");
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        &format!("delete from {table} where id = 2"),
+    ]));
+    let deleted = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        &format!("select id, name from {table} where id = 2"),
+    ]));
+    assert_eq!(deleted["data"]["rows"], serde_json::json!([]));
 
     let schema = stdout_json(dbtool(&["--dsn", dsn, "sql", "schema", table]));
     assert_eq!(schema["ok"], true);
@@ -256,6 +299,10 @@ fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
         dsn,
         &format!("insert into {qualified_table} (id, name) values (1, 'alice')"),
     );
+    cql_exec(
+        dsn,
+        &format!("insert into {qualified_table} (id, name) values (2, 'bob')"),
+    );
 
     let rows = stdout_json(dbtool(&[
         "--dsn",
@@ -266,6 +313,30 @@ fn cql_lifecycle(dsn: &str, keyspace: &str, table: &str) {
     ]));
     assert_eq!(rows["data"]["rows"][0][0], 1);
     assert_eq!(rows["data"]["rows"][0][1], "alice");
+
+    cql_exec(
+        dsn,
+        &format!("update {qualified_table} set name = 'alice-updated' where id = 1"),
+    );
+    let updated = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "query",
+        &format!("select id, name from {qualified_table} where id = 1"),
+    ]));
+    assert_eq!(updated["data"]["rows"][0][0], 1);
+    assert_eq!(updated["data"]["rows"][0][1], "alice-updated");
+
+    cql_exec(dsn, &format!("delete from {qualified_table} where id = 2"));
+    let deleted = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "cql",
+        "query",
+        &format!("select id, name from {qualified_table} where id = 2"),
+    ]));
+    assert_eq!(deleted["data"]["rows"], serde_json::json!([]));
 
     let schema = stdout_json(dbtool(&[
         "--dsn",
@@ -1038,6 +1109,9 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     }
     let deleted = stdout_json(dbtool(&delete_args));
     assert_eq!(deleted["data"]["deleted"], 7);
+
+    let missing = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", &key]));
+    assert_eq!(missing["data"]["value"], Value::Null);
 }
 
 #[test]
@@ -1152,6 +1226,16 @@ fn mongo_live_document_lifecycle() {
         r#"{"name":"alice","visits":1}"#,
     ]));
     assert_eq!(inserted["data"]["inserted"], 1);
+    let inserted_bob = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "insert",
+        &collection,
+        r#"{"name":"bob","visits":3}"#,
+    ]));
+    assert_eq!(inserted_bob["data"]["inserted"], 1);
 
     let collections = stdout_json(dbtool(&["--dsn", &dsn, "doc", "collections"]));
     assert!(
@@ -1198,6 +1282,18 @@ fn mongo_live_document_lifecycle() {
     ]));
     assert_eq!(aggregated["data"][0]["visits"], 2);
 
+    let deleted_bob = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "delete",
+        &collection,
+        "--filter",
+        r#"{"name":"bob"}"#,
+    ]));
+    assert_eq!(deleted_bob["data"]["deleted"], 1);
+
     let deleted = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
@@ -1209,6 +1305,17 @@ fn mongo_live_document_lifecycle() {
         r#"{"name":"alice"}"#,
     ]));
     assert_eq!(deleted["data"]["deleted"], 1);
+
+    let empty = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &collection,
+        "--filter",
+        "{}",
+    ]));
+    assert_eq!(empty["data"], serde_json::json!([]));
 }
 
 // ── IBM Db2 live tests ────────────────────────────────────────────────────────
@@ -1224,7 +1331,7 @@ fn db2_live_sql_lifecycle_and_schema_inspection() {
 
     // ping
     let ping = stdout_json(dbtool(&["--dsn", &dsn, "ping"]));
-    assert_eq!(ping["status"], "ok", "DB2 ping failed: {ping}");
+    assert_eq!(ping["ok"], true, "DB2 ping failed: {ping}");
 
     // caps — must include sql
     let caps = stdout_json(dbtool(&["--dsn", &dsn, "caps"]));
@@ -1233,11 +1340,11 @@ fn db2_live_sql_lifecycle_and_schema_inspection() {
     // ibmdb2 alias resolves to the same adapter
     let alias_dsn = dsn_with_scheme(&dsn, "ibmdb2");
     let alias_ping = stdout_json(dbtool(&["--dsn", &alias_dsn, "ping"]));
-    assert_eq!(alias_ping["status"], "ok", "ibmdb2:// alias ping failed");
+    assert_eq!(alias_ping["ok"], true, "ibmdb2:// alias ping failed");
 
     // list schemas — expect at least one non-system schema
     let schemas = stdout_json(dbtool(&["--dsn", &dsn, "sql", "tables"]));
-    assert_eq!(schemas["status"], "ok", "sql tables failed: {schemas}");
+    assert_eq!(schemas["ok"], true, "sql tables failed: {schemas}");
 
     // write guard — exec must be blocked without --allow-write
     let table = format!(
@@ -1245,22 +1352,15 @@ fn db2_live_sql_lifecycle_and_schema_inspection() {
         unique_name("DBTOOL_DB2_TEST").to_ascii_uppercase()
     );
     let create_sql = format!("CREATE TABLE {table} (id INTEGER NOT NULL, name VARCHAR(64))");
-    let blocked = stdout_json(dbtool(&["--dsn", &dsn, "sql", "exec", &create_sql]));
+    let blocked = stderr_json(dbtool(&["--dsn", &dsn, "sql", "exec", &create_sql]));
     assert_eq!(
-        blocked["error"]["code"], "WRITE_NOT_ALLOWED",
-        "exec without --allow-write must be blocked"
+        blocked["error"]["code"], "CONFIRM_REQUIRED",
+        "destructive DDL must require a confirmation token"
     );
 
     // create table
-    let created = stdout_json(dbtool(&[
-        "--dsn",
-        &dsn,
-        "--allow-write",
-        "sql",
-        "exec",
-        &create_sql,
-    ]));
-    assert_eq!(created["status"], "ok", "CREATE TABLE failed: {created}");
+    let created = confirmed_sql_exec(&dsn, &create_sql);
+    assert_eq!(created["ok"], true, "CREATE TABLE failed: {created}");
 
     // insert row
     let insert_sql = format!("INSERT INTO {table} VALUES (1, 'alice')");
@@ -1281,16 +1381,13 @@ fn db2_live_sql_lifecycle_and_schema_inspection() {
         "query",
         &format!("SELECT id, name FROM {table}"),
     ]));
-    assert_eq!(rows["status"], "ok", "SELECT failed: {rows}");
+    assert_eq!(rows["ok"], true, "SELECT failed: {rows}");
     assert_eq!(rows["data"]["rows"][0][0], 1);
     assert_eq!(rows["data"]["rows"][0][1], "alice");
 
     // schema inspection
     let schema_out = stdout_json(dbtool(&["--dsn", &dsn, "sql", "schema", &table]));
-    assert_eq!(
-        schema_out["status"], "ok",
-        "sql schema failed: {schema_out}"
-    );
+    assert_eq!(schema_out["ok"], true, "sql schema failed: {schema_out}");
     let cols = &schema_out["data"]["columns"];
     assert!(
         cols.as_array().is_some_and(|c| !c.is_empty()),
@@ -1299,15 +1396,8 @@ fn db2_live_sql_lifecycle_and_schema_inspection() {
 
     // drop table
     let drop_sql = format!("DROP TABLE {table}");
-    let dropped = stdout_json(dbtool(&[
-        "--dsn",
-        &dsn,
-        "--allow-write",
-        "sql",
-        "exec",
-        &drop_sql,
-    ]));
-    assert_eq!(dropped["status"], "ok", "DROP TABLE failed: {dropped}");
+    let dropped = confirmed_sql_exec(&dsn, &drop_sql);
+    assert_eq!(dropped["ok"], true, "DROP TABLE failed: {dropped}");
 }
 
 #[test]
@@ -1321,17 +1411,17 @@ fn db2_live_db2_subcommand_schema_inspection() {
 
     // ── db2 schemas ──────────────────────────────────────────────────────────
     let schemas = stdout_json(dbtool(&["--dsn", &dsn, "db2", "schemas"]));
-    assert_eq!(schemas["status"], "ok", "db2 schemas failed: {schemas}");
+    assert_eq!(schemas["ok"], true, "db2 schemas failed: {schemas}");
 
     // ── db2 tables ───────────────────────────────────────────────────────────
     let tables = stdout_json(dbtool(&[
         "--dsn", &dsn, "db2", "tables", "--schema", "DB2INST1",
     ]));
-    assert_eq!(tables["status"], "ok", "db2 tables failed: {tables}");
+    assert_eq!(tables["ok"], true, "db2 tables failed: {tables}");
 
     // ── db2 tablespaces ──────────────────────────────────────────────────────
     let tsp = stdout_json(dbtool(&["--dsn", &dsn, "db2", "tablespaces"]));
-    assert_eq!(tsp["status"], "ok", "db2 tablespaces failed: {tsp}");
+    assert_eq!(tsp["ok"], true, "db2 tablespaces failed: {tsp}");
     assert!(
         tsp["data"].as_array().is_some_and(|a| !a.is_empty()),
         "every Db2 database has at least one tablespace"
@@ -1346,38 +1436,31 @@ fn db2_live_db2_subcommand_schema_inspection() {
         "--schema",
         "DB2INST1",
     ]));
-    assert_eq!(seqs["status"], "ok", "db2 sequences failed: {seqs}");
+    assert_eq!(seqs["ok"], true, "db2 sequences failed: {seqs}");
 
     // ── db2 routines ─────────────────────────────────────────────────────────
     let rts = stdout_json(dbtool(&[
         "--dsn", &dsn, "db2", "routines", "--schema", "DB2INST1",
     ]));
-    assert_eq!(rts["status"], "ok", "db2 routines failed: {rts}");
+    assert_eq!(rts["ok"], true, "db2 routines failed: {rts}");
 
     // ── Set up a test table with a PK + FK for schema / fk / ddl tests ──────
     let base = unique_name("DBTOOL_DB2_INSP").to_ascii_uppercase();
     let parent = format!("DB2INST1.{base}_PARENT");
     let child = format!("DB2INST1.{base}_CHILD");
 
-    stdout_json(dbtool(&[
-        "--dsn",
+    confirmed_sql_exec(
         &dsn,
-        "--allow-write",
-        "sql",
-        "exec",
         &format!("CREATE TABLE {parent} (id INTEGER NOT NULL, PRIMARY KEY (id))"),
-    ]));
-    stdout_json(dbtool(&[
-        "--dsn", &dsn, "--allow-write", "sql", "exec",
+    );
+    confirmed_sql_exec(
+        &dsn,
         &format!("CREATE TABLE {child} (id INTEGER NOT NULL, parent_id INTEGER, PRIMARY KEY (id), FOREIGN KEY (parent_id) REFERENCES {parent}(id))"),
-    ]));
+    );
 
     // db2 schema
     let schema_out = stdout_json(dbtool(&["--dsn", &dsn, "db2", "schema", &child]));
-    assert_eq!(
-        schema_out["status"], "ok",
-        "db2 schema failed: {schema_out}"
-    );
+    assert_eq!(schema_out["ok"], true, "db2 schema failed: {schema_out}");
     let cols = &schema_out["data"]["columns"];
     assert!(
         cols.as_array().is_some_and(|c| !c.is_empty()),
@@ -1386,7 +1469,7 @@ fn db2_live_db2_subcommand_schema_inspection() {
 
     // db2 foreign-keys
     let fks = stdout_json(dbtool(&["--dsn", &dsn, "db2", "foreign-keys", &child]));
-    assert_eq!(fks["status"], "ok", "db2 foreign-keys failed: {fks}");
+    assert_eq!(fks["ok"], true, "db2 foreign-keys failed: {fks}");
     assert!(
         fks["data"].as_array().is_some_and(|a| !a.is_empty()),
         "child table must have at least one FK"
@@ -1394,7 +1477,7 @@ fn db2_live_db2_subcommand_schema_inspection() {
 
     // db2 ddl
     let ddl_out = stdout_json(dbtool(&["--dsn", &dsn, "db2", "ddl", &parent]));
-    assert_eq!(ddl_out["status"], "ok", "db2 ddl failed: {ddl_out}");
+    assert_eq!(ddl_out["ok"], true, "db2 ddl failed: {ddl_out}");
     let ddl_str = ddl_out["data"].as_str().unwrap_or("");
     assert!(
         ddl_str.contains("CREATE TABLE"),
@@ -1402,20 +1485,6 @@ fn db2_live_db2_subcommand_schema_inspection() {
     );
 
     // cleanup
-    stdout_json(dbtool(&[
-        "--dsn",
-        &dsn,
-        "--allow-write",
-        "sql",
-        "exec",
-        &format!("DROP TABLE {child}"),
-    ]));
-    stdout_json(dbtool(&[
-        "--dsn",
-        &dsn,
-        "--allow-write",
-        "sql",
-        "exec",
-        &format!("DROP TABLE {parent}"),
-    ]));
+    confirmed_sql_exec(&dsn, &format!("DROP TABLE {child}"));
+    confirmed_sql_exec(&dsn, &format!("DROP TABLE {parent}"));
 }
