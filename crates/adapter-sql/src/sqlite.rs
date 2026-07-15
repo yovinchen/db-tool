@@ -2,14 +2,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind,
-        TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ResultSet, TableInfo,
+        TableKind, TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ResultLimiter,
+    service::limiter::{MetadataLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, TryStreamExt};
 use sqlx::query::Query;
@@ -17,7 +17,7 @@ use sqlx::sqlite::{SqliteArguments, SqlitePoolOptions};
 use sqlx::{types::Json, Column, Row, Sqlite, SqlitePool};
 
 use crate::{
-    bounded_catalog_limit,
+    bounded_catalog_limit, bounded_metadata_limit,
     identifier::{parse_table_ref, validate_optional_schema},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, sqlite_value},
@@ -80,6 +80,7 @@ impl Connector for SqliteAdapter {
             CapabilityOperation::SqlInsertRowsAtomic,
             CapabilityOperation::SqlListSchemasBounded,
             CapabilityOperation::SqlListTablesBounded,
+            CapabilityOperation::SqlDescribeTableBounded,
         ]);
         operations
     }
@@ -510,6 +511,191 @@ impl SqlEngine for SqliteAdapter {
             indexes,
         })
     }
+
+    async fn describe_table_bounded(
+        &self,
+        table: &str,
+        budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        let table_ref = parse_table_ref(table)?;
+        let schema = table_ref.schema.as_deref().unwrap_or("main");
+        let mut limiter = MetadataLimiter::new(
+            budget,
+            format!("SQLite table schema {schema}.{}", table_ref.name),
+        )?;
+        let catalog = sqlite_catalog(schema);
+
+        let relation = sqlx::query(&format!(
+            "SELECT name, type FROM {catalog} \
+             WHERE name = ? COLLATE NOCASE AND type IN ('table','view')"
+        ))
+        .bind(&table_ref.name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+        let Some(relation) = relation else {
+            return Err(Error::Query(format!(
+                "SQLite table or view does not exist: {schema}.{}",
+                table_ref.name
+            )));
+        };
+        let relation_name = relation
+            .try_get::<String, _>(0)
+            .map_err(|error| Error::Query(error.to_string()))?;
+
+        let column_limit = bounded_metadata_limit(&limiter, "SQLite")?;
+        let column_rows = sqlx::query(
+            "SELECT name, type, \"notnull\", dflt_value, pk \
+             FROM pragma_table_xinfo(?, ?) ORDER BY cid LIMIT ?",
+        )
+        .bind(&relation_name)
+        .bind(schema)
+        .bind(column_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+
+        let mut raw_columns = Vec::with_capacity(column_rows.len());
+        for row in column_rows {
+            let name = row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let type_name = row
+                .try_get::<String, _>(1)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let declared_not_null = row
+                .try_get::<i32, _>(2)
+                .map_err(|error| Error::Query(error.to_string()))?
+                != 0;
+            let default_value = row
+                .try_get::<Option<String>, _>(3)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let primary_position = row
+                .try_get::<i32, _>(4)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let column = ColumnMeta {
+                name,
+                type_name,
+                nullable: !declared_not_null,
+                default_value,
+                primary_key: primary_position > 0,
+            };
+            limiter.observe(&column)?;
+            raw_columns.push((column, declared_not_null, primary_position));
+        }
+        if raw_columns.is_empty() {
+            return Err(Error::Query(format!(
+                "SQLite table or view has no readable columns: {schema}.{relation_name}"
+            )));
+        }
+
+        let index_limit = bounded_metadata_limit(&limiter, "SQLite")?;
+        let index_rows = sqlx::query(
+            "SELECT name, \"unique\", origin \
+             FROM pragma_index_list(?, ?) ORDER BY seq LIMIT ?",
+        )
+        .bind(&relation_name)
+        .bind(schema)
+        .bind(index_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+
+        let mut indexes = Vec::with_capacity(index_rows.len());
+        for index_row in index_rows {
+            let index_name = index_row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let unique = index_row
+                .try_get::<i32, _>(1)
+                .map_err(|error| Error::Query(error.to_string()))?
+                != 0;
+            let origin = index_row
+                .try_get::<String, _>(2)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            limiter.observe(&(index_name.as_str(), unique, origin.as_str()))?;
+
+            let membership_limit = bounded_metadata_limit(&limiter, "SQLite")?;
+            let membership_rows = sqlx::query(
+                "SELECT seqno, name FROM pragma_index_info(?, ?) ORDER BY seqno LIMIT ?",
+            )
+            .bind(&index_name)
+            .bind(schema)
+            .bind(membership_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+            if membership_rows.is_empty() {
+                return Err(Error::Serialization(format!(
+                    "SQLite index {schema}.{index_name} has no readable key columns"
+                )));
+            }
+
+            let mut columns = Vec::with_capacity(membership_rows.len());
+            for membership_row in membership_rows {
+                let sequence = membership_row
+                    .try_get::<i32, _>(0)
+                    .map_err(|error| Error::Query(error.to_string()))?;
+                let column = membership_row
+                    .try_get::<Option<String>, _>(1)
+                    .map_err(|error| Error::Query(error.to_string()))?
+                    .unwrap_or_else(|| format!("<expression:{sequence}>"));
+                limiter.observe(&column)?;
+                columns.push(column);
+            }
+            indexes.push(IndexInfo {
+                primary: origin == "pk",
+                name: index_name,
+                columns,
+                unique,
+            });
+        }
+
+        let mut primary_columns = raw_columns
+            .iter()
+            .filter(|(_, _, position)| *position > 0)
+            .map(|(column, _, position)| (*position, column.name.clone()))
+            .collect::<Vec<_>>();
+        primary_columns.sort_by_key(|(position, _)| *position);
+        let primary_columns = primary_columns
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>();
+        let has_primary_index = indexes.iter().any(|index| index.primary);
+        let rowid_primary_key = !primary_columns.is_empty() && !has_primary_index;
+        if rowid_primary_key {
+            let index_name = format!("{relation_name}_pkey");
+            limiter.observe(&(index_name.as_str(), true, "pk"))?;
+            for column in &primary_columns {
+                limiter.observe(column)?;
+            }
+            indexes.insert(
+                0,
+                IndexInfo {
+                    name: index_name,
+                    columns: primary_columns,
+                    unique: true,
+                    primary: true,
+                },
+            );
+        }
+
+        let columns = raw_columns
+            .into_iter()
+            .map(|(mut column, declared_not_null, primary_position)| {
+                column.nullable =
+                    !(declared_not_null || (rowid_primary_key && primary_position > 0));
+                column
+            })
+            .collect();
+        let schema = TableSchema {
+            name: relation_name,
+            columns,
+            indexes,
+        };
+        limiter.ensure_complete(&schema)?;
+        Ok(schema)
+    }
 }
 
 fn sqlite_catalog(schema: &str) -> String {
@@ -519,12 +705,131 @@ fn sqlite_catalog(schema: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbtool_core::model::{TableKind, Value};
+    use dbtool_core::model::{MetadataBudget, TableKind, Value, DEFAULT_METADATA_BYTES};
 
     async fn memory_sqlite() -> Box<dyn Connector> {
         sqlite_factory(Dsn::parse("sqlite::memory:").unwrap())
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bounded_schema_is_complete_at_n_and_fails_closed_at_n_plus_one() {
+        let connector = memory_sqlite().await;
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlDescribeTableBounded));
+        let sql = connector.as_sql().unwrap();
+        sql.execute(
+            "create table bounded_schema (
+                tenant text,
+                id integer,
+                note text,
+                primary key (tenant, id)
+            )",
+            &[],
+        )
+        .await
+        .unwrap();
+        sql.execute(
+            "create index bounded_schema_note_id on bounded_schema(note, id)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // 3 columns + 2 index identities + 4 index-column memberships.
+        let exact = sql
+            .describe_table_bounded(
+                "bounded_schema",
+                MetadataBudget::new(9, DEFAULT_METADATA_BYTES).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.columns.len(), 3);
+        assert_eq!(exact.indexes.len(), 2);
+        assert!(exact.indexes.iter().any(|index| {
+            index.name == "bounded_schema_note_id" && index.columns == ["note", "id"]
+        }));
+        assert!(exact
+            .indexes
+            .iter()
+            .any(|index| index.primary && index.columns == ["tenant", "id"]));
+
+        let error = sql
+            .describe_table_bounded(
+                "bounded_schema",
+                MetadataBudget::new(8, DEFAULT_METADATA_BYTES).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::MetadataBudgetExceeded {
+                unit: "items",
+                limit: 8,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_schema_enforces_bytes_and_missing_table_before_returning_data() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+        sql.execute("create table byte_budget (id integer primary key)", &[])
+            .await
+            .unwrap();
+
+        let byte_error = sql
+            .describe_table_bounded("byte_budget", MetadataBudget::new(10, 1).unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            byte_error,
+            Error::MetadataBudgetExceeded { unit: "bytes", .. }
+        ));
+
+        let complete = sql.describe_table("byte_budget").await.unwrap();
+        let primary = complete.indexes.first().unwrap();
+        let observed_item_bytes = complete
+            .columns
+            .iter()
+            .map(|column| serde_json::to_vec(column).unwrap().len())
+            .sum::<usize>()
+            + serde_json::to_vec(&(primary.name.as_str(), primary.unique, "pk"))
+                .unwrap()
+                .len()
+            + primary
+                .columns
+                .iter()
+                .map(|column| serde_json::to_vec(column).unwrap().len())
+                .sum::<usize>();
+        assert!(serde_json::to_vec(&complete).unwrap().len() > observed_item_bytes);
+
+        let container_error = sql
+            .describe_table_bounded(
+                "byte_budget",
+                MetadataBudget::new(10, observed_item_bytes).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            container_error,
+            Error::MetadataBudgetExceeded { unit: "bytes", .. }
+        ));
+
+        let missing = sql
+            .describe_table_bounded(
+                "missing_table",
+                MetadataBudget::new(10, DEFAULT_METADATA_BYTES).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            Error::Query(message) if message.contains("does not exist")
+        ));
     }
 
     #[tokio::test]

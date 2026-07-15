@@ -2,13 +2,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, MetadataBudget, ResultSet, TableInfo, TableKind,
+        TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ResultLimiter,
+    service::limiter::{MetadataLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, TryStreamExt};
 use sqlx::mysql::{MySqlArguments, MySqlRow};
@@ -16,7 +17,7 @@ use sqlx::query::Query;
 use sqlx::{types::Json, Column, MySql, MySqlPool, Row};
 
 use crate::{
-    bounded_catalog_limit, group_index_rows,
+    bounded_catalog_limit, bounded_metadata_limit, group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema, TableRef},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, mysql_value},
@@ -25,6 +26,17 @@ use crate::{
 pub struct MySqlAdapter {
     pool: MySqlPool,
     kind: ConnectorKind,
+}
+
+fn mysql_operations() -> Vec<CapabilityOperation> {
+    let mut operations = CapabilityOperation::SQL.to_vec();
+    operations.extend([
+        CapabilityOperation::SqlInsertRowsAtomic,
+        CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::SqlDescribeTableBounded,
+    ]);
+    operations
 }
 
 fn bind_mysql_params<'q>(
@@ -124,13 +136,7 @@ impl Connector for MySqlAdapter {
     }
 
     fn operations(&self) -> Vec<CapabilityOperation> {
-        let mut operations = CapabilityOperation::SQL.to_vec();
-        operations.extend([
-            CapabilityOperation::SqlInsertRowsAtomic,
-            CapabilityOperation::SqlListSchemasBounded,
-            CapabilityOperation::SqlListTablesBounded,
-        ]);
-        operations
+        mysql_operations()
     }
 
     async fn ping(&self) -> Result<()> {
@@ -546,6 +552,120 @@ impl SqlEngine for MySqlAdapter {
             indexes,
         })
     }
+
+    async fn describe_table_bounded(
+        &self,
+        table: &str,
+        budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        let table_ref = parse_table_ref(table)?;
+        let schema = table_ref.schema.as_deref();
+        let mut limiter = MetadataLimiter::new(budget, format!("MySQL table schema {table}"))?;
+
+        let column_limit = bounded_metadata_limit(&limiter, "MySQL")?;
+        let column_rows = if let Some(schema) = schema {
+            sqlx::query(mysql_bounded_column_query(true))
+                .bind(schema)
+                .bind(&table_ref.name)
+                .bind(column_limit)
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            sqlx::query(mysql_bounded_column_query(false))
+                .bind(&table_ref.name)
+                .bind(column_limit)
+                .fetch_all(&self.pool)
+                .await
+        }
+        .map_err(|error| Error::Query(error.to_string()))?;
+
+        let mut columns = Vec::with_capacity(column_rows.len());
+        for row in column_rows {
+            let column = ColumnMeta {
+                name: mysql_text(&row, 0)?,
+                type_name: mysql_text(&row, 1)?,
+                nullable: mysql_text(&row, 2)? == "YES",
+                primary_key: mysql_text(&row, 3)? == "PRI",
+                default_value: mysql_optional_text(&row, 4)?,
+            };
+            limiter.observe(&column)?;
+            columns.push(column);
+        }
+        if columns.is_empty() {
+            return Err(Error::Query(format!(
+                "MySQL table or view does not exist or has no readable columns: {table}"
+            )));
+        }
+
+        let index_limit = bounded_metadata_limit(&limiter, "MySQL")?;
+        let index_rows = if let Some(schema) = schema {
+            sqlx::query(mysql_bounded_index_query(true))
+                .bind(schema)
+                .bind(&table_ref.name)
+                .bind(index_limit)
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            sqlx::query(mysql_bounded_index_query(false))
+                .bind(&table_ref.name)
+                .bind(index_limit)
+                .fetch_all(&self.pool)
+                .await
+        }
+        .map_err(|error| Error::Query(error.to_string()))?;
+
+        let mut flat_indexes = Vec::with_capacity(index_rows.len());
+        let mut previous_index = None::<String>;
+        for row in index_rows {
+            let name = mysql_text(&row, 0)?;
+            let non_unique = mysql_text(&row, 1)?.parse::<u64>().map_err(|error| {
+                Error::Query(format!("invalid NON_UNIQUE metadata value: {error}"))
+            })?;
+            let column = mysql_text(&row, 2)?;
+            let unique = non_unique == 0;
+            let primary = name == "PRIMARY";
+            if previous_index.as_deref() != Some(name.as_str()) {
+                limiter.observe(&(name.as_str(), unique, primary))?;
+                previous_index = Some(name.clone());
+            }
+            limiter.observe(&column)?;
+            flat_indexes.push((name, unique, primary, column));
+        }
+        let indexes = group_index_rows(flat_indexes.into_iter());
+        let schema = TableSchema {
+            name: table_ref.name,
+            columns,
+            indexes,
+        };
+        limiter.ensure_complete(&schema)?;
+        Ok(schema)
+    }
+}
+
+fn mysql_bounded_column_query(qualified: bool) -> &'static str {
+    if qualified {
+        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION LIMIT ?"
+    } else {
+        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION LIMIT ?"
+    }
+}
+
+fn mysql_bounded_index_query(qualified: bool) -> &'static str {
+    if qualified {
+        "SELECT INDEX_NAME, CAST(NON_UNIQUE AS CHAR), COLUMN_NAME \
+         FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX LIMIT ?"
+    } else {
+        "SELECT INDEX_NAME, CAST(NON_UNIQUE AS CHAR), COLUMN_NAME \
+         FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX LIMIT ?"
+    }
 }
 
 fn mysql_text(row: &MySqlRow, index: usize) -> Result<String> {
@@ -592,6 +712,23 @@ mod tests {
         assert!(bind_mysql_params("select ?, ?, ?, ?, ?, ?, ?, ?", &params).is_ok());
 
         assert!(bind_mysql_params("select ?", &[Value::Timestamp(i64::MAX)]).is_err());
+    }
+
+    #[test]
+    fn mysql_bounded_schema_queries_keep_every_catalog_phase_server_limited() {
+        for qualified in [false, true] {
+            let columns = mysql_bounded_column_query(qualified);
+            let indexes = mysql_bounded_index_query(qualified);
+            assert!(columns.ends_with("ORDER BY ORDINAL_POSITION LIMIT ?"));
+            assert!(indexes.ends_with("ORDER BY INDEX_NAME, SEQ_IN_INDEX LIMIT ?"));
+            assert_eq!(columns.matches("LIMIT ?").count(), 1);
+            assert_eq!(indexes.matches("LIMIT ?").count(), 1);
+        }
+    }
+
+    #[test]
+    fn mysql_advertises_bounded_table_description() {
+        assert!(mysql_operations().contains(&CapabilityOperation::SqlDescribeTableBounded));
     }
 
     #[tokio::test]

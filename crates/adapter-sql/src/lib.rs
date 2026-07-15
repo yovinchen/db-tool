@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use dbtool_core::{
     error::{Error, Result},
     model::{IndexInfo, Value},
-    service::limiter::ListLimiter,
+    service::limiter::{ListLimiter, MetadataLimiter},
 };
 use std::collections::BTreeSet;
 
@@ -30,6 +30,21 @@ pub(crate) fn bounded_catalog_limit(max_items: usize, backend: &str) -> Result<(
         ))
     })?;
     Ok((limiter, sql_limit))
+}
+
+/// Convert the remaining complete-metadata N+1 probe to a SQL LIMIT value.
+///
+/// Unlike [`bounded_catalog_limit`], the limiter is shared across columns,
+/// index identities, and index-column memberships. Each metadata phase calls
+/// this immediately before backend access so earlier phases reduce the next
+/// query's protocol-side limit.
+pub(crate) fn bounded_metadata_limit(limiter: &MetadataLimiter, backend: &str) -> Result<i64> {
+    let probe_items = limiter.probe_items()?;
+    i64::try_from(probe_items).map_err(|_| {
+        Error::Config(format!(
+            "{backend} metadata budget is too large for a SQL LIMIT parameter"
+        ))
+    })
 }
 
 pub(crate) fn validate_atomic_insert(
@@ -125,6 +140,7 @@ pub(crate) fn group_index_rows(
 #[cfg(test)]
 mod bounded_catalog_tests {
     use super::*;
+    use dbtool_core::model::{MetadataBudget, DEFAULT_METADATA_BYTES};
 
     #[test]
     fn catalog_limit_rejects_zero_probe_overflow_and_sql_parameter_overflow() {
@@ -143,5 +159,30 @@ mod bounded_catalog_tests {
             ));
         }
         assert_eq!(bounded_catalog_limit(2, "test").unwrap().1, 3);
+    }
+
+    #[test]
+    fn metadata_limit_tracks_the_remaining_cross_phase_budget() {
+        let budget = MetadataBudget::new(3, DEFAULT_METADATA_BYTES).unwrap();
+        let mut limiter = MetadataLimiter::new(budget, "test schema").unwrap();
+
+        assert_eq!(bounded_metadata_limit(&limiter, "test").unwrap(), 4);
+        limiter.observe("column").unwrap();
+        assert_eq!(bounded_metadata_limit(&limiter, "test").unwrap(), 3);
+        limiter.observe("index").unwrap();
+        limiter.observe("index-column").unwrap();
+        assert_eq!(bounded_metadata_limit(&limiter, "test").unwrap(), 1);
+    }
+
+    #[test]
+    fn metadata_limit_rejects_sql_parameter_overflow() {
+        if usize::MAX > i64::MAX as usize {
+            let budget = MetadataBudget::new(i64::MAX as usize, 1).unwrap();
+            let limiter = MetadataLimiter::new(budget, "test schema").unwrap();
+            assert!(matches!(
+                bounded_metadata_limit(&limiter, "test"),
+                Err(Error::Config(_))
+            ));
+        }
     }
 }

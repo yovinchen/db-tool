@@ -2,13 +2,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, MetadataBudget, ResultSet, TableInfo, TableKind,
+        TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ResultLimiter,
+    service::limiter::{MetadataLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, TryStreamExt};
 use sqlx::encode::IsNull;
@@ -18,7 +19,7 @@ use sqlx::query::Query;
 use sqlx::{types::Json, Column, Encode, PgPool, Postgres, Row, Type};
 
 use crate::{
-    bounded_catalog_limit, group_index_rows,
+    bounded_catalog_limit, bounded_metadata_limit, group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, postgres_value},
@@ -27,6 +28,17 @@ use crate::{
 pub struct PostgresAdapter {
     pool: PgPool,
     kind: ConnectorKind,
+}
+
+fn postgres_operations() -> Vec<CapabilityOperation> {
+    let mut operations = CapabilityOperation::SQL.to_vec();
+    operations.extend([
+        CapabilityOperation::SqlInsertRowsAtomic,
+        CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::SqlDescribeTableBounded,
+    ]);
+    operations
 }
 
 /// PostgreSQL OID 705 (`unknown`) lets the server infer a NULL parameter's
@@ -96,13 +108,7 @@ impl Connector for PostgresAdapter {
     }
 
     fn operations(&self) -> Vec<CapabilityOperation> {
-        let mut operations = CapabilityOperation::SQL.to_vec();
-        operations.extend([
-            CapabilityOperation::SqlInsertRowsAtomic,
-            CapabilityOperation::SqlListSchemasBounded,
-            CapabilityOperation::SqlListTablesBounded,
-        ]);
-        operations
+        postgres_operations()
     }
 
     async fn ping(&self) -> Result<()> {
@@ -520,6 +526,140 @@ impl SqlEngine for PostgresAdapter {
             indexes,
         })
     }
+
+    async fn describe_table_bounded(
+        &self,
+        table: &str,
+        budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        let table_ref = parse_table_ref(table)?;
+        let schema_name = table_ref.schema.as_deref().unwrap_or("public");
+        if self.kind.0 == "redshift" {
+            return redshift_describe_table_bounded(
+                &self.pool,
+                schema_name,
+                &table_ref.name,
+                budget,
+            )
+            .await;
+        }
+
+        let mut limiter = MetadataLimiter::new(budget, format!("PostgreSQL table schema {table}"))?;
+        let column_limit = bounded_metadata_limit(&limiter, "PostgreSQL")?;
+        let column_rows = sqlx::query(postgres_bounded_column_query())
+            .bind(schema_name)
+            .bind(&table_ref.name)
+            .bind(column_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+
+        let mut columns = Vec::with_capacity(column_rows.len());
+        for row in column_rows {
+            let column = ColumnMeta {
+                name: row
+                    .try_get(0)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+                type_name: row
+                    .try_get(1)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+                nullable: !row
+                    .try_get::<bool, _>(2)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+                default_value: row
+                    .try_get(3)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+                primary_key: row
+                    .try_get(4)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+            };
+            limiter.observe(&column)?;
+            columns.push(column);
+        }
+        if columns.is_empty() {
+            return Err(Error::Query(format!(
+                "PostgreSQL table or view does not exist or has no readable columns: {table}"
+            )));
+        }
+
+        let index_limit = bounded_metadata_limit(&limiter, "PostgreSQL")?;
+        let index_rows = sqlx::query(postgres_bounded_index_query())
+            .bind(&table_ref.name)
+            .bind(schema_name)
+            .bind(index_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+
+        let mut flat_indexes = Vec::with_capacity(index_rows.len());
+        let mut previous_index = None::<String>;
+        for row in index_rows {
+            let name = row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let unique = row
+                .try_get::<bool, _>(1)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let primary = row
+                .try_get::<bool, _>(2)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let column = row
+                .try_get::<String, _>(3)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            if previous_index.as_deref() != Some(name.as_str()) {
+                limiter.observe(&(name.as_str(), unique, primary))?;
+                previous_index = Some(name.clone());
+            }
+            limiter.observe(&column)?;
+            flat_indexes.push((name, unique, primary, column));
+        }
+        let indexes = group_index_rows(flat_indexes.into_iter());
+        let schema = TableSchema {
+            name: table_ref.name,
+            columns,
+            indexes,
+        };
+        limiter.ensure_complete(&schema)?;
+        Ok(schema)
+    }
+}
+
+fn postgres_bounded_column_query() -> &'static str {
+    "SELECT a.attname, \
+            pg_catalog.format_type(a.atttypid, a.atttypmod), \
+            a.attnotnull, \
+            CASE WHEN a.attgenerated = '' \
+                 THEN pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) \
+                 ELSE NULL \
+            END, \
+            EXISTS ( \
+                SELECT 1 FROM pg_catalog.pg_constraint con \
+                WHERE con.conrelid = c.oid AND con.contype = 'p' \
+                  AND a.attnum = ANY(con.conkey) \
+            ) AS is_pk \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+     LEFT JOIN pg_catalog.pg_attrdef ad \
+            ON ad.adrelid = c.oid AND ad.adnum = a.attnum \
+     WHERE n.nspname = $1 AND c.relname = $2 \
+       AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+       AND a.attnum > 0 AND NOT a.attisdropped \
+     ORDER BY a.attnum LIMIT $3"
+}
+
+fn postgres_bounded_index_query() -> &'static str {
+    "SELECT i.relname, ix.indisunique, ix.indisprimary, \
+            COALESCE(a.attname, pg_catalog.pg_get_indexdef(ix.indexrelid, indexed_key.ord::integer, true)) \
+     FROM pg_class t \
+     JOIN pg_index ix ON t.oid = ix.indrelid \
+     JOIN pg_class i ON i.oid = ix.indexrelid \
+     JOIN pg_namespace n ON n.oid = t.relnamespace \
+     JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS indexed_key(attnum, ord) \
+          ON indexed_key.ord <= ix.indnkeyatts \
+     LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = indexed_key.attnum \
+     WHERE t.relname = $1 AND n.nspname = $2 \
+     ORDER BY i.relname, indexed_key.ord LIMIT $3"
 }
 
 async fn redshift_list_tables(pool: &PgPool, schema: &str) -> Result<Vec<TableInfo>> {
@@ -653,6 +793,80 @@ async fn redshift_describe_table(pool: &PgPool, schema: &str, table: &str) -> Re
     })
 }
 
+async fn redshift_describe_table_bounded(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    budget: MetadataBudget,
+) -> Result<TableSchema> {
+    let mut limiter =
+        MetadataLimiter::new(budget, format!("Redshift table schema {schema}.{table}"))?;
+    let column_limit = bounded_metadata_limit(&limiter, "Redshift")?;
+    let rows = sqlx::query(redshift_bounded_column_query())
+        .bind(schema)
+        .bind(table)
+        .bind(column_limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in rows {
+        let column = ColumnMeta {
+            name: row
+                .try_get(0)
+                .map_err(|error| Error::Query(error.to_string()))?,
+            type_name: row
+                .try_get(1)
+                .map_err(|error| Error::Query(error.to_string()))?,
+            nullable: row
+                .try_get::<String, _>(2)
+                .map_err(|error| Error::Query(error.to_string()))?
+                == "YES",
+            default_value: row
+                .try_get(3)
+                .map_err(|error| Error::Query(error.to_string()))?,
+            primary_key: row
+                .try_get(4)
+                .map_err(|error| Error::Query(error.to_string()))?,
+        };
+        limiter.observe(&column)?;
+        columns.push(column);
+    }
+    if columns.is_empty() {
+        return Err(Error::Query(format!(
+            "Redshift table or view does not exist or has no readable columns: {schema}.{table}"
+        )));
+    }
+
+    let result = TableSchema {
+        name: table.to_owned(),
+        columns,
+        // Amazon Redshift does not implement PostgreSQL secondary indexes.
+        indexes: vec![],
+    };
+    limiter.ensure_complete(&result)?;
+    Ok(result)
+}
+
+fn redshift_bounded_column_query() -> &'static str {
+    "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
+            (kcu.column_name IS NOT NULL) AS is_pk \
+     FROM information_schema.columns c \
+     LEFT JOIN ( \
+         SELECT kcu.column_name \
+         FROM information_schema.table_constraints tc \
+         JOIN information_schema.key_column_usage kcu \
+           ON tc.constraint_name = kcu.constraint_name \
+          AND tc.table_schema = kcu.table_schema \
+          AND tc.table_name = kcu.table_name \
+         WHERE tc.constraint_type = 'PRIMARY KEY' \
+           AND tc.table_schema = $1 AND tc.table_name = $2 \
+     ) kcu ON c.column_name = kcu.column_name \
+     WHERE c.table_schema = $1 AND c.table_name = $2 \
+     ORDER BY c.ordinal_position LIMIT $3"
+}
+
 fn postgres_table_kind(relkind: &str) -> Result<TableKind> {
     match relkind {
         "v" => Ok(TableKind::View),
@@ -696,6 +910,25 @@ mod tests {
             TableKind::MaterializedView
         );
         assert!(postgres_table_kind("S").is_err());
+    }
+
+    #[test]
+    fn postgres_family_bounded_schema_queries_keep_protocol_limits() {
+        for query in [
+            postgres_bounded_column_query(),
+            postgres_bounded_index_query(),
+            redshift_bounded_column_query(),
+        ] {
+            assert!(query.ends_with("LIMIT $3"));
+            assert_eq!(query.matches("LIMIT $3").count(), 1);
+        }
+        assert!(postgres_bounded_index_query().contains("pg_get_indexdef"));
+        assert!(postgres_bounded_index_query().contains("LEFT JOIN pg_attribute"));
+    }
+
+    #[test]
+    fn postgres_family_advertises_bounded_table_description() {
+        assert!(postgres_operations().contains(&CapabilityOperation::SqlDescribeTableBounded));
     }
 
     #[tokio::test]
