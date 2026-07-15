@@ -509,7 +509,10 @@ async fn run_ts_command(
         .strip_prefix("query ")
         .map(str::trim)
         .ok_or_else(|| Error::Config("ts command must be measurements, query <expr>, or write <measurement> <value> [field=<name>] [tag=value...]".into()))?;
-    render_json(ts.query_range(query, TimeRange::last_n_minutes(60)).await?)
+    render_json(
+        ts.query_range(query, TimeRange::last_n_minutes(60)?)
+            .await?,
+    )
 }
 
 fn parse_tui_ts_point(raw: &str) -> Result<Point> {

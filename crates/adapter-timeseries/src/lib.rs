@@ -9,7 +9,6 @@ use dbtool_core::{
 };
 use futures::future::BoxFuture;
 use serde_json::{Map, Value as JsonValue};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -85,7 +84,7 @@ impl TimeSeriesStore for PrometheusAdapter {
     }
 
     async fn query_range(&self, query: &str, range: TimeRange) -> Result<SeriesSet> {
-        let path = self.client.query_range_path(query, range);
+        let path = self.client.query_range_path(query, &range)?;
         let response = self.client.request_json("GET", &path, None).await?;
         series_set_from_response(&response)
     }
@@ -231,15 +230,19 @@ impl PrometheusHttpClient {
         request
     }
 
-    fn query_range_path(&self, query: &str, range: TimeRange) -> String {
-        let end_ms = range.end.unwrap_or_else(now_millis);
-        let start_ms = range.start.unwrap_or(end_ms - 60 * 60 * 1000);
+    fn query_range_path(&self, query: &str, range: &TimeRange) -> Result<String> {
+        if query.trim().is_empty() {
+            return Err(Error::Config(
+                "Prometheus range query must not be empty".into(),
+            ));
+        }
+        let (start_ms, end_ms) = range.require_closed()?;
         let mut query_string = form_urlencoded::Serializer::new(String::new());
         query_string.append_pair("query", query);
         query_string.append_pair("start", &millis_to_seconds(start_ms));
         query_string.append_pair("end", &millis_to_seconds(end_ms));
         query_string.append_pair("step", &self.step);
-        format!("/api/v1/query_range?{}", query_string.finish())
+        Ok(format!("/api/v1/query_range?{}", query_string.finish()))
     }
 
     fn full_path(&self, path: &str) -> String {
@@ -337,6 +340,18 @@ fn measurement_names_from_response(response: &JsonValue) -> Result<Vec<String>> 
 
 fn series_set_from_response(response: &JsonValue) -> Result<SeriesSet> {
     ensure_success(response)?;
+    let result_type = response
+        .get("data")
+        .and_then(|data| data.get("resultType"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            Error::Serialization("prometheus query response is missing resultType".into())
+        })?;
+    if result_type != "matrix" {
+        return Err(Error::Serialization(format!(
+            "prometheus range query returned unsupported resultType '{result_type}', expected matrix"
+        )));
+    }
     let results = response
         .get("data")
         .and_then(|data| data.get("result"))
@@ -595,13 +610,6 @@ fn sample_value(value: &JsonValue) -> JsonValue {
         .and_then(serde_json::Number::from_f64)
         .map(JsonValue::Number)
         .unwrap_or_else(|| value.clone())
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 fn millis_to_seconds(millis: i64) -> String {
@@ -899,13 +907,15 @@ mod tests {
     fn builds_query_range_request_with_prefix_and_step() {
         let dsn = Dsn::parse("prometheus://prom.local:9090/base?step=30s").unwrap();
         let client = PrometheusHttpClient::from_dsn(&dsn).unwrap();
-        let path = client.query_range_path(
-            r#"rate(http_requests_total{job="api"}[5m])"#,
-            TimeRange {
-                start: Some(1710000000000),
-                end: Some(1710000060000),
-            },
-        );
+        let path = client
+            .query_range_path(
+                r#"rate(http_requests_total{job="api"}[5m])"#,
+                &TimeRange {
+                    start: Some(1710000000000),
+                    end: Some(1710000060000),
+                },
+            )
+            .unwrap();
         let (request, body) = client.build_request("GET", &path, None).unwrap();
 
         assert!(request.starts_with("GET /base/api/v1/query_range?"));
@@ -916,6 +926,52 @@ mod tests {
         assert!(request.contains("end=1710000060"));
         assert!(request.contains("step=30s"));
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn range_request_rejects_open_reversed_and_empty_inputs() {
+        let client =
+            PrometheusHttpClient::from_dsn(&Dsn::parse("prometheus://prom.local:9090").unwrap())
+                .unwrap();
+        assert!(client
+            .query_range_path(
+                "up",
+                &TimeRange {
+                    start: Some(1),
+                    end: None,
+                },
+            )
+            .is_err());
+        assert!(client
+            .query_range_path(
+                "up",
+                &TimeRange {
+                    start: Some(2),
+                    end: Some(1),
+                },
+            )
+            .is_err());
+        assert!(client
+            .query_range_path(
+                "  ",
+                &TimeRange {
+                    start: Some(1),
+                    end: Some(2),
+                },
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn range_response_rejects_non_matrix_result_types() {
+        let response = json!({
+            "status": "success",
+            "data": {"resultType": "vector", "result": []}
+        });
+        assert!(matches!(
+            series_set_from_response(&response),
+            Err(Error::Serialization(message)) if message.contains("expected matrix")
+        ));
     }
 
     #[test]
