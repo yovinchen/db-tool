@@ -5,7 +5,7 @@ use dbtool_core::{
     error::Error,
     model::{Document, FindOptions, Value},
     port::CapabilityOperation,
-    service::safety::SafetyGuard,
+    service::{limiter::ListLimiter, safety::SafetyGuard},
     Result,
 };
 
@@ -86,6 +86,9 @@ pub enum DocAction {
 }
 
 pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
+    if matches!(cmd.action, DocAction::Collections) {
+        ListLimiter::new(ctx.limit).probe_items()?;
+    }
     let dsn = ctx.resolve_dsn()?;
     match &cmd.action {
         DocAction::Insert { .. } => ensure_write_allowed(ctx)?,
@@ -134,7 +137,15 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
 
     Ok(match cmd.action {
         DocAction::Collections => {
-            ctx.render_success(&kind, doc.list_collections().await?, elapsed(), false)
+            require_document_operation(
+                &operations,
+                CapabilityOperation::DocumentListCollectionsBounded,
+                &kind,
+                "DocumentStore.list_collections_bounded",
+            )?;
+            let collections = doc.list_collections_bounded(ctx.limit).await?;
+            let truncated = collections.truncated;
+            ctx.render_success(&kind, collections.items, elapsed(), truncated)
         }
         DocAction::Find {
             collection,
@@ -1014,6 +1025,42 @@ mod tests {
             "DocumentStore.delete_many",
         )
         .is_ok());
+    }
+
+    #[test]
+    fn coarse_document_capability_does_not_authorize_bounded_collection_listing() {
+        assert!(matches!(
+            require_document_operation(
+                CapabilityOperation::DOCUMENT,
+                CapabilityOperation::DocumentListCollectionsBounded,
+                "legacy-document",
+                "DocumentStore.list_collections_bounded",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-document"
+                    && needed == "DocumentStore.list_collections_bounded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn collection_limit_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(false, "mongodb://127.0.0.1:1/app");
+        ctx.dsn = None;
+        ctx.limit = 0;
+
+        let error = run(
+            &ctx,
+            DocCmd {
+                action: DocAction::Collections,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Config(message) if message.contains("greater than zero")
+        ));
     }
 
     #[tokio::test]

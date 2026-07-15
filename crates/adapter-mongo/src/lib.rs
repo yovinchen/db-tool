@@ -1,11 +1,12 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{Document, FindOptions, InsertOutcome, UpdateOutcome, Value},
+    model::{BoundedList, Document, FindOptions, InsertOutcome, UpdateOutcome, Value},
     port::{
         capability::DocumentStore,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::ListLimiter,
 };
 use futures::future::BoxFuture;
 use mongodb::{
@@ -68,6 +69,30 @@ impl DocumentStore for MongoAdapter {
             .list_collection_names()
             .await
             .map_err(|e| Error::Query(e.to_string()))
+    }
+
+    async fn list_collections_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        use futures::StreamExt;
+
+        let limiter = ListLimiter::new(max_items);
+        let probe_items = limiter.probe_items()?;
+        let batch_size = u32::try_from(probe_items).map_err(|_| {
+            Error::Config("MongoDB collection catalog limit exceeds the u32 range".into())
+        })?;
+        let mut cursor = self
+            .db
+            .list_collections()
+            .batch_size(batch_size)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut names = Vec::with_capacity(probe_items.min(256));
+        while names.len() < probe_items {
+            let Some(specification) = cursor.next().await else {
+                break;
+            };
+            names.push(specification.map_err(|e| Error::Query(e.to_string()))?.name);
+        }
+        Ok(limiter.finish(names))
     }
 
     async fn find(
@@ -264,6 +289,7 @@ impl MongoAdapter {
 fn mongo_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::DocumentListCollectionsBounded,
         CapabilityOperation::DocumentUpdateOne,
         CapabilityOperation::DocumentUpdateMany,
         CapabilityOperation::DocumentDeleteOne,
@@ -449,13 +475,14 @@ mod tests {
     }
 
     #[test]
-    fn mongo_declares_explicit_document_cardinality_operations() {
+    fn mongo_declares_explicit_document_extensions() {
         let operations = mongo_operations(Capabilities {
             document: true,
             ..Default::default()
         });
 
         for operation in [
+            CapabilityOperation::DocumentListCollectionsBounded,
             CapabilityOperation::DocumentUpdateOne,
             CapabilityOperation::DocumentUpdateMany,
             CapabilityOperation::DocumentDeleteOne,
@@ -495,6 +522,18 @@ mod tests {
             ));
         }
         assert_eq!(mongo_limit(Some(7)).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn collection_catalog_probe_rejects_invalid_limits_without_a_backend() {
+        assert!(matches!(
+            ListLimiter::new(0).probe_items(),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        assert!(matches!(
+            ListLimiter::new(usize::MAX).probe_items(),
+            Err(Error::Config(message)) if message.contains("too large")
+        ));
     }
 
     #[test]

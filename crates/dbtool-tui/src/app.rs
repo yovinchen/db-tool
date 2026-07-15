@@ -13,7 +13,7 @@ use dbtool_core::{
     registry::Registry,
     service::{
         safety::{SafetyGuard, StatementKind},
-        ConnectionManager,
+        ConnectionManager, ListLimiter,
     },
     Result,
 };
@@ -260,6 +260,7 @@ async fn execute_tui_command(
     confirmed_write: bool,
 ) -> Result<String> {
     authorize_tui_command(connection, command, confirmed_write)?;
+    validate_bounded_catalog_limit(command, limit)?;
     let conn = manager.get_or_connect(&connection.dsn).await?;
     let connector = conn.as_ref().as_ref();
     let mut parts = command.split_whitespace();
@@ -341,7 +342,14 @@ async fn execute_tui_command(
             )
             .await
         }
-        "ts" => run_ts_command(connector, command.strip_prefix("ts").unwrap_or("").trim()).await,
+        "ts" => {
+            run_ts_command(
+                connector,
+                command.strip_prefix("ts").unwrap_or("").trim(),
+                limit,
+            )
+            .await
+        }
         _ => Err(Error::Config(format!(
             "unknown TUI command '{head}'; try ping, caps, sql, schemas, tables, schema, kv, doc, search, or ts"
         ))),
@@ -451,7 +459,12 @@ async fn run_doc_command(
         .as_document()
         .ok_or_else(|| unsupported(connector, "DocumentStore"))?;
     if command == "collections" {
-        return render_json(doc.list_collections().await?);
+        require_operation(
+            connector,
+            CapabilityOperation::DocumentListCollectionsBounded,
+            "DocumentStore.list_collections_bounded",
+        )?;
+        return render_bounded_list(doc.list_collections_bounded(limit).await?);
     }
     if let Some(rest) = command.strip_prefix("find ").map(str::trim) {
         let (collection, filter) = rest
@@ -485,7 +498,12 @@ async fn run_search_command(
         .as_search()
         .ok_or_else(|| unsupported(connector, "SearchEngine"))?;
     if command == "indices" {
-        return render_json(search.list_indices().await?);
+        require_operation(
+            connector,
+            CapabilityOperation::SearchListIndicesBounded,
+            "SearchEngine.list_indices_bounded",
+        )?;
+        return render_bounded_list(search.list_indices_bounded(limit).await?);
     }
     if let Some(rest) = command.strip_prefix("index ").map(str::trim) {
         let (index, doc) = rest
@@ -516,12 +534,18 @@ async fn run_search_command(
 async fn run_ts_command(
     connector: &dyn dbtool_core::port::Connector,
     command: &str,
+    limit: usize,
 ) -> Result<String> {
     let ts = connector
         .as_timeseries()
         .ok_or_else(|| unsupported(connector, "TimeSeriesStore"))?;
     if command == "measurements" {
-        return render_json(ts.list_measurements().await?);
+        require_operation(
+            connector,
+            CapabilityOperation::TimeSeriesListMeasurementsBounded,
+            "TimeSeriesStore.list_measurements_bounded",
+        )?;
+        return render_bounded_list(ts.list_measurements_bounded(limit).await?);
     }
     if let Some(rest) = command.strip_prefix("write ").map(str::trim) {
         let point = parse_tui_ts_point(rest)?;
@@ -575,6 +599,17 @@ fn parse_tui_ts_point(raw: &str) -> Result<Point> {
             .unwrap_or_default()
             .as_millis() as i64,
     })
+}
+
+fn validate_bounded_catalog_limit(command: &str, limit: usize) -> Result<()> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    if matches!(
+        parts.as_slice(),
+        ["doc", "collections"] | ["search", "indices"] | ["ts", "measurements"]
+    ) {
+        ListLimiter::new(limit).probe_items()?;
+    }
+    Ok(())
 }
 
 fn command_requires_write(command: &str) -> Result<bool> {
@@ -935,6 +970,54 @@ readonli = true
             assert!(matches!(
                 execute_tui_command(&manager, &connection, "tables main", limit, false).await,
                 Err(Error::Config(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn document_search_and_time_series_catalogs_require_explicit_bounded_operations() {
+        for (operations, operation, kind, needed) in [
+            (
+                CapabilityOperation::DOCUMENT,
+                CapabilityOperation::DocumentListCollectionsBounded,
+                "legacy-document",
+                "DocumentStore.list_collections_bounded",
+            ),
+            (
+                CapabilityOperation::SEARCH,
+                CapabilityOperation::SearchListIndicesBounded,
+                "legacy-search",
+                "SearchEngine.list_indices_bounded",
+            ),
+            (
+                CapabilityOperation::TIME_SERIES,
+                CapabilityOperation::TimeSeriesListMeasurementsBounded,
+                "legacy-time-series",
+                "TimeSeriesStore.list_measurements_bounded",
+            ),
+        ] {
+            assert!(matches!(
+                require_declared_operation(operations, operation, kind.to_owned(), needed),
+                Err(Error::UnsupportedCapability { kind: actual_kind, needed: actual_needed })
+                    if actual_kind == kind && actual_needed == needed
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_catalog_limits_are_rejected_before_tui_connection() {
+        let registry = Arc::new(build_registry());
+        let manager = ConnectionManager::new(registry);
+        let connection = ConnectionItem {
+            name: "unreachable".to_owned(),
+            dsn: "mongodb://127.0.0.1:1/dbtool".to_owned(),
+            readonly: false,
+        };
+
+        for command in ["doc collections", "search indices", "ts measurements"] {
+            assert!(matches!(
+                execute_tui_command(&manager, &connection, command, 0, false).await,
+                Err(Error::Config(message)) if message.contains("greater than zero")
             ));
         }
     }

@@ -3,8 +3,11 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     model::Value,
-    port::capability::{SearchHits, SearchOptions},
-    service::safety::SafetyGuard,
+    port::{
+        capability::{SearchHits, SearchOptions},
+        CapabilityOperation,
+    },
+    service::{limiter::ListLimiter, safety::SafetyGuard},
     Result,
 };
 
@@ -83,6 +86,9 @@ pub enum SearchAction {
 }
 
 pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
+    if matches!(cmd.action, SearchAction::Indices) {
+        ListLimiter::new(ctx.limit).probe_items()?;
+    }
     let dsn = ctx.resolve_dsn()?;
     match &cmd.action {
         SearchAction::Index { .. }
@@ -103,6 +109,7 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
     }
 
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let se = conn
         .as_search()
         .ok_or_else(|| Error::UnsupportedCapability {
@@ -113,12 +120,22 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
     let kind = conn.kind().0.clone();
 
     Ok(match cmd.action {
-        SearchAction::Indices => ctx.render_success(
-            &kind,
-            se.list_indices().await?,
-            start.elapsed().as_millis() as u64,
-            false,
-        ),
+        SearchAction::Indices => {
+            require_search_operation(
+                &operations,
+                CapabilityOperation::SearchListIndicesBounded,
+                &kind,
+                "SearchEngine.list_indices_bounded",
+            )?;
+            let indices = se.list_indices_bounded(ctx.limit).await?;
+            let truncated = indices.truncated;
+            ctx.render_success(
+                &kind,
+                indices.items,
+                start.elapsed().as_millis() as u64,
+                truncated,
+            )
+        }
         SearchAction::Search {
             index,
             q,
@@ -171,6 +188,22 @@ fn ensure_write_allowed(ctx: &Context) -> Result<()> {
     ctx.ensure_write_allowed()
 }
 
+fn require_search_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+    needed: &'static str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed,
+        })
+    }
+}
+
 fn parse_json_value(raw: &str) -> Result<Value> {
     serde_json::from_str::<serde_json::Value>(raw)
         .map(Value::Json)
@@ -200,7 +233,52 @@ fn search_results_truncated(hits: &SearchHits, from: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbtool_core::service::formatter::Format;
     use serde_json::json;
+
+    fn test_context(limit: usize) -> Context {
+        Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: Format::Json,
+            limit,
+            throttle_overrides: Default::default(),
+            allow_write: false,
+            confirm: None,
+        }
+    }
+
+    #[test]
+    fn coarse_search_capability_does_not_authorize_bounded_index_listing() {
+        assert!(matches!(
+            require_search_operation(
+                CapabilityOperation::SEARCH,
+                CapabilityOperation::SearchListIndicesBounded,
+                "legacy-search",
+                "SearchEngine.list_indices_bounded",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-search" && needed == "SearchEngine.list_indices_bounded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn index_limit_is_rejected_before_dsn_resolution() {
+        let error = run(
+            &test_context(0),
+            SearchCmd {
+                action: SearchAction::Indices,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Config(message) if message.contains("greater than zero")
+        ));
+    }
 
     #[test]
     fn explicit_from_option_wins_over_query_body() {

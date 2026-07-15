@@ -1,11 +1,12 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{series::Series, Point, SeriesSet, TimeRange},
+    model::{series::Series, BoundedList, Point, SeriesSet, TimeRange},
     port::{
         capability::TimeSeriesStore,
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::ListLimiter,
 };
 use futures::future::BoxFuture;
 use serde_json::{Map, Value as JsonValue};
@@ -46,6 +47,10 @@ impl Connector for PrometheusAdapter {
         }
     }
 
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        time_series_operations(self.capabilities())
+    }
+
     async fn ping(&self) -> Result<()> {
         self.client
             .request_json("GET", "/api/v1/status/buildinfo", None)
@@ -71,6 +76,14 @@ impl TimeSeriesStore for PrometheusAdapter {
             .request_json("GET", "/api/v1/label/__name__/values", None)
             .await?;
         measurement_names_from_response(&response)
+    }
+
+    async fn list_measurements_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        let limiter = ListLimiter::new(max_items);
+        let probe_items = limiter.probe_items()?;
+        let path = format!("/api/v1/label/__name__/values?limit={probe_items}");
+        let response = self.client.request_json("GET", &path, None).await?;
+        measurement_names_from_response_bounded(&response, limiter, probe_items)
     }
 
     async fn write_points(&self, points: Vec<Point>) -> Result<()> {
@@ -336,6 +349,34 @@ fn measurement_names_from_response(response: &JsonValue) -> Result<Vec<String>> 
         .collect::<Result<Vec<_>>>()?;
     names.sort();
     Ok(names)
+}
+
+fn measurement_names_from_response_bounded(
+    response: &JsonValue,
+    limiter: ListLimiter,
+    probe_items: usize,
+) -> Result<BoundedList<String>> {
+    ensure_success(response)?;
+    let values = response
+        .get("data")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            Error::Serialization("prometheus label response data is not an array".into())
+        })?;
+    let mut names = Vec::with_capacity(probe_items.min(256));
+    for value in values.iter().take(probe_items) {
+        names.push(value.as_str().map(str::to_owned).ok_or_else(|| {
+            Error::Serialization("prometheus metric name is not a string".into())
+        })?);
+    }
+    names.sort();
+    Ok(limiter.finish(names))
+}
+
+fn time_series_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.push(CapabilityOperation::TimeSeriesListMeasurementsBounded);
+    operations
 }
 
 fn series_set_from_response(response: &JsonValue) -> Result<SeriesSet> {
@@ -867,6 +908,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(names, vec!["process_cpu_seconds_total", "up"]);
+    }
+
+    #[test]
+    fn bounded_measurement_names_use_an_n_plus_one_probe() {
+        let bounded = measurement_names_from_response_bounded(
+            &json!({
+                "status": "success",
+                "data": ["z_metric", "a_metric", "m_metric", "ignored"]
+            }),
+            ListLimiter::new(2),
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(bounded.items, vec!["a_metric", "m_metric"]);
+        assert!(bounded.truncated);
+    }
+
+    #[test]
+    fn prometheus_declares_only_its_verified_bounded_catalog_extension() {
+        let operations = time_series_operations(Capabilities {
+            time_series: true,
+            ..Default::default()
+        });
+
+        assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurements));
+        assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurementsBounded));
+        assert!(!operations.contains(&CapabilityOperation::SearchListIndicesBounded));
     }
 
     #[test]

@@ -3,6 +3,8 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     model::{Point, SeriesSet, TimeRange},
+    port::CapabilityOperation,
+    service::ListLimiter,
     Result,
 };
 use std::collections::HashMap;
@@ -73,11 +75,16 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
             validate_query_limit(ctx.limit)?;
             Some(resolve_query_range(*last_minutes, *start_ms, *end_ms)?)
         }
-        _ => None,
+        TsAction::Measurements => {
+            ListLimiter::new(ctx.limit).probe_items()?;
+            None
+        }
+        TsAction::Write { .. } => None,
     };
 
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let ts = conn
         .as_timeseries()
         .ok_or_else(|| Error::UnsupportedCapability {
@@ -88,12 +95,22 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
     let kind = conn.kind().0.clone();
 
     Ok(match cmd.action {
-        TsAction::Measurements => ctx.render_success(
-            &kind,
-            ts.list_measurements().await?,
-            start.elapsed().as_millis() as u64,
-            false,
-        ),
+        TsAction::Measurements => {
+            require_time_series_operation(
+                &operations,
+                CapabilityOperation::TimeSeriesListMeasurementsBounded,
+                &kind,
+                "TimeSeriesStore.list_measurements_bounded",
+            )?;
+            let measurements = ts.list_measurements_bounded(ctx.limit).await?;
+            let truncated = measurements.truncated;
+            ctx.render_success(
+                &kind,
+                measurements.items,
+                start.elapsed().as_millis() as u64,
+                truncated,
+            )
+        }
         TsAction::Query {
             query,
             last_minutes: _,
@@ -133,6 +150,22 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
     ctx.ensure_write_allowed()
+}
+
+fn require_time_series_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+    needed: &'static str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed,
+        })
+    }
 }
 
 fn validate_last_minutes(last_minutes: i64) -> Result<()> {
@@ -280,6 +313,37 @@ mod tests {
             Err(Error::WriteNotAllowed)
         ));
         assert!(ensure_write_allowed(&test_context(true)).is_ok());
+    }
+
+    #[test]
+    fn coarse_time_series_capability_does_not_authorize_bounded_measurement_listing() {
+        assert!(matches!(
+            require_time_series_operation(
+                CapabilityOperation::TIME_SERIES,
+                CapabilityOperation::TimeSeriesListMeasurementsBounded,
+                "legacy-time-series",
+                "TimeSeriesStore.list_measurements_bounded",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-time-series"
+                    && needed == "TimeSeriesStore.list_measurements_bounded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn measurement_limit_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(false);
+        ctx.limit = usize::MAX;
+        let error = run(
+            &ctx,
+            TsCmd {
+                action: TsAction::Measurements,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Config(message) if message.contains("too large")));
     }
 
     #[test]

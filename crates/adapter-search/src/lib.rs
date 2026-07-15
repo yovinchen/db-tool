@@ -1,14 +1,15 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{IndexInfo, Value},
+    model::{BoundedList, IndexInfo, Value},
     port::{
         capability::{
             SearchDeleteIndexOutcome, SearchDocument, SearchEngine, SearchHits, SearchOptions,
             SearchWriteOutcome,
         },
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::ListLimiter,
 };
 use futures::future::BoxFuture;
 use rustls::{ClientConfig, RootCertStore};
@@ -23,6 +24,10 @@ use tokio_rustls::TlsConnector;
 use url::Url;
 
 const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+// CAT indices has no reliable cursor/limit contract across OpenSearch and
+// Elasticsearch versions. Keep its unavoidable whole response materially
+// smaller than ordinary search responses before retaining only N+1 entries.
+const MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 
 pub struct SearchAdapter {
@@ -53,6 +58,10 @@ impl Connector for SearchAdapter {
         }
     }
 
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        search_operations(self.capabilities())
+    }
+
     async fn ping(&self) -> Result<()> {
         self.client.request_json("GET", "/", None).await.map(|_| ())
     }
@@ -74,6 +83,21 @@ impl SearchEngine for SearchAdapter {
             .request_json("GET", "/_cat/indices?format=json&h=index", None)
             .await?;
         indices_from_response(&response)
+    }
+
+    async fn list_indices_bounded(&self, max_items: usize) -> Result<BoundedList<IndexInfo>> {
+        let limiter = ListLimiter::new(max_items);
+        let probe_items = limiter.probe_items()?;
+        let response = self
+            .client
+            .request_json_with_body_limit(
+                "GET",
+                "/_cat/indices?format=json&h=index&s=index",
+                None,
+                MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES,
+            )
+            .await?;
+        indices_from_response_bounded(&response, limiter, probe_items)
     }
 
     async fn search(
@@ -236,6 +260,19 @@ impl SearchHttpClient {
         response.into_success()
     }
 
+    async fn request_json_with_body_limit(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&JsonValue>,
+        max_body_bytes: usize,
+    ) -> Result<JsonValue> {
+        let response = self
+            .request_json_response_with_body_limit(method, path, body, max_body_bytes)
+            .await?;
+        response.into_success()
+    }
+
     async fn request_json_optional(
         &self,
         method: &str,
@@ -252,6 +289,17 @@ impl SearchHttpClient {
         path: &str,
         body: Option<&JsonValue>,
     ) -> Result<SearchHttpResponse> {
+        self.request_json_response_with_body_limit(method, path, body, MAX_HTTP_RESPONSE_BODY_BYTES)
+            .await
+    }
+
+    async fn request_json_response_with_body_limit(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&JsonValue>,
+        max_body_bytes: usize,
+    ) -> Result<SearchHttpResponse> {
         let (request, body) = self.build_request(method, path, body)?;
 
         let stream = TcpStream::connect((self.host.as_str(), self.port))
@@ -267,10 +315,10 @@ impl SearchHttpClient {
                 .connect(server_name, stream)
                 .await
                 .map_err(|e| Error::Connection(e.to_string()))?;
-            return send_http_request(stream, &request, &body).await;
+            return send_http_request(stream, &request, &body, max_body_bytes).await;
         }
 
-        send_http_request(stream, &request, &body).await
+        send_http_request(stream, &request, &body, max_body_bytes).await
     }
 
     fn build_request(
@@ -345,6 +393,7 @@ async fn send_http_request<S>(
     mut stream: S,
     request: &str,
     body: &[u8],
+    max_body_bytes: usize,
 ) -> Result<SearchHttpResponse>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -360,9 +409,8 @@ where
             .map_err(|e| Error::Connection(e.to_string()))?;
     }
 
-    let response =
-        read_bounded_http_response(&mut stream, MAX_HTTP_RESPONSE_BODY_BYTES, true).await?;
-    parse_http_json(&response)
+    let response = read_bounded_http_response(&mut stream, max_body_bytes, true).await?;
+    parse_http_json_with_limit(&response, max_body_bytes)
 }
 
 async fn read_bounded_http_response<S>(
@@ -533,6 +581,32 @@ fn indices_from_response(response: &JsonValue) -> Result<Vec<IndexInfo>> {
         .collect::<Result<Vec<_>>>()?;
     indices.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(indices)
+}
+
+fn indices_from_response_bounded(
+    response: &JsonValue,
+    limiter: ListLimiter,
+    probe_items: usize,
+) -> Result<BoundedList<IndexInfo>> {
+    let indices = response
+        .as_array()
+        .ok_or_else(|| Error::Serialization("search index list response is not an array".into()))?;
+    let mut bounded = Vec::with_capacity(probe_items.min(256));
+    for entry in indices.iter().take(probe_items) {
+        let name = entry
+            .get("index")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| Error::Serialization("search index entry is missing index name".into()))?
+            .to_owned();
+        bounded.push(IndexInfo {
+            name,
+            columns: vec![],
+            unique: false,
+            primary: false,
+        });
+    }
+    bounded.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(limiter.finish(bounded))
 }
 
 fn search_body(query: Value, options: &SearchOptions) -> Result<JsonValue> {
@@ -729,10 +803,6 @@ fn optional_bool(object: &mut Map<String, JsonValue>, field: &str) -> Result<Opt
         .transpose()
 }
 
-fn parse_http_json(response: &[u8]) -> Result<SearchHttpResponse> {
-    parse_http_json_with_limit(response, MAX_HTTP_RESPONSE_BODY_BYTES)
-}
-
 fn parse_http_json_with_limit(
     response: &[u8],
     max_body_bytes: usize,
@@ -777,6 +847,12 @@ fn parse_http_json_with_limit(
         Err(error) => return Err(Error::Serialization(error.to_string())),
     };
     Ok(SearchHttpResponse { status, body })
+}
+
+fn search_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.push(CapabilityOperation::SearchListIndicesBounded);
+    operations
 }
 
 fn find_http_header_end(response: &[u8]) -> Option<usize> {
@@ -1174,9 +1250,42 @@ mod tests {
     }
 
     #[test]
+    fn bounded_index_list_uses_an_n_plus_one_probe() {
+        let limiter = ListLimiter::new(2);
+        let bounded = indices_from_response_bounded(
+            &json!([
+                { "index": "users" },
+                { "index": "orders" },
+                { "index": "audit" },
+                { "index": "ignored" }
+            ]),
+            limiter,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(bounded.items.len(), 2);
+        assert_eq!(bounded.items[0].name, "audit");
+        assert_eq!(bounded.items[1].name, "orders");
+        assert!(bounded.truncated);
+    }
+
+    #[test]
+    fn search_declares_only_its_verified_bounded_catalog_extension() {
+        let operations = search_operations(Capabilities {
+            search: true,
+            ..Default::default()
+        });
+
+        assert!(operations.contains(&CapabilityOperation::SearchListIndices));
+        assert!(operations.contains(&CapabilityOperation::SearchListIndicesBounded));
+        assert!(!operations.contains(&CapabilityOperation::DocumentListCollectionsBounded));
+    }
+
+    #[test]
     fn decodes_chunked_json_response() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"ok\":1\r\n1\r\n}\r\n0\r\n\r\n";
-        let value = parse_http_json(response).unwrap();
+        let value = parse_http_json_with_limit(response, MAX_HTTP_RESPONSE_BODY_BYTES).unwrap();
 
         assert_eq!(value.status, 200);
         assert_eq!(value.body["ok"], 1);
@@ -1256,7 +1365,7 @@ mod tests {
     #[test]
     fn non_success_http_error_retains_status_and_json_body() {
         let response = b"HTTP/1.1 409 Conflict\r\nContent-Length: 55\r\n\r\n{\"error\":{\"type\":\"version_conflict_engine_exception\"}}";
-        let error = parse_http_json(response)
+        let error = parse_http_json_with_limit(response, MAX_HTTP_RESPONSE_BODY_BYTES)
             .unwrap()
             .into_success()
             .unwrap_err();
@@ -1274,8 +1383,9 @@ mod tests {
 
     #[test]
     fn get_response_maps_http_404_to_none() {
-        let response = parse_http_json(
+        let response = parse_http_json_with_limit(
             b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"_index\":\"users\",\"_id\":\"missing\",\"found\":false}",
+            MAX_HTTP_RESPONSE_BODY_BYTES,
         )
         .unwrap()
         .into_optional()
