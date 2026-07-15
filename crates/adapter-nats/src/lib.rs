@@ -2,9 +2,9 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo,
-        Message, MessageCursor, MessageMetadata, MessageResource, MessageResourceKind,
-        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
+        AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
+        DeleteResourceOutcome, LagInfo, Message, MessageCursor, MessageMetadata, MessageResource,
+        MessageResourceKind, PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -125,55 +125,33 @@ impl MessageProducer for NatsAdapter {
 impl MessageConsumer for NatsAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_subject(source)?;
-        validate_consume_position(&options)?;
-        if options.max == 0 {
-            return Ok(vec![]);
-        }
+        validate_nats_consume_options(&options)?;
 
-        if let Some(ConsumeCursor::NatsJetstream { stream_sequence }) = options.cursor {
-            return self
-                .consume_jetstream(source, options.max, options.timeout, stream_sequence)
-                .await;
-        }
-
-        let deadline = checked_deadline(options.timeout)?;
-        let mut subscriber = self
-            .client
-            .subscribe(source.to_owned())
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-        self.client
-            .flush()
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
-
-        let mut messages = Vec::new();
-        while messages.len() < options.max {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-
-            match timeout(deadline - now, subscriber.next()).await {
-                Ok(Some(message)) => {
-                    let headers = nats_headers_to_core(message.headers.as_ref())?;
-                    messages.push(Message {
-                        key: None,
-                        payload: message.payload,
-                        headers,
-                        partition: None,
-                        offset: None,
-                        timestamp: None,
-                        cursor: None,
-                        metadata: None,
-                    });
+        match &options.identity {
+            ConsumerIdentity::Stateless => {
+                if let Some(ConsumeCursor::NatsJetstream { stream_sequence }) = options.cursor {
+                    self.consume_jetstream_stateless(
+                        source,
+                        options.max,
+                        options.timeout,
+                        stream_sequence,
+                    )
+                    .await
+                } else {
+                    self.consume_core_nats(source, None, options.max, options.timeout)
+                        .await
                 }
-                Ok(None) => break,
-                Err(_) => break,
+            }
+            ConsumerIdentity::Group { group, member } => {
+                debug_assert!(member.is_none());
+                self.consume_core_nats(source, Some(group.as_str()), options.max, options.timeout)
+                    .await
+            }
+            ConsumerIdentity::Durable { name } => {
+                validate_jetstream_name("consumer", name)?;
+                self.consume_jetstream_durable(source, name, &options).await
             }
         }
-
-        Ok(messages)
     }
 }
 
@@ -239,13 +217,19 @@ impl AdminInspect for NatsAdapter {
                     .consumer_info(group)
                     .await
                     .map_err(|e| Error::Query(e.to_string()))?;
+                let (committed, latest, outstanding) = nats_lag_dimensions(
+                    consumer.ack_floor.stream_sequence,
+                    info.state.last_sequence,
+                    consumer.num_ack_pending,
+                    consumer.num_pending,
+                )?;
                 lag.push(LagInfo {
                     topic: info.config.name,
                     partition: 0,
                     group: group.to_owned(),
-                    committed: u64_to_i64(consumer.ack_floor.stream_sequence),
-                    latest: u64_to_i64(info.state.last_sequence),
-                    lag: u64_to_i64(consumer.num_pending),
+                    committed,
+                    latest,
+                    lag: outstanding,
                 });
             }
         }
@@ -307,7 +291,60 @@ impl NatsAdapter {
         async_nats::jetstream::new(self.client.clone())
     }
 
-    async fn consume_jetstream(
+    async fn consume_core_nats(
+        &self,
+        subject: &str,
+        queue_group: Option<&str>,
+        max: usize,
+        wait: std::time::Duration,
+    ) -> Result<Vec<Message>> {
+        let deadline = checked_deadline(wait)?;
+        let mut subscriber = match queue_group {
+            Some(group) => self
+                .client
+                .queue_subscribe(subject.to_owned(), group.to_owned())
+                .await
+                .map_err(|error| Error::Query(error.to_string()))?,
+            None => self
+                .client
+                .subscribe(subject.to_owned())
+                .await
+                .map_err(|error| Error::Query(error.to_string()))?,
+        };
+        self.client
+            .flush()
+            .await
+            .map_err(|error| Error::Connection(error.to_string()))?;
+
+        let mut messages = Vec::new();
+        while messages.len() < max {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            match timeout(deadline - now, subscriber.next()).await {
+                Ok(Some(message)) => {
+                    let headers = nats_headers_to_core(message.headers.as_ref())?;
+                    messages.push(Message {
+                        key: None,
+                        payload: message.payload,
+                        headers,
+                        partition: None,
+                        offset: None,
+                        timestamp: None,
+                        cursor: None,
+                        metadata: None,
+                    });
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        Ok(messages)
+    }
+
+    async fn consume_jetstream_stateless(
         &self,
         subject: &str,
         max: usize,
@@ -377,6 +414,185 @@ impl NatsAdapter {
             .map_err(|error| Error::Query(error.to_string()));
         finish_temporary_consumer(consume_result, cleanup_result)
     }
+
+    async fn consume_jetstream_durable(
+        &self,
+        subject: &str,
+        durable_name: &str,
+        options: &ConsumeOptions,
+    ) -> Result<Vec<Message>> {
+        let deadline = checked_deadline(options.timeout)?;
+        let jetstream = self.jetstream();
+        let stream_name = jetstream
+            .stream_by_subject(subject)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let stream = jetstream
+            .get_stream(&stream_name)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let consumer =
+            compatible_durable_consumer(&jetstream, &stream, durable_name, subject).await?;
+        // An ACKing call reserves one third of its caller-owned deadline for
+        // server-confirmed acknowledgements. Otherwise a partially filled pull
+        // batch could consume the whole timeout waiting for more deliveries and
+        // leave no time to acknowledge the messages it already received.
+        let fetch_deadline = if options.ack == AckMode::OnSuccess {
+            deadline - (options.timeout / 3)
+        } else {
+            deadline
+        };
+        let native_messages = fetch_jetstream_batch(&consumer, options.max, fetch_deadline).await?;
+
+        // Conversion is deliberately complete before the first ACK. A malformed
+        // header or delivery envelope therefore leaves the whole fetched batch
+        // unacknowledged and eligible for redelivery.
+        let messages = native_messages
+            .iter()
+            .cloned()
+            .map(jetstream_message_to_core)
+            .collect::<Result<Vec<_>>>()?;
+
+        if options.ack == AckMode::OnSuccess {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    Error::Query(
+                        "NATS JetStream consume deadline elapsed before acknowledgements completed"
+                            .into(),
+                    )
+                })?;
+            timeout(
+                remaining,
+                futures::future::try_join_all(
+                    native_messages.iter().map(|message| message.double_ack()),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                Error::Query(
+                    "NATS JetStream verified acknowledgements exceeded consume timeout".into(),
+                )
+            })?
+            .map_err(|error| Error::Query(error.to_string()))?;
+        }
+
+        Ok(messages)
+    }
+}
+
+async fn compatible_durable_consumer(
+    jetstream: &async_nats::jetstream::Context,
+    stream: &async_nats::jetstream::stream::Stream,
+    durable_name: &str,
+    subject: &str,
+) -> Result<async_nats::jetstream::consumer::PullConsumer> {
+    use async_nats::jetstream::consumer::{pull, AckPolicy, DeliverPolicy, ReplayPolicy};
+    use async_nats::jetstream::stream::{ConsumerCreateStrictErrorKind, ConsumerErrorKind};
+
+    let stream_name = stream.cached_info().config.name.as_str();
+    match jetstream
+        .get_consumer_from_stream::<async_nats::jetstream::consumer::Config, _, _>(
+            durable_name,
+            stream_name,
+        )
+        .await
+    {
+        Ok(consumer) => {
+            validate_durable_consumer_config(
+                &consumer.cached_info().config,
+                durable_name,
+                subject,
+            )?;
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                ConsumerErrorKind::JetStream(ref jetstream_error)
+                    if jetstream_error.error_code()
+                        == async_nats::jetstream::ErrorCode::CONSUMER_NOT_FOUND
+            ) =>
+        {
+            let config = pull::Config {
+                durable_name: Some(durable_name.to_owned()),
+                deliver_policy: DeliverPolicy::All,
+                ack_policy: AckPolicy::Explicit,
+                filter_subject: subject.to_owned(),
+                replay_policy: ReplayPolicy::Instant,
+                ..Default::default()
+            };
+            match stream.create_consumer_strict(config).await {
+                Ok(consumer) => return Ok(consumer),
+                Err(error) if error.kind() == ConsumerCreateStrictErrorKind::AlreadyExists => {
+                    // A concurrent creator won the race. Re-read and validate it;
+                    // never update an existing consumer to match our request.
+                }
+                Err(error) => return Err(Error::Query(error.to_string())),
+            }
+        }
+        Err(error) => return Err(Error::Query(error.to_string())),
+    }
+
+    let consumer = jetstream
+        .get_consumer_from_stream::<pull::Config, _, _>(durable_name, stream_name)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+    validate_durable_consumer_config(&consumer.cached_info().config, durable_name, subject)?;
+    Ok(consumer)
+}
+
+fn validate_durable_consumer_config(
+    config: &async_nats::jetstream::consumer::Config,
+    durable_name: &str,
+    subject: &str,
+) -> Result<()> {
+    use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, ReplayPolicy};
+
+    let compatible = config.deliver_subject.is_none()
+        && config.durable_name.as_deref() == Some(durable_name)
+        && config.deliver_policy == DeliverPolicy::All
+        && config.ack_policy == AckPolicy::Explicit
+        && config.filter_subject == subject
+        && config.filter_subjects.is_empty()
+        && config.replay_policy == ReplayPolicy::Instant
+        && !config.headers_only
+        && config.max_deliver <= 0;
+    if compatible {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "existing NATS JetStream durable {durable_name:?} is incompatible: dbtool requires a pull consumer with deliver=all, ack=explicit, replay=instant, unlimited redelivery, full payloads, and the exact filter subject {subject:?}; the existing consumer was not modified"
+        )))
+    }
+}
+
+async fn fetch_jetstream_batch(
+    consumer: &async_nats::jetstream::consumer::PullConsumer,
+    max: usize,
+    deadline: Instant,
+) -> Result<Vec<async_nats::jetstream::Message>> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| Error::Query("NATS JetStream consume deadline elapsed".into()))?;
+    let mut batch = consumer
+        .fetch()
+        .max_messages(max)
+        .expires(remaining)
+        .messages()
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+    let mut messages = Vec::new();
+    while messages.len() < max {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let item = match timeout(remaining, batch.next()).await {
+            Ok(Some(item)) => item.map_err(|error| Error::Query(error.to_string()))?,
+            Ok(None) | Err(_) => break,
+        };
+        messages.push(item);
+    }
+    Ok(messages)
 }
 
 fn finish_temporary_consumer<T>(consume: Result<T>, cleanup: Result<bool>) -> Result<T> {
@@ -436,6 +652,9 @@ fn jetstream_message_to_core(message: async_nats::jetstream::Message) -> Result<
 fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::MessageConsumeGroup,
+        CapabilityOperation::MessageConsumeDurable,
+        CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminConsumerLag,
@@ -482,6 +701,19 @@ fn validate_subject(subject: &str) -> Result<()> {
         return Err(Error::Query(format!("invalid NATS subject: {subject:?}")));
     }
 
+    Ok(())
+}
+
+fn validate_queue_group(group: &str) -> Result<()> {
+    if group.is_empty()
+        || group
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err(Error::Config(format!(
+            "invalid Core NATS queue group: {group:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -543,6 +775,38 @@ fn validate_consume_position(options: &ConsumeOptions) -> Result<()> {
     Ok(())
 }
 
+fn validate_nats_consume_options(options: &ConsumeOptions) -> Result<()> {
+    options.validate().map_err(Error::Config)?;
+    validate_consume_position(options)?;
+    match &options.identity {
+        ConsumerIdentity::Stateless => {
+            if options.ack != AckMode::None {
+                return Err(Error::Config(
+                    "stateless NATS consumption cannot acknowledge broker state; use --durable"
+                        .into(),
+                ));
+            }
+        }
+        ConsumerIdentity::Group { group, member } => {
+            validate_queue_group(group)?;
+            if member.is_some() {
+                return Err(Error::Config(
+                    "Core NATS queue groups do not expose stable member identities; omit --consumer"
+                        .into(),
+                ));
+            }
+            if options.ack != AckMode::None {
+                return Err(Error::Config(
+                    "Core NATS queue groups have no broker acknowledgement or replay progress"
+                        .into(),
+                ));
+            }
+        }
+        ConsumerIdentity::Durable { name } => validate_jetstream_name("consumer", name)?,
+    }
+    Ok(())
+}
+
 fn nats_headers_from_core(headers: &HashMap<String, String>) -> Result<async_nats::HeaderMap> {
     let mut mapped = async_nats::HeaderMap::new();
     for (key, value) in headers {
@@ -584,6 +848,29 @@ fn checked_deadline(timeout: std::time::Duration) -> Result<Instant> {
     Instant::now().checked_add(timeout).ok_or_else(|| {
         Error::Config("Core NATS consume timeout is too large for this platform".into())
     })
+}
+
+fn nats_lag_dimensions(
+    ack_floor_stream_sequence: u64,
+    stream_last_sequence: u64,
+    num_ack_pending: usize,
+    num_pending: u64,
+) -> Result<(i64, i64, i64)> {
+    let num_ack_pending = u64::try_from(num_ack_pending)
+        .map_err(|_| Error::Serialization("NATS ack-pending count exceeds u64".into()))?;
+    let outstanding = num_ack_pending.checked_add(num_pending).ok_or_else(|| {
+        Error::Serialization("NATS total outstanding message count exceeds u64".into())
+    })?;
+    Ok((
+        exact_nats_lag_i64("ACK floor stream sequence", ack_floor_stream_sequence)?,
+        exact_nats_lag_i64("stream last sequence", stream_last_sequence)?,
+        exact_nats_lag_i64("outstanding message count", outstanding)?,
+    ))
+}
+
+fn exact_nats_lag_i64(label: &str, value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| Error::Serialization(format!("NATS {label} exceeds portable i64")))
 }
 
 fn validate_jetstream_name(kind: &str, name: &str) -> Result<()> {
@@ -668,6 +955,7 @@ fn usize_to_i16(value: usize) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, ReplayPolicy};
 
     fn message() -> Message {
         Message {
@@ -682,6 +970,20 @@ mod tests {
             timestamp: None,
             cursor: None,
             metadata: None,
+        }
+    }
+
+    fn durable_config(
+        durable_name: &str,
+        subject: &str,
+    ) -> async_nats::jetstream::consumer::Config {
+        async_nats::jetstream::consumer::Config {
+            durable_name: Some(durable_name.to_owned()),
+            deliver_policy: DeliverPolicy::All,
+            ack_policy: AckPolicy::Explicit,
+            filter_subject: subject.to_owned(),
+            replay_policy: ReplayPolicy::Instant,
+            ..Default::default()
         }
     }
 
@@ -794,6 +1096,109 @@ mod tests {
     }
 
     #[test]
+    fn nats_stateful_identity_rules_do_not_invent_protocol_semantics() {
+        let group = ConsumeOptions {
+            identity: ConsumerIdentity::Group {
+                group: "workers.eu".to_owned(),
+                member: None,
+            },
+            ack: AckMode::None,
+            ..Default::default()
+        };
+        assert!(validate_nats_consume_options(&group).is_ok());
+
+        let mut invalid = group.clone();
+        invalid.identity = ConsumerIdentity::Group {
+            group: "workers.eu".to_owned(),
+            member: Some("member-1".to_owned()),
+        };
+        assert!(matches!(
+            validate_nats_consume_options(&invalid),
+            Err(Error::Config(message)) if message.contains("stable member")
+        ));
+
+        let mut invalid = group;
+        invalid.ack = AckMode::OnSuccess;
+        assert!(matches!(
+            validate_nats_consume_options(&invalid),
+            Err(Error::Config(message)) if message.contains("no broker acknowledgement")
+        ));
+
+        let durable = ConsumeOptions {
+            identity: ConsumerIdentity::Durable {
+                name: "DBTOOL_WORKER".to_owned(),
+            },
+            ack: AckMode::OnSuccess,
+            ..Default::default()
+        };
+        assert!(validate_nats_consume_options(&durable).is_ok());
+
+        let stateless_ack = ConsumeOptions {
+            ack: AckMode::OnSuccess,
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_nats_consume_options(&stateless_ack),
+            Err(Error::Config(message)) if message.contains("use --durable")
+        ));
+    }
+
+    #[test]
+    fn durable_consumers_must_match_without_server_side_mutation() {
+        let valid = durable_config("DBTOOL_WORKER", "events.us");
+        assert!(validate_durable_consumer_config(&valid, "DBTOOL_WORKER", "events.us").is_ok());
+
+        let mut wrong_filter = valid.clone();
+        wrong_filter.filter_subject = "events.eu".to_owned();
+        assert!(matches!(
+            validate_durable_consumer_config(
+                &wrong_filter,
+                "DBTOOL_WORKER",
+                "events.us"
+            ),
+            Err(Error::Config(message))
+                if message.contains("incompatible") && message.contains("not modified")
+        ));
+
+        let mut wrong_delivery = valid.clone();
+        wrong_delivery.deliver_policy = DeliverPolicy::New;
+        assert!(
+            validate_durable_consumer_config(&wrong_delivery, "DBTOOL_WORKER", "events.us")
+                .is_err()
+        );
+
+        let mut wrong_ack = valid;
+        wrong_ack.ack_policy = AckPolicy::All;
+        assert!(
+            validate_durable_consumer_config(&wrong_ack, "DBTOOL_WORKER", "events.us").is_err()
+        );
+
+        let mut finite_redelivery = durable_config("DBTOOL_WORKER", "events.us");
+        finite_redelivery.max_deliver = 1;
+        assert!(matches!(
+            validate_durable_consumer_config(
+                &finite_redelivery,
+                "DBTOOL_WORKER",
+                "events.us"
+            ),
+            Err(Error::Config(message)) if message.contains("unlimited redelivery")
+        ));
+    }
+
+    #[test]
+    fn jetstream_lag_includes_delivered_unacknowledged_and_not_yet_delivered() {
+        assert_eq!(nats_lag_dimensions(4, 11, 3, 4).unwrap(), (4, 11, 7));
+        assert!(matches!(
+            nats_lag_dimensions(u64::MAX, u64::MAX, 1, u64::MAX),
+            Err(Error::Serialization(message)) if message.contains("outstanding")
+        ));
+        assert!(matches!(
+            nats_lag_dimensions(i64::MAX as u64 + 1, 1, 0, 0),
+            Err(Error::Serialization(message)) if message.contains("ACK floor")
+        ));
+    }
+
+    #[test]
     fn temporary_consumer_cleanup_must_succeed_and_preserves_dual_failures() {
         assert_eq!(finish_temporary_consumer(Ok(7), Ok(true)).unwrap(), 7);
         assert!(matches!(
@@ -848,6 +1253,9 @@ mod tests {
         for operation in [
             CapabilityOperation::MessageProduce,
             CapabilityOperation::MessageConsume,
+            CapabilityOperation::MessageConsumeGroup,
+            CapabilityOperation::MessageConsumeDurable,
+            CapabilityOperation::MessageConsumeAck,
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminTopicDetail,
             CapabilityOperation::MessageAdminConsumerLag,
