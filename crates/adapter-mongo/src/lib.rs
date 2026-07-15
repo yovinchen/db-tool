@@ -75,9 +75,15 @@ impl DocumentStore for MongoAdapter {
         use futures::StreamExt;
         let col = self.db.collection::<mongodb::bson::Document>(collection);
         let filter = value_to_document(filter)?;
+        let limit = mongo_limit(opts.limit)?;
+        let skip = opts
+            .skip
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| Error::Config("MongoDB skip exceeds the u64 range".into()))?;
         let find_opts = mongodb::options::FindOptions::builder()
-            .limit(opts.limit.map(|n| n as i64))
-            .skip(opts.skip.map(|n| n as u64))
+            .limit(limit)
+            .skip(skip)
             .sort(optional_document(opts.sort)?)
             .projection(optional_document(opts.projection)?)
             .build();
@@ -100,7 +106,8 @@ impl DocumentStore for MongoAdapter {
             .into_iter()
             .map(core_document_to_bson)
             .collect::<Result<Vec<_>>>()?;
-        let count = bson_docs.len() as u64;
+        let count = u64::try_from(bson_docs.len())
+            .map_err(|_| Error::Serialization("document count exceeds the u64 range".into()))?;
         let result = col
             .insert_many(bson_docs)
             .await
@@ -110,7 +117,7 @@ impl DocumentStore for MongoAdapter {
             ids: result
                 .inserted_ids
                 .into_values()
-                .map(|id| id.to_string())
+                .map(inserted_id_string)
                 .collect(),
         })
     }
@@ -178,7 +185,9 @@ impl MongoAdapter {
     ) -> Result<Vec<Document>> {
         use futures::StreamExt;
         if max_items == Some(0) {
-            return Ok(Vec::new());
+            return Err(Error::Config(
+                "MongoDB aggregate limit must be greater than zero".into(),
+            ));
         }
         let col = self.db.collection::<mongodb::bson::Document>(collection);
         let pipeline = pipeline
@@ -204,6 +213,28 @@ impl MongoAdapter {
 
 fn optional_document(value: Option<Value>) -> Result<Option<bson::Document>> {
     value.map(value_to_document).transpose()
+}
+
+fn mongo_limit(limit: Option<usize>) -> Result<Option<i64>> {
+    limit
+        .map(|limit| {
+            if limit == 0 {
+                return Err(Error::Config(
+                    "MongoDB find limit must be greater than zero".into(),
+                ));
+            }
+            i64::try_from(limit)
+                .map_err(|_| Error::Config("MongoDB find limit exceeds the i64 range".into()))
+        })
+        .transpose()
+}
+
+fn inserted_id_string(id: Bson) -> String {
+    match id {
+        Bson::ObjectId(id) => id.to_hex(),
+        Bson::String(id) => id,
+        other => other.into_canonical_extjson().to_string(),
+    }
 }
 
 fn ensure_nonempty_filter(filter: &bson::Document, operation: &str) -> Result<()> {
@@ -285,7 +316,7 @@ fn value_to_bson(value: Value) -> Result<Bson> {
 }
 
 fn json_to_bson(value: serde_json::Value) -> Result<Bson> {
-    bson::to_bson(&value).map_err(|err| Error::Serialization(err.to_string()))
+    Bson::try_from(value).map_err(|err| Error::Serialization(err.to_string()))
 }
 
 fn bson_document_to_core(document: bson::Document) -> Document {
@@ -311,9 +342,11 @@ fn bson_to_value(value: Bson) -> Value {
         Bson::Null => Value::Null,
         Bson::Int32(value) => Value::Int(value.into()),
         Bson::Int64(value) => Value::Int(value),
-        Bson::Binary(binary) => Value::Bytes(binary.bytes),
+        Bson::Binary(binary) if binary.subtype == bson::spec::BinarySubtype::Generic => {
+            Value::Bytes(binary.bytes)
+        }
         Bson::DateTime(value) => Value::Timestamp(value.timestamp_millis()),
-        other => Value::Text(other.to_string()),
+        other => Value::Json(other.into_canonical_extjson()),
     }
 }
 
@@ -367,5 +400,69 @@ mod tests {
         assert_eq!(core.get("name"), Some(&Value::Text("alice".to_owned())));
         assert_eq!(core.get("active"), Some(&Value::Bool(true)));
         assert_eq!(core.get("count"), Some(&Value::Int(3)));
+    }
+
+    #[test]
+    fn find_and_aggregate_limits_reject_zero_and_overflow() {
+        assert!(matches!(
+            mongo_limit(Some(0)),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        if usize::BITS > 63 {
+            assert!(matches!(
+                mongo_limit(Some(i64::MAX as usize + 1)),
+                Err(Error::Config(message)) if message.contains("i64 range")
+            ));
+        }
+        assert_eq!(mongo_limit(Some(7)).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn extended_json_preserves_native_bson_types_bidirectionally() {
+        let cases = [
+            Bson::ObjectId(bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            Bson::Decimal128("1234567890.0123456789".parse().unwrap()),
+            Bson::RegularExpression(bson::Regex {
+                pattern: "^dbtool".into(),
+                options: "im".into(),
+            }),
+            Bson::Timestamp(bson::Timestamp {
+                time: 1_700_000_000,
+                increment: 42,
+            }),
+            Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Uuid,
+                bytes: vec![0; 16],
+            }),
+        ];
+
+        for expected in cases {
+            let core = bson_to_value(expected.clone());
+            let Value::Json(extended) = core else {
+                panic!("special BSON value should use canonical Extended JSON")
+            };
+            assert_eq!(json_to_bson(extended).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn extended_json_object_id_can_be_used_in_filters() {
+        let document = value_to_document(Value::Json(serde_json::json!({
+            "_id": {"$oid": "507f1f77bcf86cd799439011"}
+        })))
+        .unwrap();
+
+        assert!(
+            matches!(document.get("_id"), Some(Bson::ObjectId(id)) if id.to_hex() == "507f1f77bcf86cd799439011")
+        );
+    }
+
+    #[test]
+    fn inserted_object_ids_are_returned_as_reusable_hex_strings() {
+        let id = bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        assert_eq!(
+            inserted_id_string(Bson::ObjectId(id)),
+            "507f1f77bcf86cd799439011"
+        );
     }
 }

@@ -1890,6 +1890,79 @@ fn mongo_live_document_lifecycle() {
     ]));
     assert_eq!(deleted["data"]["deleted"], 1);
 
+    let inserted_typed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "insert",
+        &collection,
+        r#"{"name":"typed","decimal":{"$numberDecimal":"1234567890.0123456789"},"regex":{"$regularExpression":{"pattern":"^dbtool","options":"im"}},"bson_timestamp":{"$timestamp":{"t":1700000000,"i":42}}}"#,
+    ]));
+    assert_eq!(inserted_typed["data"]["inserted"], 1);
+    let generated_id = inserted_typed["data"]["ids"][0]
+        .as_str()
+        .expect("MongoDB-generated ObjectId should be returned as reusable hex");
+    assert_eq!(generated_id.len(), 24);
+    assert!(generated_id
+        .chars()
+        .all(|character| character.is_ascii_hexdigit()));
+    let generated_id_filter = format!(r#"{{"_id":{{"$oid":"{generated_id}"}}}}"#);
+
+    let found_typed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &collection,
+        "--filter",
+        &generated_id_filter,
+    ]));
+    assert_eq!(found_typed["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        found_typed["data"][0]["_id"]["$dbtool"]["value"]["$oid"],
+        generated_id
+    );
+    assert_eq!(
+        found_typed["data"][0]["decimal"]["$dbtool"]["value"]["$numberDecimal"],
+        "1234567890.0123456789"
+    );
+    assert_eq!(
+        found_typed["data"][0]["regex"]["$dbtool"]["value"]["$regularExpression"]["pattern"],
+        "^dbtool"
+    );
+    assert_eq!(
+        found_typed["data"][0]["bson_timestamp"]["$dbtool"]["value"]["$timestamp"]["i"],
+        42
+    );
+
+    let updated_typed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "update",
+        &collection,
+        "--filter",
+        &generated_id_filter,
+        "--update",
+        r#"{"roundtrip":true}"#,
+    ]));
+    assert_eq!(updated_typed["data"]["matched"], 1);
+    assert_eq!(updated_typed["data"]["modified"], 1);
+
+    let deleted_typed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "delete",
+        &collection,
+        "--filter",
+        &generated_id_filter,
+    ]));
+    assert_eq!(deleted_typed["data"]["deleted"], 1);
+
     let empty = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
