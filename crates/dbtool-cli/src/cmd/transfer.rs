@@ -12,18 +12,22 @@ use dbtool_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-const KV_TRANSFER_VERSION: u32 = 1;
-const DOCUMENT_TRANSFER_VERSION: u32 = 2;
+const KV_TRANSFER_VERSION: u32 = 2;
+const DOCUMENT_TRANSFER_VERSION: u32 = 3;
 const SQL_TRANSFER_VERSION: u32 = 3;
+const MAX_TRANSFER_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Args)]
 #[command(
     about = "Export rows, keys, or documents to a dbtool JSON artifact.",
-    long_about = "Export commands are read-only. They write a versioned dbtool JSON artifact that can be restored with the matching import command."
+    long_about = "Export commands are read-only. They write a versioned dbtool JSON artifact with typed values, redacted source provenance, and explicit completeness metadata. KV and document exports observe one bounded probe item; an artifact marked incomplete cannot be imported. Files are capped at 256 MiB and published with a same-directory atomic rename."
 )]
 pub struct ExportCmd {
     #[command(subcommand)]
@@ -66,7 +70,7 @@ pub enum ExportAction {
 #[derive(Args)]
 #[command(
     about = "Import a dbtool JSON artifact into a backend.",
-    long_about = "Import commands are write operations and require --allow-write before connecting. They accept only versioned dbtool export artifacts."
+    long_about = "Import commands are write operations and require --allow-write before reading the artifact, resolving the DSN, or connecting. They read at most 256 MiB, process at most the global --limit item budget, and accept only current, internally consistent, complete dbtool artifacts. SQL currently inserts one row per request; KV and document adapters likewise do not expose a cross-request transaction contract. Successful responses therefore report atomic=false."
 )]
 pub struct ImportCmd {
     #[command(subcommand)]
@@ -89,6 +93,9 @@ pub enum ImportAction {
         accept_legacy_unmarked: bool,
     },
     /// Import kv-pairs into a key-value backend.
+    #[command(
+        long_about = "Import a complete kv-pairs artifact. Input is capped at 256 MiB and the global --limit item budget is enforced before connecting. New keys use conditional create semantics so a concurrent creator is never overwritten silently. Existing keys are rejected by default; --replace-existing requires a global --confirm token bound to the target, complete transformed key/value set, and TTL. The generic KV contract cannot promise one transaction across all keys, so the response reports atomic=false."
+    )]
     Kv {
         /// Input JSON artifact path.
         #[arg(long)]
@@ -102,8 +109,15 @@ pub enum ImportAction {
         /// Optional TTL in seconds for restored keys.
         #[arg(long)]
         ttl: Option<u64>,
+        /// Permit replacing keys that already exist. Existing keys additionally
+        /// require the target-bound global --confirm token.
+        #[arg(long)]
+        replace_existing: bool,
     },
     /// Import documents into a document collection.
+    #[command(
+        long_about = "Import a complete documents artifact with one backend batch call. Duplicate artifact _id values are rejected offline. Existing target _id values are checked best-effort immediately before insertion; a concurrent writer can still race that check. --drop-id requests backend-generated identity instead. The generic document contract does not promise transaction-level atomicity for the batch, so the response reports atomic=false."
+    )]
     Doc {
         /// Target collection.
         collection: String,
@@ -116,7 +130,7 @@ pub enum ImportAction {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum TransferArtifact {
     SqlRows {
@@ -128,27 +142,86 @@ enum TransferArtifact {
     },
     KvPairs {
         version: u32,
+        source: ArtifactSource,
+        integrity: ArtifactIntegrity,
         entries: Vec<KvEntry>,
     },
     Documents {
         version: u32,
-        collection: Option<String>,
+        source: ArtifactSource,
+        integrity: ArtifactIntegrity,
+        collection: String,
         documents: Vec<Document>,
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactSource {
+    connector: String,
+    connection: String,
+    resource: String,
+    selector: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactIntegrity {
+    value_codec: String,
+    complete: bool,
+    truncated: bool,
+    source_changed: bool,
+    exported_items: u64,
+    selected_items: u64,
+    limit: usize,
+    consistency: ArtifactConsistency,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ArtifactConsistency {
+    /// The adapter completed one bounded traversal, but did not promise a
+    /// transactionally stable snapshot while concurrent writers were active.
+    BestEffort,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KvEntry {
+    key: String,
+    value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct PreparedKvEntry {
     key: String,
     value: Vec<u8>,
 }
 
+enum PreparedImport {
+    Sql {
+        table: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
+    Kv {
+        entries: Vec<PreparedKvEntry>,
+        ttl: Option<u64>,
+        replace_existing: bool,
+    },
+    Doc {
+        collection: String,
+        documents: Vec<Document>,
+    },
+}
+
 pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
+    let probe_limit = ResultLimiter::new(ctx.limit).probe_rows()?;
     if let ExportAction::Sql { query, .. } = &cmd.action {
         ensure_readonly_export_query(query)?;
-        ResultLimiter::new(ctx.limit).probe_rows()?;
     }
     let dsn = ctx.resolve_dsn()?;
+    let connection = ctx.safety_target(&dsn);
     let conn = ctx.registry.connect(&dsn).await?;
     let start = std::time::Instant::now();
     let kind = conn.kind().0.clone();
@@ -180,21 +253,42 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 kind: kind.clone(),
                 needed: "KeyValueStore",
             })?;
-            let keys = kv.scan(&pattern, ctx.limit).await?;
+            let mut keys = kv.scan(&pattern, probe_limit).await?;
+            ensure_unique_strings(&keys, "key returned by the source scan")?;
+            let truncated = keys.len() > ctx.limit;
+            keys.truncate(ctx.limit);
+            let selected_items = usize_to_u64(keys.len(), "selected key count")?;
             let mut entries = Vec::with_capacity(keys.len());
             for key in keys {
                 if let Some(value) = kv.get(&key).await? {
                     entries.push(KvEntry {
                         key,
-                        value: value.to_vec(),
+                        value: Value::Bytes(value.to_vec()),
                     });
                 }
             }
             let count = entries.len();
+            let exported_items = usize_to_u64(count, "exported key count")?;
+            let source_changed = exported_items != selected_items;
+            let integrity = artifact_integrity(
+                ctx.limit,
+                exported_items,
+                selected_items,
+                truncated,
+                source_changed,
+            );
+            let complete = integrity.complete;
             write_artifact(
                 &out,
                 TransferArtifact::KvPairs {
                     version: KV_TRANSFER_VERSION,
+                    source: ArtifactSource {
+                        connector: kind.clone(),
+                        connection: connection.clone(),
+                        resource: "key-pattern".to_owned(),
+                        selector: Value::Text(pattern),
+                    },
+                    integrity,
                     entries,
                 },
             )?;
@@ -204,9 +298,11 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                     "kind": "kv-pairs",
                     "path": out,
                     "keys": count,
+                    "complete": complete,
+                    "source_changed": source_changed,
                 }),
                 elapsed(),
-                false,
+                truncated,
             )
         }
         ExportAction::Doc {
@@ -222,16 +318,29 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 })?;
             let filter = parse_json_value(&filter)?;
             let options = FindOptions {
-                limit: Some(ctx.limit),
+                limit: Some(probe_limit),
                 ..Default::default()
             };
-            let documents = docs.find(&collection, filter, options).await?;
+            let mut documents = docs.find(&collection, filter.clone(), options).await?;
+            let truncated = documents.len() > ctx.limit;
+            documents.truncate(ctx.limit);
             let count = documents.len();
+            let exported_items = usize_to_u64(count, "exported document count")?;
+            let integrity =
+                artifact_integrity(ctx.limit, exported_items, exported_items, truncated, false);
+            let complete = integrity.complete;
             write_artifact(
                 &out,
                 TransferArtifact::Documents {
                     version: DOCUMENT_TRANSFER_VERSION,
-                    collection: Some(collection),
+                    source: ArtifactSource {
+                        connector: kind.clone(),
+                        connection,
+                        resource: collection.clone(),
+                        selector: filter,
+                    },
+                    integrity,
+                    collection,
                     documents,
                 },
             )?;
@@ -241,9 +350,10 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                     "kind": "documents",
                     "path": out,
                     "documents": count,
+                    "complete": complete,
                 }),
                 elapsed(),
-                false,
+                truncated,
             )
         }
     })
@@ -251,51 +361,30 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
 
 pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
     ensure_write_allowed(ctx)?;
+    let artifact = read_artifact(import_input(&cmd.action))?;
+    validate_import_artifact(&cmd.action, &artifact)?;
+    let prepared = prepare_import(cmd.action, artifact, ctx.limit)?;
 
     let dsn = ctx.resolve_dsn()?;
+    let safety_target = ctx.safety_target(&dsn);
     let conn = ctx.registry.connect(&dsn).await?;
     let start = std::time::Instant::now();
     let kind = conn.kind().0.clone();
     let elapsed = || start.elapsed().as_millis() as u64;
 
-    Ok(match cmd.action {
-        ImportAction::Sql {
+    Ok(match prepared {
+        PreparedImport::Sql {
             table,
-            input,
-            accept_legacy_unmarked,
+            columns,
+            rows,
         } => {
-            let artifact = read_artifact(&input)?;
-            let TransferArtifact::SqlRows {
-                version,
-                columns,
-                rows,
-                truncated,
-            } = artifact
-            else {
-                return Err(Error::Serialization(
-                    "expected sql-rows transfer artifact".to_owned(),
-                ));
-            };
-            require_complete_sql_artifact(version, truncated, accept_legacy_unmarked)?;
             let sql = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "SqlEngine",
             })?;
-            let table = validate_identifier_path(&table, "table")?;
-            let columns = columns
-                .iter()
-                .map(|column| validate_identifier(column, "column"))
-                .collect::<Result<Vec<_>>>()?;
             let statement_prefix = format!("INSERT INTO {table} ({}) VALUES ", columns.join(", "));
             let mut inserted = 0_u64;
             for row in rows {
-                if row.len() != columns.len() {
-                    return Err(Error::Serialization(format!(
-                        "row has {} values but artifact has {} columns",
-                        row.len(),
-                        columns.len()
-                    )));
-                }
                 let values = row
                     .iter()
                     .map(sql_literal)
@@ -311,37 +400,55 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
                     "kind": "sql-rows",
                     "inserted": inserted,
                     "table": table,
+                    "atomic": false,
                 }),
                 elapsed(),
                 false,
             )
         }
-        ImportAction::Kv {
-            input,
-            strip_prefix,
-            key_prefix,
+        PreparedImport::Kv {
+            entries,
             ttl,
+            replace_existing,
         } => {
-            let artifact = read_artifact(&input)?;
-            let TransferArtifact::KvPairs { version, entries } = artifact else {
-                return Err(Error::Serialization(
-                    "expected kv-pairs transfer artifact".to_owned(),
-                ));
-            };
-            require_version("kv-pairs", version, KV_TRANSFER_VERSION)?;
             let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "KeyValueStore",
             })?;
+            let mut existing = BTreeSet::new();
+            for entry in &entries {
+                if kv.get(&entry.key).await?.is_some() {
+                    existing.insert(entry.key.clone());
+                }
+            }
+            if !existing.is_empty() {
+                if !replace_existing {
+                    return Err(Error::Config(format!(
+                        "refusing to replace {} existing key(s); retry with --replace-existing, then provide the returned target-bound --confirm token",
+                        existing.len()
+                    )));
+                }
+                let resource = serde_json::to_string(&existing)
+                    .map_err(|e| Error::Serialization(e.to_string()))?;
+                let confirmation_scope = kv_replace_confirmation_scope(&entries, ttl)?;
+                SafetyGuard::check_destructive_operation_with_scope(
+                    "import_kv_replace",
+                    &resource,
+                    &safety_target,
+                    &confirmation_scope,
+                    ctx.allow_write,
+                    ctx.confirm.as_deref(),
+                )?;
+            }
             let mut restored = 0_u64;
             for entry in entries {
-                let key = restore_key(&entry.key, strip_prefix.as_deref(), &key_prefix)?;
+                let key = entry.key;
                 kv.set(
                     &key,
                     &entry.value,
                     SetOptions {
                         ttl_secs: ttl,
-                        nx: false,
+                        nx: !existing.contains(&key),
                     },
                 )
                 .await?;
@@ -352,39 +459,25 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
                 serde_json::json!({
                     "kind": "kv-pairs",
                     "restored": restored,
+                    "replaced": existing.len(),
+                    "atomic": false,
                 }),
                 elapsed(),
                 false,
             )
         }
-        ImportAction::Doc {
+        PreparedImport::Doc {
             collection,
-            input,
-            drop_id,
+            documents,
         } => {
-            let artifact = read_artifact(&input)?;
-            let TransferArtifact::Documents {
-                version, documents, ..
-            } = artifact
-            else {
-                return Err(Error::Serialization(
-                    "expected documents transfer artifact".to_owned(),
-                ));
-            };
-            require_version("documents", version, DOCUMENT_TRANSFER_VERSION)?;
             let docs = conn
                 .as_document()
                 .ok_or_else(|| Error::UnsupportedCapability {
                     kind: kind.clone(),
                     needed: "DocumentStore",
                 })?;
-            let mut documents = documents;
-            if drop_id {
-                for document in &mut documents {
-                    document.remove("_id");
-                }
-            }
-            let count = documents.len() as u64;
+            ensure_document_ids_are_available(docs, &collection, &documents).await?;
+            let count = usize_to_u64(documents.len(), "imported document count")?;
             if count > 0 {
                 docs.insert(&collection, documents).await?;
             }
@@ -394,6 +487,7 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
                     "kind": "documents",
                     "inserted": count,
                     "collection": collection,
+                    "atomic": false,
                 }),
                 elapsed(),
                 false,
@@ -416,6 +510,318 @@ fn sql_rows_artifact(result: ResultSet) -> TransferArtifact {
     }
 }
 
+fn import_input(action: &ImportAction) -> &Path {
+    match action {
+        ImportAction::Sql { input, .. }
+        | ImportAction::Kv { input, .. }
+        | ImportAction::Doc { input, .. } => input,
+    }
+}
+
+fn artifact_integrity(
+    limit: usize,
+    exported_items: u64,
+    selected_items: u64,
+    truncated: bool,
+    source_changed: bool,
+) -> ArtifactIntegrity {
+    ArtifactIntegrity {
+        value_codec: Value::WIRE_CODEC.to_owned(),
+        complete: !truncated && !source_changed,
+        truncated,
+        source_changed,
+        exported_items,
+        selected_items,
+        limit,
+        consistency: ArtifactConsistency::BestEffort,
+    }
+}
+
+fn validate_import_artifact(action: &ImportAction, artifact: &TransferArtifact) -> Result<()> {
+    match (action, artifact) {
+        (
+            ImportAction::Sql {
+                accept_legacy_unmarked,
+                ..
+            },
+            TransferArtifact::SqlRows {
+                version, truncated, ..
+            },
+        ) => require_complete_sql_artifact(*version, *truncated, *accept_legacy_unmarked),
+        (
+            ImportAction::Kv { ttl, .. },
+            TransferArtifact::KvPairs {
+                version,
+                source,
+                integrity,
+                entries,
+            },
+        ) => {
+            require_version("kv-pairs", *version, KV_TRANSFER_VERSION)?;
+            if ttl == &Some(0) {
+                return Err(Error::Config(
+                    "KV import TTL must be greater than zero".into(),
+                ));
+            }
+            validate_source("kv-pairs", source)?;
+            if source.resource != "key-pattern" || !matches!(&source.selector, Value::Text(_)) {
+                return Err(Error::Serialization(
+                    "kv-pairs artifact source must contain a typed key-pattern selector".into(),
+                ));
+            }
+            validate_integrity("kv-pairs", integrity, entries.len())?;
+            ensure_unique_strings(
+                &entries
+                    .iter()
+                    .map(|entry| entry.key.clone())
+                    .collect::<Vec<_>>(),
+                "source key in the artifact",
+            )?;
+            for entry in entries {
+                if !matches!(entry.value, Value::Bytes(_)) {
+                    return Err(Error::Serialization(format!(
+                        "kv-pairs entry '{}' must use the typed Value::Bytes wire representation",
+                        entry.key
+                    )));
+                }
+            }
+            require_complete_integrity("kv-pairs", integrity)
+        }
+        (
+            ImportAction::Doc { .. },
+            TransferArtifact::Documents {
+                version,
+                source,
+                integrity,
+                collection,
+                documents,
+            },
+        ) => {
+            require_version("documents", *version, DOCUMENT_TRANSFER_VERSION)?;
+            validate_source("documents", source)?;
+            if source.resource != *collection || !matches!(&source.selector, Value::Json(_)) {
+                return Err(Error::Serialization(
+                    "documents artifact source collection/filter metadata is inconsistent".into(),
+                ));
+            }
+            validate_integrity("documents", integrity, documents.len())?;
+            require_complete_integrity("documents", integrity)
+        }
+        (ImportAction::Sql { .. }, _) => Err(Error::Serialization(
+            "expected sql-rows transfer artifact".to_owned(),
+        )),
+        (ImportAction::Kv { .. }, _) => Err(Error::Serialization(
+            "expected kv-pairs transfer artifact".to_owned(),
+        )),
+        (ImportAction::Doc { .. }, _) => Err(Error::Serialization(
+            "expected documents transfer artifact".to_owned(),
+        )),
+    }
+}
+
+fn prepare_import(
+    action: ImportAction,
+    artifact: TransferArtifact,
+    max_items: usize,
+) -> Result<PreparedImport> {
+    ResultLimiter::new(max_items).probe_rows()?;
+    ensure_import_item_budget(&artifact, max_items)?;
+
+    match (action, artifact) {
+        (ImportAction::Sql { table, .. }, TransferArtifact::SqlRows { columns, rows, .. }) => {
+            let table = validate_identifier_path(&table, "table")?;
+            let columns = columns
+                .into_iter()
+                .map(|column| validate_identifier(&column, "column"))
+                .collect::<Result<Vec<_>>>()?;
+            ensure_unique_sql_identifiers(&columns, "SQL artifact column")?;
+            for (row_index, row) in rows.iter().enumerate() {
+                if row.len() != columns.len() {
+                    return Err(Error::Serialization(format!(
+                        "SQL artifact row {} has {} values but the artifact has {} columns",
+                        row_index + 1,
+                        row.len(),
+                        columns.len()
+                    )));
+                }
+                for value in row {
+                    sql_literal(value)?;
+                }
+            }
+            Ok(PreparedImport::Sql {
+                table,
+                columns,
+                rows,
+            })
+        }
+        (
+            ImportAction::Kv {
+                strip_prefix,
+                key_prefix,
+                ttl,
+                replace_existing,
+                ..
+            },
+            TransferArtifact::KvPairs { entries, .. },
+        ) => Ok(PreparedImport::Kv {
+            entries: prepare_kv_entries(entries, strip_prefix.as_deref(), &key_prefix)?,
+            ttl,
+            replace_existing,
+        }),
+        (
+            ImportAction::Doc {
+                collection,
+                drop_id,
+                ..
+            },
+            TransferArtifact::Documents { documents, .. },
+        ) => {
+            if collection.trim().is_empty() || collection.contains('\0') {
+                return Err(Error::Config(
+                    "document import collection must be non-empty and contain no NUL bytes".into(),
+                ));
+            }
+            let mut documents = documents;
+            if drop_id {
+                for document in &mut documents {
+                    document.remove("_id");
+                }
+            }
+            ensure_unique_document_ids(&documents)?;
+            Ok(PreparedImport::Doc {
+                collection,
+                documents,
+            })
+        }
+        _ => Err(Error::Serialization(
+            "import action does not match transfer artifact kind".into(),
+        )),
+    }
+}
+
+fn ensure_import_item_budget(artifact: &TransferArtifact, max_items: usize) -> Result<()> {
+    let actual_items = match artifact {
+        TransferArtifact::SqlRows { rows, .. } => rows.len(),
+        TransferArtifact::KvPairs { entries, .. } => entries.len(),
+        TransferArtifact::Documents { documents, .. } => documents.len(),
+    };
+    if actual_items <= max_items {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "transfer artifact contains {actual_items} items, exceeding the import --limit {max_items}; raise --limit deliberately or split the transfer"
+    )))
+}
+
+fn validate_source(kind: &str, source: &ArtifactSource) -> Result<()> {
+    if source.connector.trim().is_empty()
+        || source.connection.trim().is_empty()
+        || source.resource.trim().is_empty()
+    {
+        return Err(Error::Serialization(format!(
+            "{kind} artifact source metadata contains an empty connector, connection, or resource"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_integrity(
+    kind: &str,
+    integrity: &ArtifactIntegrity,
+    actual_items: usize,
+) -> Result<()> {
+    if integrity.value_codec != Value::WIRE_CODEC {
+        return Err(Error::Serialization(format!(
+            "unsupported {kind} value codec: {}; expected {}",
+            integrity.value_codec,
+            Value::WIRE_CODEC
+        )));
+    }
+    if integrity.limit == 0 {
+        return Err(Error::Serialization(format!(
+            "{kind} artifact integrity limit must be greater than zero"
+        )));
+    }
+    let actual_items = usize_to_u64(actual_items, "artifact item count")?;
+    if integrity.exported_items != actual_items {
+        return Err(Error::Serialization(format!(
+            "{kind} artifact integrity count mismatch: metadata says {} exported item(s), payload has {actual_items}",
+            integrity.exported_items
+        )));
+    }
+    if integrity.exported_items > integrity.selected_items {
+        return Err(Error::Serialization(format!(
+            "{kind} artifact exported item count exceeds the selected item count"
+        )));
+    }
+    let selected_items = usize::try_from(integrity.selected_items).map_err(|_| {
+        Error::Serialization(format!(
+            "{kind} artifact selected item count exceeds the platform range"
+        ))
+    })?;
+    if selected_items > integrity.limit {
+        return Err(Error::Serialization(format!(
+            "{kind} artifact selected item count exceeds its declared limit"
+        )));
+    }
+    if integrity.source_changed != (integrity.exported_items != integrity.selected_items) {
+        return Err(Error::Serialization(format!(
+            "{kind} artifact source_changed marker disagrees with its item counts"
+        )));
+    }
+    if integrity.truncated && selected_items != integrity.limit {
+        return Err(Error::Serialization(format!(
+            "{kind} artifact truncated marker requires the declared limit to be fully consumed"
+        )));
+    }
+    let expected_complete = !integrity.truncated && !integrity.source_changed;
+    if integrity.complete != expected_complete {
+        return Err(Error::Serialization(format!(
+            "{kind} artifact complete marker contradicts its truncation/source-change markers"
+        )));
+    }
+    Ok(())
+}
+
+fn require_complete_integrity(kind: &str, integrity: &ArtifactIntegrity) -> Result<()> {
+    if integrity.complete {
+        return Ok(());
+    }
+    let reason = match (integrity.truncated, integrity.source_changed) {
+        (true, true) => "the export hit its limit and the source changed while items were read",
+        (true, false) => "the export hit its limit",
+        (false, true) => "the source changed while items were read",
+        (false, false) => "its integrity markers are inconsistent",
+    };
+    Err(Error::Serialization(format!(
+        "refusing to import incomplete {kind} artifact because {reason}; rerun export against a stable source with a sufficient --limit"
+    )))
+}
+
+fn usize_to_u64(value: usize, label: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::Serialization(format!("{label} exceeds the u64 range")))
+}
+
+fn ensure_unique_strings(values: &[String], label: &str) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if !seen.insert(value) {
+            return Err(Error::Serialization(format!(
+                "duplicate {label}: '{value}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_unique_sql_identifiers(values: &[String], label: &str) -> Result<()> {
+    let normalized = values
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    ensure_unique_strings(&normalized, label)
+}
+
 fn ensure_readonly_export_query(query: &str) -> Result<()> {
     match SafetyGuard::check(query, false, None) {
         Ok(StatementKind::Read) => Ok(()),
@@ -430,23 +836,136 @@ fn parse_json_value(raw: &str) -> Result<Value> {
 }
 
 fn write_artifact(path: &Path, artifact: TransferArtifact) -> Result<()> {
-    if let Some(parent) = path
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| Error::Config(e.to_string()))?;
+    let bytes = serialize_artifact_bounded(&artifact, MAX_TRANSFER_ARTIFACT_BYTES)?;
+    let file_name = path.file_name().ok_or_else(|| {
+        Error::Config(format!(
+            "artifact output path has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Config(format!("system clock is before the Unix epoch: {e}")))?
+        .as_nanos();
+    let temp_path = parent.join(format!(
+        ".{}.dbtool-tmp-{}-{nonce}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        fs::create_dir_all(parent).map_err(|e| Error::Config(e.to_string()))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    let bytes =
-        serde_json::to_vec_pretty(&artifact).map_err(|e| Error::Serialization(e.to_string()))?;
-    fs::write(path, bytes).map_err(|e| Error::Config(e.to_string()))
+    let mut file = options
+        .open(&temp_path)
+        .map_err(|e| Error::Config(format!("create artifact temp file: {e}")))?;
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(Error::Config(format!(
+            "persist artifact temp file: {error}"
+        )));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(Error::Config(format!(
+            "publish artifact atomically: {error}"
+        )));
+    }
+    sync_parent_directory(parent)?;
+    Ok(())
+}
+
+struct BoundedVecWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl Write for BoundedVecWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("transfer artifact size overflow"))?;
+        if next_len > self.max_bytes {
+            return Err(std::io::Error::other(format!(
+                "transfer artifact exceeds the {}-byte safety limit",
+                self.max_bytes
+            )));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_artifact_bounded(artifact: &TransferArtifact, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut writer = BoundedVecWriter {
+        bytes: Vec::new(),
+        max_bytes,
+    };
+    serde_json::to_writer_pretty(&mut writer, artifact).map_err(|error| {
+        Error::Serialization(format!(
+            "serialize transfer artifact within {max_bytes}-byte safety limit: {error}"
+        ))
+    })?;
+    Ok(writer.bytes)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| Error::Config(format!("sync artifact parent directory: {error}")))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn read_artifact(path: &Path) -> Result<TransferArtifact> {
-    let bytes = fs::read(path).map_err(|e| Error::Config(e.to_string()))?;
+    let bytes = read_file_bounded(path, MAX_TRANSFER_ARTIFACT_BYTES)?;
     let raw: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| Error::Serialization(e.to_string()))?;
     reject_legacy_value_codec_artifact(&raw)?;
     serde_json::from_value(raw).map_err(|e| Error::Serialization(e.to_string()))
+}
+
+fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let max_plus_one = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| Error::Config("artifact byte limit is too large".into()))?;
+    let max_plus_one = u64::try_from(max_plus_one)
+        .map_err(|_| Error::Config("artifact byte limit exceeds the u64 range".into()))?;
+    let file = fs::File::open(path).map_err(|e| Error::Config(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(max_plus_one)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::Config(format!("read transfer artifact: {e}")))?;
+    ensure_artifact_size(bytes.len(), max_bytes)?;
+    Ok(bytes)
+}
+
+fn ensure_artifact_size(actual_bytes: usize, max_bytes: usize) -> Result<()> {
+    if actual_bytes <= max_bytes {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "transfer artifact is {actual_bytes} bytes, exceeding the {max_bytes}-byte safety limit; reduce --limit or split the transfer"
+    )))
 }
 
 fn require_version(kind: &str, version: u32, expected: u32) -> Result<()> {
@@ -467,13 +986,20 @@ fn reject_legacy_value_codec_artifact(raw: &serde_json::Value) -> Result<()> {
         return Ok(());
     };
 
-    let legacy = match kind {
-        "sql-rows" => version < u64::from(SQL_TRANSFER_VERSION),
-        "documents" => version < u64::from(DOCUMENT_TRANSFER_VERSION),
-        _ => false,
-    };
-    if legacy {
-        return Err(legacy_value_codec_error(kind, version));
+    match kind {
+        "sql-rows" if version < u64::from(SQL_TRANSFER_VERSION) => {
+            return Err(legacy_value_codec_error(kind, version));
+        }
+        "documents" if version < 2 => {
+            return Err(legacy_value_codec_error(kind, version));
+        }
+        "documents" if version < u64::from(DOCUMENT_TRANSFER_VERSION) => {
+            return Err(legacy_transfer_integrity_error(kind, version));
+        }
+        "kv-pairs" if version < u64::from(KV_TRANSFER_VERSION) => {
+            return Err(legacy_transfer_integrity_error(kind, version));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -482,6 +1008,12 @@ fn legacy_value_codec_error(kind: &str, version: u64) -> Error {
     Error::Serialization(format!(
         "refusing to import legacy {kind} v{version}: its untagged Value representation cannot distinguish bytes, timestamps, arrays, maps, and JSON; re-export from the source with a dbtool version that writes {}",
         Value::WIRE_CODEC
+    ))
+}
+
+fn legacy_transfer_integrity_error(kind: &str, version: u64) -> Error {
+    Error::Serialization(format!(
+        "refusing to import legacy {kind} v{version}: it lacks required typed-value, source, completeness, truncation, and source-change metadata; re-export from the source"
     ))
 }
 
@@ -521,6 +1053,171 @@ fn reject_truncated_sql_artifact(truncated: bool) -> Result<()> {
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
     ctx.ensure_write_allowed()
+}
+
+fn prepare_kv_entries(
+    entries: Vec<KvEntry>,
+    strip_prefix: Option<&str>,
+    key_prefix: &str,
+) -> Result<Vec<PreparedKvEntry>> {
+    let mut prepared = Vec::with_capacity(entries.len());
+    let mut target_keys = BTreeSet::new();
+    for entry in entries {
+        let key = restore_key(&entry.key, strip_prefix, key_prefix)?;
+        if !target_keys.insert(key.clone()) {
+            return Err(Error::Serialization(format!(
+                "multiple artifact entries map to target key '{key}'"
+            )));
+        }
+        let Value::Bytes(value) = entry.value else {
+            return Err(Error::Serialization(format!(
+                "kv-pairs entry '{}' must use the typed Value::Bytes wire representation",
+                entry.key
+            )));
+        };
+        prepared.push(PreparedKvEntry { key, value });
+    }
+    Ok(prepared)
+}
+
+fn kv_replace_confirmation_scope(entries: &[PreparedKvEntry], ttl: Option<u64>) -> Result<String> {
+    SafetyGuard::confirmation_scope_digest(&(entries, ttl))
+}
+
+fn ensure_unique_document_ids(documents: &[Document]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for document in documents {
+        let Some(id) = document.get("_id") else {
+            continue;
+        };
+        // Compare the backend-facing plain shape rather than the persistence
+        // wrapper. This intentionally treats typed/scalar aliases such as
+        // Value::Int(1) and Value::Json(json!(1)) as the same target identity.
+        let encoded = serde_json::to_string(&canonical_document_id(id)?)
+            .map_err(|e| Error::Serialization(format!("invalid document _id: {e}")))?;
+        if !ids.insert(encoded) {
+            return Err(Error::Serialization(
+                "documents artifact contains duplicate _id values".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_document_id(id: &Value) -> Result<serde_json::Value> {
+    Ok(match id {
+        Value::Null => serde_json::json!({"type": "null"}),
+        Value::Bool(value) => serde_json::json!({"type": "bool", "value": value}),
+        Value::Int(value) => canonical_number(*value as f64, Some(*value)),
+        Value::Float(value) => canonical_number(*value, None),
+        Value::Text(value) => serde_json::json!({"type": "string", "value": value}),
+        Value::Bytes(value) => {
+            serde_json::json!({"type": "binary", "value": bytes_to_hex(value)})
+        }
+        Value::Timestamp(value) => serde_json::json!({"type": "date", "value": value}),
+        Value::Json(value) => canonical_json_document_id(value)?,
+        Value::Array(values) => serde_json::json!({
+            "type": "array",
+            "value": values
+                .iter()
+                .map(canonical_document_id)
+                .collect::<Result<Vec<_>>>()?
+        }),
+        Value::Map(values) => serde_json::json!({
+            "type": "document",
+            "value": values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), canonical_document_id(value)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?
+        }),
+    })
+}
+
+fn canonical_json_document_id(value: &serde_json::Value) -> Result<serde_json::Value> {
+    Ok(match value {
+        serde_json::Value::Null => serde_json::json!({"type": "null"}),
+        serde_json::Value::Bool(value) => serde_json::json!({"type": "bool", "value": value}),
+        serde_json::Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                canonical_number(integer as f64, Some(integer))
+            } else if let Some(unsigned) = value.as_u64() {
+                if let Ok(integer) = i64::try_from(unsigned) {
+                    canonical_number(integer as f64, Some(integer))
+                } else {
+                    serde_json::json!({"type": "number", "value": value.to_string()})
+                }
+            } else {
+                canonical_number(
+                    value.as_f64().ok_or_else(|| {
+                        Error::Serialization("document _id contains an invalid number".into())
+                    })?,
+                    None,
+                )
+            }
+        }
+        serde_json::Value::String(value) => {
+            serde_json::json!({"type": "string", "value": value})
+        }
+        serde_json::Value::Array(values) => serde_json::json!({
+            "type": "array",
+            "value": values
+                .iter()
+                .map(canonical_json_document_id)
+                .collect::<Result<Vec<_>>>()?
+        }),
+        serde_json::Value::Object(values) => serde_json::json!({
+            "type": "document",
+            "value": values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), canonical_json_document_id(value)?)))
+                .collect::<Result<BTreeMap<_, _>>>()?
+        }),
+    })
+}
+
+fn canonical_number(value: f64, exact_integer: Option<i64>) -> serde_json::Value {
+    if let Some(integer) = exact_integer {
+        return serde_json::json!({"type": "number", "value": integer.to_string()});
+    }
+    if value.is_finite()
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value <= i64::MAX as f64
+    {
+        serde_json::json!({"type": "number", "value": (value as i64).to_string()})
+    } else {
+        serde_json::json!({"type": "number", "value": value.to_string()})
+    }
+}
+
+async fn ensure_document_ids_are_available(
+    store: &dyn dbtool_core::port::capability::DocumentStore,
+    collection: &str,
+    documents: &[Document],
+) -> Result<()> {
+    for document in documents {
+        let Some(id) = document.get("_id") else {
+            continue;
+        };
+        let filter = Value::Map(BTreeMap::from([("_id".to_owned(), id.clone())]));
+        let matches = store
+            .find(
+                collection,
+                filter,
+                FindOptions {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if !matches.is_empty() {
+            return Err(Error::Config(
+                "target collection already contains an exported _id; choose an empty target or retry with --drop-id"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn restore_key(source: &str, strip_prefix: Option<&str>, key_prefix: &str) -> Result<String> {
@@ -596,6 +1293,30 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use dbtool_core::service::formatter::Format;
+
+    fn source(resource: &str, selector: Value) -> ArtifactSource {
+        ArtifactSource {
+            connector: "test".to_owned(),
+            connection: "conn:test".to_owned(),
+            resource: resource.to_owned(),
+            selector,
+        }
+    }
+
+    fn complete_integrity(items: usize) -> ArtifactIntegrity {
+        let items = u64::try_from(items).unwrap();
+        artifact_integrity(100, items, items, false, false)
+    }
+
+    fn kv_import_action() -> ImportAction {
+        ImportAction::Kv {
+            input: PathBuf::from("fixture.json"),
+            strip_prefix: None,
+            key_prefix: String::new(),
+            ttl: None,
+            replace_existing: false,
+        }
+    }
 
     fn test_context(allow_write: bool) -> Context {
         Context {
@@ -685,6 +1406,19 @@ mod tests {
             reject_legacy_value_codec_artifact(&documents),
             Err(Error::Serialization(message)) if message.contains("legacy documents v1")
         ));
+
+        let kv = serde_json::json!({
+            "kind": "kv-pairs",
+            "version": 1,
+            "entries": [{"key": "a", "value": [0, 255]}]
+        });
+        assert!(matches!(
+            reject_legacy_value_codec_artifact(&kv),
+            Err(Error::Serialization(message))
+                if message.contains("legacy kv-pairs v1")
+                    && message.contains("completeness")
+                    && message.contains("re-export")
+        ));
     }
 
     #[test]
@@ -732,7 +1466,9 @@ mod tests {
         ])];
         let artifact = TransferArtifact::Documents {
             version: DOCUMENT_TRANSFER_VERSION,
-            collection: Some("users".to_owned()),
+            source: source("users", Value::Json(serde_json::json!({}))),
+            integrity: complete_integrity(expected_documents.len()),
+            collection: "users".to_owned(),
             documents: expected_documents.clone(),
         };
 
@@ -748,6 +1484,267 @@ mod tests {
             panic!("expected documents artifact");
         };
         assert_eq!(documents, expected_documents);
+    }
+
+    #[test]
+    fn current_kv_artifact_uses_typed_binary_values_and_round_trips() {
+        let entries = vec![KvEntry {
+            key: "raw".to_owned(),
+            value: Value::Bytes(vec![0, 255]),
+        }];
+        let artifact = TransferArtifact::KvPairs {
+            version: KV_TRANSFER_VERSION,
+            source: source("key-pattern", Value::Text("*".to_owned())),
+            integrity: complete_integrity(entries.len()),
+            entries: entries.clone(),
+        };
+
+        let encoded = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(encoded["version"], KV_TRANSFER_VERSION);
+        assert_eq!(encoded["entries"][0]["value"]["$dbtool"]["type"], "bytes");
+        assert_eq!(encoded["entries"][0]["value"]["$dbtool"]["value"], "AP8=");
+        assert_eq!(encoded["integrity"]["complete"], true);
+        assert_eq!(encoded["integrity"]["consistency"], "best-effort");
+
+        let decoded: TransferArtifact = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, artifact);
+        validate_import_artifact(&kv_import_action(), &decoded).unwrap();
+    }
+
+    #[test]
+    fn incomplete_kv_and_document_artifacts_are_never_importable() {
+        let kv = TransferArtifact::KvPairs {
+            version: KV_TRANSFER_VERSION,
+            source: source("key-pattern", Value::Text("*".to_owned())),
+            integrity: artifact_integrity(1, 1, 1, true, false),
+            entries: vec![KvEntry {
+                key: "a".to_owned(),
+                value: Value::Bytes(vec![1]),
+            }],
+        };
+        assert!(matches!(
+            validate_import_artifact(&kv_import_action(), &kv),
+            Err(Error::Serialization(message))
+                if message.contains("incomplete kv-pairs") && message.contains("hit its limit")
+        ));
+
+        let documents = TransferArtifact::Documents {
+            version: DOCUMENT_TRANSFER_VERSION,
+            source: source("users", Value::Json(serde_json::json!({}))),
+            integrity: artifact_integrity(2, 1, 2, false, true),
+            collection: "users".to_owned(),
+            documents: vec![Document::new()],
+        };
+        let action = ImportAction::Doc {
+            collection: "users-copy".to_owned(),
+            input: PathBuf::from("fixture.json"),
+            drop_id: false,
+        };
+        assert!(matches!(
+            validate_import_artifact(&action, &documents),
+            Err(Error::Serialization(message))
+                if message.contains("incomplete documents") && message.contains("source changed")
+        ));
+    }
+
+    #[test]
+    fn forged_integrity_counts_and_markers_fail_closed() {
+        let mut integrity = complete_integrity(1);
+        integrity.exported_items = 2;
+        assert!(matches!(
+            validate_integrity("kv-pairs", &integrity, 1),
+            Err(Error::Serialization(message)) if message.contains("count mismatch")
+        ));
+
+        let mut integrity = complete_integrity(1);
+        integrity.complete = false;
+        assert!(matches!(
+            validate_integrity("documents", &integrity, 1),
+            Err(Error::Serialization(message)) if message.contains("complete marker contradicts")
+        ));
+
+        let mut integrity = complete_integrity(1);
+        integrity.value_codec = "unknown".to_owned();
+        assert!(matches!(
+            validate_integrity("documents", &integrity, 1),
+            Err(Error::Serialization(message)) if message.contains("unsupported documents value codec")
+        ));
+    }
+
+    #[test]
+    fn kv_import_preflight_preserves_bytes_and_rejects_duplicate_targets() {
+        let prepared = prepare_kv_entries(
+            vec![KvEntry {
+                key: "src:a".to_owned(),
+                value: Value::Bytes(vec![0, 255]),
+            }],
+            Some("src:"),
+            "dst:",
+        )
+        .unwrap();
+        assert_eq!(
+            prepared,
+            vec![PreparedKvEntry {
+                key: "dst:a".to_owned(),
+                value: vec![0, 255],
+            }]
+        );
+
+        assert!(matches!(
+            prepare_kv_entries(
+                vec![
+                    KvEntry {
+                        key: "a".to_owned(),
+                        value: Value::Bytes(vec![1]),
+                    },
+                    KvEntry {
+                        key: "a".to_owned(),
+                        value: Value::Bytes(vec![2]),
+                    },
+                ],
+                None,
+                "",
+            ),
+            Err(Error::Serialization(message)) if message.contains("target key 'a'")
+        ));
+    }
+
+    #[test]
+    fn duplicate_document_ids_fail_before_backend_writes() {
+        let documents = vec![
+            Document::from([("_id".to_owned(), Value::Int(7))]),
+            Document::from([("_id".to_owned(), Value::Json(serde_json::json!(7)))]),
+        ];
+        assert!(matches!(
+            ensure_unique_document_ids(&documents),
+            Err(Error::Serialization(message)) if message.contains("duplicate _id")
+        ));
+
+        let typed_identities = vec![
+            Document::from([("_id".to_owned(), Value::Timestamp(7))]),
+            Document::from([("_id".to_owned(), Value::Int(7))]),
+            Document::from([("_id".to_owned(), Value::Bytes(vec![7]))]),
+            Document::from([("_id".to_owned(), Value::Array(vec![Value::Int(7)]))]),
+        ];
+        ensure_unique_document_ids(&typed_identities).unwrap();
+    }
+
+    #[test]
+    fn import_preparation_is_bounded_and_reuses_offline_results() {
+        let artifact = TransferArtifact::KvPairs {
+            version: KV_TRANSFER_VERSION,
+            source: source("key-pattern", Value::Text("src:*".to_owned())),
+            integrity: complete_integrity(1),
+            entries: vec![KvEntry {
+                key: "src:a".to_owned(),
+                value: Value::Bytes(vec![0, 255]),
+            }],
+        };
+        let action = ImportAction::Kv {
+            input: PathBuf::from("fixture.json"),
+            strip_prefix: Some("src:".to_owned()),
+            key_prefix: "dst:".to_owned(),
+            ttl: Some(60),
+            replace_existing: true,
+        };
+
+        let PreparedImport::Kv { entries, ttl, .. } =
+            prepare_import(action, artifact.clone(), 1).unwrap()
+        else {
+            panic!("expected prepared KV import");
+        };
+        assert_eq!(entries[0].key, "dst:a");
+        assert_eq!(entries[0].value, vec![0, 255]);
+        assert_eq!(ttl, Some(60));
+        assert!(matches!(
+            prepare_import(kv_import_action(), artifact, 0),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+    }
+
+    #[test]
+    fn artifact_publish_is_atomic_and_leaves_no_temp_file() {
+        let root = std::env::temp_dir().join(format!(
+            "dbtool-transfer-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("values.json");
+        let artifact = TransferArtifact::KvPairs {
+            version: KV_TRANSFER_VERSION,
+            source: source("key-pattern", Value::Text("*".to_owned())),
+            integrity: complete_integrity(0),
+            entries: vec![],
+        };
+
+        write_artifact(&path, artifact.clone()).unwrap();
+        assert_eq!(read_artifact(&path).unwrap(), artifact);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn artifact_reads_and_writes_enforce_byte_budget() {
+        assert!(ensure_artifact_size(4, 4).is_ok());
+        assert!(matches!(
+            ensure_artifact_size(5, 4),
+            Err(Error::Config(message)) if message.contains("5 bytes") && message.contains("4-byte")
+        ));
+
+        let path = std::env::temp_dir().join(format!(
+            "dbtool-artifact-byte-budget-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"12345").unwrap();
+        assert!(read_file_bounded(&path, 4).is_err());
+        assert_eq!(read_file_bounded(&path, 5).unwrap(), b"12345");
+        fs::remove_file(path).unwrap();
+
+        let artifact = TransferArtifact::KvPairs {
+            version: KV_TRANSFER_VERSION,
+            source: source("key-pattern", Value::Text("*".to_owned())),
+            integrity: complete_integrity(0),
+            entries: vec![],
+        };
+        assert!(serialize_artifact_bounded(&artifact, 8).is_err());
+        assert!(serialize_artifact_bounded(&artifact, 4096).is_ok());
+    }
+
+    #[test]
+    fn kv_replace_confirmation_scope_binds_values_and_ttl() {
+        let first = vec![PreparedKvEntry {
+            key: "target".into(),
+            value: b"first".to_vec(),
+        }];
+        let second = vec![PreparedKvEntry {
+            key: "target".into(),
+            value: b"second".to_vec(),
+        }];
+
+        let baseline = kv_replace_confirmation_scope(&first, Some(60)).unwrap();
+        assert_ne!(
+            baseline,
+            kv_replace_confirmation_scope(&second, Some(60)).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            kv_replace_confirmation_scope(&first, Some(120)).unwrap()
+        );
     }
 
     #[test]

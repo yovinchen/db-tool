@@ -200,11 +200,60 @@ adapter 不能通过默认实现退回“全量读取再 truncate”。实现合
 公共 `query/query_cql` 保留为显式无界兼容接口，供已知规模的内部 metadata 查询和
 受控嵌入式调用使用；任何用户输入、导出或交互式调用必须优先选择 bounded 方法。
 
-`export sql` 只接受只读语句。新生成的 `sql-rows` v2 artifact 必须包含
-`truncated` 完整性字段；部分 artifact 默认拒绝导入，调用方必须提高 `--limit`
-重新导出，不能把不完整数据静默恢复成完整表。历史 v1 artifact 没有该字段，无法区分
-完整导出与旧版客户端截断，因此默认同样拒绝；人工核验后只能通过显式
-`import sql --accept-legacy-unmarked` 覆盖这一保护。
+`export sql` 只接受只读语句。新生成的 `sql-rows` v3 artifact 使用
+`dbtool-value-v2` typed wire codec，并必须包含 `truncated` 完整性字段；部分 artifact
+拒绝导入，调用方必须提高 `--limit` 重新导出，不能把不完整数据静默恢复成完整表。
+历史 v1/v2 artifact 既缺少无歧义 typed codec，也可能缺少完整性标记，因此统一 fail
+closed；保留的 `--accept-legacy-unmarked` 仅用于兼容旧命令行脚本，不会绕过版本、类型或
+截断检查，旧数据必须从源重新导出。
+
+## KV / Document artifact 完整性范式
+
+`export kv` 与 `export doc` 使用 `--limit + 1` 探测是否还有额外项目，只把前
+`--limit` 项写入 artifact。当前格式分别为 `kv-pairs` v2、`documents` v3，并固定包含：
+
+- `source.connector`、脱敏后的 `source.connection`、资源与 typed selector；
+- `integrity.value_codec=dbtool-value-v2`；
+- `complete`、`truncated`、`source_changed`、导出/选中数量和执行上限；
+- `consistency=best-effort`，明确说明遍历本身不是跨并发写入的事务快照。
+
+KV 二进制值按 `Value::Bytes` 的 base64 tagged wire format 保存，不再使用无类型的
+JSON 数字数组；Document 内的 bytes、timestamp、JSON、array、map 同样保持类型。
+当前 KV 完整性标记只覆盖本次选择到的 key/value 集合，不代表 Redis 原生 TTL 已备份；
+现有 `import kv --ttl` 是调用方显式指定的统一新 TTL，未指定时恢复为持久 key。逐 key
+保留剩余 TTL 属于后续 KV artifact 版本，当前不能把该格式描述为完整 Redis 备份。
+artifact 先以 Unix `0600` 权限写同目录临时文件并 `sync`，再通过 rename 发布并同步
+父目录，避免进程中断留下看似完整的目标文件；单个 artifact 的读写上限固定为 256 MiB。
+导入还会把全局 `--limit` 作为项目总预算，在解析 DSN 前拒绝更多 rows/keys/documents；
+超限时必须有意识地提高 `--limit` 或拆分资源。
+旧 KV v1、Document v1/v2、计数不一致、未知 codec、标记矛盾以及任何
+`complete=false` artifact 都会在连接目标数据库之前拒绝，且没有跳过类型/版本校验的
+兼容开关。
+
+```bash
+dbtool --dsn "$REDIS_DSN" --limit 1000 \
+  export kv --pattern 'app:*' --out app-kv.json
+
+dbtool --dsn "$MONGO_DSN" --limit 1000 \
+  export doc users --filter '{"active":true}' --out active-users.json
+
+dbtool --dsn "$REDIS_DSN" --limit 1000 --allow-write \
+  import kv --input app-kv.json --key-prefix 'restore:'
+
+dbtool --dsn "$MONGO_DSN" --limit 1000 --allow-write \
+  import doc users_restore --input active-users.json --drop-id
+```
+
+KV import 默认使用条件创建，目标 key 已存在时拒绝；确需覆盖时必须显式增加
+`--replace-existing`，再使用首次返回的、绑定目标 DSN、完整转换后 key/value 集合与 TTL
+摘要的全局 `--confirm` token。Document import 在写前拒绝 artifact 内重复 `_id`，并以
+best-effort 方式检查目标中已存在的 `_id`；也可由调用方显式 `--drop-id` 生成新身份。
+`_id` 预检保留 bytes/timestamp/ObjectId
+等 backend 类型，但它不是锁定快照；预检与插入之间的并发写入仍由目标唯一约束作最终裁决。
+当前 SQL import 仍逐行执行，通用 KV/Document port 也没有跨所有项目的事务保证，所以
+三类 import 的成功响应均明确返回 `atomic=false`；预检可避免已知冲突，但后端约束、竞态
+或运行时网络故障仍可能造成部分写入，调用方
+应使用独立目标资源并通过读回校验后再切换流量。
 
 ## TimeSeries / Prometheus 查询范围
 

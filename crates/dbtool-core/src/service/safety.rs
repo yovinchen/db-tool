@@ -5,6 +5,7 @@ use sqlparser::{
     dialect::GenericDialect,
     parser::Parser,
 };
+use std::io::Write;
 
 /// Statement-level classification produced by the SQL parser.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,6 +18,15 @@ pub enum StatementKind {
 pub struct SafetyGuard;
 
 impl SafetyGuard {
+    /// Produce a stable, fixed-size digest for caller-owned confirmation
+    /// semantics without first allocating the complete serialized value.
+    pub fn confirmation_scope_digest<T: serde::Serialize + ?Sized>(value: &T) -> Result<String> {
+        let mut hasher = Sha256::new();
+        serde_json::to_writer(DigestWriter(&mut hasher), value)
+            .map_err(|error| Error::Serialization(error.to_string()))?;
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     /// Returns `Ok(StatementKind)` for safe operations; `Err` for blocked ones.
     /// `allow_write`: whether non-destructive writes are permitted.
     /// `confirm_token`: if present, must match the hash of the statement.
@@ -151,6 +161,19 @@ impl SafetyGuard {
                 impact,
             }),
         }
+    }
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -368,6 +391,17 @@ fn first_keyword(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmation_scope_digest_is_stable_and_content_bound() {
+        let first = SafetyGuard::confirmation_scope_digest(&("key", b"first", 60_u64)).unwrap();
+        let same = SafetyGuard::confirmation_scope_digest(&("key", b"first", 60_u64)).unwrap();
+        let changed = SafetyGuard::confirmation_scope_digest(&("key", b"second", 60_u64)).unwrap();
+
+        assert_eq!(first, same);
+        assert_ne!(first, changed);
+        assert_eq!(first.len(), 64);
+    }
 
     #[test]
     fn read_statement_is_allowed_without_write_flag() {
