@@ -160,6 +160,66 @@ pub struct Message {
     pub metadata: Option<MessageMetadata>,
 }
 
+/// Stable identity used by a message consumer.
+///
+/// Stateless consumption preserves the legacy dbtool behavior. Group and
+/// durable identities may advance broker-owned state and therefore require
+/// explicit capability negotiation and CLI write authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ConsumerIdentity {
+    #[default]
+    Stateless,
+    Group {
+        group: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<String>,
+    },
+    Durable {
+        name: String,
+    },
+}
+
+impl ConsumerIdentity {
+    pub const fn is_stateful(&self) -> bool {
+        !matches!(self, Self::Stateless)
+    }
+
+    /// Revalidate identities constructed by embedded callers or serde before
+    /// an adapter uses them as broker resource names.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Stateless => Ok(()),
+            Self::Group { group, member } => {
+                validate_consumer_identity_part("consumer group", group)?;
+                if let Some(member) = member {
+                    validate_consumer_identity_part("consumer member", member)?;
+                }
+                Ok(())
+            }
+            Self::Durable { name } => validate_consumer_identity_part("durable consumer", name),
+        }
+    }
+}
+
+fn validate_consumer_identity_part(label: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value != value.trim() || value.chars().any(char::is_control) {
+        return Err(format!(
+            "{label} must be non-empty, have no leading or trailing whitespace, and contain no control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Acknowledgement behavior requested for successful deliveries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AckMode {
+    #[default]
+    None,
+    OnSuccess,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumeOptions {
     pub max: usize,
@@ -172,6 +232,48 @@ pub struct ConsumeOptions {
     /// fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<ConsumeCursor>,
+    /// Stateless by default for backward compatibility. Stateful identities
+    /// must be negotiated through method-level connector operations.
+    #[serde(default)]
+    pub identity: ConsumerIdentity,
+    /// No acknowledgement by default for backward compatibility.
+    #[serde(default)]
+    pub ack: AckMode,
+}
+
+impl ConsumeOptions {
+    /// Validate protocol-independent bounds, positions, and identity shape.
+    /// Backend-specific restrictions remain the adapter's responsibility.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max == 0 {
+            return Err("consume max must be greater than zero".to_owned());
+        }
+        if self.timeout.is_zero() {
+            return Err("consume timeout must be greater than zero".to_owned());
+        }
+        if self.partition.is_some_and(|partition| partition < 0) {
+            return Err("consume partition must be non-negative".to_owned());
+        }
+        if self.offset.is_some_and(|offset| offset < 0) {
+            return Err("consume offset must be non-negative".to_owned());
+        }
+        if let Some(cursor) = &self.cursor {
+            cursor.validate()?;
+            if self.partition.is_some() || self.offset.is_some() {
+                return Err("consume cursor cannot be combined with partition or offset".to_owned());
+            }
+        }
+        self.identity.validate()?;
+        if self.identity.is_stateful()
+            && (self.partition.is_some() || self.offset.is_some() || self.cursor.is_some())
+        {
+            return Err(
+                "stateful consume identity cannot be combined with partition, offset, or cursor"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for ConsumeOptions {
@@ -182,6 +284,8 @@ impl Default for ConsumeOptions {
             partition: None,
             offset: None,
             cursor: None,
+            identity: ConsumerIdentity::Stateless,
+            ack: AckMode::None,
         }
     }
 }
@@ -360,6 +464,118 @@ mod tests {
                 "id": "1710000000000-42",
             })
         );
+    }
+
+    #[test]
+    fn consumer_identity_and_ack_mode_have_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_value(ConsumerIdentity::Stateless).unwrap(),
+            serde_json::json!({ "kind": "stateless" })
+        );
+        assert_eq!(
+            serde_json::to_value(ConsumerIdentity::Group {
+                group: "orders".to_owned(),
+                member: Some("worker-1".to_owned()),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "kind": "group",
+                "group": "orders",
+                "member": "worker-1",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ConsumerIdentity::Durable {
+                name: "billing".to_owned(),
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "durable", "name": "billing" })
+        );
+        assert_eq!(
+            serde_json::to_value(AckMode::OnSuccess).unwrap(),
+            serde_json::json!("on-success")
+        );
+    }
+
+    #[test]
+    fn consume_defaults_preserve_stateless_non_acknowledging_behavior() {
+        let options = ConsumeOptions::default();
+        assert_eq!(options.identity, ConsumerIdentity::Stateless);
+        assert_eq!(options.ack, AckMode::None);
+        assert!(options.validate().is_ok());
+
+        let legacy: ConsumeOptions = serde_json::from_value(serde_json::json!({
+            "max": 10,
+            "timeout": { "secs": 1, "nanos": 0 },
+            "partition": null,
+            "offset": null,
+        }))
+        .unwrap();
+        assert_eq!(legacy.identity, ConsumerIdentity::Stateless);
+        assert_eq!(legacy.ack, AckMode::None);
+    }
+
+    #[test]
+    fn stateful_consume_identity_is_validated_without_lossy_normalization() {
+        for identity in [
+            ConsumerIdentity::Group {
+                group: String::new(),
+                member: None,
+            },
+            ConsumerIdentity::Group {
+                group: "orders".to_owned(),
+                member: Some("worker\n1".to_owned()),
+            },
+            ConsumerIdentity::Group {
+                group: "   ".to_owned(),
+                member: None,
+            },
+            ConsumerIdentity::Group {
+                group: " orders".to_owned(),
+                member: None,
+            },
+            ConsumerIdentity::Group {
+                group: "orders".to_owned(),
+                member: Some("worker-1 ".to_owned()),
+            },
+            ConsumerIdentity::Durable {
+                name: "\u{7}".to_owned(),
+            },
+        ] {
+            assert!(identity.validate().is_err(), "accepted {identity:?}");
+        }
+
+        let stateful = ConsumeOptions {
+            identity: ConsumerIdentity::Group {
+                group: "orders with spaces".to_owned(),
+                member: Some("worker-1".to_owned()),
+            },
+            ack: AckMode::None,
+            ..Default::default()
+        };
+        assert!(stateful.validate().is_ok());
+
+        for positioned in [
+            ConsumeOptions {
+                partition: Some(0),
+                ..stateful.clone()
+            },
+            ConsumeOptions {
+                offset: Some(0),
+                ..stateful.clone()
+            },
+            ConsumeOptions {
+                cursor: Some(ConsumeCursor::Kafka {
+                    partition: 0,
+                    offset: 0,
+                }),
+                ..stateful.clone()
+            },
+        ] {
+            assert!(positioned
+                .validate()
+                .is_err_and(|message| message.contains("stateful consume identity")));
+        }
     }
 
     #[test]

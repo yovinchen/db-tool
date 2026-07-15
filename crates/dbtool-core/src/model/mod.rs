@@ -8,9 +8,9 @@ pub mod value;
 
 pub use document::{Document, FindOptions, InsertOutcome, UpdateOutcome};
 pub use message::{
-    ConsumeCursor, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, Message,
-    MessageCursor, MessageMetadata, MessagePlacement, MessageResource, MessageResourceKind,
-    ProduceOutcome,
+    AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
+    DeleteResourceOutcome, Message, MessageCursor, MessageMetadata, MessagePlacement,
+    MessageResource, MessageResourceKind, ProduceOutcome,
 };
 pub use meta::{
     ColumnMeta, ForeignKeyInfo, IndexInfo, LagInfo, PartitionWatermark, RoutineInfo, RoutineKind,

@@ -752,6 +752,7 @@ mod tests {
                 partition: Some(0),
                 offset: None,
                 cursor: None,
+                ..Default::default()
             }),
             Err(Error::Config(message)) if message.contains("partitions")
         ));
@@ -762,6 +763,7 @@ mod tests {
                 partition: None,
                 offset: Some(0),
                 cursor: None,
+                ..Default::default()
             }),
             Err(Error::Config(message)) if message.contains("offsets")
         ));

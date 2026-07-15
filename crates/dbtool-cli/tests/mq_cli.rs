@@ -58,7 +58,8 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
     assert!(produce_help.contains("--timestamp-ms <EPOCH_MILLIS>"));
 
     let consume_help = stdout_text(dbtool(&["mq", "consume", "--help"]));
-    assert!(consume_help.contains("AMQP/AMQPS consume requires"));
+    assert!(consume_help.contains("AMQP/AMQPS rejects group/durable identities"));
+    assert!(consume_help.contains("requires explicit --ack on-success"));
     assert!(consume_help.contains("--allow-write"));
     assert!(consume_help.contains("reached --max"));
     assert!(consume_help.contains("does not prove that another message exists"));
@@ -68,6 +69,12 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
     assert!(consume_help.contains("--offset <OFFSET>"));
     assert!(consume_help.contains("--cursor <CURSOR>"));
     assert!(consume_help.contains("redis-stream:M-S"));
+    assert!(consume_help.contains("--group <GROUP>"));
+    assert!(consume_help.contains("--consumer <MEMBER>"));
+    assert!(consume_help.contains("--durable <NAME>"));
+    assert!(consume_help.contains("--ack <MODE>"));
+    assert!(consume_help.contains("none"));
+    assert!(consume_help.contains("on-success"));
 
     let delete_help = stdout_text(dbtool(&["mq", "delete", "--help"]));
     assert!(delete_help.contains("--kind <KIND>"));
@@ -84,8 +91,8 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
 }
 
 #[test]
-fn ack_destructive_amqp_consume_requires_write_permission_before_connecting() {
-    assert_error(
+fn amqp_consume_requires_explicit_success_ack_and_write_before_connecting() {
+    assert_config_error(
         &[
             "--dsn",
             UNREACHABLE_AMQP_DSN,
@@ -97,8 +104,165 @@ fn ack_destructive_amqp_consume_requires_write_permission_before_connecting() {
             "--timeout",
             "1",
         ],
+        "explicit --ack on-success",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_AMQP_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--ack",
+            "none",
+        ],
+        "explicit --ack on-success",
+    );
+    assert_error(
+        &[
+            "--dsn",
+            UNREACHABLE_AMQP_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--ack",
+            "on-success",
+        ],
         "WRITE_NOT_ALLOWED",
         "require --allow-write",
+    );
+}
+
+#[test]
+fn stateful_consume_contract_fails_closed_before_connecting() {
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--group",
+            "orders",
+        ],
+        "explicit --ack",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--consumer",
+            "worker-1",
+            "--ack",
+            "none",
+        ],
+        "--consumer requires --group",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--group",
+            "orders",
+            "--durable",
+            "billing",
+            "--ack",
+            "none",
+        ],
+        "mutually exclusive",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--group",
+            " orders ",
+            "--ack",
+            "none",
+        ],
+        "leading or trailing whitespace",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--durable",
+            "   ",
+            "--ack",
+            "none",
+        ],
+        "durable consumer",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--group",
+            "orders",
+            "--ack",
+            "none",
+            "--cursor",
+            "kafka:0:1",
+        ],
+        "stateful consume identity",
+    );
+    assert_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--group",
+            "orders",
+            "--ack",
+            "none",
+        ],
+        "WRITE_NOT_ALLOWED",
+        "require --allow-write",
+    );
+    assert_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--ack",
+            "on-success",
+        ],
+        "WRITE_NOT_ALLOWED",
+        "require --allow-write",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_AMQP_DSN,
+            "--allow-write",
+            "mq",
+            "consume",
+            "events",
+            "--group",
+            "orders",
+            "--ack",
+            "on-success",
+        ],
+        "does not support --group or --durable",
     );
 }
 

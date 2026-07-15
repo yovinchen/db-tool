@@ -82,6 +82,9 @@ capability_operations! {
     SearchDeleteIndex => "search.delete_index",
     MessageProduce => "message.produce",
     MessageConsume => "message.consume",
+    MessageConsumeGroup => "message.consume_group",
+    MessageConsumeDurable => "message.consume_durable",
+    MessageConsumeAck => "message.consume_ack",
     MessageAdminListTopics => "message.admin.list_topics",
     MessageAdminTopicDetail => "message.admin.topic_detail",
     MessageAdminConsumerLag => "message.admin.consumer_lag",
@@ -146,6 +149,14 @@ impl CapabilityOperation {
     ];
     pub const MESSAGE_PRODUCER: &'static [Self] = &[Self::MessageProduce];
     pub const MESSAGE_CONSUMER: &'static [Self] = &[Self::MessageConsume];
+    /// Stateful identity and acknowledgement operations are optional and must
+    /// be declared by connector-specific overrides. A legacy `consumer=true`
+    /// flag never implies broker state mutation support.
+    pub const MESSAGE_CONSUMER_EXTENSIONS: &'static [Self] = &[
+        Self::MessageConsumeGroup,
+        Self::MessageConsumeDurable,
+        Self::MessageConsumeAck,
+    ];
     /// Admin operations must be declared by connector-specific overrides.
     pub const MESSAGE_ADMIN: &'static [Self] = &[
         Self::MessageAdminListTopics,
@@ -458,6 +469,7 @@ mod tests {
                         CapabilityOperation::DocumentDeleteMany,
                     ]
                     .contains(operation)
+                    && !CapabilityOperation::MESSAGE_CONSUMER_EXTENSIONS.contains(operation)
             })
             .collect::<Vec<_>>();
 
@@ -468,6 +480,9 @@ mod tests {
         assert!(!connector
             .operations()
             .contains(&CapabilityOperation::SqlInsertRowsAtomic));
+        assert!(CapabilityOperation::MESSAGE_CONSUMER_EXTENSIONS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
         for operation in [
             CapabilityOperation::DocumentUpdateOne,
             CapabilityOperation::DocumentUpdateMany,

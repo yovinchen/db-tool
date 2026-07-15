@@ -453,6 +453,29 @@ dbtool --dsn "$KAFKA_DSN" mq consume orders \
 达到 `--max` 时，`meta.truncated=true` 只表示本次预算已用完，不证明 broker 中还有
 下一条消息。
 
+状态消费使用显式 typed 参数，不从 DSN 或固定默认 group 猜测：
+
+```bash
+# consumer group；member 只允许与 group 同时出现
+dbtool --dsn "$BROKER_DSN" --allow-write mq consume orders \
+  --group billing --consumer worker-1 --ack on-success --max 10 --timeout 5
+
+# durable consumer
+dbtool --dsn "$NATS_DSN" --allow-write mq consume ORDERS \
+  --durable billing --ack none --max 10 --timeout 5
+```
+
+`--group` 与 `--durable` 互斥；`--consumer` 必须依附 `--group`；stateful identity 必须
+显式给出 `--ack none|on-success`。即使选择 `none`，group membership、PEL 或 delivery
+状态仍可能变化，因此统一要求 `--allow-write`。stateful 模式当前不与 partition/offset/
+cursor 混用。CLI 连接后还会检查 `message.consume_group`、
+`message.consume_durable`、`message.consume_ack`；粗粒度 `consumer=true` 不会冒充这些
+扩展能力。不提供跨进程通用 `mq ack <token>`，因为 Kafka commit、Redis XACK、NATS
+reply subject 和 AMQP channel-scoped delivery tag 不是同一种可移植句柄。
+
+ACK/commit 只能保证 broker 接受进度更新；进度提交后、CLI 输出前仍存在进程崩溃窗口，
+不得描述为 exactly-once。
+
 当前 pure `rskafka` 与 native `librdkafka` 均已在 Redpanda 上逐字段验证
 payload/key/headers/partition/offset/timestamp。Kafka、Redis Streams 与 NATS JetStream
 还会返回无损 `cursor`，可原样作为 inclusive 起点重放同一条仍被保留的消息：
@@ -465,7 +488,8 @@ dbtool --dsn "$NATS_DSN" mq consume ORDERS \
   --cursor 'nats-jetstream:42' --max 1
 ```
 
-协议不接受的字段会返回 `CONFIG_ERROR`，不会静默丢弃。AMQP 返回 delivery tag、
+协议不接受的字段会返回 `CONFIG_ERROR`，不会静默丢弃。AMQP 消费必须显式选择
+`--ack on-success` 并提供写权限；返回 delivery tag、
 redelivered、exchange、routing key 等已 ACK 的诊断 metadata；它不是可跨进程复用的
 cursor。native Kafka 的 `mq lag <group>` 使用真实 committed offset 和 high watermark；
 pure Kafka 明确不支持。RabbitMQ queue depth 只属于 `mq detail`，不得伪装成
