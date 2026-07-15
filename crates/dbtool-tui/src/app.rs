@@ -856,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_connection_file_is_propagated_instead_of_ignored() {
+    fn invalid_connection_file_is_propagated_with_secret_safe_diagnostics() {
         let path = std::env::temp_dir().join(format!(
             "dbtool-tui-invalid-config-{}-{}.toml",
             std::process::id(),
@@ -880,7 +880,10 @@ readonli = true
 
         assert!(matches!(
             error,
-            Error::Config(message) if message.contains("readonli")
+            Error::Config(message)
+                if message == "connection config is invalid TOML or contains unsupported fields"
+                    && !message.contains("readonli")
+                    && !message.contains("postgres://")
         ));
     }
 
