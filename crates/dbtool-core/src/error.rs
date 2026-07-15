@@ -25,6 +25,15 @@ pub enum Error {
     // ── Query / execution ─────────────────────────────────────────────────────
     #[error("query error: {0}")]
     Query(String),
+    /// A complete metadata object exceeded its caller item or byte budget.
+    /// Callers may retry with a larger permitted budget; no partial value was
+    /// returned and no remote mutation occurred.
+    #[error("{subject} exceeds the metadata {unit} budget of {limit}")]
+    MetadataBudgetExceeded {
+        subject: String,
+        unit: &'static str,
+        limit: usize,
+    },
     /// The client submitted an irreversible protocol operation but could not
     /// prove whether the remote system applied it. Callers must inspect remote
     /// state before retrying instead of treating this as a normal transient
@@ -76,6 +85,7 @@ impl Error {
             Error::Connection(_) => "CONNECTION_ERROR",
             Error::Auth(_) => "AUTH_ERROR",
             Error::Query(_) => "QUERY_ERROR",
+            Error::MetadataBudgetExceeded { .. } => "METADATA_BUDGET_EXCEEDED",
             Error::OutcomeIndeterminate(_) => "OUTCOME_INDETERMINATE",
             Error::ConfirmRequired { .. } => "CONFIRM_REQUIRED",
             Error::ReadOnly => "READ_ONLY",
@@ -100,5 +110,20 @@ mod tests {
         assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
         assert!(!error.is_retryable());
         assert!(error.to_string().contains("inspect remote state"));
+    }
+
+    #[test]
+    fn metadata_budget_errors_have_a_stable_machine_code() {
+        let error = Error::MetadataBudgetExceeded {
+            subject: "table schema".to_owned(),
+            unit: "items",
+            limit: 100,
+        };
+        assert_eq!(error.code(), "METADATA_BUDGET_EXCEEDED");
+        assert!(!error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "table schema exceeds the metadata items budget of 100"
+        );
     }
 }

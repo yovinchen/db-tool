@@ -137,10 +137,11 @@ impl MetadataLimiter {
     /// Account for one nested item before retaining it.
     pub fn observe<T: Serialize + ?Sized>(&mut self, item: &T) -> Result<()> {
         if self.observed_items >= self.budget.max_items {
-            return Err(Error::Query(format!(
-                "{} exceeds the {}-item metadata budget; increase the caller limit",
-                self.subject, self.budget.max_items
-            )));
+            return Err(Error::MetadataBudgetExceeded {
+                subject: self.subject.clone(),
+                unit: "items",
+                limit: self.budget.max_items,
+            });
         }
         let encoded =
             serde_json::to_vec(item).map_err(|error| Error::Serialization(error.to_string()))?;
@@ -149,10 +150,11 @@ impl MetadataLimiter {
             .checked_add(encoded.len())
             .ok_or_else(|| Error::Query(format!("{} metadata size overflow", self.subject)))?;
         if self.observed_bytes > self.budget.max_bytes {
-            return Err(Error::Query(format!(
-                "{} exceeds the {}-byte metadata budget",
-                self.subject, self.budget.max_bytes
-            )));
+            return Err(Error::MetadataBudgetExceeded {
+                subject: self.subject.clone(),
+                unit: "bytes",
+                limit: self.budget.max_bytes,
+            });
         }
         self.observed_items += 1;
         Ok(())
@@ -163,10 +165,11 @@ impl MetadataLimiter {
         let encoded =
             serde_json::to_vec(value).map_err(|error| Error::Serialization(error.to_string()))?;
         if encoded.len() > self.budget.max_bytes {
-            return Err(Error::Query(format!(
-                "{} complete response exceeds the {}-byte metadata budget",
-                self.subject, self.budget.max_bytes
-            )));
+            return Err(Error::MetadataBudgetExceeded {
+                subject: self.subject.clone(),
+                unit: "bytes",
+                limit: self.budget.max_bytes,
+            });
         }
         Ok(())
     }
@@ -269,7 +272,10 @@ mod tests {
         assert_eq!(limiter.probe_items().unwrap(), 2);
         limiter.observe("name").unwrap();
         assert_eq!(limiter.probe_items().unwrap(), 1);
-        assert!(matches!(limiter.observe("probe"), Err(Error::Query(_))));
+        assert!(matches!(
+            limiter.observe("probe"),
+            Err(Error::MetadataBudgetExceeded { unit: "items", .. })
+        ));
         assert_eq!(limiter.observed_items(), 2);
 
         limiter.ensure_complete(&vec!["id", "name"]).unwrap();
@@ -281,7 +287,7 @@ mod tests {
         let mut limiter = MetadataLimiter::new(budget, "topic detail").unwrap();
         assert!(matches!(
             limiter.observe("0123456789"),
-            Err(Error::Query(_))
+            Err(Error::MetadataBudgetExceeded { unit: "bytes", .. })
         ));
         assert_eq!(limiter.observed_items(), 0);
     }
