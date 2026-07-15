@@ -8,7 +8,8 @@ use dbtool_core::{
     config::{env::discover_env_connections, ConnectionConfig},
     dsn::Dsn,
     error::Error,
-    model::{FindOptions, Point, TimeRange, Value},
+    model::{BoundedList, FindOptions, Point, TimeRange, Value},
+    port::CapabilityOperation,
     registry::Registry,
     service::{
         safety::{SafetyGuard, StatementKind},
@@ -89,7 +90,7 @@ impl App {
     }
 
     pub fn help_text() -> &'static str {
-        "dbtool-tui\n\nUsage: dbtool-tui [--smoke]\n\nKeys: Tab changes panel, Enter runs a query command, Up/Down recall command history in the query panel, F2 changes the capability form, F3 changes form field, F4 applies the form, y confirms a pending write, n cancels it, q quits.\nCommands: ping, caps, sql <query>, sql exec <statement>, tables, schema <table>, kv get/scan/set/del, doc collections/find, search indices/index/query, ts measurements/query/write."
+        "dbtool-tui\n\nUsage: dbtool-tui [--smoke]\n\nKeys: Tab changes panel, Enter runs a query command, Up/Down recall command history in the query panel, F2 changes the capability form, F3 changes form field, F4 applies the form, y confirms a pending write, n cancels it, q quits.\nCommands: ping, caps, sql <query>, sql exec <statement>, schemas, tables [schema], schema <table>, kv get/scan/set/del, doc collections/find, search indices/index/query, ts measurements/query/write."
     }
 
     pub fn smoke_summary(&self) -> String {
@@ -277,10 +278,35 @@ async fn execute_tui_command(
         }
         "caps" => render_json(connector.capabilities()),
         "tables" => {
+            require_operation(
+                connector,
+                CapabilityOperation::SqlListTablesBounded,
+                "SqlEngine.list_tables_bounded",
+            )?;
+            let schema = parts.next();
+            if parts.next().is_some() {
+                return Err(Error::Config(
+                    "tables accepts at most one schema name".into(),
+                ));
+            }
             let sql = connector
                 .as_sql()
                 .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
-            render_json(sql.list_tables(None).await?)
+            render_bounded_list(sql.list_tables_bounded(schema, limit).await?)
+        }
+        "schemas" => {
+            if parts.next().is_some() {
+                return Err(Error::Config("schemas does not accept arguments".into()));
+            }
+            require_operation(
+                connector,
+                CapabilityOperation::SqlListSchemasBounded,
+                "SqlEngine.list_schemas_bounded",
+            )?;
+            let sql = connector
+                .as_sql()
+                .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
+            render_bounded_list(sql.list_schemas_bounded(limit).await?)
         }
         "schema" => {
             let table = parts
@@ -317,7 +343,7 @@ async fn execute_tui_command(
         }
         "ts" => run_ts_command(connector, command.strip_prefix("ts").unwrap_or("").trim()).await,
         _ => Err(Error::Config(format!(
-            "unknown TUI command '{head}'; try ping, caps, sql, tables, schema, kv, doc, search, or ts"
+            "unknown TUI command '{head}'; try ping, caps, sql, schemas, tables, schema, kv, doc, search, or ts"
         ))),
     }
 }
@@ -672,6 +698,39 @@ fn unsupported(connector: &dyn dbtool_core::port::Connector, needed: &'static st
     }
 }
 
+fn require_operation(
+    connector: &dyn dbtool_core::port::Connector,
+    operation: CapabilityOperation,
+    needed: &'static str,
+) -> Result<()> {
+    require_declared_operation(
+        &connector.operations(),
+        operation,
+        connector.kind().0,
+        needed,
+    )
+}
+
+fn require_declared_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: String,
+    needed: &'static str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability { kind, needed })
+    }
+}
+
+fn render_bounded_list<T: serde::Serialize>(list: BoundedList<T>) -> Result<String> {
+    render_json(serde_json::json!({
+        "data": list.items,
+        "meta": { "truncated": list.truncated }
+    }))
+}
+
 fn render_json<T: serde::Serialize>(value: T) -> Result<String> {
     serde_json::to_string_pretty(&value).map_err(|e| Error::Serialization(e.to_string()))
 }
@@ -739,6 +798,20 @@ mod tests {
         assert!(App::help_text().contains("Up/Down recall command history"));
         assert!(App::help_text().contains("F2 changes the capability form"));
         assert!(app.smoke_summary().contains("loaded"));
+    }
+
+    #[test]
+    fn sql_catalog_commands_reject_legacy_only_declarations_without_fallback() {
+        assert!(matches!(
+            require_declared_operation(
+                CapabilityOperation::SQL,
+                CapabilityOperation::SqlListTablesBounded,
+                "legacy-sql".into(),
+                "SqlEngine.list_tables_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "SqlEngine.list_tables_bounded"
+        ));
     }
 
     #[test]
@@ -813,6 +886,57 @@ readonli = true
             .unwrap();
         assert!(query.contains("\"id\""));
         assert!(query.contains("1"));
+    }
+
+    #[tokio::test]
+    async fn sql_catalog_commands_use_bounded_operations_and_expose_truncation() {
+        let registry = Arc::new(build_registry());
+        let manager = ConnectionManager::new(registry);
+        let connection = ConnectionItem {
+            name: "sqlite".to_owned(),
+            dsn: "sqlite::memory:".to_owned(),
+            readonly: false,
+        };
+
+        for table in ["alpha", "beta", "gamma"] {
+            execute_tui_command(
+                &manager,
+                &connection,
+                &format!("sql query create table {table} (id integer)"),
+                100,
+                true,
+            )
+            .await
+            .unwrap();
+        }
+
+        let tables: serde_json::Value = serde_json::from_str(
+            &execute_tui_command(&manager, &connection, "tables main", 2, false)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tables["data"].as_array().map(Vec::len), Some(2));
+        assert_eq!(tables["data"][0]["schema"], "main");
+        assert_eq!(tables["data"][0]["name"], "alpha");
+        assert_eq!(tables["data"][1]["name"], "beta");
+        assert_eq!(tables["meta"]["truncated"], true);
+
+        let schemas: serde_json::Value = serde_json::from_str(
+            &execute_tui_command(&manager, &connection, "schemas", 1, false)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(schemas["data"], serde_json::json!(["main"]));
+        assert_eq!(schemas["meta"]["truncated"], false);
+
+        for limit in [0, usize::MAX] {
+            assert!(matches!(
+                execute_tui_command(&manager, &connection, "tables main", limit, false).await,
+                Err(Error::Config(_))
+            ));
+        }
     }
 
     #[tokio::test]

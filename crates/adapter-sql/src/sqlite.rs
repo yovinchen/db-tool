@@ -2,7 +2,8 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind, TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind,
+        TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
@@ -16,6 +17,7 @@ use sqlx::sqlite::{SqliteArguments, SqlitePoolOptions};
 use sqlx::{types::Json, Column, Row, Sqlite, SqlitePool};
 
 use crate::{
+    bounded_catalog_limit,
     identifier::{parse_table_ref, validate_optional_schema},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, sqlite_value},
@@ -74,7 +76,11 @@ impl Connector for SqliteAdapter {
 
     fn operations(&self) -> Vec<CapabilityOperation> {
         let mut operations = CapabilityOperation::SQL.to_vec();
-        operations.push(CapabilityOperation::SqlInsertRowsAtomic);
+        operations.extend([
+            CapabilityOperation::SqlInsertRowsAtomic,
+            CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListTablesBounded,
+        ]);
         operations
     }
 
@@ -280,6 +286,23 @@ impl SqlEngine for SqliteAdapter {
             .collect()
     }
 
+    async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        let (limiter, sql_limit) = bounded_catalog_limit(max_items, "SQLite")?;
+        let rows = sqlx::query("SELECT name FROM pragma_database_list ORDER BY seq LIMIT ?")
+            .bind(sql_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let schemas = rows
+            .iter()
+            .map(|row| {
+                row.try_get::<String, _>(0)
+                    .map_err(|error| Error::Query(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(schemas))
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let schema = validate_optional_schema(schema)?.unwrap_or("main");
         let catalog = sqlite_catalog(schema);
@@ -302,6 +325,45 @@ impl SqlEngine for SqliteAdapter {
                 },
             })
             .collect())
+    }
+
+    async fn list_tables_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (limiter, sql_limit) = bounded_catalog_limit(max_items, "SQLite")?;
+        let schema = validate_optional_schema(schema)?.unwrap_or("main");
+        let catalog = sqlite_catalog(schema);
+        let rows = sqlx::query(&format!(
+            "SELECT name, type FROM {catalog} \
+             WHERE type IN ('table','view') ORDER BY name LIMIT ?"
+        ))
+        .bind(sql_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+        let tables = rows
+            .iter()
+            .map(|row| {
+                let name = row
+                    .try_get::<String, _>(0)
+                    .map_err(|error| Error::Query(error.to_string()))?;
+                let relation_type = row
+                    .try_get::<String, _>(1)
+                    .map_err(|error| Error::Query(error.to_string()))?;
+                Ok(TableInfo {
+                    schema: Some(schema.to_owned()),
+                    name,
+                    kind: if relation_type == "view" {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(tables))
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -908,5 +970,80 @@ mod tests {
             sql.query_bounded("not valid sql", &[], usize::MAX).await,
             Err(Error::Config(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_bounded_catalogs_distinguish_exact_n_from_probe_rows() {
+        let connector = memory_sqlite().await;
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListSchemasBounded));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListTablesBounded));
+        let sql = connector.as_sql().unwrap();
+
+        sql.execute("attach database ':memory:' as aux", &[])
+            .await
+            .unwrap();
+        let exact_schemas = sql.list_schemas_bounded(2).await.unwrap();
+        assert_eq!(exact_schemas.items, ["main", "aux"]);
+        assert!(!exact_schemas.truncated);
+
+        sql.execute("attach database ':memory:' as extra", &[])
+            .await
+            .unwrap();
+        let limited_schemas = sql.list_schemas_bounded(2).await.unwrap();
+        assert_eq!(limited_schemas.items, ["main", "aux"]);
+        assert!(limited_schemas.truncated);
+
+        sql.execute("create table alpha (id integer)", &[])
+            .await
+            .unwrap();
+        sql.execute("create view beta as select id from alpha", &[])
+            .await
+            .unwrap();
+        let exact_tables = sql.list_tables_bounded(Some("main"), 2).await.unwrap();
+        assert_eq!(
+            exact_tables
+                .items
+                .iter()
+                .map(|table| table.qualified_name())
+                .collect::<Vec<_>>(),
+            ["main.alpha", "main.beta"]
+        );
+        assert_eq!(exact_tables.items[1].kind, TableKind::View);
+        assert!(!exact_tables.truncated);
+
+        sql.execute("create table gamma (id integer)", &[])
+            .await
+            .unwrap();
+        let limited_tables = sql.list_tables_bounded(Some("main"), 2).await.unwrap();
+        assert_eq!(
+            limited_tables
+                .items
+                .iter()
+                .map(|table| table.qualified_name())
+                .collect::<Vec<_>>(),
+            ["main.alpha", "main.beta"]
+        );
+        assert!(limited_tables.truncated);
+    }
+
+    #[tokio::test]
+    async fn sqlite_bounded_catalogs_reject_limits_before_schema_or_sql_access() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+
+        for limit in [0, usize::MAX] {
+            assert!(matches!(
+                sql.list_schemas_bounded(limit).await,
+                Err(Error::Config(_))
+            ));
+            assert!(matches!(
+                sql.list_tables_bounded(Some("invalid-schema"), limit).await,
+                Err(Error::Config(_))
+            ));
+        }
     }
 }

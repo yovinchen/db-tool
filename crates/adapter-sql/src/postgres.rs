@@ -1,7 +1,9 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value},
+    model::{
+        BoundedList, ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value,
+    },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
@@ -16,7 +18,7 @@ use sqlx::query::Query;
 use sqlx::{types::Json, Column, Encode, PgPool, Postgres, Row, Type};
 
 use crate::{
-    group_index_rows,
+    bounded_catalog_limit, group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, postgres_value},
@@ -95,7 +97,11 @@ impl Connector for PostgresAdapter {
 
     fn operations(&self) -> Vec<CapabilityOperation> {
         let mut operations = CapabilityOperation::SQL.to_vec();
-        operations.push(CapabilityOperation::SqlInsertRowsAtomic);
+        operations.extend([
+            CapabilityOperation::SqlInsertRowsAtomic,
+            CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListTablesBounded,
+        ]);
         operations
     }
 
@@ -323,6 +329,26 @@ impl SqlEngine for PostgresAdapter {
         Ok(rows.iter().map(|r| r.get::<String, _>(0)).collect())
     }
 
+    async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        let (limiter, sql_limit) = bounded_catalog_limit(max_items, "PostgreSQL")?;
+        let rows = sqlx::query(
+            "SELECT schema_name FROM information_schema.schemata \
+             ORDER BY schema_name LIMIT $1",
+        )
+        .bind(sql_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+        let schemas = rows
+            .iter()
+            .map(|row| {
+                row.try_get::<String, _>(0)
+                    .map_err(|error| Error::Query(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(schemas))
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let s = validate_optional_schema(schema)?.unwrap_or("public");
         if self.kind.0 == "redshift" {
@@ -357,6 +383,50 @@ impl SqlEngine for PostgresAdapter {
                 })
             })
             .collect()
+    }
+
+    async fn list_tables_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (limiter, sql_limit) = bounded_catalog_limit(max_items, "PostgreSQL")?;
+        let schema = validate_optional_schema(schema)?.unwrap_or("public");
+        let tables = if self.kind.0 == "redshift" {
+            redshift_list_tables_bounded(&self.pool, schema, sql_limit).await?
+        } else {
+            let rows = sqlx::query(
+                "SELECT n.nspname, c.relname, c.relkind::text \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                 ORDER BY c.relname LIMIT $2",
+            )
+            .bind(schema)
+            .bind(sql_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+            rows.iter()
+                .map(|row| {
+                    let schema = row
+                        .try_get::<String, _>(0)
+                        .map_err(|error| Error::Query(error.to_string()))?;
+                    let name = row
+                        .try_get::<String, _>(1)
+                        .map_err(|error| Error::Query(error.to_string()))?;
+                    let relkind = row
+                        .try_get::<String, _>(2)
+                        .map_err(|error| Error::Query(error.to_string()))?;
+                    Ok(TableInfo {
+                        schema: Some(schema),
+                        name,
+                        kind: postgres_table_kind(&relkind)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(limiter.finish(tables))
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -459,6 +529,46 @@ async fn redshift_list_tables(pool: &PgPool, schema: &str) -> Result<Vec<TableIn
          WHERE table_schema = $1 ORDER BY table_name",
     )
     .bind(schema)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| Error::Query(error.to_string()))?;
+
+    rows.iter()
+        .map(|row| {
+            let schema = row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let name = row
+                .try_get::<String, _>(1)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let table_type = row
+                .try_get::<String, _>(2)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            Ok(TableInfo {
+                schema: Some(schema),
+                name,
+                kind: if table_type.contains("VIEW") {
+                    TableKind::View
+                } else {
+                    TableKind::Table
+                },
+            })
+        })
+        .collect()
+}
+
+async fn redshift_list_tables_bounded(
+    pool: &PgPool,
+    schema: &str,
+    sql_limit: i64,
+) -> Result<Vec<TableInfo>> {
+    let rows = sqlx::query(
+        "SELECT table_schema, table_name, table_type \
+         FROM information_schema.tables \
+         WHERE table_schema = $1 ORDER BY table_name LIMIT $2",
+    )
+    .bind(schema)
+    .bind(sql_limit)
     .fetch_all(pool)
     .await
     .map_err(|error| Error::Query(error.to_string()))?;
@@ -668,6 +778,66 @@ mod tests {
         assert!(tables
             .iter()
             .any(|item| { item.name == view && item.kind == TableKind::MaterializedView }));
+    }
+
+    #[tokio::test]
+    async fn postgres_live_bounded_catalog_is_schema_scoped_and_exact() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_POSTGRES_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("dbtool_bound_{suffix}");
+        let connector = postgres_factory(Dsn::parse(&raw_dsn).unwrap())
+            .await
+            .unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListSchemasBounded));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListTablesBounded));
+        let sql = connector.as_sql().unwrap();
+        sql.execute(&format!("CREATE SCHEMA {schema}"), &[])
+            .await
+            .unwrap();
+
+        let exercise = async {
+            for table in ["alpha", "beta", "gamma"] {
+                sql.execute(&format!("CREATE TABLE {schema}.{table} (id integer)"), &[])
+                    .await?;
+            }
+
+            let limited = sql.list_tables_bounded(Some(&schema), 2).await?;
+            assert_eq!(
+                limited
+                    .items
+                    .iter()
+                    .map(|table| table.qualified_name())
+                    .collect::<Vec<_>>(),
+                [format!("{schema}.alpha"), format!("{schema}.beta")]
+            );
+            assert!(limited.truncated);
+
+            sql.execute(&format!("DROP TABLE {schema}.gamma"), &[])
+                .await?;
+            let exact = sql.list_tables_bounded(Some(&schema), 2).await?;
+            assert_eq!(exact.items.len(), 2);
+            assert!(exact
+                .items
+                .iter()
+                .all(|table| table.schema.as_deref() == Some(schema.as_str())));
+            assert!(!exact.truncated);
+            Ok::<_, Error>(())
+        }
+        .await;
+
+        sql.execute(&format!("DROP SCHEMA {schema} CASCADE"), &[])
+            .await
+            .unwrap();
+        exercise.unwrap();
     }
 
     #[tokio::test]

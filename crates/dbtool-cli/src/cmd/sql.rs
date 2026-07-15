@@ -3,8 +3,9 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     model::Value,
+    port::CapabilityOperation,
     service::{
-        limiter::ResultLimiter,
+        limiter::{ListLimiter, ResultLimiter},
         safety::{SafetyGuard, StatementKind},
     },
     Result,
@@ -56,11 +57,14 @@ pub enum SqlAction {
 }
 
 pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
-    if matches!(
-        &cmd.action,
-        SqlAction::Query { .. } | SqlAction::Tables { .. } | SqlAction::Schemas
-    ) {
-        ResultLimiter::new(ctx.limit).probe_rows()?;
+    match &cmd.action {
+        SqlAction::Query { .. } => {
+            ResultLimiter::new(ctx.limit).probe_rows()?;
+        }
+        SqlAction::Tables { .. } | SqlAction::Schemas => {
+            ListLimiter::new(ctx.limit).probe_items()?;
+        }
+        SqlAction::Exec { .. } | SqlAction::Schema { .. } => {}
     }
     let dsn = ctx.resolve_dsn()?;
     let target = ctx.safety_target(&dsn);
@@ -89,6 +93,7 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
     }
 
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let sql_engine = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
         kind: conn.kind().0.clone(),
         needed: "SqlEngine",
@@ -125,11 +130,19 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Tables { schema } => {
-            let (tables, truncated) =
-                limit_metadata(sql_engine.list_tables(schema.as_deref()).await?, ctx.limit)?;
+            require_sql_catalog_operation(
+                &operations,
+                CapabilityOperation::SqlListTablesBounded,
+                conn.kind().0.as_str(),
+                "SqlEngine.list_tables_bounded",
+            )?;
+            let tables = sql_engine
+                .list_tables_bounded(schema.as_deref(), ctx.limit)
+                .await?;
+            let truncated = tables.truncated;
             ctx.render_success(
                 conn.kind().0.as_str(),
-                tables,
+                tables.items,
                 start.elapsed().as_millis() as u64,
                 truncated,
             )
@@ -144,10 +157,17 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Schemas => {
-            let (schemas, truncated) = limit_metadata(sql_engine.list_schemas().await?, ctx.limit)?;
+            require_sql_catalog_operation(
+                &operations,
+                CapabilityOperation::SqlListSchemasBounded,
+                conn.kind().0.as_str(),
+                "SqlEngine.list_schemas_bounded",
+            )?;
+            let schemas = sql_engine.list_schemas_bounded(ctx.limit).await?;
+            let truncated = schemas.truncated;
             ctx.render_success(
                 conn.kind().0.as_str(),
-                schemas,
+                schemas.items,
                 start.elapsed().as_millis() as u64,
                 truncated,
             )
@@ -157,11 +177,20 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
     Ok(output)
 }
 
-fn limit_metadata<T>(mut items: Vec<T>, limit: usize) -> Result<(Vec<T>, bool)> {
-    ResultLimiter::new(limit).probe_rows()?;
-    let truncated = items.len() > limit;
-    items.truncate(limit);
-    Ok((items, truncated))
+fn require_sql_catalog_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+    needed: &'static str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed,
+        })
+    }
 }
 
 fn parse_sql_params(raw: &str) -> Result<Vec<Value>> {
@@ -299,19 +328,30 @@ mod tests {
     }
 
     #[test]
-    fn metadata_lists_are_bounded_and_mark_exact_truncation() {
-        let (exact, exact_truncated) = limit_metadata(vec![1, 2], 2).unwrap();
-        assert_eq!(exact, [1, 2]);
-        assert!(!exact_truncated);
-
-        let (limited, limited_truncated) = limit_metadata(vec![1, 2, 3], 2).unwrap();
-        assert_eq!(limited, [1, 2]);
-        assert!(limited_truncated);
-
-        assert!(matches!(limit_metadata(vec![1], 0), Err(Error::Config(_))));
+    fn metadata_lists_require_explicit_bounded_operations_without_legacy_fallback() {
+        let legacy_only = CapabilityOperation::SQL;
         assert!(matches!(
-            limit_metadata(vec![1], usize::MAX),
-            Err(Error::Config(_))
+            require_sql_catalog_operation(
+                legacy_only,
+                CapabilityOperation::SqlListTablesBounded,
+                "legacy-sql",
+                "SqlEngine.list_tables_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "SqlEngine.list_tables_bounded"
         ));
+
+        let mut explicit = legacy_only.to_vec();
+        explicit.extend([
+            CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListTablesBounded,
+        ]);
+        assert!(require_sql_catalog_operation(
+            &explicit,
+            CapabilityOperation::SqlListSchemasBounded,
+            "sqlite",
+            "SqlEngine.list_schemas_bounded",
+        )
+        .is_ok());
     }
 }

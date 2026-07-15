@@ -12,10 +12,25 @@ use chrono::{DateTime, Utc};
 use dbtool_core::{
     error::{Error, Result},
     model::{IndexInfo, Value},
+    service::limiter::ListLimiter,
 };
 use std::collections::BTreeSet;
 
 use crate::identifier::{parse_table_ref, validate_identifier, TableRef};
+
+/// Validate a caller's catalog budget and convert its N+1 probe to the signed
+/// integer accepted by SQL LIMIT parameters. Callers use this before acquiring
+/// a connection or issuing any backend request.
+pub(crate) fn bounded_catalog_limit(max_items: usize, backend: &str) -> Result<(ListLimiter, i64)> {
+    let limiter = ListLimiter::new(max_items);
+    let probe_items = limiter.probe_items()?;
+    let sql_limit = i64::try_from(probe_items).map_err(|_| {
+        Error::Config(format!(
+            "{backend} catalog limit is too large for a SQL LIMIT parameter"
+        ))
+    })?;
+    Ok((limiter, sql_limit))
+}
 
 pub(crate) fn validate_atomic_insert(
     table: &str,
@@ -105,4 +120,28 @@ pub(crate) fn group_index_rows(
         }
     }
     indexes
+}
+
+#[cfg(test)]
+mod bounded_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_limit_rejects_zero_probe_overflow_and_sql_parameter_overflow() {
+        assert!(matches!(
+            bounded_catalog_limit(0, "test"),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            bounded_catalog_limit(usize::MAX, "test"),
+            Err(Error::Config(_))
+        ));
+        if usize::MAX > i64::MAX as usize {
+            assert!(matches!(
+                bounded_catalog_limit(i64::MAX as usize, "test"),
+                Err(Error::Config(_))
+            ));
+        }
+        assert_eq!(bounded_catalog_limit(2, "test").unwrap().1, 3);
+    }
 }

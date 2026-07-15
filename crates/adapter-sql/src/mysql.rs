@@ -1,7 +1,9 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value},
+    model::{
+        BoundedList, ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value,
+    },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
@@ -14,7 +16,7 @@ use sqlx::query::Query;
 use sqlx::{types::Json, Column, MySql, MySqlPool, Row};
 
 use crate::{
-    group_index_rows,
+    bounded_catalog_limit, group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema, TableRef},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, mysql_value},
@@ -123,7 +125,11 @@ impl Connector for MySqlAdapter {
 
     fn operations(&self) -> Vec<CapabilityOperation> {
         let mut operations = CapabilityOperation::SQL.to_vec();
-        operations.push(CapabilityOperation::SqlInsertRowsAtomic);
+        operations.extend([
+            CapabilityOperation::SqlInsertRowsAtomic,
+            CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListTablesBounded,
+        ]);
         operations
     }
 
@@ -349,6 +355,23 @@ impl SqlEngine for MySqlAdapter {
         rows.iter().map(|r| mysql_text(r, 0)).collect()
     }
 
+    async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        let (limiter, sql_limit) = bounded_catalog_limit(max_items, "MySQL")?;
+        let rows = sqlx::query(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
+             ORDER BY SCHEMA_NAME LIMIT ?",
+        )
+        .bind(sql_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+        let schemas = rows
+            .iter()
+            .map(|row| mysql_text(row, 0))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(schemas))
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let schema = validate_optional_schema(schema)?;
         let rows = if let Some(schema) = schema {
@@ -388,6 +411,55 @@ impl SqlEngine for MySqlAdapter {
                 })
             })
             .collect::<Result<Vec<_>>>()?)
+    }
+
+    async fn list_tables_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (limiter, sql_limit) = bounded_catalog_limit(max_items, "MySQL")?;
+        let schema = validate_optional_schema(schema)?;
+        let rows = if let Some(schema) = schema {
+            sqlx::query(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+                 FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME LIMIT ?",
+            )
+            .bind(schema)
+            .bind(sql_limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+                 FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME LIMIT ?",
+            )
+            .bind(sql_limit)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| Error::Query(error.to_string()))?;
+
+        let tables = rows
+            .iter()
+            .map(|row| {
+                let effective_schema = mysql_text(row, 0)?;
+                let name = mysql_text(row, 1)?;
+                let table_type = mysql_text(row, 2)?;
+                Ok(TableInfo {
+                    schema: Some(effective_schema),
+                    name,
+                    kind: if table_type.contains("VIEW") {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(tables))
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -573,6 +645,65 @@ mod tests {
             .any(|item| item.name == table && item.schema.as_deref() == Some(schema.as_str())));
         assert!(described.columns[0].primary_key);
         assert_eq!(described.columns[1].default_value.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn mysql_live_bounded_catalog_distinguishes_n_from_n_plus_one() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MYSQL_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tables = [
+            format!("dbtool_bound_{suffix}_alpha"),
+            format!("dbtool_bound_{suffix}_beta"),
+            format!("dbtool_bound_{suffix}_gamma"),
+        ];
+        let connector = mysql_factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListSchemasBounded));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListTablesBounded));
+        let sql = connector.as_sql().unwrap();
+        let existing_count = sql.list_tables(None).await.unwrap().len();
+        for table in &tables {
+            sql.execute(&format!("CREATE TABLE {table} (id integer)"), &[])
+                .await
+                .unwrap();
+        }
+
+        let exercise = async {
+            let total = existing_count + tables.len();
+            let exact = sql.list_tables_bounded(None, total).await?;
+            assert_eq!(exact.items.len(), total);
+            assert!(!exact.truncated);
+
+            let limited = sql.list_tables_bounded(None, total - 1).await?;
+            assert_eq!(limited.items.len(), total - 1);
+            assert!(limited.truncated);
+            assert!(limited.items.iter().all(|table| table
+                .schema
+                .as_deref()
+                .is_some_and(|schema| !schema.is_empty())));
+
+            let all_schemas = sql.list_schemas().await?;
+            let exact_schemas = sql.list_schemas_bounded(all_schemas.len()).await?;
+            assert_eq!(exact_schemas.items, all_schemas);
+            assert!(!exact_schemas.truncated);
+            Ok::<_, Error>(())
+        }
+        .await;
+
+        for table in &tables {
+            sql.execute(&format!("DROP TABLE {table}"), &[])
+                .await
+                .unwrap();
+        }
+        exercise.unwrap();
     }
 
     #[tokio::test]

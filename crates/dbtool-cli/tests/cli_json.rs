@@ -285,6 +285,28 @@ fn global_limit_rejects_zero_before_connecting() {
 }
 
 #[test]
+fn sql_catalog_limit_rejects_zero_and_probe_overflow_before_connecting() {
+    for (limit, expected) in [
+        ("0".to_owned(), "global --limit"),
+        (usize::MAX.to_string(), "catalog item limit"),
+    ] {
+        let output = dbtool(&[
+            "--dsn",
+            "postgres://127.0.0.1:1/unreachable",
+            "--limit",
+            &limit,
+            "sql",
+            "schemas",
+        ]);
+        let error = stderr_json(&output);
+        assert_eq!(error["error"]["code"], "CONFIG_ERROR");
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(expected)));
+    }
+}
+
+#[test]
 fn cli_generate_artifacts_writes_completion_and_manpage_files() {
     let root = std::env::temp_dir().join(format!(
         "dbtool-cli-artifacts-{}-{}",

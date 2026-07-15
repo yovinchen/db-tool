@@ -31,7 +31,9 @@ fn caps_preserves_legacy_booleans_and_adds_sorted_sql_operations() {
             "sql.execute",
             "sql.insert_rows_atomic",
             "sql.list_schemas",
+            "sql.list_schemas_bounded",
             "sql.list_tables",
+            "sql.list_tables_bounded",
             "sql.query",
             "sql.query_bounded"
         ])
