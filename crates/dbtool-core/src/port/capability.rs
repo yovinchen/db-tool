@@ -1,9 +1,10 @@
 use crate::{
     model::{
         ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, Document, ExecOutcome,
-        FindOptions, ForeignKeyInfo, InsertOutcome, LagInfo, Message, MessageResource, Point,
-        ProduceOutcome, ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema,
-        TablespaceInfo, TimeRange, TopicDetail, TopicInfo, UpdateOutcome, Value,
+        FindOptions, ForeignKeyInfo, InsertOutcome, KeyExpiry, KeyValueRestoreOutcome,
+        KeyValueSnapshot, LagInfo, Message, MessageResource, Point, ProduceOutcome, ResultSet,
+        RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema, TablespaceInfo, TimeRange,
+        TopicDetail, TopicInfo, UpdateOutcome, Value,
     },
     Result,
 };
@@ -83,7 +84,38 @@ pub trait CqlEngine: Connector {
 #[async_trait]
 pub trait KeyValueStore: Connector {
     async fn get(&self, key: &str) -> Result<Option<bytes::Bytes>>;
+    /// Read a value and its absolute expiry in one backend operation.
+    ///
+    /// This optional method must not be emulated with separate `GET` and TTL
+    /// calls: a concurrent write or the passage of time would make that pair
+    /// an unsafe transfer snapshot. Connectors implementing it must explicitly
+    /// advertise `kv.get_with_expiry`.
+    async fn get_with_expiry(&self, _key: &str) -> Result<Option<KeyValueSnapshot>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "KeyValueStore.get_with_expiry",
+        })
+    }
     async fn set(&self, key: &str, value: &[u8], options: SetOptions) -> Result<()>;
+    /// Restore an exact value/lifetime pair in one backend operation.
+    ///
+    /// `nx=true` means the key must not exist. An already-expired absolute
+    /// deadline returns [`KeyValueRestoreOutcome::Expired`] without writing;
+    /// an NX conflict returns [`KeyValueRestoreOutcome::ConditionNotMet`].
+    /// Connectors implementing this method must explicitly advertise
+    /// `kv.restore_with_expiry`.
+    async fn restore_with_expiry(
+        &self,
+        _key: &str,
+        _value: &[u8],
+        _expiry: KeyExpiry,
+        _nx: bool,
+    ) -> Result<KeyValueRestoreOutcome> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "KeyValueStore.restore_with_expiry",
+        })
+    }
     async fn delete(&self, keys: &[String]) -> Result<u64>;
     async fn scan(&self, pattern: &str, limit: usize) -> Result<Vec<String>>;
     /// Escape hatch for raw protocol commands (e.g. `XLEN mystream`).

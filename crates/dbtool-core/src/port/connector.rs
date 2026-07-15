@@ -53,7 +53,9 @@ capability_operations! {
     Db2ListForeignKeys => "db2.list_foreign_keys",
     Db2GenerateDdl => "db2.generate_ddl",
     KeyValueGet => "kv.get",
+    KeyValueGetWithExpiry => "kv.get_with_expiry",
     KeyValueSet => "kv.set",
+    KeyValueRestoreWithExpiry => "kv.restore_with_expiry",
     KeyValueDelete => "kv.delete",
     KeyValueScan => "kv.scan",
     KeyValueRawCommand => "kv.raw_command",
@@ -122,6 +124,11 @@ impl CapabilityOperation {
         Self::KeyValueScan,
         Self::KeyValueRawCommand,
     ];
+    /// Atomic lifetime operations are optional and must be declared by each
+    /// connector. The legacy `key_value=true` flag never implies that a
+    /// backend can observe or restore a value and its expiry atomically.
+    pub const KEY_VALUE_LIFETIME: &'static [Self] =
+        &[Self::KeyValueGetWithExpiry, Self::KeyValueRestoreWithExpiry];
     pub const DOCUMENT: &'static [Self] = &[
         Self::DocumentListCollections,
         Self::DocumentFind,
@@ -422,6 +429,32 @@ mod tests {
         connector.ping().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn legacy_kv_connectors_neither_claim_nor_inherit_atomic_lifetime_operations() {
+        let connector = MockKvConnector::default();
+        assert!(CapabilityOperation::KEY_VALUE_LIFETIME
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+
+        assert!(matches!(
+            connector.get_with_expiry("key").await,
+            Err(crate::Error::UnsupportedCapability { kind, needed })
+                if kind == "mock-kv" && needed == "KeyValueStore.get_with_expiry"
+        ));
+        assert!(matches!(
+            connector
+                .restore_with_expiry(
+                    "key",
+                    b"value",
+                    crate::model::KeyExpiry::Persistent,
+                    false,
+                )
+                .await,
+            Err(crate::Error::UnsupportedCapability { kind, needed })
+                if kind == "mock-kv" && needed == "KeyValueStore.restore_with_expiry"
+        ));
+    }
+
     #[test]
     fn operation_names_are_unique_stable_and_round_trip_through_serde() {
         let mut names = HashSet::new();
@@ -462,6 +495,7 @@ mod tests {
             .filter(|operation| {
                 !CapabilityOperation::MESSAGE_ADMIN.contains(operation)
                     && *operation != CapabilityOperation::SqlInsertRowsAtomic
+                    && !CapabilityOperation::KEY_VALUE_LIFETIME.contains(operation)
                     && ![
                         CapabilityOperation::DocumentUpdateOne,
                         CapabilityOperation::DocumentUpdateMany,
@@ -480,6 +514,9 @@ mod tests {
         assert!(!connector
             .operations()
             .contains(&CapabilityOperation::SqlInsertRowsAtomic));
+        assert!(CapabilityOperation::KEY_VALUE_LIFETIME
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::MESSAGE_CONSUMER_EXTENSIONS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));

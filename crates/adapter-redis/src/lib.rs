@@ -2,9 +2,10 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo,
-        Message, MessageCursor, MessagePlacement, MessageResource, MessageResourceKind,
-        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo, Value,
+        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, KeyExpiry,
+        KeyValueRestoreOutcome, KeyValueSnapshot, LagInfo, Message, MessageCursor,
+        MessagePlacement, MessageResource, MessageResourceKind, PartitionWatermark, ProduceOutcome,
+        TopicDetail, TopicInfo, Value,
     },
     port::{
         capability::{
@@ -23,6 +24,82 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::time::{timeout, Instant};
 
 const REDIS_SCAN_COUNT: usize = 10;
+const REDIS_LUA_SAFE_INTEGER_MAX_MS: i64 = 9_007_199_254_740_991;
+
+// TIME intentionally precedes PTTL. Computing the absolute deadline from an
+// earlier server timestamp and a later remaining TTL can only shorten the
+// observed lifetime; it can never extend the source key's lifetime.
+const GET_WITH_EXPIRY_SCRIPT: &str = r#"
+local value = redis.call('GET', KEYS[1])
+local server_time = redis.call('TIME')
+local pttl = redis.call('PTTL', KEYS[1])
+if value == false or pttl == -2 then
+  return {0, '', server_time[1], server_time[2], pttl}
+end
+return {1, value, server_time[1], server_time[2], pttl}
+"#;
+
+// Status values: 1 = stored, 0 = NX condition not met, 2 = expired,
+// -1 = invalid server time, -2 = invalid adapter input.
+const RESTORE_WITH_EXPIRY_SCRIPT: &str = r#"
+local server_time = redis.call('TIME')
+local seconds = tonumber(server_time[1])
+local micros = tonumber(server_time[2])
+local max_safe_ms = 9007199254740991
+if seconds == nil or micros == nil or seconds < 0 or micros < 0 or micros >= 1000000 then
+  return -1
+end
+local now_ms = seconds * 1000 + math.floor(micros / 1000)
+if now_ms > max_safe_ms then
+  return -1
+end
+
+local mode = ARGV[2]
+local nx = ARGV[4]
+if nx ~= '0' and nx ~= '1' then
+  return -2
+end
+
+if mode == 'persistent' then
+  local stored
+  if nx == '1' then
+    stored = redis.call('SET', KEYS[1], ARGV[1], 'NX')
+  else
+    stored = redis.call('SET', KEYS[1], ARGV[1])
+  end
+  if stored == false then
+    return 0
+  end
+  return 1
+end
+
+if mode ~= 'expires_at_unix_ms' then
+  return -2
+end
+local deadline_text = ARGV[3]
+if string.sub(deadline_text, 1, 1) == '-' then
+  return 2
+end
+local deadline = tonumber(deadline_text)
+if deadline == nil or deadline < 0 or deadline > max_safe_ms or deadline ~= math.floor(deadline) then
+  return -2
+end
+if deadline <= now_ms then
+  return 2
+end
+
+local remaining = string.format('%.0f', deadline - now_ms)
+local stored
+if nx == '1' then
+  stored = redis.call('SET', KEYS[1], ARGV[1], 'PX', remaining, 'NX')
+else
+  stored = redis.call('SET', KEYS[1], ARGV[1], 'PX', remaining)
+end
+if stored == false then
+  return 0
+end
+return 1
+"#;
 
 pub struct RedisAdapter {
     client: Client,
@@ -108,6 +185,18 @@ impl KeyValueStore for RedisAdapter {
         Ok(val.map(bytes::Bytes::from))
     }
 
+    async fn get_with_expiry(&self, key: &str) -> Result<Option<KeyValueSnapshot>> {
+        let mut c = self.conn.lock().await;
+        let response: (i64, Vec<u8>, i64, i64, i64) = redis::cmd("EVAL")
+            .arg(GET_WITH_EXPIRY_SCRIPT)
+            .arg(1)
+            .arg(key)
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        decode_get_with_expiry_response(response)
+    }
+
     async fn set(&self, key: &str, value: &[u8], options: SetOptions) -> Result<()> {
         let mut c = self.conn.lock().await;
         let nx = options.nx;
@@ -123,6 +212,33 @@ impl KeyValueStore for RedisAdapter {
         }
 
         Ok(())
+    }
+
+    async fn restore_with_expiry(
+        &self,
+        key: &str,
+        value: &[u8],
+        expiry: KeyExpiry,
+        nx: bool,
+    ) -> Result<KeyValueRestoreOutcome> {
+        validate_restore_expiry(expiry)?;
+        let (mode, deadline) = match expiry {
+            KeyExpiry::Persistent => ("persistent", String::new()),
+            KeyExpiry::ExpiresAtUnixMs(deadline) => ("expires_at_unix_ms", deadline.to_string()),
+        };
+        let mut c = self.conn.lock().await;
+        let status: i64 = redis::cmd("EVAL")
+            .arg(RESTORE_WITH_EXPIRY_SCRIPT)
+            .arg(1)
+            .arg(key)
+            .arg(value)
+            .arg(mode)
+            .arg(deadline)
+            .arg(if nx { "1" } else { "0" })
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        decode_restore_with_expiry_status(status)
     }
 
     async fn delete(&self, keys: &[String]) -> Result<u64> {
@@ -169,6 +285,87 @@ impl KeyValueStore for RedisAdapter {
             .map_err(|e| Error::Query(e.to_string()))?;
         validate_raw_response_budget(&val)?;
         redis_value_to_core(val)
+    }
+}
+
+fn decode_get_with_expiry_response(
+    (status, value, seconds, micros, pttl): (i64, Vec<u8>, i64, i64, i64),
+) -> Result<Option<KeyValueSnapshot>> {
+    let server_time_ms = checked_redis_time_ms(seconds, micros)?;
+    match status {
+        0 if pttl == -2 && value.is_empty() => Ok(None),
+        0 => Err(Error::Serialization(format!(
+            "Redis lifetime script returned inconsistent missing-key state (pttl={pttl}, value_bytes={})",
+            value.len()
+        ))),
+        1 => {
+            let expiry = match pttl {
+                -1 => KeyExpiry::Persistent,
+                pttl if pttl >= 0 => {
+                    let deadline = server_time_ms.checked_add(pttl).ok_or_else(|| {
+                        Error::Serialization("Redis expiry deadline overflowed i64".into())
+                    })?;
+                    if deadline > REDIS_LUA_SAFE_INTEGER_MAX_MS {
+                        return Err(Error::Serialization(format!(
+                            "Redis expiry deadline {deadline} exceeds the exact Lua integer range"
+                        )));
+                    }
+                    KeyExpiry::ExpiresAtUnixMs(deadline)
+                }
+                other => {
+                    return Err(Error::Serialization(format!(
+                        "Redis PTTL returned unsupported negative value {other}"
+                    )))
+                }
+            };
+            Ok(Some(KeyValueSnapshot {
+                value: bytes::Bytes::from(value),
+                expiry,
+            }))
+        }
+        other => Err(Error::Serialization(format!(
+            "Redis lifetime script returned unexpected status {other}"
+        ))),
+    }
+}
+
+fn checked_redis_time_ms(seconds: i64, micros: i64) -> Result<i64> {
+    if seconds < 0 || !(0..1_000_000).contains(&micros) {
+        return Err(Error::Serialization(format!(
+            "Redis TIME returned invalid seconds/microseconds pair ({seconds}, {micros})"
+        )));
+    }
+    seconds
+        .checked_mul(1_000)
+        .and_then(|millis| millis.checked_add(micros / 1_000))
+        .ok_or_else(|| Error::Serialization("Redis TIME milliseconds overflowed i64".into()))
+}
+
+fn validate_restore_expiry(expiry: KeyExpiry) -> Result<()> {
+    if let KeyExpiry::ExpiresAtUnixMs(deadline) = expiry {
+        if deadline > REDIS_LUA_SAFE_INTEGER_MAX_MS {
+            return Err(Error::Config(format!(
+                "Redis absolute expiry {deadline} exceeds the exact Lua integer range"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn decode_restore_with_expiry_status(status: i64) -> Result<KeyValueRestoreOutcome> {
+    match status {
+        1 => Ok(KeyValueRestoreOutcome::Stored),
+        0 => Ok(KeyValueRestoreOutcome::ConditionNotMet),
+        2 => Ok(KeyValueRestoreOutcome::Expired),
+        -1 => Err(Error::Serialization(
+            "Redis TIME could not be represented safely by the lifetime script".into(),
+        )),
+        -2 => Err(Error::Internal(
+            "Redis lifetime script rejected adapter-generated arguments".into(),
+        )),
+        other => Err(Error::Serialization(format!(
+            "Redis lifetime restore script returned unexpected status {other}"
+        ))),
     }
 }
 
@@ -1045,6 +1242,8 @@ fn validate_raw_simple_zadd(args: &[String], command: &str) -> Result<()> {
 fn redis_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::KeyValueGetWithExpiry,
+        CapabilityOperation::KeyValueRestoreWithExpiry,
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminConsumerLag,
@@ -1514,6 +1713,204 @@ mod tests {
     }
 
     #[test]
+    fn lifetime_read_script_orders_time_before_pttl_and_decodes_exact_values() {
+        let get_position = GET_WITH_EXPIRY_SCRIPT.find("'GET'").unwrap();
+        let time_position = GET_WITH_EXPIRY_SCRIPT.find("'TIME'").unwrap();
+        let pttl_position = GET_WITH_EXPIRY_SCRIPT.find("'PTTL'").unwrap();
+        assert!(get_position < time_position && time_position < pttl_position);
+
+        assert_eq!(
+            decode_get_with_expiry_response((0, vec![], 1, 0, -2)).unwrap(),
+            None
+        );
+        assert_eq!(
+            decode_get_with_expiry_response((1, vec![], 1, 0, -1)).unwrap(),
+            Some(KeyValueSnapshot {
+                value: bytes::Bytes::new(),
+                expiry: KeyExpiry::Persistent,
+            })
+        );
+        assert_eq!(
+            decode_get_with_expiry_response((1, vec![0, 0xff], 1, 500_000, 23)).unwrap(),
+            Some(KeyValueSnapshot {
+                value: bytes::Bytes::from_static(&[0, 0xff]),
+                expiry: KeyExpiry::ExpiresAtUnixMs(1_523),
+            })
+        );
+    }
+
+    #[test]
+    fn lifetime_read_fails_closed_on_invalid_pttl_time_or_status() {
+        for response in [
+            (0, vec![1], 1, 0, -2),
+            (0, vec![], 1, 0, -1),
+            (1, vec![], 1, 0, -3),
+            (9, vec![], 1, 0, -1),
+            (1, vec![], -1, 0, -1),
+            (1, vec![], 1, 1_000_000, -1),
+            (1, vec![], i64::MAX, 0, 1),
+            (1, vec![], 9_007_199_254_740, 991_000, 1),
+        ] {
+            assert!(decode_get_with_expiry_response(response).is_err());
+        }
+        assert!(checked_redis_time_ms(i64::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn lifetime_restore_outcomes_and_lua_integer_limits_are_explicit() {
+        assert_eq!(
+            decode_restore_with_expiry_status(1).unwrap(),
+            KeyValueRestoreOutcome::Stored
+        );
+        assert_eq!(
+            decode_restore_with_expiry_status(0).unwrap(),
+            KeyValueRestoreOutcome::ConditionNotMet
+        );
+        assert_eq!(
+            decode_restore_with_expiry_status(2).unwrap(),
+            KeyValueRestoreOutcome::Expired
+        );
+        assert!(decode_restore_with_expiry_status(-1).is_err());
+        assert!(decode_restore_with_expiry_status(-2).is_err());
+        assert!(decode_restore_with_expiry_status(3).is_err());
+
+        assert!(validate_restore_expiry(KeyExpiry::Persistent).is_ok());
+        assert!(validate_restore_expiry(KeyExpiry::ExpiresAtUnixMs(i64::MIN)).is_ok());
+        assert!(
+            validate_restore_expiry(KeyExpiry::ExpiresAtUnixMs(REDIS_LUA_SAFE_INTEGER_MAX_MS))
+                .is_ok()
+        );
+        assert!(validate_restore_expiry(KeyExpiry::ExpiresAtUnixMs(
+            REDIS_LUA_SAFE_INTEGER_MAX_MS + 1
+        ))
+        .is_err());
+
+        let time_position = RESTORE_WITH_EXPIRY_SCRIPT.find("'TIME'").unwrap();
+        let expired_position = RESTORE_WITH_EXPIRY_SCRIPT
+            .find("deadline <= now_ms")
+            .unwrap();
+        let expiring_set_position = RESTORE_WITH_EXPIRY_SCRIPT.find("'PX', remaining").unwrap();
+        assert!(time_position < expired_position && expired_position < expiring_set_position);
+    }
+
+    #[tokio::test]
+    async fn redis_live_lifetime_contract_preserves_bytes_deadlines_and_write_conditions() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let persistent_key = format!("dbtool_it_lifetime_{suffix}:persistent");
+        let expiring_key = format!("dbtool_it_lifetime_{suffix}:expiring");
+        let past_key = format!("dbtool_it_lifetime_{suffix}:past");
+        let keys = vec![
+            persistent_key.clone(),
+            expiring_key.clone(),
+            past_key.clone(),
+        ];
+
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let driver_url = dsn.raw_with_scheme("redis").unwrap();
+        let client = Client::open(driver_url.as_str()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&keys)
+            .query_async::<u64>(&mut direct)
+            .await
+            .unwrap();
+
+        let connector = factory(dsn).await.unwrap();
+        let kv = connector.as_kv().unwrap();
+        assert_eq!(kv.get_with_expiry(&persistent_key).await.unwrap(), None);
+
+        assert_eq!(
+            kv.restore_with_expiry(
+                &persistent_key,
+                &[0, 0xff, b'Z'],
+                KeyExpiry::Persistent,
+                false,
+            )
+            .await
+            .unwrap(),
+            KeyValueRestoreOutcome::Stored
+        );
+        assert_eq!(
+            kv.get_with_expiry(&persistent_key).await.unwrap(),
+            Some(KeyValueSnapshot {
+                value: bytes::Bytes::from_static(&[0, 0xff, b'Z']),
+                expiry: KeyExpiry::Persistent,
+            })
+        );
+        assert_eq!(
+            kv.restore_with_expiry(&persistent_key, b"replacement", KeyExpiry::Persistent, true,)
+                .await
+                .unwrap(),
+            KeyValueRestoreOutcome::ConditionNotMet
+        );
+        assert_eq!(
+            kv.get(&persistent_key).await.unwrap(),
+            Some(bytes::Bytes::from_static(&[0, 0xff, b'Z']))
+        );
+
+        let (seconds, micros): (i64, i64) =
+            redis::cmd("TIME").query_async(&mut direct).await.unwrap();
+        let deadline = checked_redis_time_ms(seconds, micros)
+            .unwrap()
+            .checked_add(60_000)
+            .unwrap();
+        assert_eq!(
+            kv.restore_with_expiry(
+                &expiring_key,
+                b"",
+                KeyExpiry::ExpiresAtUnixMs(deadline),
+                false,
+            )
+            .await
+            .unwrap(),
+            KeyValueRestoreOutcome::Stored
+        );
+        let expiring = kv.get_with_expiry(&expiring_key).await.unwrap().unwrap();
+        assert!(expiring.value.is_empty());
+        let KeyExpiry::ExpiresAtUnixMs(observed_deadline) = expiring.expiry else {
+            panic!("expiring restore became persistent")
+        };
+        assert!(observed_deadline <= deadline);
+        assert!(observed_deadline >= deadline - 1_000);
+
+        kv.set(&past_key, b"original", SetOptions::default())
+            .await
+            .unwrap();
+        let (seconds, micros): (i64, i64) =
+            redis::cmd("TIME").query_async(&mut direct).await.unwrap();
+        let now = checked_redis_time_ms(seconds, micros).unwrap();
+        assert_eq!(
+            kv.restore_with_expiry(
+                &past_key,
+                b"must-not-be-written",
+                KeyExpiry::ExpiresAtUnixMs(now),
+                true,
+            )
+            .await
+            .unwrap(),
+            KeyValueRestoreOutcome::Expired
+        );
+        assert_eq!(
+            kv.get(&past_key).await.unwrap(),
+            Some(bytes::Bytes::from_static(b"original"))
+        );
+
+        assert_eq!(kv.delete(&keys).await.unwrap(), 3);
+        assert_eq!(
+            kv.scan(&format!("dbtool_it_lifetime_{suffix}:*"), 10)
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn scan_collector_deduplicates_across_pages_and_stops_at_zero() {
         let mut collector = ScanCollector::new(4).unwrap();
         assert_eq!(
@@ -1931,6 +2328,8 @@ mod tests {
         });
 
         for operation in [
+            CapabilityOperation::KeyValueGetWithExpiry,
+            CapabilityOperation::KeyValueRestoreWithExpiry,
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminTopicDetail,
             CapabilityOperation::MessageAdminConsumerLag,

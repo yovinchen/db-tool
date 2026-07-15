@@ -1,4 +1,5 @@
 pub mod document;
+pub mod kv;
 pub mod message;
 pub mod meta;
 pub mod result;
@@ -7,6 +8,7 @@ pub mod series;
 pub mod value;
 
 pub use document::{Document, FindOptions, InsertOutcome, UpdateOutcome};
+pub use kv::{KeyExpiry, KeyValueRestoreOutcome, KeyValueSnapshot};
 pub use message::{
     AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
     DeleteResourceOutcome, Message, MessageCursor, MessageMetadata, MessagePlacement,
