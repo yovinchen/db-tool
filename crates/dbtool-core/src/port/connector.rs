@@ -1,5 +1,5 @@
 use super::capability::{
-    AdminInspect, CqlEngine, Db2Engine, DocumentStore, KeyValueStore, MessageConsumer,
+    AdminInspect, AdminMutate, CqlEngine, Db2Engine, DocumentStore, KeyValueStore, MessageConsumer,
     MessageProducer, SearchEngine, SqlEngine, TimeSeriesStore,
 };
 use crate::Result;
@@ -277,6 +277,9 @@ pub trait Connector: Send + Sync {
     fn as_admin(&self) -> Option<&dyn AdminInspect> {
         None
     }
+    fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +402,7 @@ mod tests {
         assert!(connector.as_cql().is_none());
         assert!(connector.as_document().is_none());
         assert!(connector.as_producer().is_none());
+        assert!(connector.as_admin_mutate().is_none());
         connector.ping().await.unwrap();
     }
 

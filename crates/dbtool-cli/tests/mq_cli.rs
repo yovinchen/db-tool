@@ -66,6 +66,19 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
     assert!(consume_help.contains("--timeout <TIMEOUT>"));
     assert!(consume_help.contains("--partition <PARTITION>"));
     assert!(consume_help.contains("--offset <OFFSET>"));
+
+    let delete_help = stdout_text(dbtool(&["mq", "delete", "--help"]));
+    assert!(delete_help.contains("--kind <KIND>"));
+    for kind in [
+        "kafka-topic",
+        "amqp-queue",
+        "redis-stream",
+        "nats-jetstream",
+    ] {
+        assert!(delete_help.contains(kind), "missing resource kind {kind}");
+    }
+    assert!(delete_help.contains("--if-empty"));
+    assert!(delete_help.contains("--if-unused"));
 }
 
 #[test]
@@ -100,6 +113,58 @@ fn produce_still_requires_write_permission_before_connecting() {
         ],
         "WRITE_NOT_ALLOWED",
         "require --allow-write",
+    );
+}
+
+#[test]
+fn resource_delete_requires_write_and_target_bound_confirmation_before_connecting() {
+    assert_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "delete",
+            "--kind",
+            "kafka-topic",
+            "events",
+        ],
+        "WRITE_NOT_ALLOWED",
+        "require --allow-write",
+    );
+
+    let first = stderr_json(dbtool(&[
+        "--dsn",
+        UNREACHABLE_DSN,
+        "--allow-write",
+        "mq",
+        "delete",
+        "--kind",
+        "kafka-topic",
+        "events",
+    ]));
+    assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
+    assert_eq!(
+        first["error"]["impact"]["resource"],
+        "kafka-topic:\"events\""
+    );
+    assert_eq!(first["error"]["impact"]["op"], "DELETE_MESSAGE_RESOURCE");
+}
+
+#[test]
+fn resource_delete_rejects_amqp_only_conditions_before_connecting() {
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "--allow-write",
+            "mq",
+            "delete",
+            "--kind",
+            "kafka-topic",
+            "events",
+            "--if-empty",
+        ],
+        "only to --kind amqp-queue",
     );
 }
 

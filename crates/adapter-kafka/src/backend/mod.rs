@@ -1,7 +1,9 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::Message,
+    model::{
+        DeleteResourceOptions, Message, MessageResource, MessageResourceKind, PartitionWatermark,
+    },
     port::connector::Connector,
 };
 use futures::future::BoxFuture;
@@ -62,6 +64,33 @@ fn validate_consume_position(partition: Option<i32>, offset: Option<i64>) -> Res
     Ok(())
 }
 
+fn validate_kafka_delete_request(
+    resource: &MessageResource,
+    options: DeleteResourceOptions,
+) -> Result<()> {
+    if resource.kind != MessageResourceKind::KafkaTopic {
+        return Err(Error::Config(format!(
+            "Kafka adapters can only delete kafka-topic resources, not {}",
+            resource.kind.as_str()
+        )));
+    }
+    if options.if_empty || options.if_unused {
+        return Err(Error::Config(
+            "Kafka topic deletion does not support the AMQP-only if_empty or if_unused options"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn kafka_messages_before(watermarks: &[PartitionWatermark]) -> Option<u64> {
+    watermarks.iter().try_fold(0u64, |total, watermark| {
+        let partition_messages = watermark.high.checked_sub(watermark.low)?;
+        let partition_messages = u64::try_from(partition_messages).ok()?;
+        total.checked_add(partition_messages)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +143,58 @@ mod tests {
 
         assert!(matches!(error, Error::Config(_)));
         assert!(error.to_string().contains("explicit partition"));
+    }
+
+    #[test]
+    fn kafka_delete_rejects_other_resource_kinds_and_amqp_options() {
+        let wrong_kind = MessageResource {
+            kind: MessageResourceKind::RedisStream,
+            name: "events".to_owned(),
+        };
+        let error = validate_kafka_delete_request(&wrong_kind, DeleteResourceOptions::default())
+            .unwrap_err();
+        assert!(matches!(error, Error::Config(_)));
+        assert!(error.to_string().contains("redis-stream"));
+
+        let topic = MessageResource {
+            kind: MessageResourceKind::KafkaTopic,
+            name: "events".to_owned(),
+        };
+        let error = validate_kafka_delete_request(
+            &topic,
+            DeleteResourceOptions {
+                if_empty: true,
+                if_unused: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(_)));
+        assert!(error.to_string().contains("AMQP-only"));
+    }
+
+    #[test]
+    fn kafka_message_count_sums_exact_partition_watermarks() {
+        let watermarks = [
+            PartitionWatermark {
+                partition: 0,
+                low: 2,
+                high: 7,
+            },
+            PartitionWatermark {
+                partition: 1,
+                low: 10,
+                high: 13,
+            },
+        ];
+
+        assert_eq!(kafka_messages_before(&watermarks), Some(8));
+        assert_eq!(
+            kafka_messages_before(&[PartitionWatermark {
+                partition: 0,
+                low: 5,
+                high: 4,
+            }]),
+            None
+        );
     }
 }

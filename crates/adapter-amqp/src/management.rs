@@ -2,10 +2,13 @@ use crate::validate_queue;
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{LagInfo, PartitionWatermark, TopicDetail, TopicInfo},
+    model::{
+        DeleteResourceOptions, DeleteResourceOutcome, LagInfo, MessageResource,
+        MessageResourceKind, PartitionWatermark, TopicDetail, TopicInfo,
+    },
     port::{
-        capability::AdminInspect,
-        connector::{Capabilities, Connector, ConnectorKind},
+        capability::{AdminInspect, AdminMutate},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
 };
 use futures::future::BoxFuture;
@@ -14,8 +17,12 @@ use std::collections::HashMap;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    time::timeout,
 };
 use url::Url;
+
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub struct RabbitManagementAdapter {
     client: RabbitManagementClient,
@@ -45,6 +52,10 @@ impl Connector for RabbitManagementAdapter {
         }
     }
 
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        rabbit_management_operations(self.capabilities())
+    }
+
     async fn ping(&self) -> Result<()> {
         self.client.get_json("/api/overview").await.map(|_| ())
     }
@@ -54,6 +65,10 @@ impl Connector for RabbitManagementAdapter {
     }
 
     fn as_admin(&self) -> Option<&dyn AdminInspect> {
+        Some(self)
+    }
+
+    fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
         Some(self)
     }
 }
@@ -79,21 +94,42 @@ impl AdminInspect for RabbitManagementAdapter {
         queue_detail(&queue)
     }
 
-    async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>> {
-        validate_queue(group)?;
-        let queue = self.client.get_json(&self.client.queue_path(group)).await?;
-        let ready = json_i64(&queue, "messages_ready");
-        let unacked = json_i64(&queue, "messages_unacknowledged");
-        let total = ready + unacked;
+    async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
+        Err(Error::UnsupportedCapability {
+            kind: self.kind.0.clone(),
+            needed: "ConsumerLag (RabbitMQ queue depth is not consumer-group lag)",
+        })
+    }
+}
 
-        Ok(vec![LagInfo {
-            topic: json_string(&queue, "name").unwrap_or_else(|| group.to_owned()),
-            partition: 0,
-            group: group.to_owned(),
-            committed: unacked,
-            latest: total,
-            lag: ready,
-        }])
+#[async_trait::async_trait]
+impl AdminMutate for RabbitManagementAdapter {
+    async fn delete_resource(
+        &self,
+        resource: MessageResource,
+        options: DeleteResourceOptions,
+    ) -> Result<DeleteResourceOutcome> {
+        validate_management_delete_request(&resource)?;
+
+        let queue_path = self.client.queue_path(&resource.name);
+        let queue = self.client.get_json(&queue_path).await?;
+        let counts = queue_delete_counts(&queue)?;
+        let messages_before = counts.total_messages()?;
+        self.client.delete_queue(&resource.name, options).await?;
+        if self.client.get_optional_json(&queue_path).await?.is_some() {
+            return Err(Error::Query(format!(
+                "RabbitMQ acknowledged deletion of queue {:?}, but the queue still exists",
+                resource.name
+            )));
+        }
+
+        Ok(DeleteResourceOutcome {
+            resource,
+            acknowledged: true,
+            verified_absent: true,
+            messages_before: Some(messages_before),
+            consumers_before: Some(counts.consumers),
+        })
     }
 }
 
@@ -152,26 +188,142 @@ impl RabbitManagementClient {
         format!("{}/{}", self.queues_path(), percent_encode(queue))
     }
 
+    fn queue_delete_path(&self, queue: &str, options: DeleteResourceOptions) -> String {
+        format!(
+            "{}?if-empty={}&if-unused={}",
+            self.queue_path(queue),
+            options.if_empty,
+            options.if_unused
+        )
+    }
+
     async fn get_json(&self, path: &str) -> Result<Value> {
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let response = self.request("GET", path).await?;
+        success_json(&response, false)?.ok_or_else(|| {
+            Error::Serialization("RabbitMQ management returned an empty JSON response".into())
+        })
+    }
+
+    async fn get_optional_json(&self, path: &str) -> Result<Option<Value>> {
+        let response = self.request("GET", path).await?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        success_json(&response, false)
+    }
+
+    async fn delete_queue(&self, queue: &str, options: DeleteResourceOptions) -> Result<()> {
+        let path = self.queue_delete_path(queue, options);
+        let response = self.request("DELETE", &path).await?;
+        // RabbitMQ returns HTTP 204 with an empty body for a successful queue
+        // deletion. Some compatible servers return a JSON success body.
+        success_json(&response, true)?;
+        Ok(())
+    }
+
+    async fn request(&self, method: &str, path: &str) -> Result<HttpResponse> {
+        let mut stream = timeout(
+            HTTP_TIMEOUT,
+            TcpStream::connect((self.host.as_str(), self.port)),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|e| Error::Connection(e.to_string()))?;
         let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Basic {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-            self.host, self.port, self.authorization
+            "{method} {path} HTTP/1.1\r\nHost: {}:{}\r\nAuthorization: Basic {}\r\nAccept: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            self.host, self.port, self.authorization,
         );
-        stream
-            .write_all(request.as_bytes())
+        timeout(HTTP_TIMEOUT, stream.write_all(request.as_bytes()))
             .await
+            .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Connection(e.to_string()))?;
 
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
+        let response = timeout(HTTP_TIMEOUT, read_bounded_response(&mut stream))
+            .await
+            .map_err(|_| Error::Timeout)??;
+        parse_http_response(&response)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+async fn read_bounded_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = stream
+            .read(&mut buffer)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
-        parse_http_json(&response)
+        if read == 0 {
+            return Ok(response);
+        }
+        let next_len = response
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| Error::Connection("RabbitMQ HTTP response size overflow".into()))?;
+        if next_len > MAX_HTTP_RESPONSE_BYTES {
+            return Err(Error::Connection(format!(
+                "RabbitMQ HTTP response exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+            )));
+        }
+        response.extend_from_slice(&buffer[..read]);
     }
+}
+
+fn rabbit_management_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminDelete,
+    ]);
+    operations
+}
+
+fn validate_management_delete_request(resource: &MessageResource) -> Result<()> {
+    if resource.kind != MessageResourceKind::AmqpQueue {
+        return Err(Error::Config(format!(
+            "RabbitMQ management can delete only amqp-queue resources, not {}",
+            resource.kind.as_str()
+        )));
+    }
+    validate_queue(&resource.name)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueueDeleteCounts {
+    ready: u64,
+    unacknowledged: u64,
+    consumers: u64,
+}
+
+impl QueueDeleteCounts {
+    fn total_messages(self) -> Result<u64> {
+        self.ready
+            .checked_add(self.unacknowledged)
+            .ok_or_else(|| Error::Serialization("RabbitMQ queue message count overflow".into()))
+    }
+}
+
+fn queue_delete_counts(queue: &Value) -> Result<QueueDeleteCounts> {
+    Ok(QueueDeleteCounts {
+        ready: json_u64_required(queue, "messages_ready")?,
+        unacknowledged: json_u64_required(queue, "messages_unacknowledged")?,
+        consumers: json_u64_required(queue, "consumers")?,
+    })
+}
+
+fn json_u64_required(value: &Value, key: &str) -> Result<u64> {
+    value.get(key).and_then(Value::as_u64).ok_or_else(|| {
+        Error::Serialization(format!(
+            "RabbitMQ queue response is missing non-negative integer {key}"
+        ))
+    })
 }
 
 fn queue_topic_info(queue: &Value) -> Result<TopicInfo> {
@@ -186,6 +338,10 @@ fn queue_topic_info(queue: &Value) -> Result<TopicInfo> {
 
 fn queue_detail(queue: &Value) -> Result<TopicDetail> {
     let info = queue_topic_info(queue)?;
+    let message_count = json_u64_required(queue, "messages")?;
+    let consumer_count = json_u64_required(queue, "consumers")?;
+    let total = i64::try_from(message_count)
+        .map_err(|_| Error::Serialization("RabbitMQ message count exceeds i64".into()))?;
     let mut config = HashMap::new();
     for key in [
         "vhost",
@@ -203,15 +359,8 @@ fn queue_detail(queue: &Value) -> Result<TopicDetail> {
             config.insert(key.to_owned(), json_config_value(value));
         }
     }
-    config.insert(
-        "message_count".to_owned(),
-        json_i64(queue, "messages").to_string(),
-    );
-    config.insert(
-        "consumer_count".to_owned(),
-        json_i64(queue, "consumers").to_string(),
-    );
-    let total = json_i64(queue, "messages");
+    config.insert("message_count".to_owned(), message_count.to_string());
+    config.insert("consumer_count".to_owned(), consumer_count.to_string());
 
     Ok(TopicDetail {
         info,
@@ -231,10 +380,6 @@ fn json_string(value: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn json_i64(value: &Value, key: &str) -> i64 {
-    value.get(key).and_then(Value::as_i64).unwrap_or_default()
-}
-
 fn json_config_value(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
@@ -245,7 +390,7 @@ fn json_config_value(value: &Value) -> String {
     }
 }
 
-fn parse_http_json(response: &[u8]) -> Result<Value> {
+fn parse_http_response(response: &[u8]) -> Result<HttpResponse> {
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -270,19 +415,35 @@ fn parse_http_json(response: &[u8]) -> Result<Value> {
     } else {
         body.to_vec()
     };
-    let body_text = std::str::from_utf8(&body)
-        .map_err(|e| Error::Connection(format!("invalid HTTP response body: {e}")))?;
+    Ok(HttpResponse { status, body })
+}
 
-    if !(200..300).contains(&status) {
-        if status == 401 || status == 403 {
-            return Err(Error::Auth(body_text.to_owned()));
+fn success_json(response: &HttpResponse, allow_empty: bool) -> Result<Option<Value>> {
+    if !(200..300).contains(&response.status) {
+        let body = String::from_utf8_lossy(&response.body);
+        if response.status == 401 || response.status == 403 {
+            return Err(Error::Auth(body.into_owned()));
         }
         return Err(Error::Query(format!(
-            "RabbitMQ management returned HTTP {status}: {body_text}"
+            "RabbitMQ management returned HTTP {}: {body}",
+            response.status
         )));
     }
 
-    serde_json::from_str(body_text).map_err(|e| Error::Serialization(e.to_string()))
+    let body_text = std::str::from_utf8(&response.body)
+        .map_err(|e| Error::Connection(format!("invalid HTTP response body: {e}")))?;
+    if body_text.trim().is_empty() {
+        if allow_empty {
+            return Ok(None);
+        }
+        return Err(Error::Serialization(
+            "RabbitMQ management returned an empty JSON response".into(),
+        ));
+    }
+
+    serde_json::from_str(body_text)
+        .map(Some)
+        .map_err(|e| Error::Serialization(e.to_string()))
 }
 
 fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>> {
@@ -301,13 +462,25 @@ fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>> {
         if size == 0 {
             return Ok(decoded);
         }
-        if body.len() < size + 2 {
+        let chunk_with_terminator = size
+            .checked_add(2)
+            .ok_or_else(|| Error::Connection("RabbitMQ chunk size overflow".into()))?;
+        if body.len() < chunk_with_terminator {
             return Err(Error::Connection(
                 "truncated chunked RabbitMQ response".into(),
             ));
         }
+        let next_len = decoded
+            .len()
+            .checked_add(size)
+            .ok_or_else(|| Error::Connection("RabbitMQ decoded body size overflow".into()))?;
+        if next_len > MAX_HTTP_RESPONSE_BYTES {
+            return Err(Error::Connection(format!(
+                "RabbitMQ decoded body exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+            )));
+        }
         decoded.extend_from_slice(&body[..size]);
-        body = &body[size + 2..];
+        body = &body[chunk_with_terminator..];
     }
 }
 
@@ -422,5 +595,93 @@ mod tests {
         assert_eq!(detail.config["message_count"], "3");
         assert_eq!(detail.config["consumer_count"], "4");
         assert_eq!(detail.watermarks[0].high, 3);
+        assert!(queue_detail(&serde_json::json!({
+            "name": "jobs",
+            "consumers": 4
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn management_profile_omits_queue_depth_as_consumer_lag() {
+        let operations = rabbit_management_operations(Capabilities {
+            admin: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            operations,
+            vec![
+                CapabilityOperation::MessageAdminListTopics,
+                CapabilityOperation::MessageAdminTopicDetail,
+                CapabilityOperation::MessageAdminDelete,
+            ]
+        );
+        assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
+    }
+
+    #[test]
+    fn queue_delete_path_maps_broker_preconditions() {
+        let dsn = Dsn::parse("rabbitmq+http://dbtool:secret@localhost/%2F").unwrap();
+        let client = RabbitManagementClient::from_dsn(&dsn).unwrap();
+
+        assert_eq!(
+            client.queue_delete_path(
+                "jobs/email",
+                DeleteResourceOptions {
+                    if_empty: true,
+                    if_unused: false,
+                }
+            ),
+            "/api/queues/%2F/jobs%2Femail?if-empty=true&if-unused=false"
+        );
+    }
+
+    #[test]
+    fn delete_preflight_requires_exact_ready_unacked_and_consumer_counts() {
+        let counts = queue_delete_counts(&serde_json::json!({
+            "messages_ready": 2,
+            "messages_unacknowledged": 3,
+            "consumers": 4
+        }))
+        .unwrap();
+
+        assert_eq!(counts.ready, 2);
+        assert_eq!(counts.unacknowledged, 3);
+        assert_eq!(counts.consumers, 4);
+        assert_eq!(counts.total_messages().unwrap(), 5);
+        assert!(queue_delete_counts(&serde_json::json!({
+            "messages_ready": 2,
+            "consumers": 4
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn empty_204_delete_response_is_a_success_without_json() {
+        let response = parse_http_response(
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(response.status, 204);
+        assert_eq!(success_json(&response, true).unwrap(), None);
+        assert!(success_json(&response, false).is_err());
+    }
+
+    #[test]
+    fn management_delete_accepts_only_amqp_queue_resources() {
+        assert!(validate_management_delete_request(&MessageResource {
+            kind: MessageResourceKind::AmqpQueue,
+            name: "jobs".to_owned(),
+        })
+        .is_ok());
+        assert!(matches!(
+            validate_management_delete_request(&MessageResource {
+                kind: MessageResourceKind::NatsJetstream,
+                name: "jobs".to_owned(),
+            }),
+            Err(Error::Config(message)) if message.contains("amqp-queue")
+        ));
     }
 }

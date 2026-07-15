@@ -1,8 +1,9 @@
 use crate::{
     model::{
-        ConsumeOptions, Document, ExecOutcome, FindOptions, ForeignKeyInfo, InsertOutcome, LagInfo,
-        Message, Point, ProduceOutcome, ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo,
-        TableSchema, TablespaceInfo, TimeRange, TopicDetail, TopicInfo, UpdateOutcome, Value,
+        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, Document, ExecOutcome,
+        FindOptions, ForeignKeyInfo, InsertOutcome, LagInfo, Message, MessageResource, Point,
+        ProduceOutcome, ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema,
+        TablespaceInfo, TimeRange, TopicDetail, TopicInfo, UpdateOutcome, Value,
     },
     Result,
 };
@@ -156,6 +157,19 @@ pub trait AdminInspect: Connector {
     async fn list_topics(&self) -> Result<Vec<TopicInfo>>;
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail>;
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>>;
+}
+
+/// Destructive lifecycle operations for persistent messaging resources.
+///
+/// This is deliberately separate from [`AdminInspect`]. Callers must still
+/// apply their write policy and target-bound confirmation before invoking it.
+#[async_trait]
+pub trait AdminMutate: Connector {
+    async fn delete_resource(
+        &self,
+        resource: MessageResource,
+        options: DeleteResourceOptions,
+    ) -> Result<DeleteResourceOutcome>;
 }
 
 /// IBM Db2-specific schema inspection capability.

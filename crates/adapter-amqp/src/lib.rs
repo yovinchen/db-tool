@@ -1,17 +1,20 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{ConsumeOptions, LagInfo, Message, ProduceOutcome, TopicDetail, TopicInfo},
+    model::{
+        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
+        MessageResource, MessageResourceKind, ProduceOutcome, TopicDetail, TopicInfo,
+    },
     port::{
-        capability::{AdminInspect, MessageConsumer, MessageProducer},
-        connector::{Capabilities, Connector, ConnectorKind},
+        capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
 };
 use futures::future::BoxFuture;
 use lapin::{
     options::{
         BasicAckOptions, BasicGetOptions, BasicPublishOptions, ConfirmSelectOptions,
-        QueueDeclareOptions,
+        QueueDeclareOptions, QueueDeleteOptions,
     },
     publisher_confirm::Confirmation,
     tcp::OwnedTLSConfig,
@@ -62,6 +65,10 @@ impl Connector for AmqpAdapter {
             ..Default::default()
         }
     }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        direct_amqp_operations(self.capabilities())
+    }
     async fn ping(&self) -> Result<()> {
         self.conn
             .create_channel()
@@ -86,6 +93,10 @@ impl Connector for AmqpAdapter {
     }
 
     fn as_admin(&self) -> Option<&dyn AdminInspect> {
+        Some(self)
+    }
+
+    fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
         Some(self)
     }
 }
@@ -240,6 +251,43 @@ impl AdminInspect for AmqpAdapter {
     }
 }
 
+#[async_trait::async_trait]
+impl AdminMutate for AmqpAdapter {
+    async fn delete_resource(
+        &self,
+        resource: MessageResource,
+        options: DeleteResourceOptions,
+    ) -> Result<DeleteResourceOutcome> {
+        validate_amqp_delete_request(&resource)?;
+
+        let channel = self.channel().await?;
+        let queue = declare_queue(&channel, &resource.name, true).await?;
+        let messages_before = u64::from(queue.message_count());
+        let consumers_before = u64::from(queue.consumer_count());
+        channel
+            .queue_delete(
+                &resource.name,
+                QueueDeleteOptions {
+                    if_empty: options.if_empty,
+                    if_unused: options.if_unused,
+                    // A synchronous queue.delete-ok is the broker's
+                    // authoritative confirmation that the named queue is gone.
+                    nowait: false,
+                },
+            )
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        Ok(DeleteResourceOutcome {
+            resource,
+            acknowledged: true,
+            verified_absent: true,
+            messages_before: Some(messages_before),
+            consumers_before: Some(consumers_before),
+        })
+    }
+}
+
 impl AmqpAdapter {
     async fn channel(&self) -> Result<lapin::Channel> {
         self.conn
@@ -247,6 +295,25 @@ impl AmqpAdapter {
             .await
             .map_err(|e| Error::Connection(e.to_string()))
     }
+}
+
+fn direct_amqp_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminDelete,
+    ]);
+    operations
+}
+
+fn validate_amqp_delete_request(resource: &MessageResource) -> Result<()> {
+    if resource.kind != MessageResourceKind::AmqpQueue {
+        return Err(Error::Config(format!(
+            "direct AMQP can delete only amqp-queue resources, not {}",
+            resource.kind.as_str()
+        )));
+    }
+    validate_queue(&resource.name)
 }
 
 async fn declare_queue(
@@ -554,5 +621,46 @@ mod tests {
             validate_produce_message(&candidate),
             Err(Error::Config(message)) if message.contains("255-byte")
         ));
+    }
+
+    #[test]
+    fn direct_amqp_declares_only_real_admin_operations() {
+        let operations = direct_amqp_operations(Capabilities {
+            producer: true,
+            consumer: true,
+            admin: true,
+            ..Default::default()
+        });
+
+        assert!(operations.contains(&CapabilityOperation::MessageProduce));
+        assert!(operations.contains(&CapabilityOperation::MessageConsume));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetail));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminDelete));
+        assert!(!operations.contains(&CapabilityOperation::MessageAdminListTopics));
+        assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
+    }
+
+    #[test]
+    fn direct_amqp_delete_accepts_only_named_amqp_queues() {
+        let queue = MessageResource {
+            kind: MessageResourceKind::AmqpQueue,
+            name: "jobs".to_owned(),
+        };
+        assert!(validate_amqp_delete_request(&queue).is_ok());
+
+        let stream = MessageResource {
+            kind: MessageResourceKind::RedisStream,
+            name: "jobs".to_owned(),
+        };
+        assert!(matches!(
+            validate_amqp_delete_request(&stream),
+            Err(Error::Config(message)) if message.contains("amqp-queue")
+        ));
+
+        let unnamed = MessageResource {
+            kind: MessageResourceKind::AmqpQueue,
+            name: String::new(),
+        };
+        assert!(validate_amqp_delete_request(&unnamed).is_err());
     }
 }

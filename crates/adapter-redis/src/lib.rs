@@ -2,12 +2,15 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, LagInfo, Message, MessagePlacement, PartitionWatermark, ProduceOutcome,
+        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
+        MessagePlacement, MessageResource, MessageResourceKind, PartitionWatermark, ProduceOutcome,
         TopicDetail, TopicInfo, Value,
     },
     port::{
-        capability::{AdminInspect, KeyValueStore, MessageConsumer, MessageProducer, SetOptions},
-        connector::{Capabilities, Connector, ConnectorKind},
+        capability::{
+            AdminInspect, AdminMutate, KeyValueStore, MessageConsumer, MessageProducer, SetOptions,
+        },
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
 };
 use futures::{future::BoxFuture, StreamExt};
@@ -58,6 +61,10 @@ impl Connector for RedisAdapter {
         }
     }
 
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        redis_operations(self.capabilities())
+    }
+
     async fn ping(&self) -> Result<()> {
         let mut c = self.conn.lock().await;
         redis::cmd("PING")
@@ -83,6 +90,10 @@ impl Connector for RedisAdapter {
     }
 
     fn as_admin(&self) -> Option<&dyn AdminInspect> {
+        Some(self)
+    }
+
+    fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
         Some(self)
     }
 }
@@ -251,7 +262,7 @@ impl AdminInspect for RedisAdapter {
                 .query_async(&mut *c)
                 .await
                 .map_err(|e| Error::Query(e.to_string()))?;
-            let latest: i64 = redis::cmd("XLEN")
+            let latest: u64 = redis::cmd("XLEN")
                 .arg(&stream.name)
                 .query_async(&mut *c)
                 .await
@@ -262,8 +273,7 @@ impl AdminInspect for RedisAdapter {
                 if g.name != group {
                     continue;
                 }
-                let committed = redis_stream_offset(&g.last_delivered_id);
-                let lag = g.lag.unwrap_or(g.pending) as i64;
+                let (latest, committed, lag) = redis_lag_dimensions(latest, g.lag)?;
                 results.push(LagInfo {
                     topic: stream.name.clone(),
                     partition: 0,
@@ -276,6 +286,81 @@ impl AdminInspect for RedisAdapter {
         }
 
         Ok(results)
+    }
+}
+
+#[async_trait::async_trait]
+impl AdminMutate for RedisAdapter {
+    async fn delete_resource(
+        &self,
+        resource: MessageResource,
+        options: DeleteResourceOptions,
+    ) -> Result<DeleteResourceOutcome> {
+        validate_redis_delete_request(&resource, options)?;
+
+        // TYPE, XLEN, and DEL must be one atomic server-side operation. A
+        // separate preflight would allow another client to replace the stream
+        // with a different key type between TYPE and DEL.
+        let script = r#"
+local resource_type = redis.call('TYPE', KEYS[1]).ok
+if resource_type == 'none' then
+  return {0, 0}
+end
+if resource_type ~= 'stream' then
+  return {-1, 0}
+end
+local messages = redis.call('XLEN', KEYS[1])
+local deleted = redis.call('DEL', KEYS[1])
+return {deleted, messages}
+"#;
+        let mut c = self.conn.lock().await;
+        let (delete_status, messages_before): (i64, u64) = redis::cmd("EVAL")
+            .arg(script)
+            .arg(1)
+            .arg(&resource.name)
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        match delete_status {
+            1 => {}
+            0 => {
+                return Err(Error::Query(format!(
+                    "Redis Stream {:?} does not exist",
+                    resource.name
+                )))
+            }
+            -1 => {
+                return Err(Error::Query(format!(
+                    "Redis resource {:?} is not a stream",
+                    resource.name
+                )))
+            }
+            status => {
+                return Err(Error::Query(format!(
+                    "Redis returned unexpected stream deletion status {status} for {:?}",
+                    resource.name
+                )))
+            }
+        }
+        let resource_type_after: String = redis::cmd("TYPE")
+            .arg(&resource.name)
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        if resource_type_after != "none" {
+            return Err(Error::Query(format!(
+                "Redis deleted stream {:?}, but a resource now exists at that key",
+                resource.name
+            )));
+        }
+
+        Ok(DeleteResourceOutcome {
+            resource,
+            acknowledged: true,
+            verified_absent: true,
+            messages_before: Some(messages_before),
+            consumers_before: None,
+        })
     }
 }
 
@@ -488,6 +573,60 @@ fn validate_raw_command(args: &[String]) -> Result<()> {
         | "EVALSHA" => Err(Error::WriteNotAllowed),
         _ => Ok(()),
     }
+}
+
+fn redis_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminConsumerLag,
+        CapabilityOperation::MessageAdminDelete,
+    ]);
+    operations
+}
+
+fn validate_redis_delete_request(
+    resource: &MessageResource,
+    options: DeleteResourceOptions,
+) -> Result<()> {
+    if resource.kind != MessageResourceKind::RedisStream {
+        return Err(Error::Config(format!(
+            "Redis can delete only redis-stream resources, not {}",
+            resource.kind.as_str()
+        )));
+    }
+    if options.if_empty || options.if_unused {
+        return Err(Error::Config(
+            "Redis Stream deletion does not support AMQP if-empty/if-unused options".into(),
+        ));
+    }
+    validate_redis_name("stream", &resource.name)
+}
+
+fn redis_lag_dimensions(latest: u64, lag: Option<usize>) -> Result<(i64, i64, i64)> {
+    let lag = lag.ok_or_else(|| {
+        Error::Query(
+            "Redis server did not report consumer-group lag; pending is not a lag substitute"
+                .into(),
+        )
+    })?;
+    let lag = u64::try_from(lag)
+        .map_err(|_| Error::Serialization("Redis consumer-group lag exceeds u64".into()))?;
+    let committed = latest.checked_sub(lag).ok_or_else(|| {
+        Error::Serialization(format!(
+            "Redis consumer-group lag {lag} exceeds stream length {latest}"
+        ))
+    })?;
+
+    Ok((
+        i64::try_from(latest)
+            .map_err(|_| Error::Serialization("Redis stream length exceeds i64".into()))?,
+        i64::try_from(committed)
+            .map_err(|_| Error::Serialization("Redis committed count exceeds i64".into()))?,
+        i64::try_from(lag)
+            .map_err(|_| Error::Serialization("Redis consumer-group lag exceeds i64".into()))?,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -934,5 +1073,69 @@ mod tests {
             1500
         );
         assert!(duration_millis_usize(std::time::Duration::MAX).is_err());
+    }
+
+    #[test]
+    fn redis_declares_complete_real_admin_profile() {
+        let operations = redis_operations(Capabilities {
+            key_value: true,
+            producer: true,
+            consumer: true,
+            admin: true,
+            ..Default::default()
+        });
+
+        for operation in [
+            CapabilityOperation::MessageAdminListTopics,
+            CapabilityOperation::MessageAdminTopicDetail,
+            CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminDelete,
+        ] {
+            assert!(operations.contains(&operation));
+        }
+        assert!(operations.contains(&CapabilityOperation::KeyValueGet));
+        assert!(operations.contains(&CapabilityOperation::MessageProduce));
+        assert!(operations.contains(&CapabilityOperation::MessageConsume));
+    }
+
+    #[test]
+    fn redis_delete_accepts_only_streams_without_amqp_options() {
+        let stream = MessageResource {
+            kind: MessageResourceKind::RedisStream,
+            name: "events".to_owned(),
+        };
+        assert!(validate_redis_delete_request(&stream, DeleteResourceOptions::default()).is_ok());
+        assert!(matches!(
+            validate_redis_delete_request(
+                &stream,
+                DeleteResourceOptions {
+                    if_empty: true,
+                    if_unused: false,
+                }
+            ),
+            Err(Error::Config(message)) if message.contains("AMQP")
+        ));
+
+        let queue = MessageResource {
+            kind: MessageResourceKind::AmqpQueue,
+            name: "events".to_owned(),
+        };
+        assert!(matches!(
+            validate_redis_delete_request(&queue, DeleteResourceOptions::default()),
+            Err(Error::Config(message)) if message.contains("redis-stream")
+        ));
+    }
+
+    #[test]
+    fn redis_lag_uses_server_lag_and_count_dimensions_only() {
+        assert_eq!(redis_lag_dimensions(10, Some(3)).unwrap(), (10, 7, 3));
+        assert!(matches!(
+            redis_lag_dimensions(10, None),
+            Err(Error::Query(message)) if message.contains("pending is not a lag substitute")
+        ));
+        assert!(matches!(
+            redis_lag_dimensions(2, Some(3)),
+            Err(Error::Serialization(message)) if message.contains("exceeds stream length")
+        ));
     }
 }

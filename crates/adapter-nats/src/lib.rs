@@ -2,12 +2,13 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, LagInfo, Message, PartitionWatermark, ProduceOutcome, TopicDetail,
+        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
+        MessageResource, MessageResourceKind, PartitionWatermark, ProduceOutcome, TopicDetail,
         TopicInfo,
     },
     port::{
-        capability::{AdminInspect, MessageConsumer, MessageProducer},
-        connector::{Capabilities, Connector, ConnectorKind},
+        capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
 };
 use futures::future::BoxFuture;
@@ -54,6 +55,10 @@ impl Connector for NatsAdapter {
             ..Default::default()
         }
     }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        nats_operations(self.capabilities())
+    }
     async fn ping(&self) -> Result<()> {
         self.client
             .flush()
@@ -73,6 +78,10 @@ impl Connector for NatsAdapter {
     }
 
     fn as_admin(&self) -> Option<&dyn AdminInspect> {
+        Some(self)
+    }
+
+    fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
         Some(self)
     }
 }
@@ -237,9 +246,97 @@ impl AdminInspect for NatsAdapter {
     }
 }
 
+#[async_trait::async_trait]
+impl AdminMutate for NatsAdapter {
+    async fn delete_resource(
+        &self,
+        resource: MessageResource,
+        options: DeleteResourceOptions,
+    ) -> Result<DeleteResourceOutcome> {
+        validate_nats_delete_request(&resource, options)?;
+
+        let jetstream = self.jetstream();
+        let stream = jetstream
+            .get_stream(&resource.name)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let messages_before = stream.cached_info().state.messages;
+        let consumers_before = u64::try_from(stream.cached_info().state.consumer_count)
+            .map_err(|_| Error::Serialization("NATS consumer count exceeds u64".into()))?;
+        let status = jetstream
+            .delete_stream(&resource.name)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        if !status.success {
+            return Err(Error::Query(format!(
+                "NATS did not acknowledge deletion of JetStream {:?}",
+                resource.name
+            )));
+        }
+        match jetstream.get_stream(&resource.name).await {
+            Ok(_) => {
+                return Err(Error::Query(format!(
+                    "NATS acknowledged deletion of JetStream {:?}, but it still exists",
+                    resource.name
+                )))
+            }
+            Err(error) if nats_stream_not_found(&error) => {}
+            Err(error) => return Err(Error::Query(error.to_string())),
+        }
+
+        Ok(DeleteResourceOutcome {
+            resource,
+            acknowledged: true,
+            verified_absent: true,
+            messages_before: Some(messages_before),
+            consumers_before: Some(consumers_before),
+        })
+    }
+}
+
 impl NatsAdapter {
     fn jetstream(&self) -> async_nats::jetstream::Context {
         async_nats::jetstream::new(self.client.clone())
+    }
+}
+
+fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminConsumerLag,
+        CapabilityOperation::MessageAdminDelete,
+    ]);
+    operations
+}
+
+fn validate_nats_delete_request(
+    resource: &MessageResource,
+    options: DeleteResourceOptions,
+) -> Result<()> {
+    if resource.kind != MessageResourceKind::NatsJetstream {
+        return Err(Error::Config(format!(
+            "NATS can delete only nats-jetstream resources, not {}",
+            resource.kind.as_str()
+        )));
+    }
+    if options.if_empty || options.if_unused {
+        return Err(Error::Config(
+            "NATS JetStream deletion does not support AMQP if-empty/if-unused options".into(),
+        ));
+    }
+    validate_jetstream_name("stream", &resource.name)
+}
+
+fn nats_stream_not_found(error: &async_nats::jetstream::context::GetStreamError) -> bool {
+    match error.kind() {
+        async_nats::jetstream::context::GetStreamErrorKind::JetStream(error) => {
+            // STREAM.INFO returns HTTP-style status 404 only when the named
+            // stream is absent; other JetStream failures must remain visible.
+            error.code() == 404
+        }
+        _ => false,
     }
 }
 
@@ -540,6 +637,55 @@ mod tests {
         assert!(matches!(
             nats_headers_to_core(Some(&headers)),
             Err(Error::Serialization(message)) if message.contains("2 values")
+        ));
+    }
+
+    #[test]
+    fn nats_declares_jetstream_admin_profile_with_core_defaults() {
+        let operations = nats_operations(Capabilities {
+            producer: true,
+            consumer: true,
+            admin: true,
+            ..Default::default()
+        });
+
+        for operation in [
+            CapabilityOperation::MessageProduce,
+            CapabilityOperation::MessageConsume,
+            CapabilityOperation::MessageAdminListTopics,
+            CapabilityOperation::MessageAdminTopicDetail,
+            CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminDelete,
+        ] {
+            assert!(operations.contains(&operation));
+        }
+    }
+
+    #[test]
+    fn nats_delete_accepts_only_jetstreams_without_amqp_options() {
+        let stream = MessageResource {
+            kind: MessageResourceKind::NatsJetstream,
+            name: "EVENTS".to_owned(),
+        };
+        assert!(validate_nats_delete_request(&stream, DeleteResourceOptions::default()).is_ok());
+        assert!(matches!(
+            validate_nats_delete_request(
+                &stream,
+                DeleteResourceOptions {
+                    if_empty: false,
+                    if_unused: true,
+                }
+            ),
+            Err(Error::Config(message)) if message.contains("AMQP")
+        ));
+
+        let queue = MessageResource {
+            kind: MessageResourceKind::AmqpQueue,
+            name: "EVENTS".to_owned(),
+        };
+        assert!(matches!(
+            validate_nats_delete_request(&queue, DeleteResourceOptions::default()),
+            Err(Error::Config(message)) if message.contains("nats-jetstream")
         ));
     }
 }

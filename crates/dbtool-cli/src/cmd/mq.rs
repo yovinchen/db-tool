@@ -1,9 +1,10 @@
 use super::Context;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use dbtool_core::{
     dsn::Dsn,
     error::Error,
-    model::{ConsumeOptions, Message},
+    model::{ConsumeOptions, DeleteResourceOptions, Message, MessageResource, MessageResourceKind},
+    service::safety::SafetyGuard,
     Result,
 };
 use std::{
@@ -14,7 +15,7 @@ use std::{
 #[derive(Args)]
 #[command(
     about = "Produce, consume, and inspect bounded message queue workflows.",
-    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write. AMQP/AMQPS consume also requires --allow-write because successful delivery is ACKed and removed from the queue. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
+    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write. AMQP/AMQPS consume also requires --allow-write because successful delivery is ACKed and removed from the queue. Persistent resource deletion requires both --allow-write and a target-bound --confirm token. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
 )]
 pub struct MqCmd {
     #[command(subcommand)]
@@ -74,6 +75,47 @@ pub enum MqAction {
         /// Consumer group, durable consumer, or queue name depending on backend.
         group: String,
     },
+    /// Delete one persistent topic, queue, or stream after confirmation.
+    #[command(
+        long_about = "Delete one persistent messaging resource. The explicit --kind prevents a topic, queue, Redis Stream, and NATS JetStream from being treated as interchangeable. This destructive operation requires --allow-write and a target-bound --confirm token. --if-empty and --if-unused apply only to AMQP queues."
+    )]
+    Delete {
+        /// Persistent resource type.
+        #[arg(long, value_enum)]
+        kind: MqResourceKind,
+        /// Exact topic, queue, or stream name.
+        name: String,
+        /// For AMQP queues, refuse deletion while messages remain.
+        #[arg(long)]
+        if_empty: bool,
+        /// For AMQP queues, refuse deletion while consumers are attached.
+        #[arg(long)]
+        if_unused: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MqResourceKind {
+    KafkaTopic,
+    AmqpQueue,
+    RedisStream,
+    NatsJetstream,
+}
+
+impl MqResourceKind {
+    fn into_core(self) -> MessageResourceKind {
+        match self {
+            Self::KafkaTopic => MessageResourceKind::KafkaTopic,
+            Self::AmqpQueue => MessageResourceKind::AmqpQueue,
+            Self::RedisStream => MessageResourceKind::RedisStream,
+            Self::NatsJetstream => MessageResourceKind::NatsJetstream,
+        }
+    }
+}
+
+struct DeleteRequest {
+    resource: MessageResource,
+    options: DeleteResourceOptions,
 }
 
 pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
@@ -108,10 +150,34 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
         } => Some(build_consume_options(*max, *timeout, *partition, *offset)?),
         _ => None,
     };
+    let delete_request = match &cmd.action {
+        MqAction::Delete {
+            kind,
+            name,
+            if_empty,
+            if_unused,
+        } => Some(build_delete_request(*kind, name, *if_empty, *if_unused)?),
+        _ => None,
+    };
 
     let dsn = ctx.resolve_dsn()?;
     if matches!(cmd.action, MqAction::Consume { .. }) && consume_requires_write(&dsn)? {
         ensure_write_allowed(ctx)?;
+    }
+    if let Some(request) = &delete_request {
+        ensure_write_allowed(ctx)?;
+        let safety_resource = format!(
+            "{}:{:?}",
+            request.resource.kind.as_str(),
+            request.resource.name
+        );
+        SafetyGuard::check_destructive_operation(
+            "delete_message_resource",
+            &safety_resource,
+            &ctx.safety_target(&dsn),
+            ctx.allow_write,
+            ctx.confirm.as_deref(),
+        )?;
     }
     let conn = ctx.registry.connect(&dsn).await?;
     let start = std::time::Instant::now();
@@ -192,6 +258,21 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             let lag = admin.consumer_lag(&group).await?;
             ctx.render_success(&kind, lag, elapsed(), false)
         }
+        MqAction::Delete { .. } => {
+            let admin = conn
+                .as_admin_mutate()
+                .ok_or_else(|| Error::UnsupportedCapability {
+                    kind: kind.clone(),
+                    needed: "AdminMutate.delete_resource",
+                })?;
+            let request = delete_request.ok_or_else(|| {
+                Error::Internal("validated message resource deletion input is missing".into())
+            })?;
+            let outcome = admin
+                .delete_resource(request.resource, request.options)
+                .await?;
+            ctx.render_success(&kind, outcome, elapsed(), false)
+        }
     })
 }
 
@@ -202,6 +283,36 @@ fn ensure_write_allowed(ctx: &Context) -> Result<()> {
 fn consume_requires_write(raw_dsn: &str) -> Result<bool> {
     let dsn = Dsn::parse(raw_dsn)?;
     Ok(matches!(dsn.scheme.as_str(), "amqp" | "amqps"))
+}
+
+fn build_delete_request(
+    kind: MqResourceKind,
+    name: &str,
+    if_empty: bool,
+    if_unused: bool,
+) -> Result<DeleteRequest> {
+    if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::Config(
+            "mq delete resource name must be non-empty and contain no control characters".into(),
+        ));
+    }
+    let kind = kind.into_core();
+    if (if_empty || if_unused) && kind != MessageResourceKind::AmqpQueue {
+        return Err(Error::Config(
+            "mq delete --if-empty and --if-unused apply only to --kind amqp-queue".into(),
+        ));
+    }
+
+    Ok(DeleteRequest {
+        resource: MessageResource {
+            kind,
+            name: name.to_owned(),
+        },
+        options: DeleteResourceOptions {
+            if_empty,
+            if_unused,
+        },
+    })
 }
 
 fn build_message(
@@ -382,5 +493,20 @@ mod tests {
         assert!(!consume_requires_write("redis://127.0.0.1:6379").unwrap());
         assert!(!consume_requires_write("nats://127.0.0.1:4222").unwrap());
         assert!(!consume_requires_write("kafka://127.0.0.1:9092").unwrap());
+    }
+
+    #[test]
+    fn delete_request_keeps_resource_kind_and_amqp_conditions_explicit() {
+        let request = build_delete_request(MqResourceKind::AmqpQueue, "jobs", true, true).unwrap();
+        assert_eq!(request.resource.kind, MessageResourceKind::AmqpQueue);
+        assert_eq!(request.resource.name, "jobs");
+        assert!(request.options.if_empty);
+        assert!(request.options.if_unused);
+
+        assert!(matches!(
+            build_delete_request(MqResourceKind::KafkaTopic, "events", true, false),
+            Err(Error::Config(message)) if message.contains("only to --kind amqp-queue")
+        ));
+        assert!(build_delete_request(MqResourceKind::RedisStream, "", false, false).is_err());
     }
 }

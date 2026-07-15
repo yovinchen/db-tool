@@ -141,10 +141,10 @@ enum Commands {
         long_about = "Search commands use JSON request bodies and the global --limit against OpenSearch/Elasticsearch-compatible endpoints. Each document mutation requires --allow-write; delete-index additionally requires a target-bound confirmation token."
     )]
     Search(cmd::search::SearchCmd),
-    /// Message queue operations (produce / consume / topics / lag)
+    /// Message queue operations (produce / consume / inspect / delete)
     #[command(
-        about = "Message queue operations (produce / consume / topics / lag)",
-        long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write; consume is always bounded by --max and --timeout."
+        about = "Message queue operations (produce / consume / inspect / delete)",
+        long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write; AMQP consume also requires write permission because it ACKs deliveries; persistent resource deletion additionally requires a target-bound confirmation token."
     )]
     Mq(cmd::mq::MqCmd),
     /// Manage named connections
@@ -176,7 +176,10 @@ async fn main() {
     let filter = if cli.verbose {
         "dbtool=debug,info"
     } else {
-        "warn"
+        // JSON is the default machine contract. Dependency warnings written
+        // before the final envelope would make stderr impossible to parse.
+        // Operators who want diagnostic logs opt in with --verbose.
+        "off"
     };
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(filter))

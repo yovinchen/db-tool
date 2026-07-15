@@ -5,11 +5,12 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, LagInfo, Message, MessagePlacement, PartitionWatermark, ProduceOutcome,
-        TopicDetail, TopicInfo,
+        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
+        MessagePlacement, MessageResource, PartitionWatermark, ProduceOutcome, TopicDetail,
+        TopicInfo,
     },
     port::{
-        capability::{AdminInspect, MessageConsumer, MessageProducer},
+        capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
 };
@@ -26,7 +27,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{validate_consume_position, validate_produce_message};
+use super::{
+    kafka_messages_before, validate_consume_position, validate_kafka_delete_request,
+    validate_produce_message,
+};
 
 pub struct RskafkaAdapter {
     client: Client,
@@ -70,6 +74,7 @@ impl Connector for RskafkaAdapter {
         operations.extend([
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminTopicDetail,
+            CapabilityOperation::MessageAdminDelete,
         ]);
         operations
     }
@@ -95,6 +100,10 @@ impl Connector for RskafkaAdapter {
     }
 
     fn as_admin(&self) -> Option<&dyn AdminInspect> {
+        Some(self)
+    }
+
+    fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
         Some(self)
     }
 }
@@ -289,6 +298,36 @@ impl AdminInspect for RskafkaAdapter {
     }
 }
 
+#[async_trait::async_trait]
+impl AdminMutate for RskafkaAdapter {
+    async fn delete_resource(
+        &self,
+        resource: MessageResource,
+        options: DeleteResourceOptions,
+    ) -> Result<DeleteResourceOutcome> {
+        validate_kafka_delete_request(&resource, options)?;
+        validate_topic(&resource.name)?;
+
+        let detail = self.topic_detail(&resource.name).await?;
+        let messages_before = kafka_messages_before(&detail.watermarks);
+        self.client
+            .controller_client()
+            .map_err(|error| Error::Connection(error.to_string()))?
+            .delete_topic(resource.name.clone(), 5_000)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        self.wait_for_topic_absence(&resource.name).await?;
+
+        Ok(DeleteResourceOutcome {
+            resource,
+            acknowledged: true,
+            verified_absent: true,
+            messages_before,
+            consumers_before: None,
+        })
+    }
+}
+
 impl RskafkaAdapter {
     async fn ensure_topic(&self, name: &str) -> Result<()> {
         if self
@@ -325,6 +364,27 @@ impl RskafkaAdapter {
             .collect::<Vec<_>>();
         topics.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(topics)
+    }
+
+    async fn wait_for_topic_absence(&self, name: &str) -> Result<()> {
+        let deadline = consume_deadline(Duration::from_secs(5))?;
+        loop {
+            let Some(remaining) = remaining_until(deadline) else {
+                return Err(topic_deletion_not_verified(name));
+            };
+            let topics = match tokio::time::timeout(remaining, self.topic_infos()).await {
+                Ok(result) => result?,
+                Err(_) => return Err(topic_deletion_not_verified(name)),
+            };
+            if !topics.iter().any(|topic| topic.name == name) {
+                return Ok(());
+            }
+
+            let Some(remaining) = remaining_until(deadline) else {
+                return Err(topic_deletion_not_verified(name));
+            };
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+        }
     }
 }
 
@@ -386,6 +446,12 @@ fn require_topic(topics: Vec<TopicInfo>, name: &str) -> Result<TopicInfo> {
         .into_iter()
         .find(|topic| topic.name == name)
         .ok_or_else(|| Error::Query(format!("topic not found: {name}")))
+}
+
+fn topic_deletion_not_verified(name: &str) -> Error {
+    Error::Query(format!(
+        "Kafka acknowledged deletion of topic {name:?}, but its absence was not verified within 5 seconds"
+    ))
 }
 
 fn remaining_until(deadline: Instant) -> Option<Duration> {
@@ -479,5 +545,14 @@ mod tests {
 
         assert!(matches!(error, Error::Query(_)));
         assert!(error.to_string().contains("missing-topic"));
+    }
+
+    #[test]
+    fn unverified_pure_delete_is_a_query_error() {
+        let error = topic_deletion_not_verified("events");
+
+        assert!(matches!(error, Error::Query(_)));
+        assert!(error.to_string().contains("not verified"));
+        assert!(error.to_string().contains("events"));
     }
 }

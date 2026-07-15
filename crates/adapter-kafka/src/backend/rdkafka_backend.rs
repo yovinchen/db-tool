@@ -4,11 +4,12 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, LagInfo, Message, MessagePlacement, PartitionWatermark, ProduceOutcome,
-        TopicDetail, TopicInfo,
+        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
+        MessagePlacement, MessageResource, PartitionWatermark, ProduceOutcome, TopicDetail,
+        TopicInfo,
     },
     port::{
-        capability::{AdminInspect, MessageConsumer, MessageProducer},
+        capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
 };
@@ -29,7 +30,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{validate_consume_position, validate_produce_message};
+use super::{
+    kafka_messages_before, validate_consume_position, validate_kafka_delete_request,
+    validate_produce_message,
+};
 
 pub struct RdkafkaAdapter {
     producer: FutureProducer,
@@ -81,6 +85,7 @@ impl Connector for RdkafkaAdapter {
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminTopicDetail,
             CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminDelete,
         ]);
         operations
     }
@@ -105,6 +110,10 @@ impl Connector for RdkafkaAdapter {
     }
 
     fn as_admin(&self) -> Option<&dyn AdminInspect> {
+        Some(self)
+    }
+
+    fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
         Some(self)
     }
 }
@@ -233,6 +242,11 @@ impl AdminInspect for RdkafkaAdapter {
             .iter()
             .find(|topic| topic.name() == name)
             .ok_or_else(|| Error::Query(format!("topic not found: {name}")))?;
+        if let Some(error) = topic.error() {
+            return Err(Error::Query(format!(
+                "Kafka topic {name:?} is unavailable: {error:?}"
+            )));
+        }
         let info = topic_info(topic);
         let mut watermarks = Vec::new();
         for partition in topic.partitions() {
@@ -327,6 +341,39 @@ impl AdminInspect for RdkafkaAdapter {
     }
 }
 
+#[async_trait::async_trait]
+impl AdminMutate for RdkafkaAdapter {
+    async fn delete_resource(
+        &self,
+        resource: MessageResource,
+        options: DeleteResourceOptions,
+    ) -> Result<DeleteResourceOutcome> {
+        validate_kafka_delete_request(&resource, options)?;
+        validate_topic(&resource.name)?;
+
+        let detail = self.topic_detail(&resource.name).await?;
+        let messages_before = kafka_messages_before(&detail.watermarks);
+        let admin_options = AdminOptions::new()
+            .request_timeout(Some(Duration::from_secs(5)))
+            .operation_timeout(Some(Duration::from_secs(5)));
+        let results = self
+            .admin
+            .delete_topics(&[resource.name.as_str()], &admin_options)
+            .await
+            .map_err(kafka_query_error)?;
+        require_deleted_topic(results, &resource.name)?;
+        self.wait_for_topic_absence(&resource.name).await?;
+
+        Ok(DeleteResourceOutcome {
+            resource,
+            acknowledged: true,
+            verified_absent: true,
+            messages_before,
+            consumers_before: None,
+        })
+    }
+}
+
 impl RdkafkaAdapter {
     fn consumer(&self, group: &str) -> Result<BaseConsumer> {
         consumer_client_config(&self.consumer_config, group)?
@@ -388,6 +435,25 @@ impl RdkafkaAdapter {
             .fetch_watermarks(topic, partition, native_timeout(timeout))
             .map(|(low, _)| low)
             .map_err(kafka_query_error)
+    }
+
+    async fn wait_for_topic_absence(&self, name: &str) -> Result<()> {
+        let consumer = self.consumer("dbtool")?;
+        let deadline = consume_deadline(Duration::from_secs(5))?;
+        loop {
+            let Some(remaining) = remaining_until(deadline) else {
+                return Err(topic_deletion_not_verified(name));
+            };
+            let topics = self.topic_infos_with(&consumer, remaining)?;
+            if !topics.iter().any(|topic| topic.name == name) {
+                return Ok(());
+            }
+
+            let Some(remaining) = remaining_until(deadline) else {
+                return Err(topic_deletion_not_verified(name));
+            };
+            tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+        }
     }
 }
 
@@ -509,6 +575,33 @@ fn lag_info(
         latest,
         lag: latest.saturating_sub(committed).max(0),
     })
+}
+
+fn require_deleted_topic(
+    mut results: Vec<rdkafka::admin::TopicResult>,
+    expected: &str,
+) -> Result<()> {
+    if results.len() != 1 {
+        return Err(Error::Query(format!(
+            "Kafka returned {} delete results for one requested topic",
+            results.len()
+        )));
+    }
+    match results.pop().expect("length checked above") {
+        Ok(topic) if topic == expected => Ok(()),
+        Ok(topic) => Err(Error::Query(format!(
+            "Kafka acknowledged deletion for topic {topic:?} instead of {expected:?}"
+        ))),
+        Err((topic, error)) => Err(Error::Query(format!(
+            "failed to delete Kafka topic {topic:?}: {error}"
+        ))),
+    }
+}
+
+fn topic_deletion_not_verified(name: &str) -> Error {
+    Error::Query(format!(
+        "Kafka acknowledged deletion of topic {name:?}, but its absence was not verified within 5 seconds"
+    ))
 }
 
 fn validate_topic(topic: &str) -> Result<()> {
@@ -689,6 +782,30 @@ mod tests {
             native_timeout(Duration::MAX),
             Timeout::After(Duration::from_millis(i32::MAX as u64))
         );
+    }
+
+    #[test]
+    fn native_delete_requires_one_matching_success_result() {
+        require_deleted_topic(vec![Ok("events".to_owned())], "events").unwrap();
+
+        let wrong_topic =
+            require_deleted_topic(vec![Ok("other".to_owned())], "events").unwrap_err();
+        assert!(matches!(wrong_topic, Error::Query(_)));
+        assert!(wrong_topic.to_string().contains("instead of"));
+
+        let broker_error = require_deleted_topic(
+            vec![Err((
+                "events".to_owned(),
+                RDKafkaErrorCode::TopicAlreadyExists,
+            ))],
+            "events",
+        )
+        .unwrap_err();
+        assert!(matches!(broker_error, Error::Query(_)));
+        assert!(broker_error.to_string().contains("failed to delete"));
+
+        let missing_result = require_deleted_topic(vec![], "events").unwrap_err();
+        assert!(matches!(missing_result, Error::Query(_)));
     }
 
     #[tokio::test]

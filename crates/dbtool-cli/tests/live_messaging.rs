@@ -77,6 +77,40 @@ fn stderr_json(output: Output) -> Value {
     serde_json::from_slice(&output.stderr).expect("stderr should be JSON")
 }
 
+fn confirmed_mq_delete(dsn: &str, resource_kind: &str, name: &str, conditions: &[&str]) -> Value {
+    let mut first_args = vec![
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "mq",
+        "delete",
+        "--kind",
+        resource_kind,
+        name,
+    ];
+    first_args.extend_from_slice(conditions);
+    let first = stderr_json(dbtool(&first_args));
+    assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
+    let token = first["error"]["confirm_token"]
+        .as_str()
+        .expect("mq delete should return a confirmation token");
+
+    let mut second_args = vec![
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "--confirm",
+        token,
+        "mq",
+        "delete",
+        "--kind",
+        resource_kind,
+        name,
+    ];
+    second_args.extend_from_slice(conditions);
+    stdout_json_retry(&second_args)
+}
+
 fn dsn(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
@@ -241,15 +275,12 @@ fn redis_live_stream_produce_detail_and_consume() {
     ]));
     assert_eq!(group_destroyed["data"], 1);
 
-    let deleted = stdout_json(dbtool(&[
-        "--dsn",
-        &dsn,
-        "--allow-write",
-        "kv",
-        "del",
-        &stream,
-    ]));
-    assert_eq!(deleted["data"]["deleted"], 1);
+    let deleted = confirmed_mq_delete(&dsn, "redis-stream", &stream, &[]);
+    assert_eq!(deleted["data"]["resource"]["kind"], "redis-stream");
+    assert_eq!(deleted["data"]["resource"]["name"], stream);
+    assert_eq!(deleted["data"]["messages_before"], 1);
+    assert_eq!(deleted["data"]["acknowledged"], true);
+    assert_eq!(deleted["data"]["verified_absent"], true);
 
     let missing = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", &stream]));
     assert_eq!(missing["data"]["value"], Value::Null);
@@ -479,10 +510,36 @@ fn run_kafka_smoke(
         assert_eq!(consumed["data"][0]["timestamp"], 1_710_000_000_123_i64);
     }
 
-    // The public MQ API has no topic-delete operation. Keep that boundary explicit instead of
-    // claiming cleanup; local integration environments remove the broker volume on teardown.
-    let lag = stderr_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
-    assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    if cfg!(feature = "full-native") {
+        let lag = stdout_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
+        assert!(lag["data"].is_array());
+    } else {
+        let lag = stderr_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
+        assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    }
+
+    let deleted = confirmed_mq_delete(dsn, "kafka-topic", &topic, &[]);
+    assert_eq!(deleted["data"]["resource"]["kind"], "kafka-topic");
+    assert_eq!(deleted["data"]["resource"]["name"], topic);
+    assert!(
+        deleted["data"]["messages_before"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1
+    );
+    assert_eq!(deleted["data"]["verified_absent"], true);
+    let topics_after_cleanup = stdout_json_retry_until(&["--dsn", dsn, "mq", "topics"], |value| {
+        !value["data"]
+            .as_array()
+            .expect("topics should be an array")
+            .iter()
+            .any(|item| item["name"] == topic)
+    });
+    assert!(!topics_after_cleanup["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == topic));
 }
 
 #[test]
@@ -554,10 +611,18 @@ fn amqp_live_queue_produce_detail_and_consume() {
         value["data"]["config"]["message_count"] == "0"
     });
     assert_eq!(drained["data"]["config"]["message_count"], "0");
+
+    let deleted = confirmed_mq_delete(&dsn, "amqp-queue", &queue, &["--if-empty", "--if-unused"]);
+    assert_eq!(deleted["data"]["resource"]["kind"], "amqp-queue");
+    assert_eq!(deleted["data"]["messages_before"], 0);
+    assert_eq!(deleted["data"]["consumers_before"], 0);
+    assert_eq!(deleted["data"]["verified_absent"], true);
+    let missing = stderr_json(dbtool(&["--dsn", &dsn, "mq", "detail", &queue]));
+    assert_eq!(missing["error"]["code"], "QUERY_ERROR");
 }
 
 #[test]
-fn rabbitmq_management_live_lists_detail_and_queue_lag() {
+fn rabbitmq_management_live_lists_details_and_deletes_queues() {
     if !integration_enabled() {
         return;
     }
@@ -605,12 +670,8 @@ fn rabbitmq_management_live_lists_detail_and_queue_lag() {
     assert_eq!(detail["data"]["config"]["message_count"], "1");
     assert_eq!(detail["data"]["watermarks"][0]["high"], 1);
 
-    let lag = stdout_json_retry_until(&["--dsn", &management_dsn, "mq", "lag", &queue], |value| {
-        value["data"][0]["latest"] == 1 && value["data"][0]["lag"] == 1
-    });
-    assert_eq!(lag["data"][0]["topic"], queue);
-    assert_eq!(lag["data"][0]["latest"], 1);
-    assert_eq!(lag["data"][0]["lag"], 1);
+    let lag = stderr_json(dbtool(&["--dsn", &management_dsn, "mq", "lag", &queue]));
+    assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
 
     let unsupported = stderr_json(dbtool(&[
         "--dsn",
@@ -650,12 +711,28 @@ fn rabbitmq_management_live_lists_detail_and_queue_lag() {
     );
     assert_eq!(drained_detail["data"]["config"]["message_count"], "0");
 
-    let drained_lag =
-        stdout_json_retry_until(&["--dsn", &management_dsn, "mq", "lag", &queue], |value| {
-            value["data"][0]["latest"] == 0 && value["data"][0]["lag"] == 0
+    let deleted = confirmed_mq_delete(
+        &management_dsn,
+        "amqp-queue",
+        &queue,
+        &["--if-empty", "--if-unused"],
+    );
+    assert_eq!(deleted["data"]["messages_before"], 0);
+    assert_eq!(deleted["data"]["consumers_before"], 0);
+    assert_eq!(deleted["data"]["verified_absent"], true);
+    let topics_after_cleanup =
+        stdout_json_retry_until(&["--dsn", &management_dsn, "mq", "topics"], |value| {
+            !value["data"]
+                .as_array()
+                .expect("topics should be an array")
+                .iter()
+                .any(|item| item["name"] == queue)
         });
-    assert_eq!(drained_lag["data"][0]["latest"], 0);
-    assert_eq!(drained_lag["data"][0]["lag"], 0);
+    assert!(!topics_after_cleanup["data"]
+        .as_array()
+        .expect("topics should be an array")
+        .iter()
+        .any(|item| item["name"] == queue));
 }
 
 #[test]
@@ -716,6 +793,8 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
         value["data"]["config"]["message_count"] == "0"
     });
     assert_eq!(drained["data"]["config"]["message_count"], "0");
+    let deleted = confirmed_mq_delete(&dsn, "amqp-queue", &queue, &["--if-empty", "--if-unused"]);
+    assert_eq!(deleted["data"]["verified_absent"], true);
 }
 
 #[test]
@@ -837,16 +916,11 @@ fn nats_live_jetstream_admin_lists_detail_and_lag() {
         .iter()
         .any(|item| item["topic"] == stream && item["group"] == consumer && item["lag"] == 1));
 
-    rt.block_on(async {
-        let client = async_nats::connect(dsn.clone())
-            .await
-            .expect("NATS client should reconnect for cleanup");
-        let jetstream = async_nats::jetstream::new(client);
-        jetstream
-            .delete_stream(stream.clone())
-            .await
-            .expect("JetStream stream cleanup should succeed");
-    });
+    let deleted = confirmed_mq_delete(&dsn, "nats-jetstream", &stream, &[]);
+    assert_eq!(deleted["data"]["resource"]["kind"], "nats-jetstream");
+    assert_eq!(deleted["data"]["messages_before"], 1);
+    assert_eq!(deleted["data"]["consumers_before"], 1);
+    assert_eq!(deleted["data"]["verified_absent"], true);
 
     let topics_after_cleanup = stdout_json_retry_until(&["--dsn", &dsn, "mq", "topics"], |value| {
         !value["data"]
@@ -976,14 +1050,10 @@ fn nats_mq_tls_live_publish_subscribe_and_jetstream_admin() {
             && item["group"] == jetstream_consumer
             && item["lag"] == 1));
 
-    rt.block_on(async {
-        let client = nats_client_for_test(&dsn).await;
-        let jetstream = async_nats::jetstream::new(client);
-        jetstream
-            .delete_stream(stream.clone())
-            .await
-            .expect("NATS TLS JetStream stream cleanup should succeed");
-    });
+    let deleted = confirmed_mq_delete(&dsn, "nats-jetstream", &stream, &[]);
+    assert_eq!(deleted["data"]["messages_before"], 1);
+    assert_eq!(deleted["data"]["consumers_before"], 1);
+    assert_eq!(deleted["data"]["verified_absent"], true);
 
     let topics_after_cleanup = stdout_json_retry_until(&["--dsn", &dsn, "mq", "topics"], |value| {
         !value["data"]
