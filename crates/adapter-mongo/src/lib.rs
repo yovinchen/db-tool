@@ -294,6 +294,7 @@ fn mongo_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::DocumentUpdateMany,
         CapabilityOperation::DocumentDeleteOne,
         CapabilityOperation::DocumentDeleteMany,
+        CapabilityOperation::DocumentDropCollection,
     ]);
     operations
 }
@@ -487,6 +488,7 @@ mod tests {
             CapabilityOperation::DocumentUpdateMany,
             CapabilityOperation::DocumentDeleteOne,
             CapabilityOperation::DocumentDeleteMany,
+            CapabilityOperation::DocumentDropCollection,
         ] {
             assert!(operations.contains(&operation));
         }

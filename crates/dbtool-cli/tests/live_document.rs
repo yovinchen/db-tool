@@ -96,6 +96,7 @@ fn mongo_live_full_find_options_bounded_aggregate_and_drop() {
         "document.update_many",
         "document.delete_one",
         "document.delete_many",
+        "document.drop_collection",
     ] {
         assert!(operations
             .iter()

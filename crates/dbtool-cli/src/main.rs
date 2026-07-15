@@ -101,7 +101,7 @@ struct GenerateArtifactsCmd {
 enum Commands {
     /// Verify connectivity to a backend
     Ping,
-    /// Show capabilities of a connection
+    /// Show legacy capability families and exact method-level operation names
     Caps,
     /// SQL operations (query / exec / tables / schema)
     #[command(

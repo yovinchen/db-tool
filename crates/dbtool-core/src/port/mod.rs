@@ -5,4 +5,6 @@ pub use capability::{
     AdminInspect, AdminMutate, DocumentStore, KeyValueStore, MessageConsumer, MessageProducer,
     SearchEngine, SqlEngine, TimeSeriesStore,
 };
-pub use connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind};
+pub use connector::{
+    Capabilities, CapabilityOperation, CapabilityReport, Connector, ConnectorKind,
+};

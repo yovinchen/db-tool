@@ -242,6 +242,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
         )?;
     }
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let start = std::time::Instant::now();
     let elapsed = || start.elapsed().as_millis() as u64;
     let kind = conn.kind().0.clone();
@@ -255,6 +256,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             partition: _,
             timestamp_ms: _,
         } => {
+            require_message_operation(&operations, CapabilityOperation::MessageProduce, &kind)?;
             let producer = conn
                 .as_producer()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -279,6 +281,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             durable: _,
             ack: _,
         } => {
+            require_message_operation(&operations, CapabilityOperation::MessageConsume, &kind)?;
             let consumer = conn
                 .as_consumer()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -289,7 +292,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                 Error::Internal("validated message consumer options are missing".into())
             })?;
             let opts = request.options;
-            require_consume_operations(&conn.operations(), &opts, &kind)?;
+            require_consume_operations(&operations, &opts, &kind)?;
             let max = opts.max;
             let msgs = consumer.consume(&topic, opts).await?;
             // Reaching the requested count proves only that the CLI budget was
@@ -298,22 +301,27 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             ctx.render_success(&kind, msgs, elapsed(), limit_reached)
         }
         MqAction::Topics => {
+            require_message_operation(
+                &operations,
+                CapabilityOperation::MessageAdminListTopicsBounded,
+                &kind,
+            )?;
             let admin = conn
                 .as_admin()
                 .ok_or_else(|| Error::UnsupportedCapability {
                     kind: kind.clone(),
                     needed: "AdminInspect",
                 })?;
-            require_message_operation(
-                &conn.operations(),
-                CapabilityOperation::MessageAdminListTopicsBounded,
-                &kind,
-            )?;
             let topics = admin.list_topics_bounded(ctx.limit).await?;
             let truncated = topics.truncated;
             ctx.render_success(&kind, topics.items, elapsed(), truncated)
         }
         MqAction::Detail { topic } => {
+            require_message_operation(
+                &operations,
+                CapabilityOperation::MessageAdminTopicDetail,
+                &kind,
+            )?;
             let admin = conn
                 .as_admin()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -324,6 +332,11 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             ctx.render_success(&kind, detail, elapsed(), false)
         }
         MqAction::Lag { group } => {
+            require_message_operation(
+                &operations,
+                CapabilityOperation::MessageAdminConsumerLag,
+                &kind,
+            )?;
             let admin = conn
                 .as_admin()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -334,6 +347,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             ctx.render_success(&kind, lag, elapsed(), false)
         }
         MqAction::Delete { .. } => {
+            require_message_operation(&operations, CapabilityOperation::MessageAdminDelete, &kind)?;
             let admin = conn
                 .as_admin_mutate()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -628,6 +642,65 @@ mod tests {
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "legacy-mq"
                     && needed == CapabilityOperation::MessageAdminListTopicsBounded.as_str()
+        ));
+    }
+
+    #[test]
+    fn partial_admin_profiles_cannot_dispatch_unadvertised_methods() {
+        let legacy_admin_without_operations = [];
+        for operation in [
+            CapabilityOperation::MessageAdminListTopicsBounded,
+            CapabilityOperation::MessageAdminTopicDetail,
+            CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminDelete,
+        ] {
+            assert!(matches!(
+                require_message_operation(
+                    &legacy_admin_without_operations,
+                    operation,
+                    "legacy-admin"
+                ),
+                Err(Error::UnsupportedCapability { kind, needed })
+                    if kind == "legacy-admin" && needed == operation.as_str()
+            ));
+        }
+
+        let topic_only = [CapabilityOperation::MessageAdminTopicDetail];
+        assert!(require_message_operation(
+            &topic_only,
+            CapabilityOperation::MessageAdminTopicDetail,
+            "amqp"
+        )
+        .is_ok());
+
+        for operation in [
+            CapabilityOperation::MessageAdminListTopicsBounded,
+            CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminDelete,
+        ] {
+            assert!(matches!(
+                require_message_operation(&topic_only, operation, "amqp"),
+                Err(Error::UnsupportedCapability { kind, needed })
+                    if kind == "amqp" && needed == operation.as_str()
+            ));
+        }
+
+        let list_only = [CapabilityOperation::MessageAdminListTopicsBounded];
+        assert!(require_message_operation(
+            &list_only,
+            CapabilityOperation::MessageAdminListTopicsBounded,
+            "list-only"
+        )
+        .is_ok());
+        assert!(matches!(
+            require_message_operation(
+                &list_only,
+                CapabilityOperation::MessageAdminTopicDetail,
+                "list-only"
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "list-only"
+                    && needed == CapabilityOperation::MessageAdminTopicDetail.as_str()
         ));
     }
 

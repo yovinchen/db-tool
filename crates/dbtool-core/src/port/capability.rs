@@ -268,8 +268,12 @@ pub trait DocumentStore: Connector {
         max_items: usize,
     ) -> Result<Vec<Document>>;
 
-    /// Drop a document collection. Connectors that cannot manage collection
-    /// lifecycle must reject the operation explicitly.
+    /// Drop a document collection.
+    ///
+    /// This lifecycle method is optional and is never inferred from the coarse
+    /// `document=true` capability. Implementations must advertise
+    /// `document.drop_collection`; connectors that cannot manage collection
+    /// lifecycle retain this fail-closed default.
     async fn drop_collection(&self, _collection: &str) -> Result<()> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -936,6 +940,7 @@ mod tests {
             CapabilityOperation::DocumentUpdateMany,
             CapabilityOperation::DocumentDeleteOne,
             CapabilityOperation::DocumentDeleteMany,
+            CapabilityOperation::DocumentDropCollection,
         ] {
             assert!(!connector.operations().contains(&operation));
         }
@@ -970,6 +975,11 @@ mod tests {
             connector.delete_one("users", filter).await,
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "legacy-document" && needed == "DocumentStore.delete_one"
+        ));
+        assert!(matches!(
+            connector.drop_collection("users").await,
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-document" && needed == "DocumentStore.drop_collection"
         ));
     }
 }

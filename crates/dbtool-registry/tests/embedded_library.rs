@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use dbtool_core::{
     error::Error,
     model::Value,
+    port::CapabilityOperation,
     service::{safety::StatementKind, ConnectionManager, FlowControl, SafetyGuard, ThrottleConfig},
 };
 use dbtool_registry::build_registry;
@@ -16,6 +17,16 @@ async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior()
     let conn_again = manager.get_or_connect("sqlite::memory:").await.unwrap();
     assert!(Arc::ptr_eq(&conn, &conn_again));
     assert!(conn.capabilities().sql);
+    let operations = conn.operations();
+    for operation in [
+        CapabilityOperation::SqlExecute,
+        CapabilityOperation::SqlQueryBounded,
+    ] {
+        assert!(
+            operations.contains(&operation),
+            "embedded caller must negotiate {operation:?} before downcasting"
+        );
+    }
 
     assert_eq!(
         SafetyGuard::check("select 1", false, None).unwrap(),

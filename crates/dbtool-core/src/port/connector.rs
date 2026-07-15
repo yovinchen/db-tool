@@ -149,8 +149,11 @@ impl CapabilityOperation {
         Self::DocumentDelete,
         Self::DocumentAggregate,
         Self::DocumentAggregateBounded,
-        Self::DocumentDropCollection,
     ];
+    /// Collection lifecycle is optional. A legacy `document=true` connector
+    /// may rely on the trait's fail-closed default and must not advertise this
+    /// method until its adapter implements and verifies the backend operation.
+    pub const DOCUMENT_LIFECYCLE: &'static [Self] = &[Self::DocumentDropCollection];
     pub const TIME_SERIES: &'static [Self] = &[
         Self::TimeSeriesListMeasurements,
         Self::TimeSeriesWritePoints,
@@ -214,6 +217,24 @@ pub struct Capabilities {
     pub producer: bool,
     pub consumer: bool,
     pub admin: bool,
+}
+
+/// Backward-compatible capability report used by CLI, TUI, and embedded
+/// callers. Legacy family booleans remain flattened while `operations` is the
+/// authoritative, stable, method-level negotiation surface.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityReport {
+    #[serde(flatten)]
+    pub legacy: Capabilities,
+    pub operations: Vec<CapabilityOperation>,
+}
+
+impl CapabilityReport {
+    pub fn new(legacy: Capabilities, mut operations: Vec<CapabilityOperation>) -> Self {
+        operations.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        operations.dedup();
+        Self { legacy, operations }
+    }
 }
 
 impl Capabilities {
@@ -504,7 +525,33 @@ mod tests {
     }
 
     #[test]
-    fn legacy_flags_derive_every_non_admin_method_but_never_guess_admin_methods() {
+    fn capability_report_preserves_legacy_fields_and_normalizes_operations() {
+        let report = CapabilityReport::new(
+            Capabilities {
+                sql: true,
+                ..Default::default()
+            },
+            vec![
+                CapabilityOperation::SqlQuery,
+                CapabilityOperation::SqlExecute,
+                CapabilityOperation::SqlQuery,
+            ],
+        );
+        assert_eq!(
+            report.operations,
+            [
+                CapabilityOperation::SqlExecute,
+                CapabilityOperation::SqlQuery
+            ]
+        );
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["sql"], true);
+        assert_eq!(value["operations"][0], "sql.execute");
+        assert!(value.get("legacy").is_none());
+    }
+
+    #[test]
+    fn legacy_flags_derive_required_methods_but_never_guess_optional_extensions() {
         let connector = LegacyConnector(Capabilities {
             sql: true,
             cql: true,
@@ -524,6 +571,7 @@ mod tests {
                 !CapabilityOperation::MESSAGE_ADMIN.contains(operation)
                     && *operation != CapabilityOperation::SqlInsertRowsAtomic
                     && !CapabilityOperation::KEY_VALUE_LIFETIME.contains(operation)
+                    && !CapabilityOperation::DOCUMENT_LIFECYCLE.contains(operation)
                     && !CapabilityOperation::BOUNDED_CATALOGS.contains(operation)
                     && ![
                         CapabilityOperation::DocumentUpdateOne,
@@ -544,6 +592,9 @@ mod tests {
             .operations()
             .contains(&CapabilityOperation::SqlInsertRowsAtomic));
         assert!(CapabilityOperation::KEY_VALUE_LIFETIME
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::DOCUMENT_LIFECYCLE
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::MESSAGE_CONSUMER_EXTENSIONS

@@ -233,6 +233,12 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             )
         }
         DocAction::Drop { collection } => {
+            require_document_operation(
+                &operations,
+                CapabilityOperation::DocumentDropCollection,
+                &kind,
+                "DocumentStore.drop_collection",
+            )?;
             doc.drop_collection(&collection).await?;
             ctx.render_success(
                 &kind,
@@ -1025,6 +1031,17 @@ mod tests {
             "DocumentStore.delete_many",
         )
         .is_ok());
+
+        assert!(matches!(
+            require_document_operation(
+                coarse,
+                CapabilityOperation::DocumentDropCollection,
+                "legacy-document",
+                "DocumentStore.drop_collection",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "DocumentStore.drop_collection"
+        ));
     }
 
     #[test]

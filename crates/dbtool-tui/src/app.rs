@@ -9,7 +9,7 @@ use dbtool_core::{
     dsn::Dsn,
     error::Error,
     model::{BoundedList, FindOptions, Point, TimeRange, Value},
-    port::CapabilityOperation,
+    port::{CapabilityOperation, CapabilityReport},
     registry::Registry,
     service::{
         safety::{SafetyGuard, StatementKind},
@@ -274,10 +274,16 @@ async fn execute_tui_command(
             render_json(serde_json::json!({
                 "status": "ok",
                 "kind": connector.kind().0,
-                "capabilities": connector.capabilities()
+                "capabilities": CapabilityReport::new(
+                    connector.capabilities(),
+                    connector.operations()
+                )
             }))
         }
-        "caps" => render_json(connector.capabilities()),
+        "caps" => render_json(CapabilityReport::new(
+            connector.capabilities(),
+            connector.operations(),
+        )),
         "tables" => {
             require_operation(
                 connector,
@@ -915,6 +921,34 @@ readonli = true
             .await
             .unwrap();
         assert!(ping.contains("\"status\": \"ok\""));
+        let ping: serde_json::Value = serde_json::from_str(&ping).unwrap();
+        assert_eq!(ping["capabilities"]["sql"], true);
+        assert_eq!(
+            ping["capabilities"]["operations"],
+            serde_json::json!([
+                "sql.describe_table",
+                "sql.execute",
+                "sql.insert_rows_atomic",
+                "sql.list_schemas",
+                "sql.list_schemas_bounded",
+                "sql.list_tables",
+                "sql.list_tables_bounded",
+                "sql.query",
+                "sql.query_bounded"
+            ])
+        );
+
+        let caps: serde_json::Value = serde_json::from_str(
+            &execute_tui_command(&manager, &connection, "caps", 100, false)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(caps, ping["capabilities"]);
+        let operations = caps["operations"].as_array().unwrap();
+        assert!(operations.windows(2).all(|pair| {
+            pair[0].as_str().expect("operation name") < pair[1].as_str().expect("operation name")
+        }));
 
         let query = execute_tui_command(&manager, &connection, "sql select 1 as id", 100, false)
             .await
