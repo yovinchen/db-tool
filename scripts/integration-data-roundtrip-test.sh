@@ -202,21 +202,23 @@ run_dbtool \
   export kv \
   --pattern "dbtool_it_fixture:user:*" \
   --out "$export_dir/redis-values.json" >/dev/null
-run_dbtool \
+redis_artifact="$(cat "$export_dir/redis-values.json")"
+assert_json_predicate "$redis_artifact" 'data["version"] == 3 and all(entry["expiry"]["kind"] == "persistent" for entry in data["entries"])'
+redis_import="$(run_dbtool \
   --dsn "$DBTOOL_IT_REDIS_DSN" \
   --allow-write \
   import kv \
   --input "$export_dir/redis-values.json" \
   --strip-prefix "dbtool_it_fixture:user:" \
-  --key-prefix "dbtool_it_roundtrip:user:" \
-  --ttl 120 >/dev/null
+  --key-prefix "dbtool_it_roundtrip:user:")"
+assert_json_predicate "$redis_import" 'data["data"]["restored"] == 3 and data["data"]["expired_skipped"] == 0 and data["data"]["per_entry_atomic"] is True and data["data"]["expiry_preserved"] is True'
 redis_roundtrip="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" kv raw MGET dbtool_it_roundtrip:user:1 dbtool_it_roundtrip:user:2 dbtool_it_roundtrip:user:3)"
 assert_json_predicate "$redis_roundtrip" 'data["data"] == ["alice","bob","carol"]'
 redis_roundtrip_keys="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --limit 3 kv scan "dbtool_it_roundtrip:user:*")"
 assert_json_predicate "$redis_roundtrip_keys" 'len(data["data"]) == 3'
 for key in dbtool_it_roundtrip:user:1 dbtool_it_roundtrip:user:2 dbtool_it_roundtrip:user:3; do
   redis_ttl="$(run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" kv raw TTL "$key")"
-  assert_json_predicate "$redis_ttl" '1 <= data["data"] <= 120'
+  assert_json_predicate "$redis_ttl" 'data["data"] == -1'
 done
 
 echo "dbtool data roundtrip: exporting MongoDB fixture documents"

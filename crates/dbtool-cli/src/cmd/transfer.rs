@@ -2,8 +2,8 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::{Document, FindOptions, ResultSet, Value},
-    port::{capability::SetOptions, CapabilityOperation},
+    model::{Document, FindOptions, KeyExpiry, KeyValueRestoreOutcome, ResultSet, Value},
+    port::CapabilityOperation,
     service::{
         limiter::ResultLimiter,
         safety::{SafetyGuard, StatementKind},
@@ -19,7 +19,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const KV_TRANSFER_VERSION: u32 = 2;
+const KV_TRANSFER_VERSION: u32 = 3;
 const DOCUMENT_TRANSFER_VERSION: u32 = 3;
 const SQL_TRANSFER_VERSION: u32 = 3;
 const MAX_TRANSFER_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
@@ -97,7 +97,7 @@ pub enum ImportAction {
     },
     /// Import kv-pairs into a key-value backend.
     #[command(
-        long_about = "Import a complete kv-pairs artifact. Input is capped at 256 MiB and the global --limit item budget is enforced before connecting. New keys use conditional create semantics so a concurrent creator is never overwritten silently. Existing keys are rejected by default; --replace-existing requires a global --confirm token bound to the target, complete transformed key/value set, and TTL. The generic KV contract cannot promise one transaction across all keys, so the response reports atomic=false."
+        long_about = "Import a complete kv-pairs v3 artifact while preserving each key's exact bytes and source lifetime. Input is capped at 256 MiB and the global --limit item budget is enforced before connecting. Already-expired entries are skipped without writing. New keys use conditional create semantics so a concurrent creator is never overwritten silently. Existing keys are rejected by default; --replace-existing requires a global --confirm token bound to the target plus every transformed target key, exact value, and absolute expiry. Each key/value/expiry restore is atomic, but the complete multi-key import is not, so the response reports per_entry_atomic=true and atomic=false."
     )]
     Kv {
         /// Input JSON artifact path.
@@ -109,9 +109,6 @@ pub enum ImportAction {
         /// Prefix to prepend to restored keys.
         #[arg(long, default_value = "")]
         key_prefix: String,
-        /// Optional TTL in seconds for restored keys.
-        #[arg(long)]
-        ttl: Option<u64>,
         /// Permit replacing keys that already exist. Existing keys additionally
         /// require the target-bound global --confirm token.
         #[arg(long)]
@@ -193,12 +190,14 @@ enum ArtifactConsistency {
 struct KvEntry {
     key: String,
     value: Value,
+    expiry: KeyExpiry,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct PreparedKvEntry {
     key: String,
     value: Vec<u8>,
+    expiry: KeyExpiry,
 }
 
 enum PreparedImport {
@@ -209,7 +208,6 @@ enum PreparedImport {
     },
     Kv {
         entries: Vec<PreparedKvEntry>,
-        ttl: Option<u64>,
         replace_existing: bool,
     },
     Doc {
@@ -252,6 +250,15 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
             )
         }
         ExportAction::Kv { pattern, out } => {
+            if !conn
+                .operations()
+                .contains(&CapabilityOperation::KeyValueGetWithExpiry)
+            {
+                return Err(Error::UnsupportedCapability {
+                    kind: kind.clone(),
+                    needed: "kv.get_with_expiry",
+                });
+            }
             let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "KeyValueStore",
@@ -263,10 +270,11 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
             let selected_items = usize_to_u64(keys.len(), "selected key count")?;
             let mut entries = Vec::with_capacity(keys.len());
             for key in keys {
-                if let Some(value) = kv.get(&key).await? {
+                if let Some(snapshot) = kv.get_with_expiry(&key).await? {
                     entries.push(KvEntry {
                         key,
-                        value: Value::Bytes(value.to_vec()),
+                        value: Value::Bytes(snapshot.value.to_vec()),
+                        expiry: snapshot.expiry,
                     });
                 }
             }
@@ -409,29 +417,33 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
         }
         PreparedImport::Kv {
             entries,
-            ttl,
             replace_existing,
         } => {
+            if !conn
+                .operations()
+                .contains(&CapabilityOperation::KeyValueRestoreWithExpiry)
+            {
+                return Err(Error::UnsupportedCapability {
+                    kind: kind.clone(),
+                    needed: "kv.restore_with_expiry",
+                });
+            }
             let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "KeyValueStore",
             })?;
             let mut existing = BTreeSet::new();
-            for entry in &entries {
-                if kv.get(&entry.key).await?.is_some() {
-                    existing.insert(entry.key.clone());
+            if replace_existing {
+                for entry in &entries {
+                    if kv.get(&entry.key).await?.is_some() {
+                        existing.insert(entry.key.clone());
+                    }
                 }
             }
             if !existing.is_empty() {
-                if !replace_existing {
-                    return Err(Error::Config(format!(
-                        "refusing to replace {} existing key(s); retry with --replace-existing, then provide the returned target-bound --confirm token",
-                        existing.len()
-                    )));
-                }
                 let resource = serde_json::to_string(&existing)
                     .map_err(|e| Error::Serialization(e.to_string()))?;
-                let confirmation_scope = kv_replace_confirmation_scope(&entries, ttl)?;
+                let confirmation_scope = kv_replace_confirmation_scope(&entries)?;
                 SafetyGuard::check_destructive_operation_with_scope(
                     "import_kv_replace",
                     &resource,
@@ -442,26 +454,52 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
                 )?;
             }
             let mut restored = 0_u64;
+            let mut expired_skipped = 0_u64;
+            let mut replaced = 0_u64;
             for entry in entries {
-                let key = entry.key;
-                kv.set(
-                    &key,
-                    &entry.value,
-                    SetOptions {
-                        ttl_secs: ttl,
-                        nx: !existing.contains(&key),
-                    },
-                )
-                .await?;
-                restored += 1;
+                let was_present_at_preflight = existing.contains(&entry.key);
+                let outcome = kv
+                    .restore_with_expiry(
+                        &entry.key,
+                        &entry.value,
+                        entry.expiry,
+                        !was_present_at_preflight,
+                    )
+                    .await?;
+                match outcome {
+                    KeyValueRestoreOutcome::Stored => {
+                        restored = restored.checked_add(1).ok_or_else(|| {
+                            Error::Serialization("restored KV count overflowed u64".into())
+                        })?;
+                        if was_present_at_preflight {
+                            replaced = replaced.checked_add(1).ok_or_else(|| {
+                                Error::Serialization("replaced KV count overflowed u64".into())
+                            })?;
+                        }
+                    }
+                    KeyValueRestoreOutcome::Expired => {
+                        expired_skipped = expired_skipped.checked_add(1).ok_or_else(|| {
+                            Error::Serialization("expired KV count overflowed u64".into())
+                        })?;
+                    }
+                    KeyValueRestoreOutcome::ConditionNotMet => {
+                        return Err(Error::Config(format!(
+                            "target key '{}' already exists or changed after preflight; no existing key was overwritten without an exact replacement confirmation, but earlier entries may already have been restored because multi-key KV import is not atomic",
+                            entry.key
+                        )));
+                    }
+                }
             }
             ctx.render_success(
                 &kind,
                 serde_json::json!({
                     "kind": "kv-pairs",
                     "restored": restored,
-                    "replaced": existing.len(),
+                    "expired_skipped": expired_skipped,
+                    "replaced": replaced,
                     "atomic": false,
+                    "per_entry_atomic": true,
+                    "expiry_preserved": true,
                 }),
                 elapsed(),
                 false,
@@ -550,7 +588,7 @@ fn validate_import_artifact(action: &ImportAction, artifact: &TransferArtifact) 
             },
         ) => require_complete_sql_artifact(*version, *truncated, *accept_legacy_unmarked),
         (
-            ImportAction::Kv { ttl, .. },
+            ImportAction::Kv { .. },
             TransferArtifact::KvPairs {
                 version,
                 source,
@@ -559,11 +597,6 @@ fn validate_import_artifact(action: &ImportAction, artifact: &TransferArtifact) 
             },
         ) => {
             require_version("kv-pairs", *version, KV_TRANSFER_VERSION)?;
-            if ttl == &Some(0) {
-                return Err(Error::Config(
-                    "KV import TTL must be greater than zero".into(),
-                ));
-            }
             validate_source("kv-pairs", source)?;
             if source.resource != "key-pattern" || !matches!(&source.selector, Value::Text(_)) {
                 return Err(Error::Serialization(
@@ -656,14 +689,12 @@ fn prepare_import(
             ImportAction::Kv {
                 strip_prefix,
                 key_prefix,
-                ttl,
                 replace_existing,
                 ..
             },
             TransferArtifact::KvPairs { entries, .. },
         ) => Ok(PreparedImport::Kv {
             entries: prepare_kv_entries(entries, strip_prefix.as_deref(), &key_prefix)?,
-            ttl,
             replace_existing,
         }),
         (
@@ -995,7 +1026,11 @@ fn reject_legacy_value_codec_artifact(raw: &serde_json::Value) -> Result<()> {
             return Err(legacy_transfer_integrity_error(kind, version));
         }
         "kv-pairs" if version < u64::from(KV_TRANSFER_VERSION) => {
-            return Err(legacy_transfer_integrity_error(kind, version));
+            return Err(if version == 2 {
+                legacy_kv_expiry_error(version)
+            } else {
+                legacy_transfer_integrity_error(kind, version)
+            });
         }
         _ => {}
     }
@@ -1012,6 +1047,12 @@ fn legacy_value_codec_error(kind: &str, version: u64) -> Error {
 fn legacy_transfer_integrity_error(kind: &str, version: u64) -> Error {
     Error::Serialization(format!(
         "refusing to import legacy {kind} v{version}: it lacks required typed-value, source, completeness, truncation, and source-change metadata; re-export from the source"
+    ))
+}
+
+fn legacy_kv_expiry_error(version: u64) -> Error {
+    Error::Serialization(format!(
+        "refusing to import legacy kv-pairs v{version}: it has no per-key expiry, so dbtool cannot distinguish persistent keys from expiring keys or restore their lifetime without loss; re-export from the source as kv-pairs v{KV_TRANSFER_VERSION}"
     ))
 }
 
@@ -1073,13 +1114,17 @@ fn prepare_kv_entries(
                 entry.key
             )));
         };
-        prepared.push(PreparedKvEntry { key, value });
+        prepared.push(PreparedKvEntry {
+            key,
+            value,
+            expiry: entry.expiry,
+        });
     }
     Ok(prepared)
 }
 
-fn kv_replace_confirmation_scope(entries: &[PreparedKvEntry], ttl: Option<u64>) -> Result<String> {
-    SafetyGuard::confirmation_scope_digest(&(entries, ttl))
+fn kv_replace_confirmation_scope(entries: &[PreparedKvEntry]) -> Result<String> {
+    SafetyGuard::confirmation_scope_digest(entries)
 }
 
 fn ensure_unique_document_ids(documents: &[Document]) -> Result<()> {
@@ -1284,7 +1329,6 @@ mod tests {
             input: PathBuf::from("fixture.json"),
             strip_prefix: None,
             key_prefix: String::new(),
-            ttl: None,
             replace_existing: false,
         }
     }
@@ -1374,6 +1418,22 @@ mod tests {
                     && message.contains("completeness")
                     && message.contains("re-export")
         ));
+
+        let kv_v2 = serde_json::json!({
+            "kind": "kv-pairs",
+            "version": 2,
+            "source": {},
+            "integrity": {},
+            "entries": []
+        });
+        assert!(matches!(
+            reject_legacy_value_codec_artifact(&kv_v2),
+            Err(Error::Serialization(message))
+                if message.contains("legacy kv-pairs v2")
+                    && message.contains("per-key expiry")
+                    && message.contains("persistent")
+                    && message.contains("re-export")
+        ));
     }
 
     #[test]
@@ -1446,6 +1506,7 @@ mod tests {
         let entries = vec![KvEntry {
             key: "raw".to_owned(),
             value: Value::Bytes(vec![0, 255]),
+            expiry: KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123),
         }];
         let artifact = TransferArtifact::KvPairs {
             version: KV_TRANSFER_VERSION,
@@ -1458,6 +1519,13 @@ mod tests {
         assert_eq!(encoded["version"], KV_TRANSFER_VERSION);
         assert_eq!(encoded["entries"][0]["value"]["$dbtool"]["type"], "bytes");
         assert_eq!(encoded["entries"][0]["value"]["$dbtool"]["value"], "AP8=");
+        assert_eq!(
+            encoded["entries"][0]["expiry"],
+            serde_json::json!({
+                "kind": "expires-at-unix-ms",
+                "unix_ms": 1_710_000_000_123_i64
+            })
+        );
         assert_eq!(encoded["integrity"]["complete"], true);
         assert_eq!(encoded["integrity"]["consistency"], "best-effort");
 
@@ -1475,12 +1543,29 @@ mod tests {
             entries: vec![KvEntry {
                 key: "a".to_owned(),
                 value: Value::Bytes(vec![1]),
+                expiry: KeyExpiry::Persistent,
             }],
         };
         assert!(matches!(
             validate_import_artifact(&kv_import_action(), &kv),
             Err(Error::Serialization(message))
                 if message.contains("incomplete kv-pairs") && message.contains("hit its limit")
+        ));
+
+        let changed_kv = TransferArtifact::KvPairs {
+            version: KV_TRANSFER_VERSION,
+            source: source("key-pattern", Value::Text("*".to_owned())),
+            integrity: artifact_integrity(2, 1, 2, false, true),
+            entries: vec![KvEntry {
+                key: "survived".to_owned(),
+                value: Value::Bytes(vec![1]),
+                expiry: KeyExpiry::Persistent,
+            }],
+        };
+        assert!(matches!(
+            validate_import_artifact(&kv_import_action(), &changed_kv),
+            Err(Error::Serialization(message))
+                if message.contains("incomplete kv-pairs") && message.contains("source changed")
         ));
 
         let documents = TransferArtifact::Documents {
@@ -1532,6 +1617,7 @@ mod tests {
             vec![KvEntry {
                 key: "src:a".to_owned(),
                 value: Value::Bytes(vec![0, 255]),
+                expiry: KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123),
             }],
             Some("src:"),
             "dst:",
@@ -1542,6 +1628,7 @@ mod tests {
             vec![PreparedKvEntry {
                 key: "dst:a".to_owned(),
                 value: vec![0, 255],
+                expiry: KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123),
             }]
         );
 
@@ -1551,10 +1638,12 @@ mod tests {
                     KvEntry {
                         key: "a".to_owned(),
                         value: Value::Bytes(vec![1]),
+                        expiry: KeyExpiry::Persistent,
                     },
                     KvEntry {
                         key: "a".to_owned(),
                         value: Value::Bytes(vec![2]),
+                        expiry: KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123),
                     },
                 ],
                 None,
@@ -1593,24 +1682,27 @@ mod tests {
             entries: vec![KvEntry {
                 key: "src:a".to_owned(),
                 value: Value::Bytes(vec![0, 255]),
+                expiry: KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123),
             }],
         };
         let action = ImportAction::Kv {
             input: PathBuf::from("fixture.json"),
             strip_prefix: Some("src:".to_owned()),
             key_prefix: "dst:".to_owned(),
-            ttl: Some(60),
             replace_existing: true,
         };
 
-        let PreparedImport::Kv { entries, ttl, .. } =
+        let PreparedImport::Kv { entries, .. } =
             prepare_import(action, artifact.clone(), 1).unwrap()
         else {
             panic!("expected prepared KV import");
         };
         assert_eq!(entries[0].key, "dst:a");
         assert_eq!(entries[0].value, vec![0, 255]);
-        assert_eq!(ttl, Some(60));
+        assert_eq!(
+            entries[0].expiry,
+            KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123)
+        );
         assert!(matches!(
             prepare_import(kv_import_action(), artifact, 0),
             Err(Error::Config(message)) if message.contains("greater than zero")
@@ -1681,25 +1773,35 @@ mod tests {
     }
 
     #[test]
-    fn kv_replace_confirmation_scope_binds_values_and_ttl() {
+    fn kv_replace_confirmation_scope_binds_target_keys_values_and_expiry() {
         let first = vec![PreparedKvEntry {
             key: "target".into(),
             value: b"first".to_vec(),
+            expiry: KeyExpiry::Persistent,
         }];
         let second = vec![PreparedKvEntry {
             key: "target".into(),
             value: b"second".to_vec(),
+            expiry: KeyExpiry::Persistent,
+        }];
+        let different_key = vec![PreparedKvEntry {
+            key: "other-target".into(),
+            value: b"first".to_vec(),
+            expiry: KeyExpiry::Persistent,
+        }];
+        let expiring = vec![PreparedKvEntry {
+            key: "target".into(),
+            value: b"first".to_vec(),
+            expiry: KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123),
         }];
 
-        let baseline = kv_replace_confirmation_scope(&first, Some(60)).unwrap();
+        let baseline = kv_replace_confirmation_scope(&first).unwrap();
+        assert_ne!(baseline, kv_replace_confirmation_scope(&second).unwrap());
         assert_ne!(
             baseline,
-            kv_replace_confirmation_scope(&second, Some(60)).unwrap()
+            kv_replace_confirmation_scope(&different_key).unwrap()
         );
-        assert_ne!(
-            baseline,
-            kv_replace_confirmation_scope(&first, Some(120)).unwrap()
-        );
+        assert_ne!(baseline, kv_replace_confirmation_scope(&expiring).unwrap());
     }
 
     #[test]

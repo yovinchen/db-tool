@@ -177,7 +177,11 @@ The roundtrip smoke starts Postgres, MySQL, Redis, and MongoDB, loads the shared
 fixture data, writes versioned JSON artifacts through public `dbtool export
 sql/kv/doc` commands, restores them through public `dbtool import sql/kv/doc`
 commands into independent target tables, Redis key prefixes, and MongoDB
-collections, then reads the restored data back through dbtool. This is a
+collections, then reads the restored data back through dbtool. Redis uses
+`kv-pairs` v3: every entry must contain explicit persistent/absolute expiry,
+restored fixture keys remain persistent, and the success response must report
+per-entry atomic lifetime preservation. The smoke does not pass a uniform
+import TTL because that would be a lossy transform. This is a
 logical dbtool export/restore smoke, not a replacement for product-native
 physical backup tooling.
 

@@ -60,7 +60,7 @@ and test-hardening commits remain listed inside each evidence file.
 | DB-CASSANDRA-001 | CQL | Cassandra `cassandra://` | Docker cassandra | Ready | COMPLETE | `docs/test-evidence/cassandra.md` | `f3712b3`; SQL/CQL CRUD, types, full fixture, safety, limit, metadata, and cleanup passed |
 | DB-SCYLLA-001 | CQL | ScyllaDB `scylla://` | compatible alias only | Ready | PARTIAL | - | no real ScyllaDB product profile |
 | DB-DB2-001 | SQL/Db2 | IBM Db2 `db2://` | Docker db2 + host ODBC | Ready | BLOCKED | - | IBM Db2 ODBC driver is not registered on the host |
-| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | `1ceffc8`, IF-T57/IF-T62; binary fidelity, confirmed raw mutation, denylist and exact multi-page SCAN refreshed |
+| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | `1ceffc8`, `2dd5590`, IF-T57/IF-T62/IF-T64; binary/raw/SCAN plus v3 absolute-expiry artifact lifecycle and cleanup refreshed |
 | DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | `1ceffc8`; atomic NX+TTL refreshed |
 | DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | `1ceffc8`; atomic NX+TTL refreshed |
 | DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | `1ceffc8`; atomic NX+TTL refreshed |
