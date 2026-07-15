@@ -115,6 +115,28 @@ fn confirmed_sql_exec(dsn: &str, sql: &str) -> Value {
     ]))
 }
 
+fn confirmed_kv_raw(dsn: &str, raw_args: &[&str]) -> Value {
+    let mut first_args = vec!["--dsn", dsn, "--allow-write", "kv", "raw"];
+    first_args.extend_from_slice(raw_args);
+    let first = stderr_json(dbtool(&first_args));
+    assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
+    let token = first["error"]["confirm_token"]
+        .as_str()
+        .expect("raw KV mutation confirmation token");
+
+    let mut confirmed_args = vec![
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "--confirm",
+        token,
+        "kv",
+        "raw",
+    ];
+    confirmed_args.extend_from_slice(raw_args);
+    stdout_json(dbtool(&confirmed_args))
+}
+
 fn setup_sql_exec(dsn: &str, sql: &str) -> Value {
     let first = dbtool(&["--dsn", dsn, "--allow-write", "sql", "exec", sql]);
     if first.status.success() {
@@ -831,16 +853,7 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
     ]));
     assert_eq!(blocked_raw_set["error"]["code"], "WRITE_NOT_ALLOWED");
 
-    let raw_set = stdout_json(dbtool(&[
-        "--dsn",
-        dsn,
-        "--allow-write",
-        "kv",
-        "raw",
-        "SET",
-        &raw_key,
-        "raw-value",
-    ]));
+    let raw_set = confirmed_kv_raw(dsn, &["SET", &raw_key, "raw-value"]);
     assert_eq!(raw_set["data"], "OK");
 
     stdout_json(dbtool(&[
@@ -914,7 +927,7 @@ fn redis_family_kv_probe(dsn: &str, expected_kind: &str, prefix: &str) {
     }
 
     let blocked_flush = stderr_json(dbtool(&["--dsn", dsn, "kv", "raw", "FLUSHALL"]));
-    assert_eq!(blocked_flush["error"]["code"], "WRITE_NOT_ALLOWED");
+    assert_eq!(blocked_flush["error"]["code"], "CONFIG_ERROR");
 
     let deleted = stdout_json(dbtool(&[
         "--dsn",
@@ -1478,27 +1491,10 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     ]));
     assert_eq!(blocked_raw_set["error"]["code"], "WRITE_NOT_ALLOWED");
 
-    let raw_set = stdout_json(dbtool(&[
-        "--dsn",
-        &dsn,
-        "--allow-write",
-        "kv",
-        "raw",
-        "SET",
-        &raw_key,
-        "raw-value",
-    ]));
+    let raw_set = confirmed_kv_raw(&dsn, &["SET", &raw_key, "raw-value"]);
     assert_eq!(raw_set["data"], "OK");
 
-    let incr = stdout_json(dbtool(&[
-        "--dsn",
-        &dsn,
-        "--allow-write",
-        "kv",
-        "raw",
-        "INCR",
-        &counter_key,
-    ]));
+    let incr = confirmed_kv_raw(&dsn, &["INCR", &counter_key]);
     assert_eq!(incr["data"], 1);
 
     let multi_get = stdout_json(dbtool(&[
@@ -1655,7 +1651,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     }
 
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "kv", "raw", "FLUSHALL"]));
-    assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
+    assert_eq!(blocked["error"]["code"], "CONFIG_ERROR");
 
     let mut delete_args = vec![
         "--dsn",

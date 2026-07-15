@@ -167,7 +167,8 @@ impl KeyValueStore for RedisAdapter {
             .query_async(&mut *c)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(redis_value_to_core(val))
+        validate_raw_response_budget(&val)?;
+        redis_value_to_core(val)
     }
 }
 
@@ -649,17 +650,396 @@ impl RedisAdapter {
     }
 }
 
+const RAW_ADAPTER_ITEM_LIMIT: usize = 10_000;
+const RAW_MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
+const RAW_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
 fn validate_raw_command(args: &[String]) -> Result<()> {
-    let command = args
-        .first()
-        .ok_or_else(|| Error::Config("raw command requires at least one argument".into()))?
-        .to_ascii_uppercase();
+    validate_raw_request_size(args)?;
+    let command = normalized_raw_command(args)?;
+    if is_forbidden_raw_command(&command) {
+        return Err(Error::Config(format!(
+            "Redis raw command {command} is forbidden by the adapter safety policy"
+        )));
+    }
 
     match command.as_str() {
-        "FLUSHALL" | "FLUSHDB" | "SHUTDOWN" | "CONFIG" | "MODULE" | "SCRIPT" | "EVAL"
-        | "EVALSHA" => Err(Error::WriteNotAllowed),
-        _ => Ok(()),
+        "PING" => expect_raw_arity(args, &[1, 2], &command),
+        "ECHO" => expect_raw_arity(args, &[2], &command),
+        "GET" | "TTL" | "PTTL" | "TYPE" | "STRLEN" | "HLEN" | "LLEN" | "SCARD" | "ZCARD"
+        | "XLEN" => expect_raw_arity(args, &[2], &command),
+        "DBSIZE" | "TIME" | "LASTSAVE" => expect_raw_arity(args, &[1], &command),
+        "HGET" | "HEXISTS" | "SISMEMBER" | "ZSCORE" => expect_raw_arity(args, &[3], &command),
+        "LINDEX" => {
+            expect_raw_arity(args, &[3], &command)?;
+            parse_raw_i64(args, 2, &command)?;
+            Ok(())
+        }
+        "MGET" | "EXISTS" => {
+            expect_raw_min_arity(args, 2, &command)?;
+            check_raw_item_budget(&command, args.len() - 1)
+        }
+        "HMGET" => {
+            expect_raw_min_arity(args, 3, &command)?;
+            check_raw_item_budget(&command, args.len() - 2)
+        }
+        "LRANGE" => {
+            expect_raw_arity(args, &[4], &command)?;
+            check_raw_index_range(args, 2, 3, &command)
+        }
+        "ZRANGE" | "ZREVRANGE" => {
+            expect_raw_arity(args, &[4, 5], &command)?;
+            if args.len() == 5 && !args[4].eq_ignore_ascii_case("WITHSCORES") {
+                return Err(Error::Config(format!(
+                    "Redis raw {command} permits only the optional WITHSCORES modifier"
+                )));
+            }
+            check_raw_index_range(args, 2, 3, &command)
+        }
+        "SRANDMEMBER" => {
+            expect_raw_arity(args, &[2, 3], &command)?;
+            if args.len() == 3 {
+                let count = parse_raw_i64(args, 2, &command)?;
+                let count = count.checked_abs().ok_or_else(|| {
+                    Error::Config(format!(
+                        "Redis raw {command} count is outside the i64 range"
+                    ))
+                })?;
+                check_raw_item_budget(&command, count as usize)?;
+            }
+            Ok(())
+        }
+        "XRANGE" | "XREVRANGE" => {
+            expect_raw_arity(args, &[6], &command)?;
+            if !args[4].eq_ignore_ascii_case("COUNT") {
+                return Err(Error::Config(format!(
+                    "Redis raw {command} requires an explicit COUNT"
+                )));
+            }
+            let count = parse_raw_positive_usize(args, 5, &command)?;
+            check_raw_item_budget(&command, count)
+        }
+
+        "SET" => expect_raw_min_arity(args, 3, &command),
+        "DEL" | "UNLINK" => {
+            expect_raw_min_arity(args, 2, &command)?;
+            check_raw_item_budget(&command, args.len() - 1)
+        }
+        "INCR" | "DECR" | "PERSIST" | "GETDEL" => expect_raw_arity(args, &[2], &command),
+        "APPEND" | "INCRBY" | "INCRBYFLOAT" | "DECRBY" => expect_raw_arity(args, &[3], &command),
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
+            expect_raw_arity(args, &[3, 4], &command)?;
+            if args.len() == 4
+                && !matches!(
+                    args[3].to_ascii_uppercase().as_str(),
+                    "NX" | "XX" | "GT" | "LT"
+                )
+            {
+                return Err(Error::Config(format!(
+                    "Redis raw {command} accepts only NX, XX, GT, or LT as its condition"
+                )));
+            }
+            Ok(())
+        }
+        "RENAME" | "RENAMENX" => expect_raw_arity(args, &[3], &command),
+        "HSET" => {
+            expect_raw_min_arity(args, 4, &command)?;
+            if !(args.len() - 2).is_multiple_of(2) {
+                return Err(Error::Config(format!(
+                    "Redis raw {command} requires field/value pairs"
+                )));
+            }
+            check_raw_item_budget(&command, (args.len() - 2) / 2)
+        }
+        "HDEL" | "SADD" | "SREM" | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "ZREM" | "XDEL" => {
+            expect_raw_min_arity(args, 3, &command)?;
+            check_raw_item_budget(&command, args.len() - 2)
+        }
+        "HINCRBY" | "HINCRBYFLOAT" | "LSET" | "ZINCRBY" => expect_raw_arity(args, &[4], &command),
+        "LTRIM" => {
+            expect_raw_arity(args, &[4], &command)?;
+            check_raw_index_range(args, 2, 3, &command)
+        }
+        "LPOP" | "RPOP" | "SPOP" => {
+            expect_raw_arity(args, &[2, 3], &command)?;
+            if args.len() == 3 {
+                let count = parse_raw_positive_usize(args, 2, &command)?;
+                check_raw_item_budget(&command, count)?;
+            }
+            Ok(())
+        }
+        "ZADD" => validate_raw_simple_zadd(args, &command),
+        _ => Err(Error::Config(format!(
+            "Redis raw command {command} is not in the adapter allowlist"
+        ))),
     }
+}
+
+fn normalized_raw_command(args: &[String]) -> Result<String> {
+    let raw = args
+        .first()
+        .ok_or_else(|| Error::Config("raw command requires at least one argument".into()))?;
+    if raw.is_empty()
+        || !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(Error::Config(
+            "Redis raw command name must contain only ASCII letters, digits, or underscore".into(),
+        ));
+    }
+    Ok(raw.to_ascii_uppercase())
+}
+
+fn validate_raw_request_size(args: &[String]) -> Result<()> {
+    let mut total = 0_usize;
+    for (index, arg) in args.iter().enumerate() {
+        if arg.len() > RAW_MAX_ARGUMENT_BYTES {
+            return Err(Error::Config(format!(
+                "Redis raw argument {index} exceeds the 1 MiB adapter budget"
+            )));
+        }
+        total = total
+            .checked_add(arg.len())
+            .ok_or_else(|| Error::Config("Redis raw request byte budget overflow".into()))?;
+    }
+    if total > RAW_MAX_REQUEST_BYTES {
+        return Err(Error::Config(
+            "Redis raw request exceeds the 8 MiB adapter budget".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raw_response_budget(value: &redis::Value) -> Result<()> {
+    let mut budget = RawResponseBudget::default();
+    budget.visit(value)
+}
+
+#[derive(Default)]
+struct RawResponseBudget {
+    items: usize,
+    bytes: usize,
+}
+
+impl RawResponseBudget {
+    fn visit(&mut self, value: &redis::Value) -> Result<()> {
+        self.items = self
+            .items
+            .checked_add(1)
+            .ok_or_else(|| Error::Serialization("RESP item budget overflow".into()))?;
+        if self.items > RAW_ADAPTER_ITEM_LIMIT {
+            return Err(Error::Serialization(format!(
+                "RESP response exceeds the adapter item budget {RAW_ADAPTER_ITEM_LIMIT}"
+            )));
+        }
+
+        match value {
+            redis::Value::BulkString(bytes) => self.add_bytes(bytes.len())?,
+            redis::Value::SimpleString(text) | redis::Value::VerbatimString { text, .. } => {
+                self.add_bytes(text.len())?
+            }
+            redis::Value::Array(values)
+            | redis::Value::Set(values)
+            | redis::Value::Push { data: values, .. } => {
+                for value in values {
+                    self.visit(value)?;
+                }
+            }
+            redis::Value::Map(values) => {
+                for (key, value) in values {
+                    self.visit(key)?;
+                    self.visit(value)?;
+                }
+            }
+            redis::Value::Attribute { data, attributes } => {
+                self.visit(data)?;
+                for (key, value) in attributes {
+                    self.visit(key)?;
+                    self.visit(value)?;
+                }
+            }
+            redis::Value::BigNumber(value) => self.add_bytes(value.to_string().len())?,
+            redis::Value::ServerError(error) => {
+                self.add_bytes(format!("{error:?}").len())?;
+            }
+            redis::Value::Nil
+            | redis::Value::Int(_)
+            | redis::Value::Okay
+            | redis::Value::Double(_)
+            | redis::Value::Boolean(_) => {}
+        }
+        Ok(())
+    }
+
+    fn add_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Serialization("RESP byte budget overflow".into()))?;
+        if self.bytes > RAW_MAX_REQUEST_BYTES {
+            return Err(Error::Serialization(
+                "RESP response exceeds the 8 MiB adapter byte budget".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_forbidden_raw_command(command: &str) -> bool {
+    matches!(
+        command,
+        "ACL"
+            | "ASKING"
+            | "AUTH"
+            | "BGREWRITEAOF"
+            | "BGSAVE"
+            | "CLIENT"
+            | "CLUSTER"
+            | "COMMAND"
+            | "CONFIG"
+            | "DEBUG"
+            | "DISCARD"
+            | "DUMP"
+            | "EVAL"
+            | "EVALSHA"
+            | "EVAL_RO"
+            | "EVALSHA_RO"
+            | "EXEC"
+            | "FAILOVER"
+            | "FCALL"
+            | "FCALL_RO"
+            | "FLUSHALL"
+            | "FLUSHDB"
+            | "FUNCTION"
+            | "INFO"
+            | "LATENCY"
+            | "MEMORY"
+            | "MIGRATE"
+            | "MODULE"
+            | "MONITOR"
+            | "MOVE"
+            | "MULTI"
+            | "PSUBSCRIBE"
+            | "PSYNC"
+            | "PUBLISH"
+            | "PUBSUB"
+            | "PUNSUBSCRIBE"
+            | "READONLY"
+            | "READWRITE"
+            | "REPLICAOF"
+            | "RESTORE"
+            | "ROLE"
+            | "SAVE"
+            | "SCRIPT"
+            | "SELECT"
+            | "SHUTDOWN"
+            | "SLOWLOG"
+            | "SLAVEOF"
+            | "SSUBSCRIBE"
+            | "SUBSCRIBE"
+            | "SUNSUBSCRIBE"
+            | "SWAPDB"
+            | "SYNC"
+            | "UNSUBSCRIBE"
+            | "UNWATCH"
+            | "WATCH"
+    )
+}
+
+fn expect_raw_arity(args: &[String], accepted: &[usize], command: &str) -> Result<()> {
+    if accepted.contains(&args.len()) {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "Redis raw {command} received {} argument(s); accepted total argument counts: {accepted:?}",
+            args.len()
+        )))
+    }
+}
+
+fn expect_raw_min_arity(args: &[String], minimum: usize, command: &str) -> Result<()> {
+    if args.len() >= minimum {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "Redis raw {command} requires at least {} argument(s) after the command",
+            minimum - 1
+        )))
+    }
+}
+
+fn check_raw_item_budget(command: &str, count: usize) -> Result<()> {
+    if count == 0 || count > RAW_ADAPTER_ITEM_LIMIT {
+        return Err(Error::Config(format!(
+            "Redis raw {command} item count {count} is outside the adapter range 1..={RAW_ADAPTER_ITEM_LIMIT}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_raw_i64(args: &[String], index: usize, command: &str) -> Result<i64> {
+    args[index].parse::<i64>().map_err(|_| {
+        Error::Config(format!(
+            "Redis raw {command} argument {index} must be an i64 integer"
+        ))
+    })
+}
+
+fn parse_raw_positive_usize(args: &[String], index: usize, command: &str) -> Result<usize> {
+    let value = args[index].parse::<usize>().map_err(|_| {
+        Error::Config(format!(
+            "Redis raw {command} argument {index} must be a positive integer"
+        ))
+    })?;
+    if value == 0 {
+        return Err(Error::Config(format!(
+            "Redis raw {command} argument {index} must be greater than zero"
+        )));
+    }
+    Ok(value)
+}
+
+fn check_raw_index_range(
+    args: &[String],
+    start_index: usize,
+    stop_index: usize,
+    command: &str,
+) -> Result<()> {
+    let start = parse_raw_i64(args, start_index, command)?;
+    let stop = parse_raw_i64(args, stop_index, command)?;
+    if start < 0 || stop < 0 {
+        return Err(Error::Config(format!(
+            "Redis raw {command} rejects negative indexes because the result size depends on remote state"
+        )));
+    }
+    if stop < start {
+        return Ok(());
+    }
+    let count = stop
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| Error::Config(format!("Redis raw {command} range size overflow")))?;
+    check_raw_item_budget(command, count)
+}
+
+fn validate_raw_simple_zadd(args: &[String], command: &str) -> Result<()> {
+    expect_raw_min_arity(args, 4, command)?;
+    if !(args.len() - 2).is_multiple_of(2) {
+        return Err(Error::Config(
+            "Redis raw ZADD accepts only score/member pairs in portable mode".into(),
+        ));
+    }
+    for score_index in (2..args.len()).step_by(2) {
+        let score = args[score_index]
+            .parse::<f64>()
+            .map_err(|_| Error::Config("Redis raw ZADD score must be numeric".into()))?;
+        if !score.is_finite() {
+            return Err(Error::Config("Redis raw ZADD score must be finite".into()));
+        }
+    }
+    check_raw_item_budget(command, (args.len() - 2) / 2)
 }
 
 fn redis_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
@@ -962,55 +1342,88 @@ fn checked_deadline(timeout: std::time::Duration) -> Result<Instant> {
     })
 }
 
-fn redis_value_to_core(value: redis::Value) -> Value {
-    match value {
+fn redis_value_to_core(value: redis::Value) -> Result<Value> {
+    Ok(match value {
         redis::Value::Nil => Value::Null,
         redis::Value::Int(value) => Value::Int(value),
         redis::Value::BulkString(bytes) => bytes_to_value(bytes),
-        redis::Value::Array(values) | redis::Value::Set(values) => {
-            Value::Array(values.into_iter().map(redis_value_to_core).collect())
+        redis::Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(redis_value_to_core)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        redis::Value::Set(_) => {
+            return Err(Error::Serialization(
+                "RESP set values cannot preserve set identity in the portable Value model; use a dedicated bounded command"
+                    .into(),
+            ))
         }
         redis::Value::SimpleString(value) => Value::Text(value),
         redis::Value::Okay => Value::Text("OK".to_owned()),
-        redis::Value::Map(values) => redis_pairs_to_map(values),
+        redis::Value::Map(values) => redis_pairs_to_map(values)?,
         redis::Value::Attribute { data, attributes } => {
             let mut map = BTreeMap::new();
-            map.insert("data".to_owned(), redis_value_to_core(*data));
-            map.insert("attributes".to_owned(), redis_pairs_to_map(attributes));
+            map.insert("data".to_owned(), redis_value_to_core(*data)?);
+            map.insert("attributes".to_owned(), redis_pairs_to_map(attributes)?);
             Value::Map(map)
         }
-        redis::Value::Double(value) => Value::Float(value),
+        redis::Value::Double(value) if value.is_finite() => Value::Float(value),
+        redis::Value::Double(_) => {
+            return Err(Error::Serialization(
+                "RESP double is non-finite and cannot be represented portably".into(),
+            ))
+        }
         redis::Value::Boolean(value) => Value::Bool(value),
-        redis::Value::VerbatimString { text, .. } => Value::Text(text),
-        redis::Value::BigNumber(value) => Value::Text(value.to_string()),
-        redis::Value::Push { kind, data } => {
-            let mut map = BTreeMap::new();
-            map.insert("kind".to_owned(), Value::Text(format!("{kind:?}")));
-            map.insert(
-                "data".to_owned(),
-                Value::Array(data.into_iter().map(redis_value_to_core).collect()),
-            );
-            Value::Map(map)
+        redis::Value::VerbatimString { .. } => {
+            return Err(Error::Serialization(
+                "RESP verbatim strings carry a format tag that the portable Value model cannot preserve"
+                    .into(),
+            ))
         }
-        redis::Value::ServerError(error) => Value::Text(format!("{error:?}")),
+        redis::Value::BigNumber(_) => {
+            return Err(Error::Serialization(
+                "RESP big numbers exceed the portable Value integer contract".into(),
+            ))
+        }
+        redis::Value::Push { .. } => {
+            return Err(Error::Serialization(
+                "RESP push values are connection-mode events and are forbidden in kv raw".into(),
+            ))
+        }
+        redis::Value::ServerError(error) => {
+            return Err(Error::Query(format!("Redis server error: {error:?}")))
+        }
+    })
+}
+
+fn redis_pairs_to_map(values: Vec<(redis::Value, redis::Value)>) -> Result<Value> {
+    let mut map = BTreeMap::new();
+    for (raw_key, raw_value) in values {
+        let key = redis_key_to_string(raw_key)?;
+        let value = redis_value_to_core(raw_value)?;
+        if map.insert(key.clone(), value).is_some() {
+            return Err(Error::Serialization(format!(
+                "RESP map contains duplicate portable key {key:?}"
+            )));
+        }
     }
+    Ok(Value::Map(map))
 }
 
-fn redis_pairs_to_map(values: Vec<(redis::Value, redis::Value)>) -> Value {
-    let map = values
-        .into_iter()
-        .map(|(key, value)| (redis_key_to_string(key), redis_value_to_core(value)))
-        .collect();
-    Value::Map(map)
-}
-
-fn redis_key_to_string(value: redis::Value) -> String {
-    match redis_value_to_core(value) {
-        Value::Text(value) => value,
-        Value::Int(value) => value.to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Float(value) => value.to_string(),
-        other => serde_json::to_string(&other).unwrap_or_else(|_| "<non-string-key>".to_owned()),
+fn redis_key_to_string(value: redis::Value) -> Result<String> {
+    match value {
+        redis::Value::SimpleString(value) => Ok(value),
+        redis::Value::BulkString(bytes) => String::from_utf8(bytes).map_err(|_| {
+            Error::Serialization(
+                "RESP map contains a non-UTF-8 bulk-string key that cannot be represented portably"
+                    .into(),
+            )
+        }),
+        redis::Value::Okay => Ok("OK".to_owned()),
+        _ => Err(Error::Serialization(
+            "RESP map key is not a portable UTF-8 string".into(),
+        )),
     }
 }
 
@@ -1038,12 +1451,48 @@ mod tests {
     }
 
     #[test]
-    fn raw_command_validation_blocks_global_destructive_commands() {
+    fn raw_command_validation_is_fail_closed_and_bounded() {
+        for forbidden in [
+            "FLUSHALL",
+            "SELECT",
+            "EVAL",
+            "FUNCTION",
+            "FCALL",
+            "MULTI",
+            "MIGRATE",
+            "RESTORE",
+            "SUBSCRIBE",
+        ] {
+            assert!(matches!(
+                validate_raw_command(&[forbidden.to_owned()]),
+                Err(Error::Config(_))
+            ));
+        }
         assert!(matches!(
-            validate_raw_command(&["FLUSHALL".to_owned()]),
-            Err(Error::WriteNotAllowed)
+            validate_raw_command(&["UNKNOWN_COMMAND".to_owned()]),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            validate_raw_command(&["KEYS".to_owned(), "*".to_owned()]),
+            Err(Error::Config(_))
         ));
         assert!(validate_raw_command(&["XLEN".to_owned(), "stream".to_owned()]).is_ok());
+        assert!(validate_raw_command(&[
+            "XRANGE".to_owned(),
+            "stream".to_owned(),
+            "-".to_owned(),
+            "+".to_owned(),
+            "COUNT".to_owned(),
+            "10".to_owned(),
+        ])
+        .is_ok());
+        assert!(validate_raw_command(&[
+            "LRANGE".to_owned(),
+            "list".to_owned(),
+            "-1".to_owned(),
+            "-1".to_owned(),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1184,17 +1633,82 @@ mod tests {
         let value = redis_value_to_core(redis::Value::Array(vec![
             redis::Value::Int(42),
             redis::Value::BulkString(b"hello".to_vec()),
+            redis::Value::BulkString(vec![0, 255]),
             redis::Value::Boolean(true),
-        ]));
+        ]))
+        .unwrap();
 
         assert_eq!(
             value,
             Value::Array(vec![
                 Value::Int(42),
                 Value::Text("hello".to_owned()),
+                Value::Bytes(vec![0, 255]),
                 Value::Bool(true),
             ])
         );
+    }
+
+    #[test]
+    fn redis_maps_reject_nonportable_or_colliding_keys() {
+        assert!(matches!(
+            redis_value_to_core(redis::Value::Map(vec![(
+                redis::Value::BulkString(vec![0xff]),
+                redis::Value::Int(1),
+            )])),
+            Err(Error::Serialization(message)) if message.contains("non-UTF-8")
+        ));
+        assert!(matches!(
+            redis_value_to_core(redis::Value::Map(vec![(
+                redis::Value::Int(1),
+                redis::Value::Int(1),
+            )])),
+            Err(Error::Serialization(message)) if message.contains("map key")
+        ));
+        assert!(matches!(
+            redis_value_to_core(redis::Value::Map(vec![
+                (
+                    redis::Value::SimpleString("same".into()),
+                    redis::Value::Int(1),
+                ),
+                (
+                    redis::Value::BulkString(b"same".to_vec()),
+                    redis::Value::Int(2),
+                ),
+            ])),
+            Err(Error::Serialization(message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn redis_protocol_shapes_without_portable_identity_are_errors() {
+        assert!(matches!(
+            redis_value_to_core(redis::Value::Set(vec![redis::Value::Int(1)])),
+            Err(Error::Serialization(message)) if message.contains("set values")
+        ));
+        assert!(matches!(
+            redis_value_to_core(redis::Value::BigNumber("123".parse().unwrap())),
+            Err(Error::Serialization(message)) if message.contains("big numbers")
+        ));
+    }
+
+    #[test]
+    fn raw_response_budget_rejects_oversized_bytes_and_collections() {
+        assert!(matches!(
+            validate_raw_response_budget(&redis::Value::BulkString(vec![
+                0;
+                RAW_MAX_REQUEST_BYTES + 1
+            ])),
+            Err(Error::Serialization(message)) if message.contains("byte budget")
+        ));
+        assert!(matches!(
+            validate_raw_response_budget(&redis::Value::Array(
+                (0..RAW_ADAPTER_ITEM_LIMIT)
+                    .map(|_| redis::Value::Nil)
+                    .collect()
+            )),
+            Err(Error::Serialization(message)) if message.contains("item budget")
+        ));
     }
 
     #[test]

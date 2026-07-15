@@ -89,7 +89,12 @@ seed_redis_commands() {
   while IFS= read -r command || [[ -n "$command" ]]; do
     [[ -z "$command" || "$command" == \#* ]] && continue
     read -r -a args <<<"$command"
-    run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --allow-write kv raw "${args[@]}" >/dev/null
+    if [[ "${args[0]}" != "SET" || "${#args[@]}" -ne 3 ]]; then
+      echo "unsupported Redis fixture command: $command" >&2
+      return 1
+    fi
+    run_dbtool --dsn "$DBTOOL_IT_REDIS_DSN" --allow-write \
+      kv set "${args[1]}" "${args[2]}" >/dev/null
   done <"$file"
 }
 

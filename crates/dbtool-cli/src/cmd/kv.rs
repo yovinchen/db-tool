@@ -1,6 +1,15 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{error::Error, port::capability::SetOptions, service::ResultLimiter, Result};
+use dbtool_core::{
+    error::Error,
+    model::{decode_canonical_base64, Value},
+    port::capability::SetOptions,
+    service::{ResultLimiter, SafetyGuard},
+    Result,
+};
+
+const MAX_RAW_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_RAW_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Args)]
 pub struct KvCmd {
@@ -10,17 +19,20 @@ pub struct KvCmd {
 
 #[derive(Subcommand)]
 pub enum KvAction {
-    /// Read one key and return its UTF-8 value when present.
+    /// Read one key and return its exact bytes plus optional UTF-8 text.
     Get {
         /// Key name to read.
         key: String,
     },
-    /// Write one string value, optionally with a TTL or only when absent.
+    /// Write one text or canonical-base64 value, optionally with a TTL.
     Set {
         /// Key name to write.
         key: String,
-        /// String value to store.
-        value: String,
+        /// UTF-8 text value to store. Mutually exclusive with --value-base64.
+        value: Option<String>,
+        /// Canonical RFC 4648 base64 bytes to store.
+        #[arg(long, value_name = "BASE64")]
+        value_base64: Option<String>,
         /// Expiration time in seconds.
         #[arg(long)]
         ttl: Option<u64>,
@@ -39,7 +51,7 @@ pub enum KvAction {
         /// Key names to delete.
         keys: Vec<String>,
     },
-    /// Send a raw command, e.g.: dbtool kv raw XLEN mystream
+    /// Send one explicitly allowlisted, bounded raw Redis command.
     Raw {
         /// Raw command name followed by its arguments.
         args: Vec<String>,
@@ -47,22 +59,53 @@ pub enum KvAction {
 }
 
 pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
+    // Prepare every caller-controlled value and command policy before DSN
+    // resolution or network access. Invalid base64 and unsafe raw commands are
+    // configuration errors even when the target is unavailable.
+    let prepared_set = match &cmd.action {
+        KvAction::Set {
+            value,
+            value_base64,
+            ..
+        } => Some(prepare_set_value(
+            value.as_deref(),
+            value_base64.as_deref(),
+        )?),
+        _ => None,
+    };
+    let raw_plan = match &cmd.action {
+        KvAction::Raw { args } => Some(classify_raw_command(args, ctx.limit)?),
+        _ => None,
+    };
+
     match &cmd.action {
         KvAction::Set { .. } | KvAction::Del { .. } => ensure_write_allowed(ctx)?,
-        KvAction::Raw { args } => {
-            let Some(command) = args.first() else {
-                return Err(Error::Config(
-                    "raw command requires at least one argument".into(),
-                ));
-            };
-            if !is_readonly_raw_command(command) {
-                ensure_write_allowed(ctx)?;
-            }
+        KvAction::Raw { .. } if raw_plan.as_ref().is_some_and(RawCommandPlan::is_mutation) => {
+            ensure_write_allowed(ctx)?;
         }
-        KvAction::Get { .. } | KvAction::Scan { .. } => {}
+        KvAction::Get { .. } | KvAction::Scan { .. } | KvAction::Raw { .. } => {}
     }
 
     let dsn = ctx.resolve_dsn()?;
+    if let Some(plan) = raw_plan.as_ref().filter(|plan| plan.is_mutation()) {
+        let scope = SafetyGuard::confirmation_scope_digest(&(
+            plan.command.as_str(),
+            plan.target.as_deref(),
+            match &cmd.action {
+                KvAction::Raw { args } => args.as_slice(),
+                _ => &[],
+            },
+        ))?;
+        SafetyGuard::check_destructive_operation_with_scope(
+            "redis_raw_mutation",
+            &plan.resource_label(),
+            &ctx.safety_target(&dsn),
+            &scope,
+            ctx.allow_write,
+            ctx.confirm.as_deref(),
+        )?;
+    }
+
     let conn = ctx.registry.connect(&dsn).await?;
     let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
         kind: conn.kind().0.clone(),
@@ -75,22 +118,38 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
 
     Ok(match cmd.action {
         KvAction::Get { key } => {
-            let val = kv.get(&key).await?;
-            let s = val.map(|b| String::from_utf8_lossy(&b).into_owned());
+            let value = kv.get(&key).await?;
+            let (value, value_bytes, encoding) = match value {
+                Some(bytes) => {
+                    let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
+                    let encoding = if text.is_some() { "utf8" } else { "binary" };
+                    (text, Some(Value::Bytes(bytes.to_vec())), Some(encoding))
+                }
+                None => (None, None, None),
+            };
             ctx.render_success(
                 &kind,
-                serde_json::json!({"key": key, "value": s}),
+                serde_json::json!({
+                    "key": key,
+                    "value": value,
+                    "value_bytes": value_bytes,
+                    "encoding": encoding,
+                }),
                 elapsed(),
                 false,
             )
         }
         KvAction::Set {
             key,
-            value,
+            value: _,
+            value_base64: _,
             ttl,
             nx,
         } => {
-            kv.set(&key, value.as_bytes(), SetOptions { ttl_secs: ttl, nx })
+            let value = prepared_set
+                .as_deref()
+                .ok_or_else(|| Error::Internal("prepared KV value is missing".into()))?;
+            kv.set(&key, value, SetOptions { ttl_secs: ttl, nx })
                 .await?;
             ctx.render_success(&kind, serde_json::json!({"ok": true}), elapsed(), false)
         }
@@ -111,6 +170,449 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
     })
 }
 
+fn prepare_set_value(value: Option<&str>, value_base64: Option<&str>) -> Result<Vec<u8>> {
+    match (value, value_base64) {
+        (Some(_), Some(_)) => Err(Error::Config(
+            "kv set accepts exactly one of positional VALUE or --value-base64".into(),
+        )),
+        (None, None) => Err(Error::Config(
+            "kv set requires positional VALUE or --value-base64".into(),
+        )),
+        (Some(value), None) => Ok(value.as_bytes().to_vec()),
+        (None, Some(value)) => decode_canonical_base64(value)
+            .map_err(|error| Error::Config(format!("invalid --value-base64: {error}"))),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawCommandAccess {
+    ReadOnly,
+    Mutation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawCommandPlan {
+    command: String,
+    access: RawCommandAccess,
+    target: Option<String>,
+}
+
+impl RawCommandPlan {
+    fn readonly(command: String) -> Self {
+        Self {
+            command,
+            access: RawCommandAccess::ReadOnly,
+            target: None,
+        }
+    }
+
+    fn mutation(command: String, target: String) -> Self {
+        Self {
+            command,
+            access: RawCommandAccess::Mutation,
+            target: Some(target),
+        }
+    }
+
+    fn is_mutation(&self) -> bool {
+        self.access == RawCommandAccess::Mutation
+    }
+
+    fn resource_label(&self) -> String {
+        match self.target.as_deref() {
+            Some(target) => format!("{}:{target}", self.command),
+            None => self.command.clone(),
+        }
+    }
+}
+
+fn classify_raw_command(args: &[String], limit: usize) -> Result<RawCommandPlan> {
+    if limit == 0 {
+        return Err(Error::Config(
+            "global --limit must be greater than zero for kv raw".into(),
+        ));
+    }
+    validate_raw_request_size(args)?;
+    let command = normalized_raw_command(args)?;
+
+    if is_forbidden_raw_command(&command) {
+        return Err(Error::Config(format!(
+            "Redis raw command {command} is forbidden by the portable safety policy"
+        )));
+    }
+
+    match command.as_str() {
+        "PING" => expect_arity(args, &[1, 2], &command),
+        "ECHO" => expect_arity(args, &[2], &command),
+        "GET" | "TTL" | "PTTL" | "TYPE" | "STRLEN" | "HLEN" | "LLEN" | "SCARD" | "ZCARD"
+        | "XLEN" => expect_arity(args, &[2], &command),
+        "DBSIZE" | "TIME" | "LASTSAVE" => expect_arity(args, &[1], &command),
+        "HGET" | "HEXISTS" | "SISMEMBER" | "ZSCORE" => expect_arity(args, &[3], &command),
+        "LINDEX" => {
+            expect_arity(args, &[3], &command)?;
+            parse_i64_arg(args, 2, &command)?;
+            Ok(())
+        }
+        "MGET" | "EXISTS" => {
+            expect_min_arity(args, 2, &command)?;
+            check_item_budget(&command, args.len() - 1, limit)
+        }
+        "HMGET" => {
+            expect_min_arity(args, 3, &command)?;
+            check_item_budget(&command, args.len() - 2, limit)
+        }
+        "LRANGE" => {
+            expect_arity(args, &[4], &command)?;
+            check_index_range_budget(args, 2, 3, &command, limit)
+        }
+        "ZRANGE" | "ZREVRANGE" => {
+            expect_arity(args, &[4, 5], &command)?;
+            if args.len() == 5 && !args[4].eq_ignore_ascii_case("WITHSCORES") {
+                return Err(Error::Config(format!(
+                    "kv raw {command} permits only the optional WITHSCORES modifier; use a dedicated bounded command for other modes"
+                )));
+            }
+            check_index_range_budget(args, 2, 3, &command, limit)
+        }
+        "SRANDMEMBER" => {
+            expect_arity(args, &[2, 3], &command)?;
+            if args.len() == 3 {
+                let count = parse_i64_arg(args, 2, &command)?;
+                let count = count.checked_abs().ok_or_else(|| {
+                    Error::Config(format!("kv raw {command} count is outside the i64 range"))
+                })?;
+                check_item_budget(&command, count as usize, limit)?;
+            }
+            Ok(())
+        }
+        "XRANGE" | "XREVRANGE" => {
+            expect_arity(args, &[6], &command)?;
+            if !args[4].eq_ignore_ascii_case("COUNT") {
+                return Err(Error::Config(format!(
+                    "kv raw {command} requires an explicit COUNT bounded by global --limit"
+                )));
+            }
+            let count = parse_positive_usize_arg(args, 5, &command)?;
+            check_item_budget(&command, count, limit)
+        }
+
+        "SET" => expect_min_arity(args, 3, &command),
+        "DEL" | "UNLINK" => {
+            expect_min_arity(args, 2, &command)?;
+            check_item_budget(&command, args.len() - 1, limit)
+        }
+        "INCR" | "DECR" | "PERSIST" | "GETDEL" => expect_arity(args, &[2], &command),
+        "APPEND" | "INCRBY" | "INCRBYFLOAT" | "DECRBY" => expect_arity(args, &[3], &command),
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
+            expect_arity(args, &[3, 4], &command)?;
+            if args.len() == 4
+                && !matches!(
+                    args[3].to_ascii_uppercase().as_str(),
+                    "NX" | "XX" | "GT" | "LT"
+                )
+            {
+                return Err(Error::Config(format!(
+                    "kv raw {command} accepts only NX, XX, GT, or LT as its condition"
+                )));
+            }
+            Ok(())
+        }
+        "RENAME" | "RENAMENX" => expect_arity(args, &[3], &command),
+        "HSET" => {
+            expect_min_arity(args, 4, &command)?;
+            if !(args.len() - 2).is_multiple_of(2) {
+                return Err(Error::Config(format!(
+                    "kv raw {command} requires field/value pairs"
+                )));
+            }
+            check_item_budget(&command, (args.len() - 2) / 2, limit)
+        }
+        "HDEL" | "SADD" | "SREM" | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "ZREM" | "XDEL" => {
+            expect_min_arity(args, 3, &command)?;
+            check_item_budget(&command, args.len() - 2, limit)
+        }
+        "HINCRBY" | "HINCRBYFLOAT" | "LSET" | "ZINCRBY" => expect_arity(args, &[4], &command),
+        "LTRIM" => {
+            expect_arity(args, &[4], &command)?;
+            check_index_range_budget(args, 2, 3, &command, limit)
+        }
+        "LPOP" | "RPOP" | "SPOP" => {
+            expect_arity(args, &[2, 3], &command)?;
+            if args.len() == 3 {
+                let count = parse_positive_usize_arg(args, 2, &command)?;
+                check_item_budget(&command, count, limit)?;
+            }
+            Ok(())
+        }
+        "ZADD" => validate_simple_zadd(args, &command, limit),
+        _ => {
+            return Err(Error::Config(format!(
+                "Redis raw command {command} is not in the portable allowlist"
+            )))
+        }
+    }?;
+
+    if is_raw_mutation(&command) {
+        Ok(RawCommandPlan::mutation(command, raw_mutation_target(args)))
+    } else {
+        Ok(RawCommandPlan::readonly(command))
+    }
+}
+
+fn normalized_raw_command(args: &[String]) -> Result<String> {
+    let raw = args
+        .first()
+        .ok_or_else(|| Error::Config("raw command requires at least one argument".into()))?;
+    if raw.is_empty()
+        || !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(Error::Config(
+            "Redis raw command name must contain only ASCII letters, digits, or underscore".into(),
+        ));
+    }
+    Ok(raw.to_ascii_uppercase())
+}
+
+fn validate_raw_request_size(args: &[String]) -> Result<()> {
+    let mut total = 0_usize;
+    for (index, arg) in args.iter().enumerate() {
+        if arg.len() > MAX_RAW_ARGUMENT_BYTES {
+            return Err(Error::Config(format!(
+                "kv raw argument {index} exceeds the 1 MiB safety budget"
+            )));
+        }
+        total = total
+            .checked_add(arg.len())
+            .ok_or_else(|| Error::Config("kv raw request byte budget overflow".into()))?;
+    }
+    if total > MAX_RAW_REQUEST_BYTES {
+        return Err(Error::Config(
+            "kv raw request exceeds the 8 MiB safety budget".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_forbidden_raw_command(command: &str) -> bool {
+    matches!(
+        command,
+        "ACL"
+            | "ASKING"
+            | "AUTH"
+            | "BGREWRITEAOF"
+            | "BGSAVE"
+            | "CLIENT"
+            | "CLUSTER"
+            | "COMMAND"
+            | "CONFIG"
+            | "DEBUG"
+            | "DISCARD"
+            | "DUMP"
+            | "EVAL"
+            | "EVALSHA"
+            | "EVAL_RO"
+            | "EVALSHA_RO"
+            | "EXEC"
+            | "FAILOVER"
+            | "FCALL"
+            | "FCALL_RO"
+            | "FLUSHALL"
+            | "FLUSHDB"
+            | "FUNCTION"
+            | "INFO"
+            | "LATENCY"
+            | "MEMORY"
+            | "MIGRATE"
+            | "MODULE"
+            | "MONITOR"
+            | "MOVE"
+            | "MULTI"
+            | "PSUBSCRIBE"
+            | "PSYNC"
+            | "PUBLISH"
+            | "PUBSUB"
+            | "PUNSUBSCRIBE"
+            | "READONLY"
+            | "READWRITE"
+            | "REPLICAOF"
+            | "RESTORE"
+            | "ROLE"
+            | "SAVE"
+            | "SCRIPT"
+            | "SELECT"
+            | "SHUTDOWN"
+            | "SLOWLOG"
+            | "SLAVEOF"
+            | "SSUBSCRIBE"
+            | "SUBSCRIBE"
+            | "SUNSUBSCRIBE"
+            | "SWAPDB"
+            | "SYNC"
+            | "UNSUBSCRIBE"
+            | "UNWATCH"
+            | "WATCH"
+    )
+}
+
+fn is_raw_mutation(command: &str) -> bool {
+    matches!(
+        command,
+        "SET"
+            | "DEL"
+            | "UNLINK"
+            | "INCR"
+            | "DECR"
+            | "PERSIST"
+            | "GETDEL"
+            | "APPEND"
+            | "INCRBY"
+            | "INCRBYFLOAT"
+            | "DECRBY"
+            | "EXPIRE"
+            | "PEXPIRE"
+            | "EXPIREAT"
+            | "PEXPIREAT"
+            | "RENAME"
+            | "RENAMENX"
+            | "HSET"
+            | "HDEL"
+            | "SADD"
+            | "SREM"
+            | "LPUSH"
+            | "RPUSH"
+            | "LPUSHX"
+            | "RPUSHX"
+            | "ZREM"
+            | "XDEL"
+            | "HINCRBY"
+            | "HINCRBYFLOAT"
+            | "LSET"
+            | "ZINCRBY"
+            | "LTRIM"
+            | "LPOP"
+            | "RPOP"
+            | "SPOP"
+            | "ZADD"
+    )
+}
+
+fn raw_mutation_target(args: &[String]) -> String {
+    match args.first().map(|command| command.to_ascii_uppercase()) {
+        Some(command) if matches!(command.as_str(), "RENAME" | "RENAMENX") => {
+            format!("{} -> {}", args[1], args[2])
+        }
+        Some(command) if matches!(command.as_str(), "DEL" | "UNLINK") => {
+            format!("{} key(s), first={}", args.len() - 1, args[1])
+        }
+        _ => args.get(1).cloned().unwrap_or_else(|| "<none>".into()),
+    }
+}
+
+fn expect_arity(args: &[String], accepted: &[usize], command: &str) -> Result<()> {
+    if accepted.contains(&args.len()) {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "kv raw {command} received {} argument(s); accepted total argument counts: {accepted:?}",
+        args.len()
+    )))
+}
+
+fn expect_min_arity(args: &[String], minimum: usize, command: &str) -> Result<()> {
+    if args.len() >= minimum {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "kv raw {command} requires at least {} argument(s) after the command",
+            minimum - 1
+        )))
+    }
+}
+
+fn check_item_budget(command: &str, count: usize, limit: usize) -> Result<()> {
+    if count == 0 {
+        return Err(Error::Config(format!(
+            "kv raw {command} requires at least one item"
+        )));
+    }
+    if count > limit {
+        return Err(Error::Config(format!(
+            "kv raw {command} requests {count} item(s), exceeding global --limit {limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_i64_arg(args: &[String], index: usize, command: &str) -> Result<i64> {
+    args[index].parse::<i64>().map_err(|_| {
+        Error::Config(format!(
+            "kv raw {command} argument {} must be an i64 integer",
+            index
+        ))
+    })
+}
+
+fn parse_positive_usize_arg(args: &[String], index: usize, command: &str) -> Result<usize> {
+    let value = args[index].parse::<usize>().map_err(|_| {
+        Error::Config(format!(
+            "kv raw {command} argument {} must be a positive integer",
+            index
+        ))
+    })?;
+    if value == 0 {
+        return Err(Error::Config(format!(
+            "kv raw {command} argument {} must be greater than zero",
+            index
+        )));
+    }
+    Ok(value)
+}
+
+fn check_index_range_budget(
+    args: &[String],
+    start_index: usize,
+    stop_index: usize,
+    command: &str,
+    limit: usize,
+) -> Result<()> {
+    let start = parse_i64_arg(args, start_index, command)?;
+    let stop = parse_i64_arg(args, stop_index, command)?;
+    if start < 0 || stop < 0 {
+        return Err(Error::Config(format!(
+            "kv raw {command} rejects negative indexes because their result size depends on remote collection length"
+        )));
+    }
+    if stop < start {
+        return Ok(());
+    }
+    let count = stop
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| Error::Config(format!("kv raw {command} range size overflow")))?;
+    check_item_budget(command, count, limit)
+}
+
+fn validate_simple_zadd(args: &[String], command: &str, limit: usize) -> Result<()> {
+    expect_min_arity(args, 4, command)?;
+    if !(args.len() - 2).is_multiple_of(2) {
+        return Err(Error::Config(
+            "kv raw ZADD accepts only score/member pairs in portable mode".into(),
+        ));
+    }
+    for score_index in (2..args.len()).step_by(2) {
+        let score = args[score_index]
+            .parse::<f64>()
+            .map_err(|_| Error::Config("kv raw ZADD score must be numeric".into()))?;
+        if !score.is_finite() {
+            return Err(Error::Config("kv raw ZADD score must be finite".into()));
+        }
+    }
+    check_item_budget(command, (args.len() - 2) / 2, limit)
+}
+
 fn limit_scan_keys(mut keys: Vec<String>, limit: usize) -> (Vec<String>, bool) {
     let truncated = keys.len() > limit;
     keys.truncate(limit);
@@ -121,64 +623,143 @@ fn ensure_write_allowed(ctx: &Context) -> Result<()> {
     ctx.ensure_write_allowed()
 }
 
-fn is_readonly_raw_command(command: &str) -> bool {
-    matches!(
-        command.to_ascii_uppercase().as_str(),
-        "PING"
-            | "ECHO"
-            | "GET"
-            | "MGET"
-            | "EXISTS"
-            | "TTL"
-            | "PTTL"
-            | "TYPE"
-            | "STRLEN"
-            | "DBSIZE"
-            | "SCAN"
-            | "KEYS"
-            | "HGET"
-            | "HMGET"
-            | "HGETALL"
-            | "HEXISTS"
-            | "HLEN"
-            | "HKEYS"
-            | "HVALS"
-            | "LLEN"
-            | "LRANGE"
-            | "LINDEX"
-            | "SCARD"
-            | "SISMEMBER"
-            | "SMEMBERS"
-            | "SRANDMEMBER"
-            | "ZCARD"
-            | "ZRANGE"
-            | "ZREVRANGE"
-            | "ZSCORE"
-            | "XLEN"
-            | "XRANGE"
-            | "XREVRANGE"
-            | "XINFO"
-            | "XREAD"
-            | "PUBSUB"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbtool_core::service::formatter::Format;
 
-    #[test]
-    fn readonly_raw_commands_do_not_need_write_flag() {
-        assert!(is_readonly_raw_command("ping"));
-        assert!(is_readonly_raw_command("GET"));
-        assert!(is_readonly_raw_command("xinfo"));
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn test_context(allow_write: bool) -> Context {
+        Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: Some("redis://127.0.0.1:1/0".to_owned()),
+            format: Format::Json,
+            limit: 2,
+            throttle_overrides: Default::default(),
+            allow_write,
+            confirm: None,
+        }
     }
 
     #[test]
-    fn mutating_raw_commands_need_write_flag() {
-        assert!(!is_readonly_raw_command("set"));
-        assert!(!is_readonly_raw_command("incr"));
-        assert!(!is_readonly_raw_command("xadd"));
+    fn set_values_are_exclusive_and_base64_is_strict() {
+        assert_eq!(prepare_set_value(Some("hello"), None).unwrap(), b"hello");
+        assert_eq!(prepare_set_value(None, Some("AP8=")).unwrap(), [0, 255]);
+        assert_eq!(prepare_set_value(None, Some("")).unwrap(), Vec::<u8>::new());
+        assert!(matches!(
+            prepare_set_value(Some("hello"), Some("aGVsbG8=")),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            prepare_set_value(None, None),
+            Err(Error::Config(_))
+        ));
+        for invalid in ["aGVsbG8", "AB==", "aGVsbG8===", "aGVs bG8="] {
+            assert!(matches!(
+                prepare_set_value(None, Some(invalid)),
+                Err(Error::Config(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_base64_fails_before_connecting() {
+        let error = run(
+            &test_context(true),
+            KvCmd {
+                action: KvAction::Set {
+                    key: "key".into(),
+                    value: None,
+                    value_base64: Some("not-base64".into()),
+                    ttl: None,
+                    nx: false,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("base64")));
+    }
+
+    #[test]
+    fn raw_policy_has_three_fail_closed_classes() {
+        assert_eq!(
+            classify_raw_command(&strings(&["GET", "key"]), 2)
+                .unwrap()
+                .access,
+            RawCommandAccess::ReadOnly
+        );
+        assert_eq!(
+            classify_raw_command(&strings(&["SET", "key", "value"]), 2)
+                .unwrap()
+                .access,
+            RawCommandAccess::Mutation
+        );
+        for command in [
+            "FLUSHALL",
+            "SELECT",
+            "EVAL",
+            "FUNCTION",
+            "MULTI",
+            "SUBSCRIBE",
+            "MIGRATE",
+        ] {
+            assert!(matches!(
+                classify_raw_command(&strings(&[command]), 2),
+                Err(Error::Config(_))
+            ));
+        }
+        assert!(matches!(
+            classify_raw_command(&strings(&["TOTALLY_UNKNOWN"]), 2),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn raw_collection_reads_are_bounded_before_connecting() {
+        assert!(classify_raw_command(&strings(&["MGET", "one", "two"]), 2).is_ok());
+        assert!(matches!(
+            classify_raw_command(&strings(&["MGET", "one", "two", "three"]), 2),
+            Err(Error::Config(message)) if message.contains("--limit")
+        ));
+        assert!(classify_raw_command(&strings(&["LRANGE", "list", "0", "1"]), 2).is_ok());
+        assert!(classify_raw_command(&strings(&["LRANGE", "list", "-1", "-1"]), 2).is_err());
+        for unbounded in ["KEYS", "HGETALL", "SMEMBERS", "SCAN", "XREAD"] {
+            assert!(classify_raw_command(&strings(&[unbounded, "*"]), 2).is_err());
+        }
+    }
+
+    #[test]
+    fn raw_mutation_confirmation_binds_all_arguments_and_target() {
+        let args = strings(&["SET", "key", "first"]);
+        let plan = classify_raw_command(&args, 2).unwrap();
+        let first = SafetyGuard::confirmation_scope_digest(&(
+            plan.command.as_str(),
+            plan.target.as_deref(),
+            args.as_slice(),
+        ))
+        .unwrap();
+        let changed_args = strings(&["SET", "key", "second"]);
+        let changed = SafetyGuard::confirmation_scope_digest(&(
+            plan.command.as_str(),
+            plan.target.as_deref(),
+            changed_args.as_slice(),
+        ))
+        .unwrap();
+        let changed_target_args = strings(&["SET", "other", "first"]);
+        let changed_target_plan = classify_raw_command(&changed_target_args, 2).unwrap();
+        let changed_target = SafetyGuard::confirmation_scope_digest(&(
+            changed_target_plan.command.as_str(),
+            changed_target_plan.target.as_deref(),
+            changed_target_args.as_slice(),
+        ))
+        .unwrap();
+        assert_ne!(first, changed);
+        assert_ne!(first, changed_target);
     }
 
     #[test]

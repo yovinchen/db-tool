@@ -19,4 +19,4 @@ pub use meta::{
 pub use result::{ExecOutcome, ResultSet};
 pub use search::{SearchDeleteIndexOutcome, SearchDocument, SearchHits, SearchWriteOutcome};
 pub use series::{Point, SeriesSet, TimeRange};
-pub use value::Value;
+pub use value::{decode_canonical_base64, Value};

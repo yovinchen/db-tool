@@ -128,11 +128,14 @@ fn cli_help_documents_core_command_families() {
 
     let kv_help = stdout_text(&dbtool(&["kv", "--help"]));
     assert!(kv_help.contains("Read one key"));
-    assert!(kv_help.contains("Write one string value"));
+    assert!(kv_help.contains("Write one text or canonical-base64 value"));
     assert!(kv_help.contains("Scan keys matching a pattern"));
     assert!(kv_help.contains("Delete one or more keys"));
+    assert!(kv_help.contains("allowlisted, bounded raw Redis command"));
     let kv_set_help = stdout_text(&dbtool(&["kv", "set", "--help"]));
     assert!(kv_set_help.contains("--nx"));
+    assert!(kv_set_help.contains("--value-base64"));
+    assert!(kv_set_help.contains("Canonical RFC 4648 base64"));
 
     let doc_help = stdout_text(&dbtool(&["doc", "--help"]));
     assert!(doc_help.contains("List document collections"));
@@ -158,7 +161,7 @@ fn cli_help_documents_core_command_families() {
 
     let mq_help = stdout_text(&dbtool(&["mq", "--help"]));
     assert!(mq_help.contains("Kafka-compatible"));
-    assert!(mq_help.contains("consume is always bounded"));
+    assert!(mq_help.contains("Consume messages (always bounded)"));
 
     let conn_help = stdout_text(&dbtool(&["conn", "--help"]));
     assert!(conn_help.contains("DBTOOL_CONN_*"));

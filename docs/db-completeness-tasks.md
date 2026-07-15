@@ -33,7 +33,7 @@ successful service run are intentionally different states.
 | --- | --- |
 | SQL | ping/caps, schemas/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/index metadata, typed values, limit/truncation, bound-parameter import with whole-batch rollback where advertised, write guard/confirm, cleanup |
 | CQL | ping/caps, keyspaces/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/primary-key metadata, typed values, limit, write guard, cleanup |
-| KV/cache | ping/caps, SET, GET, overwrite, TTL, exact N/N+1 SCAN, multi-page/error propagation, raw read, raw write guard, DELETE, post-delete read, cleanup |
+| KV/cache | ping/caps, text/binary/empty SET+GET, missing distinction, overwrite, TTL, exact N/N+1 SCAN, multi-page/error propagation, bounded typed raw read, confirmed allowlisted raw mutation, forbidden/unknown rejection, DELETE, post-delete read, cleanup |
 | Document | ping/caps with explicit one/many operations, collections, INSERT, FIND, single UPDATE/DELETE, confirmed multi UPDATE/DELETE with exact counts, aggregate, empty result verification, cleanup |
 | Search | ping/caps, write guard, index document, list indices, search/readback; update/delete are recorded `UNSUPPORTED` until the public capability exposes them |
 | Time series | ping/caps, write guard, remote write, measurement list, range readback; update/delete are not applicable to the Prometheus model |
@@ -60,7 +60,7 @@ and test-hardening commits remain listed inside each evidence file.
 | DB-CASSANDRA-001 | CQL | Cassandra `cassandra://` | Docker cassandra | Ready | COMPLETE | `docs/test-evidence/cassandra.md` | `f3712b3`; SQL/CQL CRUD, types, full fixture, safety, limit, metadata, and cleanup passed |
 | DB-SCYLLA-001 | CQL | ScyllaDB `scylla://` | compatible alias only | Ready | PARTIAL | - | no real ScyllaDB product profile |
 | DB-DB2-001 | SQL/Db2 | IBM Db2 `db2://` | Docker db2 + host ODBC | Ready | BLOCKED | - | IBM Db2 ODBC driver is not registered on the host |
-| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | `1ceffc8`, IF-T57; atomic NX+TTL and exact multi-page SCAN refreshed |
+| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | `1ceffc8`, IF-T57/IF-T62; binary fidelity, confirmed raw mutation, denylist and exact multi-page SCAN refreshed |
 | DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | `1ceffc8`; atomic NX+TTL refreshed |
 | DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | `1ceffc8`; atomic NX+TTL refreshed |
 | DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | `1ceffc8`; atomic NX+TTL refreshed |

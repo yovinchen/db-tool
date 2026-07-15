@@ -185,7 +185,7 @@ impl<'de> Deserialize<'de> for Value {
             WireInput::Extended(envelope) => match envelope.extension {
                 WireValue::Bytes { codec, value } => {
                     validate_wire_codec::<D::Error>(&codec)?;
-                    Self::Bytes(decode_base64(&value).map_err(serde::de::Error::custom)?)
+                    Self::Bytes(decode_canonical_base64(&value).map_err(serde::de::Error::custom)?)
                 }
                 WireValue::Timestamp { codec, value } => {
                     validate_wire_codec::<D::Error>(&codec)?;
@@ -244,7 +244,10 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
-fn decode_base64(encoded: &str) -> std::result::Result<Vec<u8>, String> {
+/// Decode canonical RFC 4648 base64, including mandatory padding and zero
+/// trailing bits. This is shared by the typed value codec and CLI inputs so a
+/// byte sequence has exactly one accepted textual representation.
+pub fn decode_canonical_base64(encoded: &str) -> std::result::Result<Vec<u8>, String> {
     let bytes = encoded.as_bytes();
     if bytes.is_empty() {
         return Ok(Vec::new());
