@@ -16,12 +16,12 @@ Resource operations:
 
 | Resource | Create/write | Read all fixture data | Metadata/admin | Guard/limit/security | Update/delete | Cleanup |
 | --- | --- | --- | --- | --- | --- | --- |
-| `dbtool_it_search_security_*` | authenticated HTTPS index creation and Alice/Bob/Carol 3/3 writes PASS | every name/role/source value exact PASS | ping, `caps.search=true`, exact index listing PASS | write guard; size clamp; from/truncated; wrong password rejected with HTTP 401; missing CA rejected at certificate validation PASS | public SearchEngine update/delete UNSUPPORTED | disposable OpenSearch volume removed PASS |
+| `dbtool_it_search_security_*` | authenticated HTTPS index creation and Alice/Bob/Carol 3/3 writes PASS | every name/role/source value exact PASS | ping, `caps.search=true`, exact index listing PASS | write guard; size clamp; from/truncated; wrong password rejected with HTTP 401; missing CA rejected at certificate validation PASS | this earlier security-plugin run predates IF-T45 CRUD; shared adapter CRUD is service-free tested, but a new plugin live CRUD run is not claimed here | disposable OpenSearch volume removed PASS |
 
 The campaign also proved that stale certificates regenerate before startup,
 the CA signing key remains outside the mounted service directory with mode
 0600, and the HTTPS port is published only on `127.0.0.1`.
 
-Cleanup: PASS by disposable Docker teardown; public search delete is UNSUPPORTED
+Cleanup: PASS by disposable Docker teardown for this prior security-plugin run
 
 Commits: `2e93c35`, `bbb6323`, `932655d`, `b9dd9fd`

@@ -4,13 +4,14 @@ use dbtool_core::{
     error::Error,
     model::Value,
     port::capability::{SearchHits, SearchOptions},
+    service::safety::SafetyGuard,
     Result,
 };
 
 #[derive(Args)]
 #[command(
     about = "Inspect and query OpenSearch/Elasticsearch-compatible indices.",
-    long_about = "Search commands use JSON request bodies and the global --limit for hit count. Indexing a document is a write operation and requires --allow-write."
+    long_about = "Search commands use JSON request bodies and the global --limit for hit count. Index, put, update, delete, and delete-index are write operations and require --allow-write; delete-index also requires a target-bound --confirm token."
 )]
 pub struct SearchCmd {
     #[command(subcommand)]
@@ -42,14 +43,65 @@ pub enum SearchAction {
         /// JSON document object to index; requires --allow-write.
         doc: String,
     },
+    /// Create or replace one JSON document using a stable caller-provided ID.
+    Put {
+        /// Index name to write to.
+        index: String,
+        /// Stable document identifier.
+        id: String,
+        /// JSON document object to store; requires --allow-write.
+        doc: String,
+    },
+    /// Read one document by stable ID. A missing document returns JSON null.
+    Get {
+        /// Index name to read from.
+        index: String,
+        /// Stable document identifier.
+        id: String,
+    },
+    /// Partially update one document by stable ID.
+    Update {
+        /// Index name containing the document.
+        index: String,
+        /// Stable document identifier.
+        id: String,
+        /// JSON patch object. Plain objects are wrapped in a Search `doc` update.
+        patch: String,
+    },
+    /// Delete one document by stable ID.
+    Delete {
+        /// Index name containing the document.
+        index: String,
+        /// Stable document identifier.
+        id: String,
+    },
+    /// Delete one complete index after target-bound confirmation.
+    DeleteIndex {
+        /// Exact index name to delete.
+        index: String,
+    },
 }
 
 pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
-    if matches!(cmd.action, SearchAction::Index { .. }) {
-        ensure_write_allowed(ctx)?;
+    let dsn = ctx.resolve_dsn()?;
+    match &cmd.action {
+        SearchAction::Index { .. }
+        | SearchAction::Put { .. }
+        | SearchAction::Update { .. }
+        | SearchAction::Delete { .. } => ensure_write_allowed(ctx)?,
+        SearchAction::DeleteIndex { index } => {
+            ensure_write_allowed(ctx)?;
+            SafetyGuard::check_destructive_operation(
+                "delete_search_index",
+                index,
+                &ctx.safety_target(&dsn),
+                ctx.allow_write,
+                ctx.confirm.as_deref(),
+            )?;
+        }
+        SearchAction::Indices | SearchAction::Search { .. } | SearchAction::Get { .. } => {}
     }
 
-    let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
     let se = conn
         .as_search()
@@ -87,13 +139,30 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
         }
         SearchAction::Index { index, doc } => {
             let doc = parse_json_value(&doc)?;
-            se.index_doc(&index, doc).await?;
-            ctx.render_success(
-                &kind,
-                serde_json::json!({"indexed": true}),
-                start.elapsed().as_millis() as u64,
-                false,
-            )
+            let outcome = se.index_doc(&index, doc).await?;
+            ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
+        }
+        SearchAction::Put { index, id, doc } => {
+            let doc = parse_json_value(&doc)?;
+            let outcome = se.put_doc(&index, &id, doc).await?;
+            ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
+        }
+        SearchAction::Get { index, id } => {
+            let document = se.get_doc(&index, &id).await?;
+            ctx.render_success(&kind, document, start.elapsed().as_millis() as u64, false)
+        }
+        SearchAction::Update { index, id, patch } => {
+            let patch = parse_json_value(&patch)?;
+            let outcome = se.update_doc(&index, &id, patch).await?;
+            ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
+        }
+        SearchAction::Delete { index, id } => {
+            let outcome = se.delete_doc(&index, &id).await?;
+            ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
+        }
+        SearchAction::DeleteIndex { index } => {
+            let outcome = se.delete_index(&index).await?;
+            ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
         }
     })
 }
@@ -138,7 +207,13 @@ mod tests {
     fn truncated_accounts_for_total_offset_and_returned_hits() {
         let hits = SearchHits {
             total: 10,
+            total_relation: "eq".to_owned(),
             hits: vec![json!({}); 3],
+            took_ms: 1,
+            timed_out: false,
+            aggregations: None,
+            hits_metadata: Default::default(),
+            extra: Default::default(),
         };
 
         assert!(search_results_truncated(&hits, 0));
@@ -150,7 +225,13 @@ mod tests {
     fn truncated_is_false_when_the_last_page_is_short() {
         let hits = SearchHits {
             total: 10,
+            total_relation: "eq".to_owned(),
             hits: vec![json!({}); 2],
+            took_ms: 1,
+            timed_out: false,
+            aggregations: None,
+            hits_metadata: Default::default(),
+            extra: Default::default(),
         };
 
         assert!(!search_results_truncated(&hits, 8));

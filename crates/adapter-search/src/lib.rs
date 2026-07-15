@@ -3,7 +3,10 @@ use dbtool_core::{
     error::{Error, Result},
     model::{IndexInfo, Value},
     port::{
-        capability::{SearchEngine, SearchHits, SearchOptions},
+        capability::{
+            SearchDeleteIndexOutcome, SearchDocument, SearchEngine, SearchHits, SearchOptions,
+            SearchWriteOutcome,
+        },
         connector::{Capabilities, Connector, ConnectorKind},
     },
 };
@@ -76,6 +79,7 @@ impl SearchEngine for SearchAdapter {
         query: Value,
         options: SearchOptions,
     ) -> Result<SearchHits> {
+        validate_resource(index, "index")?;
         let body = search_body(query, &options)?;
         let response = self
             .client
@@ -88,16 +92,73 @@ impl SearchEngine for SearchAdapter {
         search_hits_from_response(&response)
     }
 
-    async fn index_doc(&self, index: &str, doc: Value) -> Result<()> {
+    async fn index_doc(&self, index: &str, doc: Value) -> Result<SearchWriteOutcome> {
+        validate_resource(index, "index")?;
         let body = core_value_to_json(doc)?;
-        self.client
+        let response = self
+            .client
             .request_json(
                 "POST",
                 &format!("/{}/_doc", percent_encode_path_segment(index)),
                 Some(&body),
             )
-            .await
-            .map(|_| ())
+            .await?;
+        parse_write_response(response, "index document")
+    }
+
+    async fn put_doc(&self, index: &str, id: &str, doc: Value) -> Result<SearchWriteOutcome> {
+        validate_resource(index, "index")?;
+        validate_resource(id, "document id")?;
+        let body = core_value_to_json(doc)?;
+        let response = self
+            .client
+            .request_json("PUT", &document_path(index, id, "_doc"), Some(&body))
+            .await?;
+        parse_write_response(response, "put document")
+    }
+
+    async fn get_doc(&self, index: &str, id: &str) -> Result<Option<SearchDocument>> {
+        validate_resource(index, "index")?;
+        validate_resource(id, "document id")?;
+        self.client
+            .request_json_optional("GET", &document_path(index, id, "_doc"), None)
+            .await?
+            .map(parse_document_response)
+            .transpose()
+    }
+
+    async fn update_doc(&self, index: &str, id: &str, patch: Value) -> Result<SearchWriteOutcome> {
+        validate_resource(index, "index")?;
+        validate_resource(id, "document id")?;
+        let body = update_body(core_value_to_json(patch)?)?;
+        let response = self
+            .client
+            .request_json("POST", &document_path(index, id, "_update"), Some(&body))
+            .await?;
+        parse_write_response(response, "update document")
+    }
+
+    async fn delete_doc(&self, index: &str, id: &str) -> Result<SearchWriteOutcome> {
+        validate_resource(index, "index")?;
+        validate_resource(id, "document id")?;
+        let response = self
+            .client
+            .request_json("DELETE", &document_path(index, id, "_doc"), None)
+            .await?;
+        parse_write_response(response, "delete document")
+    }
+
+    async fn delete_index(&self, index: &str) -> Result<SearchDeleteIndexOutcome> {
+        validate_resource(index, "index")?;
+        let response = self
+            .client
+            .request_json(
+                "DELETE",
+                &format!("/{}", percent_encode_path_segment(index)),
+                None,
+            )
+            .await?;
+        parse_delete_index_response(response)
     }
 }
 
@@ -168,6 +229,26 @@ impl SearchHttpClient {
         path: &str,
         body: Option<&JsonValue>,
     ) -> Result<JsonValue> {
+        let response = self.request_json_response(method, path, body).await?;
+        response.into_success()
+    }
+
+    async fn request_json_optional(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&JsonValue>,
+    ) -> Result<Option<JsonValue>> {
+        let response = self.request_json_response(method, path, body).await?;
+        response.into_optional()
+    }
+
+    async fn request_json_response(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&JsonValue>,
+    ) -> Result<SearchHttpResponse> {
         let (request, body) = self.build_request(method, path, body)?;
 
         let stream = TcpStream::connect((self.host.as_str(), self.port))
@@ -226,7 +307,42 @@ impl SearchHttpClient {
     }
 }
 
-async fn send_http_request<S>(mut stream: S, request: &str, body: &[u8]) -> Result<JsonValue>
+#[derive(Debug, Clone, PartialEq)]
+struct SearchHttpResponse {
+    status: u16,
+    body: JsonValue,
+}
+
+impl SearchHttpResponse {
+    fn into_success(self) -> Result<JsonValue> {
+        if (200..300).contains(&self.status) {
+            return Ok(self.body);
+        }
+
+        Err(Error::Query(
+            json!({
+                "backend": "search",
+                "http_status": self.status,
+                "summary": format!("HTTP {}", self.status),
+                "response": self.body,
+            })
+            .to_string(),
+        ))
+    }
+
+    fn into_optional(self) -> Result<Option<JsonValue>> {
+        if self.status == 404 {
+            return Ok(None);
+        }
+        self.into_success().map(Some)
+    }
+}
+
+async fn send_http_request<S>(
+    mut stream: S,
+    request: &str,
+    body: &[u8],
+) -> Result<SearchHttpResponse>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -385,9 +501,7 @@ fn search_body(query: Value, options: &SearchOptions) -> Result<JsonValue> {
         object.insert("from".to_owned(), JsonValue::Number(from.into()));
     }
     if options.source {
-        object
-            .entry("_source".to_owned())
-            .or_insert_with(|| JsonValue::Bool(true));
+        object.insert("_source".to_owned(), JsonValue::Bool(true));
     }
 
     Ok(body)
@@ -405,31 +519,153 @@ fn looks_like_search_body(value: &JsonValue) -> bool {
 }
 
 fn search_hits_from_response(response: &JsonValue) -> Result<SearchHits> {
-    let hits = response
-        .get("hits")
+    let mut top_level = response
+        .as_object()
+        .cloned()
+        .ok_or_else(|| Error::Serialization("search response is not an object".into()))?;
+    let mut hits_container = top_level
+        .remove("hits")
         .ok_or_else(|| Error::Serialization("search response is missing hits".into()))?;
-    let total = match hits.get("total") {
-        Some(JsonValue::Number(number)) => number.as_u64().unwrap_or_default(),
-        Some(JsonValue::Object(object)) => object
-            .get("value")
-            .and_then(JsonValue::as_u64)
-            .unwrap_or_default(),
-        _ => 0,
+    let hits_object = hits_container
+        .as_object_mut()
+        .ok_or_else(|| Error::Serialization("search response hits is not an object".into()))?;
+    let total_value = hits_object
+        .remove("total")
+        .ok_or_else(|| Error::Serialization("search response is missing hits.total".into()))?;
+    let (total, total_relation) = match total_value {
+        JsonValue::Number(number) => (
+            number.as_u64().ok_or_else(|| {
+                Error::Serialization("search response hits.total is not an unsigned integer".into())
+            })?,
+            "eq".to_owned(),
+        ),
+        JsonValue::Object(mut object) => {
+            let total = object
+                .remove("value")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    Error::Serialization(
+                        "search response hits.total.value is not an unsigned integer".into(),
+                    )
+                })?;
+            let relation = object
+                .remove("relation")
+                .map(|value| {
+                    value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                        Error::Serialization(
+                            "search response hits.total.relation is not a string".into(),
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or_else(|| "eq".to_owned());
+            if !object.is_empty() {
+                hits_object.insert("total_metadata".to_owned(), JsonValue::Object(object));
+            }
+            (total, relation)
+        }
+        _ => {
+            return Err(Error::Serialization(
+                "search response hits.total has an unsupported shape".into(),
+            ))
+        }
     };
-    let hits = hits
-        .get("hits")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| Error::Serialization("search response hits.hits is not an array".into()))?
-        .clone();
+    let hits = hits_object
+        .remove("hits")
+        .and_then(|value| value.as_array().cloned())
+        .ok_or_else(|| Error::Serialization("search response hits.hits is not an array".into()))?;
+    let took_ms = optional_u64(&mut top_level, "took")?.unwrap_or_default();
+    let timed_out = optional_bool(&mut top_level, "timed_out")?.unwrap_or(false);
+    let aggregations = top_level.remove("aggregations");
 
-    Ok(SearchHits { total, hits })
+    Ok(SearchHits {
+        total,
+        total_relation,
+        hits,
+        took_ms,
+        timed_out,
+        aggregations,
+        hits_metadata: std::mem::take(hits_object),
+        extra: top_level,
+    })
 }
 
 fn core_value_to_json(value: Value) -> Result<JsonValue> {
     serde_json::to_value(value).map_err(|e| Error::Serialization(e.to_string()))
 }
 
-fn parse_http_json(response: &[u8]) -> Result<JsonValue> {
+fn parse_write_response(response: JsonValue, operation: &str) -> Result<SearchWriteOutcome> {
+    serde_json::from_value(response).map_err(|e| {
+        Error::Serialization(format!(
+            "invalid {operation} response from search backend: {e}"
+        ))
+    })
+}
+
+fn parse_document_response(response: JsonValue) -> Result<SearchDocument> {
+    serde_json::from_value(response).map_err(|e| {
+        Error::Serialization(format!(
+            "invalid get document response from search backend: {e}"
+        ))
+    })
+}
+
+fn parse_delete_index_response(response: JsonValue) -> Result<SearchDeleteIndexOutcome> {
+    serde_json::from_value(response).map_err(|e| {
+        Error::Serialization(format!(
+            "invalid delete index response from search backend: {e}"
+        ))
+    })
+}
+
+fn update_body(patch: JsonValue) -> Result<JsonValue> {
+    patch
+        .as_object()
+        .ok_or_else(|| Error::Config("search update patch must be a JSON object".into()))?;
+    Ok(json!({ "doc": patch }))
+}
+
+fn validate_resource(resource: &str, label: &str) -> Result<()> {
+    if resource.is_empty() {
+        return Err(Error::Config(format!("search {label} must not be empty")));
+    }
+    Ok(())
+}
+
+fn document_path(index: &str, id: &str, operation: &str) -> String {
+    format!(
+        "/{}/{}/{}",
+        percent_encode_path_segment(index),
+        operation,
+        percent_encode_path_segment(id)
+    )
+}
+
+fn optional_u64(object: &mut Map<String, JsonValue>, field: &str) -> Result<Option<u64>> {
+    object
+        .remove(field)
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                Error::Serialization(format!(
+                    "search response {field} is not an unsigned integer"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn optional_bool(object: &mut Map<String, JsonValue>, field: &str) -> Result<Option<bool>> {
+    object
+        .remove(field)
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                Error::Serialization(format!("search response {field} is not a boolean"))
+            })
+        })
+        .transpose()
+}
+
+fn parse_http_json(response: &[u8]) -> Result<SearchHttpResponse> {
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -454,17 +690,19 @@ fn parse_http_json(response: &[u8]) -> Result<JsonValue> {
     };
     let body_text = std::str::from_utf8(&body).map_err(|e| Error::Serialization(e.to_string()))?;
 
-    if !(200..300).contains(&status) {
-        return Err(Error::Query(format!(
-            "search backend returned HTTP {status}: {body_text}"
-        )));
-    }
-
     if body_text.trim().is_empty() {
-        return Ok(JsonValue::Object(Map::new()));
+        return Ok(SearchHttpResponse {
+            status,
+            body: JsonValue::Object(Map::new()),
+        });
     }
 
-    serde_json::from_str(body_text).map_err(|e| Error::Serialization(e.to_string()))
+    let body = match serde_json::from_str(body_text) {
+        Ok(body) => body,
+        Err(_) if !(200..300).contains(&status) => json!({ "raw": body_text }),
+        Err(error) => return Err(Error::Serialization(error.to_string())),
+    };
+    Ok(SearchHttpResponse { status, body })
 }
 
 fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
@@ -629,6 +867,23 @@ mod tests {
     }
 
     #[test]
+    fn explicit_source_option_overrides_body_false() {
+        let body = search_body(
+            Value::Json(json!({
+                "query": { "match_all": {} },
+                "_source": false
+            })),
+            &SearchOptions {
+                source: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(body["_source"], true);
+    }
+
+    #[test]
     fn rejects_non_integer_body_size_when_a_limit_is_applied() {
         let error = search_body(
             Value::Json(json!({ "query": { "match_all": {} }, "size": -1 })),
@@ -648,8 +903,13 @@ mod tests {
     #[test]
     fn parses_search_hits_total_shapes() {
         let hits = search_hits_from_response(&json!({
+            "took": 7,
+            "timed_out": false,
+            "aggregations": { "roles": { "buckets": [{"key": "reader", "doc_count": 2}] } },
+            "_shards": { "total": 1, "successful": 1 },
             "hits": {
-                "total": { "value": 2 },
+                "total": { "value": 2, "relation": "gte" },
+                "max_score": 1.0,
                 "hits": [
                     { "_id": "1", "_source": { "name": "alice" } },
                     { "_id": "2", "_source": { "name": "bob" } }
@@ -659,7 +919,84 @@ mod tests {
         .unwrap();
 
         assert_eq!(hits.total, 2);
+        assert_eq!(hits.total_relation, "gte");
         assert_eq!(hits.hits.len(), 2);
+        assert_eq!(hits.took_ms, 7);
+        assert!(!hits.timed_out);
+        assert_eq!(
+            hits.aggregations.as_ref().unwrap()["roles"]["buckets"][0]["key"],
+            "reader"
+        );
+        assert_eq!(hits.hits_metadata["max_score"], 1.0);
+        assert_eq!(hits.extra["_shards"]["successful"], 1);
+
+        let legacy = search_hits_from_response(&json!({
+            "hits": { "total": 4, "hits": [] }
+        }))
+        .unwrap();
+        assert_eq!(legacy.total, 4);
+        assert_eq!(legacy.total_relation, "eq");
+    }
+
+    #[test]
+    fn parses_write_and_get_responses_without_dropping_backend_metadata() {
+        let outcome = parse_write_response(
+            json!({
+                "_index": "users",
+                "_id": "user-1",
+                "_version": 3,
+                "_seq_no": 8,
+                "_primary_term": 1,
+                "result": "updated",
+                "forced_refresh": true,
+                "_shards": { "successful": 1 }
+            }),
+            "update document",
+        )
+        .unwrap();
+        assert_eq!(outcome.index, "users");
+        assert_eq!(outcome.id, "user-1");
+        assert_eq!(outcome.version, Some(3));
+        assert_eq!(outcome.result, "updated");
+        assert_eq!(outcome.extra["forced_refresh"], true);
+        assert_eq!(outcome.extra["_shards"]["successful"], 1);
+
+        let document = parse_document_response(json!({
+            "_index": "users",
+            "_id": "user-1",
+            "_version": 3,
+            "found": true,
+            "_source": { "name": "alice" },
+            "fields": { "role": ["reader"] }
+        }))
+        .unwrap();
+        assert_eq!(document.id, "user-1");
+        assert_eq!(document.source.unwrap()["name"], "alice");
+        assert_eq!(document.extra["fields"]["role"][0], "reader");
+    }
+
+    #[test]
+    fn update_body_always_wraps_the_caller_patch_without_reinterpreting_fields() {
+        assert_eq!(
+            update_body(json!({"role": "writer"})).unwrap(),
+            json!({"doc": {"role": "writer"}})
+        );
+        assert_eq!(
+            update_body(json!({"doc": "literal document field"})).unwrap(),
+            json!({"doc": {"doc": "literal document field"}})
+        );
+        assert!(matches!(
+            update_body(json!(["not", "an", "object"])),
+            Err(Error::Config(message)) if message.contains("JSON object")
+        ));
+    }
+
+    #[test]
+    fn document_paths_percent_encode_each_caller_controlled_segment() {
+        assert_eq!(
+            document_path("people/current", "alice smith/1", "_doc"),
+            "/people%2Fcurrent/_doc/alice%20smith%2F1"
+        );
     }
 
     #[test]
@@ -679,7 +1016,38 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"ok\":1\r\n1\r\n}\r\n0\r\n\r\n";
         let value = parse_http_json(response).unwrap();
 
-        assert_eq!(value["ok"], 1);
+        assert_eq!(value.status, 200);
+        assert_eq!(value.body["ok"], 1);
+    }
+
+    #[test]
+    fn non_success_http_error_retains_status_and_json_body() {
+        let response = b"HTTP/1.1 409 Conflict\r\nContent-Length: 55\r\n\r\n{\"error\":{\"type\":\"version_conflict_engine_exception\"}}";
+        let error = parse_http_json(response)
+            .unwrap()
+            .into_success()
+            .unwrap_err();
+        let Error::Query(message) = error else {
+            panic!("expected query error");
+        };
+        let detail: JsonValue = serde_json::from_str(&message).unwrap();
+        assert_eq!(detail["backend"], "search");
+        assert_eq!(detail["http_status"], 409);
+        assert_eq!(
+            detail["response"]["error"]["type"],
+            "version_conflict_engine_exception"
+        );
+    }
+
+    #[test]
+    fn get_response_maps_http_404_to_none() {
+        let response = parse_http_json(
+            b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"_index\":\"users\",\"_id\":\"missing\",\"found\":false}",
+        )
+        .unwrap()
+        .into_optional()
+        .unwrap();
+        assert_eq!(response, None);
     }
 
     #[test]

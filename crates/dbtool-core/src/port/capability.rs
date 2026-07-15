@@ -8,6 +8,7 @@ use crate::{
 };
 use async_trait::async_trait;
 
+pub use crate::model::{SearchDeleteIndexOutcome, SearchDocument, SearchHits, SearchWriteOutcome};
 pub use crate::port::connector::Connector;
 
 #[async_trait]
@@ -97,7 +98,18 @@ pub trait SearchEngine: Connector {
     async fn list_indices(&self) -> Result<Vec<crate::model::IndexInfo>>;
     async fn search(&self, index: &str, query: Value, options: SearchOptions)
         -> Result<SearchHits>;
-    async fn index_doc(&self, index: &str, doc: Value) -> Result<()>;
+    /// Create a document using a backend-generated identifier.
+    async fn index_doc(&self, index: &str, doc: Value) -> Result<SearchWriteOutcome>;
+    /// Create or replace a document using a caller-controlled stable identifier.
+    async fn put_doc(&self, index: &str, id: &str, doc: Value) -> Result<SearchWriteOutcome>;
+    /// Get one document by stable identifier. A backend HTTP 404 maps to `None`.
+    async fn get_doc(&self, index: &str, id: &str) -> Result<Option<SearchDocument>>;
+    /// Partially update one document by stable identifier.
+    async fn update_doc(&self, index: &str, id: &str, patch: Value) -> Result<SearchWriteOutcome>;
+    /// Delete one document by stable identifier.
+    async fn delete_doc(&self, index: &str, id: &str) -> Result<SearchWriteOutcome>;
+    /// Delete one complete index.
+    async fn delete_index(&self, index: &str) -> Result<SearchDeleteIndexOutcome>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,12 +117,6 @@ pub struct SearchOptions {
     pub size: Option<usize>,
     pub from: Option<usize>,
     pub source: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SearchHits {
-    pub total: u64,
-    pub hits: Vec<serde_json::Value>,
 }
 
 #[async_trait]

@@ -116,7 +116,7 @@ fn opensearch_live_index_search_and_list() {
     }
 
     let dsn = required_env("DBTOOL_IT_OPENSEARCH_DSN");
-    run_search_lifecycle(&dsn, "opensearch", "dbtool_it_search");
+    run_search_lifecycle(&dsn, "opensearch", "dbtool_it_search", true);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn opensearch_tls_live_index_search_and_list() {
 
     let dsn = required_env("DBTOOL_IT_OPENSEARCH_TLS_DSN");
     assert_tls_seed_fixture(&dsn);
-    run_search_lifecycle(&dsn, "opensearch+https", "dbtool_it_search_tls");
+    run_search_lifecycle(&dsn, "opensearch+https", "dbtool_it_search_tls", false);
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn elasticsearch_native_live_index_search_and_list() {
     }
 
     let dsn = required_env("DBTOOL_IT_ELASTICSEARCH_DSN");
-    run_search_lifecycle(&dsn, "elasticsearch", "dbtool_it_elasticsearch");
+    run_search_lifecycle(&dsn, "elasticsearch", "dbtool_it_elasticsearch", true);
 }
 
 #[test]
@@ -148,7 +148,7 @@ fn opensearch_security_tls_live_index_search_and_list() {
 
     let dsn = required_env("DBTOOL_IT_OPENSEARCH_SECURITY_DSN");
     assert_opensearch_security_rejects_bad_credentials_and_missing_ca();
-    run_search_lifecycle(&dsn, "opensearch+https", "dbtool_it_search_security");
+    run_search_lifecycle(&dsn, "opensearch+https", "dbtool_it_search_security", true);
 }
 
 fn assert_opensearch_security_rejects_bad_credentials_and_missing_ca() {
@@ -228,7 +228,7 @@ fn assert_tls_seed_fixture(dsn: &str) {
     );
 }
 
-fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str) {
+fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str, full_crud: bool) {
     let index = unique_name(prefix);
 
     let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
@@ -248,22 +248,114 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str) {
     ]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
 
-    let fixture_docs = [
-        r#"{"name":"alice","role":"search-reader","source":"dbtool-live-fixture"}"#,
-        r#"{"name":"bob","role":"search-writer","source":"dbtool-live-fixture"}"#,
-        r#"{"name":"carol","role":"search-reviewer","source":"dbtool-live-fixture"}"#,
-    ];
-    for doc in fixture_docs {
-        let indexed = stdout_json(dbtool(&[
+    if full_crud {
+        let auto = stdout_json(dbtool(&[
             "--dsn",
             dsn,
             "--allow-write",
             "search",
             "index",
             &index,
-            doc,
+            r#"{"name":"temporary","role":"search-temporary","source":"dbtool-live-fixture"}"#,
         ]));
-        assert_eq!(indexed["data"]["indexed"], true);
+        assert_eq!(auto["data"]["index"], index);
+        assert_eq!(auto["data"]["result"], "created");
+        let generated_id = auto["data"]["id"]
+            .as_str()
+            .expect("auto indexed document must return its generated ID")
+            .to_owned();
+        assert!(!generated_id.is_empty());
+
+        let deleted = stdout_json(dbtool(&[
+            "--dsn",
+            dsn,
+            "--allow-write",
+            "search",
+            "delete",
+            &index,
+            &generated_id,
+        ]));
+        assert_eq!(deleted["data"]["id"], generated_id);
+        assert_eq!(deleted["data"]["result"], "deleted");
+
+        let fixture_docs = [
+            (
+                "alice",
+                r#"{"name":"alice","role":"search-reader","source":"dbtool-live-fixture"}"#,
+            ),
+            (
+                "bob",
+                r#"{"name":"bob","role":"search-writer","source":"dbtool-live-fixture"}"#,
+            ),
+            (
+                "carol",
+                r#"{"name":"carol","role":"search-reviewer","source":"dbtool-live-fixture"}"#,
+            ),
+        ];
+        for (id, doc) in fixture_docs {
+            let put = stdout_json(dbtool(&[
+                "--dsn",
+                dsn,
+                "--allow-write",
+                "search",
+                "put",
+                &index,
+                id,
+                doc,
+            ]));
+            assert_eq!(put["data"]["index"], index);
+            assert_eq!(put["data"]["id"], id);
+            assert_eq!(put["data"]["result"], "created");
+            assert_eq!(put["data"]["version"], 1);
+        }
+
+        let alice = stdout_json(dbtool(&["--dsn", dsn, "search", "get", &index, "alice"]));
+        assert_eq!(alice["data"]["index"], index);
+        assert_eq!(alice["data"]["id"], "alice");
+        assert_eq!(alice["data"]["found"], true);
+        assert_eq!(alice["data"]["source"]["name"], "alice");
+        assert_eq!(alice["data"]["source"]["role"], "search-reader");
+
+        let missing = stdout_json(dbtool(&["--dsn", dsn, "search", "get", &index, "missing"]));
+        assert!(missing["data"].is_null());
+
+        let updated = stdout_json(dbtool(&[
+            "--dsn",
+            dsn,
+            "--allow-write",
+            "search",
+            "update",
+            &index,
+            "bob",
+            r#"{"role":"search-editor","revision":2}"#,
+        ]));
+        assert_eq!(updated["data"]["id"], "bob");
+        assert_eq!(updated["data"]["result"], "updated");
+        assert_eq!(updated["data"]["version"], 2);
+
+        let bob = stdout_json(dbtool(&["--dsn", dsn, "search", "get", &index, "bob"]));
+        assert_eq!(bob["data"]["source"]["role"], "search-editor");
+        assert_eq!(bob["data"]["source"]["revision"], 2);
+    } else {
+        let fixture_docs = [
+            r#"{"name":"alice","role":"search-reader","source":"dbtool-live-fixture"}"#,
+            r#"{"name":"bob","role":"search-writer","source":"dbtool-live-fixture"}"#,
+            r#"{"name":"carol","role":"search-reviewer","source":"dbtool-live-fixture"}"#,
+        ];
+        for doc in fixture_docs {
+            let indexed = stdout_json(dbtool(&[
+                "--dsn",
+                dsn,
+                "--allow-write",
+                "search",
+                "index",
+                &index,
+                doc,
+            ]));
+            assert_eq!(indexed["data"]["index"], index);
+            assert_eq!(indexed["data"]["result"], "created");
+            assert!(indexed["data"]["id"].as_str().is_some());
+        }
     }
 
     let hits = stdout_json_retry(
@@ -276,7 +368,7 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str) {
             "search",
             &index,
             "--q",
-            r#"{"match_all":{}}"#,
+            r#"{"query":{"match_all":{}},"aggs":{"roles":{"terms":{"field":"role.keyword"}}}}"#,
             "--source",
         ],
         |value| {
@@ -287,7 +379,21 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str) {
         },
     );
     assert_eq!(hits["data"]["total"], 3);
+    assert_eq!(hits["data"]["total_relation"], "eq");
+    assert_eq!(hits["data"]["timed_out"], false);
+    assert!(hits["data"]["took_ms"].is_u64());
     assert_eq!(hits["meta"]["truncated"], false);
+    if full_crud {
+        assert_eq!(
+            hits["data"]["aggregations"]["roles"]["buckets"]
+                .as_array()
+                .expect("role aggregation buckets must be returned")
+                .iter()
+                .map(|bucket| bucket["doc_count"].as_u64().unwrap())
+                .sum::<u64>(),
+            3
+        );
+    }
     assert_eq!(
         search_fixture_rows(&hits),
         vec![
@@ -298,7 +404,11 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str) {
             ),
             (
                 "bob".to_owned(),
-                "search-writer".to_owned(),
+                if full_crud {
+                    "search-editor".to_owned()
+                } else {
+                    "search-writer".to_owned()
+                },
                 "dbtool-live-fixture".to_owned()
             ),
             (
@@ -386,8 +496,71 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str) {
         })
     );
 
-    // SearchEngine intentionally exposes no public delete operation. The
-    // disposable observability Compose volume owns lifecycle cleanup.
+    if full_crud {
+        let deleted = stdout_json(dbtool(&[
+            "--dsn",
+            dsn,
+            "--allow-write",
+            "search",
+            "delete",
+            &index,
+            "carol",
+        ]));
+        assert_eq!(deleted["data"]["id"], "carol");
+        assert_eq!(deleted["data"]["result"], "deleted");
+        let missing = stdout_json(dbtool(&["--dsn", dsn, "search", "get", &index, "carol"]));
+        assert!(missing["data"].is_null());
+
+        let confirmation = stderr_json(dbtool(&[
+            "--dsn",
+            dsn,
+            "--allow-write",
+            "search",
+            "delete-index",
+            &index,
+        ]));
+        assert_eq!(confirmation["error"]["code"], "CONFIRM_REQUIRED");
+        assert_eq!(confirmation["error"]["impact"]["resource"], index);
+        let token = confirmation["error"]["confirm_token"]
+            .as_str()
+            .expect("delete-index must provide a confirmation token")
+            .to_owned();
+
+        let wrong_target = stderr_json(dbtool(&[
+            "--dsn",
+            dsn,
+            "--allow-write",
+            "--confirm",
+            &token,
+            "search",
+            "delete-index",
+            "another-index",
+        ]));
+        assert_eq!(wrong_target["error"]["code"], "INTERNAL_ERROR");
+
+        let removed = stdout_json(dbtool(&[
+            "--dsn",
+            dsn,
+            "--allow-write",
+            "--confirm",
+            &token,
+            "search",
+            "delete-index",
+            &index,
+        ]));
+        assert_eq!(removed["data"]["acknowledged"], true);
+
+        let indices = stdout_json_retry(&["--dsn", dsn, "search", "indices"], |value| {
+            value["data"]
+                .as_array()
+                .is_some_and(|items| items.iter().all(|item| item["name"] != index))
+        });
+        assert!(indices["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["name"] != index));
+    }
 }
 
 #[test]

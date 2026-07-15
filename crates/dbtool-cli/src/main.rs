@@ -135,10 +135,10 @@ enum Commands {
         long_about = "Time-series commands list metric names, run bounded range queries, and write single samples through Prometheus remote write behind --allow-write."
     )]
     Ts(cmd::ts::TsCmd),
-    /// Full-text search operations (search / indices)
+    /// Full-text search operations and document/index lifecycle
     #[command(
-        about = "Full-text search operations (search / indices / index)",
-        long_about = "Search commands use JSON request bodies and the global --limit for hit count against OpenSearch/Elasticsearch-compatible endpoints. Indexing a document is a write operation and requires --allow-write."
+        about = "Search operations (indices / search / index / put / get / update / delete / delete-index)",
+        long_about = "Search commands use JSON request bodies and the global --limit against OpenSearch/Elasticsearch-compatible endpoints. Each document mutation requires --allow-write; delete-index additionally requires a target-bound confirmation token."
     )]
     Search(cmd::search::SearchCmd),
     /// Message queue operations (produce / consume / topics / lag)

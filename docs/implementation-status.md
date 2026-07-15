@@ -60,8 +60,8 @@ usable.
 | AMQP/RabbitMQ | `amqp://`, `amqps://` | AMQP | produce, consume, queue detail | RabbitMQ plain and AMQPS TLS live tests |
 | RabbitMQ management | `rabbitmq+http://` | RabbitMQ HTTP admin | queue list, detail, lag | RabbitMQ management live test |
 | NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS plain and TLS live tests |
-| OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list, search, document index, hard limit/pagination | Exact three-document real HTTP run, HTTPS fixture, and real security-plugin HTTPS/basic-auth plus negative auth/trust checks |
-| Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | OpenSearch-compatible index/search/list/limit surface | Exact three-document product-native HTTP run; product-native HTTPS remains explicit boundary |
+| OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list/search/aggregations, auto-ID index, stable-ID put/get/update/delete, confirmed delete-index, hard limit/pagination | OpenSearch 2.17.1 full CRUD with exact metadata and zero residual indices; HTTPS fixture and security-plugin transport/auth evidence retained |
+| Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | OpenSearch-compatible list/search/aggregations and full document/index lifecycle | Elasticsearch 8.15.5 full CRUD with exact metadata and zero residual indices; product-native HTTPS remains explicit boundary |
 | Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list, bounded range query, and remote write | Exact two-series tagged/timestamped remote-write readback against Prometheus 2.55.1 |
 
 ## Docker Service Profiles
@@ -114,7 +114,7 @@ usable.
 | Document | `doc collections`, `doc find`, `doc insert`, `doc update`, `doc delete`, `doc aggregate`, `doc drop` | find exposes skip/sort/projection and exact truncation; insert/update/delete require `--allow-write`; update/delete reject empty filters; drop requires target-bound confirmation |
 | Transfer | `export sql`, `export kv`, `export doc`, `import sql`, `import kv`, `import doc` | all import commands require `--allow-write` before DSN resolution, artifact reads, or connecting |
 | Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write` |
-| Search | `search indices`, `search search`, `search index` | `index` requires `--allow-write` |
+| Search | `search indices`, `search search`, `search index`, `search put`, `search get`, `search update`, `search delete`, `search delete-index` | all mutations require `--allow-write`; `delete-index` additionally requires a target-bound `--confirm` token |
 | Time series | `ts measurements`, `ts query`, `ts write` | Prometheus remote write is exposed through explicit `--allow-write`; remote write uses a minimal protobuf/snappy encoder with no new runtime dependency |
 
 ## Explicit Boundaries

@@ -142,6 +142,12 @@ fn cli_help_documents_core_command_families() {
     let search_help = stdout_text(&dbtool(&["search", "--help"]));
     assert!(search_help.contains("OpenSearch/Elasticsearch-compatible"));
     assert!(search_help.contains("requires --allow-write"));
+    for action in ["index", "put", "get", "update", "delete", "delete-index"] {
+        assert!(
+            search_help.contains(action),
+            "missing search action {action}"
+        );
+    }
 
     let ts_help = stdout_text(&dbtool(&["ts", "--help"]));
     assert!(ts_help.contains("Prometheus-compatible"));
@@ -573,6 +579,44 @@ fn search_index_requires_write_flag_before_connecting() {
     ]));
 
     assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");
+}
+
+#[test]
+fn all_search_document_mutations_require_write_flag_before_connecting() {
+    let cases = [
+        vec!["search", "put", "users", "user-1", r#"{"name":"alice"}"#],
+        vec!["search", "update", "users", "user-1", r#"{"name":"bob"}"#],
+        vec!["search", "delete", "users", "user-1"],
+    ];
+
+    for case in cases {
+        let mut args = vec!["--dsn", "opensearch://127.0.0.1:1"];
+        args.extend(case);
+        let err = stderr_json(&dbtool(&args));
+        assert_eq!(err["error"]["code"], "WRITE_NOT_ALLOWED");
+    }
+}
+
+#[test]
+fn search_delete_index_requires_target_bound_confirmation_before_connecting() {
+    let dsn = "opensearch://127.0.0.1:1";
+    let blocked = stderr_json(&dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "search",
+        "delete-index",
+        "users",
+    ]));
+
+    assert_eq!(blocked["error"]["code"], "CONFIRM_REQUIRED");
+    assert_eq!(blocked["error"]["impact"]["op"], "DELETE_SEARCH_INDEX");
+    assert_eq!(blocked["error"]["impact"]["resource"], "users");
+    assert_eq!(
+        blocked["error"]["impact"]["target"],
+        "dsn:opensearch://127.0.0.1:1"
+    );
+    assert!(blocked["error"]["confirm_token"].as_str().is_some());
 }
 
 #[test]

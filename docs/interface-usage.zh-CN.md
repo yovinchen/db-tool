@@ -172,3 +172,51 @@ MySQL 与 SQLite 使用 `?`，PostgreSQL 使用 `$1`、`$2`。参数不会插入
 `sql query --schema` 当前没有跨方言的执行语义，因此在连接前返回
 `SqlQuerySchema` 的 `UNSUPPORTED_CAPABILITY`。表列表仍通过
 `sql tables --schema <name>` 使用已实现的 schema 过滤。
+
+## Search / OpenSearch / Elasticsearch
+
+完整文档生命周期使用稳定 ID；自动 ID 写入也会返回后端生成的 ID：
+
+```bash
+dbtool --dsn "$SEARCH_DSN" --allow-write \
+  search put users user-42 '{"name":"Alice","role":"reader"}'
+
+dbtool --dsn "$SEARCH_DSN" search get users user-42
+
+dbtool --dsn "$SEARCH_DSN" --allow-write \
+  search update users user-42 '{"role":"editor","revision":2}'
+
+dbtool --dsn "$SEARCH_DSN" --allow-write \
+  search delete users user-42
+```
+
+`index`（自动 ID）、`put`、`update`、`delete` 的结果均保留稳定字段
+`index/id/result/version`，同时把 `_seq_no`、`_primary_term`、shard 信息等后端字段
+保留下来。`get` 对缺失文档返回 `data: null`；其他 HTTP 404/409/5xx 不会伪装成功，
+错误消息包含 HTTP 状态和后端 JSON。
+
+搜索请求可直接包含完整 body，CLI 的 `--limit` 会覆盖更大的 body `size`，显式
+`--from` 会覆盖 body offset，`--source` 会覆盖 body 中的 `_source:false`。响应返回：
+
+- `total` 与 `total_relation`；
+- `hits`、`took_ms`、`timed_out`；
+- `aggregations`；
+- 未被统一模型识别的顶层与 hits-container 元数据。
+
+```bash
+dbtool --dsn "$SEARCH_DSN" --limit 20 search search users \
+  --q '{"query":{"match_all":{}},"aggs":{"roles":{"terms":{"field":"role.keyword"}}}}' \
+  --source
+```
+
+删索引属于破坏性资源操作。第一次调用只获取目标绑定令牌，第二次才执行：
+
+```bash
+dbtool --dsn "$SEARCH_DSN" --allow-write search delete-index users
+dbtool --dsn "$SEARCH_DSN" --allow-write --confirm '<confirm_token>' \
+  search delete-index users
+```
+
+令牌绑定 DSN/命名连接、操作和精确索引名；同一令牌改成另一个索引会在连接前被拒绝。
+OpenSearch 2.17.1 与 Elasticsearch 8.15.5 的完整生命周期已通过 Docker 实测，
+测试后没有 `dbtool_it_*` 索引残留。
