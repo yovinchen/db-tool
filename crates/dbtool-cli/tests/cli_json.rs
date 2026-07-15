@@ -526,13 +526,22 @@ fn sql_query_supports_ndjson_format() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2);
-    assert_eq!(
-        serde_json::from_str::<Value>(lines[0]).unwrap()["name"],
-        "alice"
-    );
-    assert_eq!(serde_json::from_str::<Value>(lines[1]).unwrap()["id"], 2);
+    let records = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 3);
+    for record in &records {
+        assert_eq!(record["ok"], true);
+        assert_eq!(record["kind"], "sqlite");
+        assert!(record["meta"]["elapsed_ms"].is_number());
+        assert_eq!(record["meta"]["truncated"], false);
+    }
+    assert_eq!(records[0]["record"], "schema");
+    assert_eq!(records[0]["data"]["columns"][0]["name"], "id");
+    assert_eq!(records[1]["record"], "row");
+    assert_eq!(records[1]["data"], serde_json::json!([1, "alice"]));
+    assert_eq!(records[2]["data"], serde_json::json!([2, "bob"]));
 }
 
 #[test]
