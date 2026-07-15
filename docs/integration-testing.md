@@ -823,7 +823,7 @@ The live tests cover:
 - TiDB secure HA logical data roundtrip with TLS SQL export through one SQL
   node, restore through the other node, and cross-node readback.
 - TiDB TiProxy drill with a TLS proxy entrypoint, a `REQUIRE SSL` user, and new proxy connections that keep writing/reading while each TiDB SQL node is stopped in turn.
-- Real Valkey compatibility through `valkey://`; optional KeyDB and Dragonfly compatibility through `DBTOOL_IT_COMPAT_EXTRA=1`.
+- Real Valkey compatibility through `valkey://`; optional KeyDB and Dragonfly compatibility through `DBTOOL_IT_COMPAT_EXTRA=1`. The KV artifact v3 matrix is run unchanged against all three products and proves exact bytes, persistent/absolute expiry, expired-entry skip, no lifetime extension, expiry-bound replacement confirmation, and zero prefix residue; `TIME` accepts either exact integer or decimal-text RESP elements because Dragonfly and Redis-family servers encode that response differently.
 - MongoDB ping, insert/find/update/aggregate/delete.
 - Redis Streams produce, topics, detail, consume; Redis Pub/Sub subscribe/publish round trip.
 - Kafka ping through metadata, produce, topics, detail/watermarks, and consume.

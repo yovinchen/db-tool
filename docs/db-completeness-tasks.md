@@ -61,9 +61,9 @@ and test-hardening commits remain listed inside each evidence file.
 | DB-SCYLLA-001 | CQL | ScyllaDB `scylla://` | compatible alias only | Ready | PARTIAL | - | no real ScyllaDB product profile |
 | DB-DB2-001 | SQL/Db2 | IBM Db2 `db2://` | Docker db2 + host ODBC | Ready | BLOCKED | - | IBM Db2 ODBC driver is not registered on the host |
 | DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | `1ceffc8`, `2dd5590`, IF-T57/IF-T62/IF-T64; binary/raw/SCAN plus v3 absolute-expiry artifact lifecycle and cleanup refreshed |
-| DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | `1ceffc8`; atomic NX+TTL refreshed |
-| DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | `1ceffc8`; atomic NX+TTL refreshed |
-| DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | `1ceffc8`; atomic NX+TTL refreshed |
+| DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | `1ceffc8`, `29b3126`, IF-T64; atomic NX+TTL and v3 absolute-expiry artifact lifecycle refreshed |
+| DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | `1ceffc8`, `29b3126`, IF-T64; atomic NX+TTL and v3 absolute-expiry artifact lifecycle refreshed |
+| DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | `1ceffc8`, `29b3126`, IF-T64; integer `TIME` compatibility and v3 absolute-expiry artifact lifecycle refreshed |
 | DB-MONGO-001 | Document | MongoDB `mongodb://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mongodb.md` | `fe7cfb9`, IF-T61; explicit one/many counts, confirmation binding and zero collection residual |
 | DB-OPENSEARCH-001 | Search | OpenSearch `opensearch://` | Docker observability | Ready | COMPLETE | `docs/test-evidence/opensearch.md` | IF-T45; auto/stable ID writes, get/update/delete, aggregation, confirmed delete-index, zero residual test indices |
 | DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | COMPLETE | `docs/test-evidence/opensearch-security.md` | `b9dd9fd`; real plugin, CA/auth positive and negative checks |

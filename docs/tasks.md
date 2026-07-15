@@ -89,7 +89,7 @@ Goal: Redis-compatible and MongoDB adapters.
 - [x] Negotiated atomic KV value/absolute-expiry snapshot and restore contract.
 - [x] KV artifact v3 preserves per-key lifetime, rejects v2 offline, and skips expired entries without reviving them.
 - [x] Redis Docker v3 lifecycle coverage for persistent/binary/empty/long/expired keys, confirmation binding, and cleanup.
-- [ ] Refresh KV artifact v3 lifecycle against real Valkey, KeyDB, and Dragonfly before closing IF-T64.
+- [x] Refresh KV artifact v3 lifecycle against real Valkey, KeyDB, and Dragonfly before closing IF-T64.
 - [x] Live protocol alias verification for Valkey/KeyDB/Dragonfly through the Redis adapter.
 - [x] Redis Streams/PubSub capability split.
 - [x] MongoDB filter/update/aggregate implementation.

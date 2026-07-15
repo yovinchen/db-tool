@@ -48,16 +48,17 @@ fn redis_server_time_ms(dsn: &str) -> i64 {
         2,
         "Redis TIME should contain seconds and microseconds"
     );
-    let seconds = parts[0]
-        .as_str()
-        .expect("Redis TIME seconds should be text")
-        .parse::<i64>()
-        .expect("Redis TIME seconds should be an integer");
-    let microseconds = parts[1]
-        .as_str()
-        .expect("Redis TIME microseconds should be text")
-        .parse::<i64>()
-        .expect("Redis TIME microseconds should be an integer");
+    let integer = |value: &Value, label: &str| {
+        value.as_i64().unwrap_or_else(|| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("Redis TIME {label} should be integer or decimal text"))
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("Redis TIME {label} should be an integer"))
+        })
+    };
+    let seconds = integer(&parts[0], "seconds");
+    let microseconds = integer(&parts[1], "microseconds");
     seconds
         .checked_mul(1_000)
         .and_then(|value| value.checked_add(microseconds / 1_000))
