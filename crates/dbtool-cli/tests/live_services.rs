@@ -1834,15 +1834,80 @@ fn mongo_live_document_lifecycle() {
     ]));
     assert_eq!(updated_doc["data"][0]["visits"], 2);
 
+    let archive_collection = format!("{collection}_archive");
+    let out_pipeline = format!(r#"[{{"$out":"{archive_collection}"}}]"#);
     let blocked_out = stderr_json(dbtool(&[
         "--dsn",
         &dsn,
         "doc",
         "aggregate",
         &collection,
-        &format!(r#"[{{"$out":"{collection}_archive"}}]"#),
+        &out_pipeline,
     ]));
     assert_eq!(blocked_out["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let out_confirmation = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "aggregate",
+        &collection,
+        &out_pipeline,
+    ]));
+    assert_eq!(out_confirmation["error"]["code"], "CONFIRM_REQUIRED");
+    assert!(out_confirmation["error"]["impact"]["resource"]
+        .as_str()
+        .is_some_and(|resource| resource.ends_with(&format!(".{archive_collection}"))));
+    let out_token = out_confirmation["error"]["confirm_token"]
+        .as_str()
+        .expect("$out should return a confirmation token");
+    let out_result = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "--confirm",
+        out_token,
+        "doc",
+        "aggregate",
+        &collection,
+        &out_pipeline,
+    ]));
+    assert_eq!(out_result["data"], serde_json::json!([]));
+
+    let archived = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &archive_collection,
+        "--filter",
+        "{}",
+    ]));
+    assert_eq!(archived["data"].as_array().map(Vec::len), Some(2));
+
+    let archive_drop_confirmation = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "drop",
+        &archive_collection,
+    ]));
+    let archive_drop_token = archive_drop_confirmation["error"]["confirm_token"]
+        .as_str()
+        .expect("archive drop should return a confirmation token");
+    let archive_dropped = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "--confirm",
+        archive_drop_token,
+        "doc",
+        "drop",
+        &archive_collection,
+    ]));
+    assert_eq!(archive_dropped["data"]["dropped"], true);
 
     let aggregated = stdout_json(dbtool(&[
         "--dsn",

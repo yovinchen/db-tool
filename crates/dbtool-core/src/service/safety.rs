@@ -73,6 +73,52 @@ impl SafetyGuard {
         allow_write: bool,
         confirm_token: Option<&str>,
     ) -> Result<()> {
+        Self::check_destructive_operation_internal(
+            operation,
+            resource,
+            target,
+            None,
+            allow_write,
+            confirm_token,
+        )
+    }
+
+    /// Like [`Self::check_destructive_operation`], but additionally binds the
+    /// confirmation token to caller-owned semantics that should not be exposed
+    /// in the human-readable impact object. This is intended for structured
+    /// operations such as an aggregation pipeline where the visible resource
+    /// alone is not a complete description of the write.
+    pub fn check_destructive_operation_with_scope(
+        operation: &str,
+        resource: &str,
+        target: &str,
+        confirmation_scope: &str,
+        allow_write: bool,
+        confirm_token: Option<&str>,
+    ) -> Result<()> {
+        if confirmation_scope.is_empty() {
+            return Err(Error::Config(
+                "destructive operation confirmation scope must not be empty".into(),
+            ));
+        }
+        Self::check_destructive_operation_internal(
+            operation,
+            resource,
+            target,
+            Some(confirmation_scope),
+            allow_write,
+            confirm_token,
+        )
+    }
+
+    fn check_destructive_operation_internal(
+        operation: &str,
+        resource: &str,
+        target: &str,
+        confirmation_scope: Option<&str>,
+        allow_write: bool,
+        confirm_token: Option<&str>,
+    ) -> Result<()> {
         if !allow_write {
             return Err(Error::WriteNotAllowed);
         }
@@ -90,7 +136,11 @@ impl SafetyGuard {
             "resource": resource,
             "target": target,
         });
-        let normalized = format!("{} {}", impact["op"].as_str().unwrap_or_default(), resource);
+        let mut normalized = format!("{} {}", impact["op"].as_str().unwrap_or_default(), resource);
+        if let Some(scope) = confirmation_scope {
+            normalized.push('\0');
+            normalized.push_str(scope);
+        }
         let token = compute_token(&normalized, target, &impact);
 
         match confirm_token {
@@ -453,6 +503,51 @@ mod tests {
                 None,
             ),
             Err(Error::WriteNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn non_sql_confirmation_can_bind_hidden_structured_semantics() {
+        let error = SafetyGuard::check_destructive_operation_with_scope(
+            "mongo_aggregate_out",
+            "app.archive",
+            "conn:local",
+            "source=users\npipeline=[{\"$out\":\"archive\"}]",
+            true,
+            None,
+        )
+        .unwrap_err();
+        let token = match error {
+            Error::ConfirmRequired {
+                confirm_token,
+                impact,
+            } => {
+                assert_eq!(impact["resource"], "app.archive");
+                assert!(impact.get("confirmation_scope").is_none());
+                confirm_token
+            }
+            other => panic!("expected confirmation requirement, got {other:?}"),
+        };
+
+        SafetyGuard::check_destructive_operation_with_scope(
+            "mongo_aggregate_out",
+            "app.archive",
+            "conn:local",
+            "source=users\npipeline=[{\"$out\":\"archive\"}]",
+            true,
+            Some(&token),
+        )
+        .unwrap();
+        assert!(matches!(
+            SafetyGuard::check_destructive_operation_with_scope(
+                "mongo_aggregate_out",
+                "app.archive",
+                "conn:local",
+                "source=orders\npipeline=[{\"$out\":\"archive\"}]",
+                true,
+                Some(&token),
+            ),
+            Err(Error::Internal(message)) if message.contains("mismatch")
         ));
     }
 
