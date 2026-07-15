@@ -150,15 +150,30 @@ fn parse_duration(value: &str, field: &str) -> Result<Duration> {
     let amount = amount
         .parse::<u64>()
         .map_err(|_| Error::Config(format!("{field} has invalid duration amount")))?;
-    match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "s" | "sec" | "secs" | "second" | "seconds" => Ok(Duration::from_secs(amount)),
-        "ms" | "millisecond" | "milliseconds" => Ok(Duration::from_millis(amount)),
-        "m" | "min" | "mins" | "minute" | "minutes" => Ok(Duration::from_secs(amount * 60)),
-        "h" | "hr" | "hrs" | "hour" | "hours" => Ok(Duration::from_secs(amount * 60 * 60)),
+    let duration = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => Duration::from_secs(amount),
+        "ms" | "millisecond" | "milliseconds" => Duration::from_millis(amount),
+        "m" | "min" | "mins" | "minute" | "minutes" => Duration::from_secs(
+            amount
+                .checked_mul(60)
+                .ok_or_else(|| Error::Config(format!("{field} duration is too large")))?,
+        ),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Duration::from_secs(
+            amount
+                .checked_mul(60 * 60)
+                .ok_or_else(|| Error::Config(format!("{field} duration is too large")))?,
+        ),
         _ => Err(Error::Config(format!(
             "{field} must use one of: ms, s, m, h"
-        ))),
+        )))?,
+    };
+
+    if std::time::Instant::now().checked_add(duration).is_none() {
+        return Err(Error::Config(format!(
+            "{field} duration exceeds the platform timer range"
+        )));
     }
+    Ok(duration)
 }
 
 fn parse_rate(value: &str, field: &str) -> Result<Rate> {
@@ -385,5 +400,20 @@ request_timout = "1s"
                 "expected {unknown_field:?} in error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn duration_overflow_is_a_config_error_instead_of_a_panic() {
+        for value in [format!("{}m", u64::MAX), format!("{}h", u64::MAX)] {
+            let error = parse_duration(&value, "limits.request_timeout").unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message.contains("too large")));
+        }
+
+        let error =
+            parse_duration(&format!("{}s", u64::MAX), "limits.request_timeout").unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Config(message) if message.contains("timer range")
+        ));
     }
 }

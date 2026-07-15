@@ -73,11 +73,8 @@ impl FlowControl {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let deadline_at = Instant::now()
-            + self
-                .config
-                .overall_deadline
-                .unwrap_or(self.config.request_timeout);
+        self.validate_durations()?;
+        let deadline_at = deadline_from_now(self.config.overall_deadline)?;
         let mut attempt = 0u32;
 
         loop {
@@ -85,10 +82,9 @@ impl FlowControl {
                 Ok(v) => return Ok(v),
                 Err(e) if e.is_retryable() && attempt < self.config.max_retries => {
                     attempt += 1;
-                    let rem = remaining(deadline_at)?;
                     // Exponential backoff with jitter, capped by remaining budget.
                     let backoff = Duration::from_millis(100 * (1u64 << attempt.min(6)));
-                    let nap = backoff.min(rem);
+                    let nap = remaining(deadline_at)?.map_or(backoff, |rem| backoff.min(rem));
                     if nap.is_zero() {
                         return Err(Error::DeadlineExceeded);
                     }
@@ -107,48 +103,85 @@ impl FlowControl {
     where
         F: std::future::Future<Output = Result<T>>,
     {
-        let deadline_at = Instant::now()
-            + self
-                .config
-                .overall_deadline
-                .unwrap_or(self.config.request_timeout);
+        self.validate_durations()?;
+        let deadline_at = deadline_from_now(self.config.overall_deadline)?;
         self.run_once(deadline_at, op).await
     }
 
-    async fn run_once<F, T>(&self, deadline_at: Instant, op: F) -> Result<T>
+    async fn run_once<F, T>(&self, deadline_at: Option<Instant>, op: F) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,
     {
         if let Some(rate) = &self.rate {
-            let wait = self.config.acquire_timeout.min(remaining(deadline_at)?);
+            let wait = budget_with_deadline(self.config.acquire_timeout, deadline_at)?;
             tokio::time::timeout(wait, rate.until_ready())
                 .await
                 .map_err(|_| Error::RateLimited)?;
         }
 
         // Acquire concurrency permit with timeout to avoid infinite blocking.
-        let wait = self.config.acquire_timeout.min(remaining(deadline_at)?);
+        let wait = budget_with_deadline(self.config.acquire_timeout, deadline_at)?;
         let _permit = tokio::time::timeout(wait, self.sem.clone().acquire_owned())
             .await
             .map_err(|_| Error::Overloaded)?
             .map_err(|_| Error::Internal("semaphore closed".into()))?;
 
         // Execute op under a budget = min(remaining, single request timeout).
-        let budget = remaining(deadline_at)?.min(self.config.request_timeout);
+        let budget = budget_with_deadline(self.config.request_timeout, deadline_at)?;
         tokio::time::timeout(budget, op)
             .await
             .map_err(|_| Error::Timeout)?
     }
+
+    fn validate_durations(&self) -> Result<()> {
+        validate_duration(self.config.acquire_timeout, "acquire_timeout")?;
+        validate_duration(self.config.request_timeout, "request_timeout")?;
+        if let Some(deadline) = self.config.overall_deadline {
+            validate_duration(deadline, "overall_deadline")?;
+        }
+        Ok(())
+    }
 }
 
 #[inline]
-fn remaining(deadline_at: Instant) -> Result<Duration> {
+fn deadline_from_now(duration: Option<Duration>) -> Result<Option<Instant>> {
+    duration
+        .map(|duration| {
+            Instant::now().checked_add(duration).ok_or_else(|| {
+                Error::Config("overall_deadline exceeds the platform timer range".into())
+            })
+        })
+        .transpose()
+}
+
+#[inline]
+fn remaining(deadline_at: Option<Instant>) -> Result<Option<Duration>> {
+    let Some(deadline_at) = deadline_at else {
+        return Ok(None);
+    };
     let now = Instant::now();
     if now >= deadline_at {
         Err(Error::DeadlineExceeded)
     } else {
-        Ok(deadline_at - now)
+        Ok(Some(deadline_at - now))
     }
+}
+
+#[inline]
+fn budget_with_deadline(budget: Duration, deadline_at: Option<Instant>) -> Result<Duration> {
+    Ok(remaining(deadline_at)?.map_or(budget, |remaining| budget.min(remaining)))
+}
+
+fn validate_duration(duration: Duration, field: &str) -> Result<()> {
+    if duration.is_zero() {
+        return Err(Error::Config(format!("{field} must be greater than 0")));
+    }
+    if Instant::now().checked_add(duration).is_none() {
+        return Err(Error::Config(format!(
+            "{field} exceeds the platform timer range"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -273,5 +306,54 @@ mod tests {
             attempts.load(Ordering::SeqCst) >= 1,
             "at least one operation attempt should run"
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_overall_deadline_gives_admission_and_request_separate_budgets() {
+        let flow = Arc::new(FlowControl::new(ThrottleConfig {
+            max_concurrency: 1,
+            acquire_timeout: Duration::from_millis(100),
+            request_timeout: Duration::from_millis(50),
+            overall_deadline: None,
+            max_retries: 0,
+            ..ThrottleConfig::default()
+        }));
+
+        let holder = {
+            let flow = Arc::clone(&flow);
+            tokio::spawn(async move {
+                flow.run_single(async {
+                    sleep(Duration::from_millis(35)).await;
+                    Ok::<_, Error>(())
+                })
+                .await
+            })
+        };
+        sleep(Duration::from_millis(5)).await;
+
+        let result = flow
+            .run_single(async {
+                sleep(Duration::from_millis(40)).await;
+                Ok::<_, Error>("completed")
+            })
+            .await;
+
+        assert_eq!(result.unwrap(), "completed");
+        assert!(holder.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn programmatic_oversized_duration_returns_error_instead_of_panicking() {
+        let flow = FlowControl::new(ThrottleConfig {
+            request_timeout: Duration::from_secs(u64::MAX),
+            overall_deadline: None,
+            ..test_config()
+        });
+
+        let error = flow
+            .run_single(async { Ok::<_, Error>(()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("timer range")));
     }
 }
