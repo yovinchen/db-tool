@@ -56,15 +56,35 @@ impl TuiRuntime for CrosstermRuntime {
 pub struct App {
     _manager: Arc<ConnectionManager>,
     state: AppState,
+    startup_error: Option<String>,
 }
 
 impl App {
     pub fn new(registry: Arc<Registry>) -> Self {
+        Self::from_connection_load(registry, load_connection_items())
+    }
+
+    fn from_connection_load(
+        registry: Arc<Registry>,
+        connections: Result<Vec<ConnectionItem>>,
+    ) -> Self {
         let manager = Arc::new(ConnectionManager::new(registry));
-        let connections = load_connection_items();
-        Self {
-            _manager: Arc::clone(&manager),
-            state: AppState::with_connections(connections),
+        match connections {
+            Ok(connections) => Self {
+                _manager: Arc::clone(&manager),
+                state: AppState::with_connections(connections),
+                startup_error: None,
+            },
+            Err(error) => {
+                let startup_error = format_error(&error);
+                let mut state = AppState::with_connections(Vec::new());
+                state.result_text = startup_error.clone();
+                Self {
+                    _manager: Arc::clone(&manager),
+                    state,
+                    startup_error: Some(startup_error),
+                }
+            }
         }
     }
 
@@ -73,6 +93,9 @@ impl App {
     }
 
     pub fn smoke_summary(&self) -> String {
+        if let Some(error) = &self.startup_error {
+            return format!("error: configuration load failed; {error}");
+        }
         format!(
             "ok: loaded {} connection(s); selected panel: {:?}",
             self.state.connections.len(),
@@ -128,6 +151,12 @@ impl App {
     }
 
     async fn execute_current(&mut self, confirmed_write: bool) {
+        if let Some(error) = &self.startup_error {
+            self.state.pending_write = None;
+            self.state.result_text = error.clone();
+            return;
+        }
+
         let command = if confirmed_write {
             self.state
                 .pending_write
@@ -185,21 +214,24 @@ impl App {
     }
 }
 
-fn load_connection_items() -> Vec<ConnectionItem> {
+fn load_connection_items() -> Result<Vec<ConnectionItem>> {
+    load_connection_items_from(&ConnectionConfig::default_path())
+}
+
+fn load_connection_items_from(path: &std::path::Path) -> Result<Vec<ConnectionItem>> {
     let mut connections = Vec::new();
 
-    if let Ok(config) = ConnectionConfig::load(&ConnectionConfig::default_path()) {
-        connections.extend(
-            config
-                .connections
-                .into_iter()
-                .map(|(name, entry)| ConnectionItem {
-                    name,
-                    dsn: entry.dsn,
-                    readonly: entry.readonly.unwrap_or(false),
-                }),
-        );
-    }
+    let config = ConnectionConfig::load(path)?;
+    connections.extend(
+        config
+            .connections
+            .into_iter()
+            .map(|(name, entry)| ConnectionItem {
+                name,
+                dsn: entry.dsn,
+                readonly: entry.readonly.unwrap_or(false),
+            }),
+    );
 
     connections.extend(
         discover_env_connections()
@@ -216,7 +248,7 @@ fn load_connection_items() -> Vec<ConnectionItem> {
     if connections.is_empty() {
         connections.push(ConnectionItem::default());
     }
-    connections
+    Ok(connections)
 }
 
 async fn execute_tui_command(
@@ -706,6 +738,58 @@ mod tests {
         assert!(app.smoke_summary().contains("loaded"));
     }
 
+    #[test]
+    fn invalid_connection_file_is_propagated_instead_of_ignored() {
+        let path = std::env::temp_dir().join(format!(
+            "dbtool-tui-invalid-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[connections.prod]
+dsn = "postgres://127.0.0.1:1/app"
+readonli = true
+"#,
+        )
+        .unwrap();
+
+        let error = load_connection_items_from(&path).unwrap_err();
+        std::fs::remove_file(path).ok();
+
+        assert!(matches!(
+            error,
+            Error::Config(message) if message.contains("readonli")
+        ));
+    }
+
+    #[tokio::test]
+    async fn configuration_error_is_rendered_and_blocks_execution() {
+        let registry = Arc::new(build_registry());
+        let mut app = App::from_connection_load(
+            registry,
+            Err(Error::Config("unknown field `readonli`".to_owned())),
+        );
+
+        assert!(app.state.connections.is_empty());
+        let rendered: serde_json::Value = serde_json::from_str(&app.state.result_text).unwrap();
+        assert_eq!(rendered["error"]["code"], "CONFIG_ERROR");
+        assert!(rendered["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("readonli")));
+        assert!(app.smoke_summary().contains("configuration load failed"));
+        assert!(app.smoke_summary().contains("CONFIG_ERROR"));
+
+        let original_error = app.state.result_text.clone();
+        app.state.query_input = "ping".to_owned();
+        app.execute_current(false).await;
+        assert_eq!(app.state.result_text, original_error);
+    }
+
     #[tokio::test]
     async fn dispatches_ping_and_sql_query() {
         let registry = Arc::new(build_registry());
@@ -867,6 +951,7 @@ mod tests {
         let registry = Arc::new(build_registry());
         let mut app = App {
             _manager: Arc::new(ConnectionManager::new(registry)),
+            startup_error: None,
             state: AppState {
                 pending_write: Some("exec insert into t values (1)".to_owned()),
                 ..AppState::with_connections(vec![ConnectionItem {
@@ -888,6 +973,7 @@ mod tests {
         let registry = Arc::new(build_registry());
         let mut app = App {
             _manager: Arc::new(ConnectionManager::new(registry)),
+            startup_error: None,
             state: AppState {
                 active_panel: crate::state::Panel::QueryInput,
                 query_input: "ping".to_owned(),
@@ -909,6 +995,7 @@ mod tests {
         let registry = Arc::new(build_registry());
         let mut app = App {
             _manager: Arc::new(ConnectionManager::new(registry)),
+            startup_error: None,
             state: AppState {
                 active_panel: crate::state::Panel::QueryInput,
                 query_input: "exec create table tui_history (id integer primary key)".to_owned(),

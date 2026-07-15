@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionConfig {
     #[serde(default)]
     pub defaults: Option<Defaults>,
@@ -15,11 +16,13 @@ pub struct ConnectionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Defaults {
     pub limits: Option<LimitsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     pub max_concurrency: Option<usize>,
     pub rate: Option<String>,
@@ -30,8 +33,10 @@ pub struct LimitsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionEntry {
     pub dsn: String,
+    #[serde(default, alias = "read_only")]
     pub readonly: Option<bool>,
     pub limits: Option<LimitsConfig>,
 }
@@ -321,5 +326,64 @@ rate = "10/hour"
         let err = config.throttle_config_for(None).unwrap_err();
 
         assert!(matches!(err, Error::Config(message) if message.contains("rate")));
+    }
+
+    #[test]
+    fn read_only_remains_a_compatible_readonly_alias() {
+        let config: ConnectionConfig = toml::from_str(
+            r#"
+[connections.archive]
+dsn = "sqlite::memory:"
+read_only = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.connections["archive"].readonly, Some(true));
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_at_every_config_scope() {
+        let cases = [
+            (
+                "root_option",
+                r#"
+root_option = true
+"#,
+            ),
+            (
+                "limtis",
+                r#"
+[defaults]
+limtis = true
+"#,
+            ),
+            (
+                "readonli",
+                r#"
+[connections.prod]
+dsn = "postgres://127.0.0.1:1/app"
+readonli = true
+"#,
+            ),
+            (
+                "request_timout",
+                r#"
+[connections.prod]
+dsn = "postgres://127.0.0.1:1/app"
+
+[connections.prod.limits]
+request_timout = "1s"
+"#,
+            ),
+        ];
+
+        for (unknown_field, toml) in cases {
+            let error = toml::from_str::<ConnectionConfig>(toml).unwrap_err();
+            assert!(
+                error.to_string().contains(unknown_field),
+                "expected {unknown_field:?} in error: {error}"
+            );
+        }
     }
 }

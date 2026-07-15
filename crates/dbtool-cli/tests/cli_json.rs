@@ -742,6 +742,72 @@ readonly = true
 }
 
 #[test]
+fn read_only_alias_remains_fail_closed_before_connecting() {
+    let err = stderr_json(&dbtool_with_config(
+        &[
+            "--conn",
+            "locked",
+            "--allow-write",
+            "sql",
+            "exec",
+            "insert into users (id) values (1)",
+        ],
+        r#"
+[connections.locked]
+dsn = "postgres://127.0.0.1:1/app"
+read_only = true
+"#,
+    ));
+
+    assert_eq!(err["error"]["code"], "READ_ONLY");
+}
+
+#[test]
+fn misspelled_connection_and_flow_control_fields_fail_before_connecting() {
+    let cases = [
+        (
+            "readonli",
+            r#"
+[connections.typo]
+dsn = "postgres://127.0.0.1:1/app"
+readonli = true
+"#,
+        ),
+        (
+            "request_timout",
+            r#"
+[connections.typo]
+dsn = "postgres://127.0.0.1:1/app"
+
+[connections.typo.limits]
+request_timout = "1s"
+"#,
+        ),
+        (
+            "max_concurency",
+            r#"
+[defaults.limits]
+max_concurency = 1
+
+[connections.typo]
+dsn = "postgres://127.0.0.1:1/app"
+"#,
+        ),
+    ];
+
+    for (unknown_field, config) in cases {
+        let err = stderr_json(&dbtool_with_config(&["--conn", "typo", "ping"], config));
+        assert_eq!(err["error"]["code"], "CONFIG_ERROR");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(unknown_field)),
+            "expected {unknown_field:?} in config error: {err}"
+        );
+    }
+}
+
+#[test]
 fn named_connection_limits_are_loaded_for_data_commands() {
     let output = dbtool_with_config(
         &["--conn", "limit-test", "ping"],
