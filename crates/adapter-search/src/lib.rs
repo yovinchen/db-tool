@@ -591,7 +591,7 @@ fn search_hits_from_response(response: &JsonValue) -> Result<SearchHits> {
 }
 
 fn core_value_to_json(value: Value) -> Result<JsonValue> {
-    serde_json::to_value(value).map_err(|e| Error::Serialization(e.to_string()))
+    value.to_plain_json()
 }
 
 fn parse_write_response(response: JsonValue, operation: &str) -> Result<SearchWriteOutcome> {

@@ -279,6 +279,7 @@ fn sql_export_records_truncation_and_import_refuses_partial_artifact() {
         &fs::read(&artifact).expect("bounded SQL export artifact should exist"),
     )
     .expect("bounded SQL export artifact should be JSON");
+    assert_eq!(artifact_json["version"], 3);
     assert_eq!(artifact_json["truncated"], true);
     assert_eq!(artifact_json["rows"], serde_json::json!([[1], [2]]));
 
@@ -302,7 +303,7 @@ fn sql_export_records_truncation_and_import_refuses_partial_artifact() {
 }
 
 #[test]
-fn sql_import_rejects_unmarked_legacy_artifact_by_default() {
+fn sql_import_rejects_legacy_untagged_value_artifact() {
     let root = temp_path("legacy-artifact");
     fs::create_dir_all(&root).expect("temporary directory should be created");
     let artifact = root.join("rows-v1.json");
@@ -332,7 +333,9 @@ fn sql_import_rejects_unmarked_legacy_artifact_by_default() {
     assert_eq!(rejected["error"]["code"], "SERIALIZATION_ERROR");
     assert!(rejected["error"]["message"]
         .as_str()
-        .is_some_and(|message| message.contains("--accept-legacy-unmarked")));
+        .is_some_and(|message| message.contains("untagged Value")
+            && message.contains("re-export")
+            && message.contains("dbtool-value-v2")));
 
     fs::remove_dir_all(root).expect("temporary directory should be removed");
 }

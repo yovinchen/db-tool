@@ -4,6 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use dbtool_core::model::Value as CoreValue;
 use serde_json::Value;
 
 fn integration_enabled() -> bool {
@@ -545,7 +546,10 @@ fn mysql_family_typed_probe(dsn: &str, expected_kind: &str) {
     let row = &typed["data"]["rows"][0];
     assert_eq!(row[0], 42);
     assert_eq!(row[1].as_f64().expect("float should decode"), 3.5);
-    assert_eq!(row[2], serde_json::json!([104, 105]));
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[2].clone()).unwrap(),
+        CoreValue::Bytes(vec![104, 105])
+    );
     assert_eq!(row[3], Value::Null);
 
     let limited = stdout_json(dbtool(&[
@@ -1241,18 +1245,45 @@ fn cassandra_live_cql_lifecycle_and_typed_values() {
     assert_eq!(row[1], "alice");
     assert_eq!(row[2].as_f64().expect("score should decode"), 3.5);
     assert_eq!(row[3], true);
-    assert_eq!(row[4], serde_json::json!(["core", "cql"]));
-    let mut labels = row[5]
-        .as_array()
-        .expect("set should decode as an array")
-        .clone();
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[4].clone()).unwrap(),
+        CoreValue::Array(vec![
+            CoreValue::Text("core".into()),
+            CoreValue::Text("cql".into())
+        ])
+    );
+    let CoreValue::Array(mut labels) = serde_json::from_value::<CoreValue>(row[5].clone()).unwrap()
+    else {
+        panic!("set should decode as a typed array");
+    };
     labels.sort_by_key(|value| value.as_str().unwrap_or_default().to_owned());
-    assert_eq!(Value::Array(labels), serde_json::json!(["blue", "green"]));
-    assert_eq!(row[6], serde_json::json!({"attempts": 2, "level": 7}));
-    assert_eq!(row[7], serde_json::json!([9, "nine"]));
-    assert_eq!(row[8], serde_json::json!([104, 105]));
+    assert_eq!(
+        labels,
+        vec![
+            CoreValue::Text("blue".into()),
+            CoreValue::Text("green".into())
+        ]
+    );
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[6].clone()).unwrap(),
+        CoreValue::Map(std::collections::BTreeMap::from([
+            ("attempts".into(), CoreValue::Int(2)),
+            ("level".into(), CoreValue::Int(7)),
+        ]))
+    );
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[7].clone()).unwrap(),
+        CoreValue::Array(vec![CoreValue::Int(9), CoreValue::Text("nine".into())])
+    );
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[8].clone()).unwrap(),
+        CoreValue::Bytes(vec![104, 105])
+    );
     assert_eq!(row[9], "550e8400-e29b-41d4-a716-446655440000");
-    assert_eq!(row[10], 1_783_987_200_000_i64);
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[10].clone()).unwrap(),
+        CoreValue::Timestamp(1_783_987_200_000_i64)
+    );
     assert_eq!(row[11], Value::Null);
 
     let typed_schema = stdout_json(dbtool(&[
@@ -1419,8 +1450,13 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let multi_get = stdout_json(dbtool(&[
         "--dsn", &dsn, "kv", "raw", "MGET", &key, &raw_key,
     ]));
-    assert_eq!(multi_get["data"][0], "alice-updated");
-    assert_eq!(multi_get["data"][1], "raw-value");
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(multi_get["data"].clone()).unwrap(),
+        CoreValue::Array(vec![
+            CoreValue::Text("alice-updated".into()),
+            CoreValue::Text("raw-value".into()),
+        ])
+    );
 
     stdout_json(dbtool(&[
         "--dsn",

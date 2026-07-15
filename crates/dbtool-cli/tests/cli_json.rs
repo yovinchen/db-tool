@@ -5,6 +5,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use dbtool_core::model::Value as CoreValue;
 use serde_json::Value;
 
 static CONFIG_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -417,8 +418,8 @@ fn sql_cli_binds_json_parameters_to_sqlite_without_interpolation() {
     assert_eq!(queried["data"]["rows"][0][2], 12.75);
     assert_eq!(queried["data"]["rows"][0][3], true);
     assert_eq!(
-        queried["data"]["rows"][0][4],
-        serde_json::json!([0, 127, 255])
+        serde_json::from_value::<CoreValue>(queried["data"]["rows"][0][4].clone()).unwrap(),
+        CoreValue::Bytes(vec![0, 127, 255])
     );
     assert_eq!(queried["data"]["rows"][0][5], Value::Null);
 

@@ -1,3 +1,4 @@
+use dbtool_core::model::Value as CoreValue;
 use serde_json::Value;
 use std::{
     env,
@@ -176,12 +177,18 @@ fn run_parameter_lifecycle(backend: Backend) {
     assert_eq!(row[1], injection);
     assert_eq!(row[2], 12.75);
     assert_eq!(row[3], true);
-    assert_eq!(row[4], serde_json::json!([0, 127, 255]));
-    assert_eq!(row[5], Value::Null);
-    assert_eq!(row[6], timestamp);
     assert_eq!(
-        row[7],
-        serde_json::json!({"source": backend.prefix(), "tags": ["bound", "safe"]})
+        serde_json::from_value::<CoreValue>(row[4].clone()).unwrap(),
+        CoreValue::Bytes(vec![0, 127, 255])
+    );
+    assert_eq!(row[5], Value::Null);
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[6].clone()).unwrap(),
+        CoreValue::Timestamp(timestamp)
+    );
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[7].clone()).unwrap(),
+        CoreValue::Json(serde_json::json!({"source": backend.prefix(), "tags": ["bound", "safe"]}))
     );
 
     let count = stdout_json(dbtool(&[

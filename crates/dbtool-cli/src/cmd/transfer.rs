@@ -16,8 +16,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TRANSFER_VERSION: u32 = 1;
-const SQL_TRANSFER_VERSION: u32 = 2;
+const KV_TRANSFER_VERSION: u32 = 1;
+const DOCUMENT_TRANSFER_VERSION: u32 = 2;
+const SQL_TRANSFER_VERSION: u32 = 3;
 
 #[derive(Args)]
 #[command(
@@ -82,8 +83,8 @@ pub enum ImportAction {
         /// Input JSON artifact path.
         #[arg(long)]
         input: PathBuf,
-        /// Accept a legacy v1 SQL artifact without an integrity marker. Such
-        /// artifacts may contain a silently truncated export.
+        /// Deprecated compatibility flag. Legacy SQL artifacts are rejected
+        /// because their untagged values cannot be migrated without type loss.
         #[arg(long)]
         accept_legacy_unmarked: bool,
     },
@@ -193,7 +194,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
             write_artifact(
                 &out,
                 TransferArtifact::KvPairs {
-                    version: TRANSFER_VERSION,
+                    version: KV_TRANSFER_VERSION,
                     entries,
                 },
             )?;
@@ -229,7 +230,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
             write_artifact(
                 &out,
                 TransferArtifact::Documents {
-                    version: TRANSFER_VERSION,
+                    version: DOCUMENT_TRANSFER_VERSION,
                     collection: Some(collection),
                     documents,
                 },
@@ -327,7 +328,7 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
                     "expected kv-pairs transfer artifact".to_owned(),
                 ));
             };
-            require_version(version)?;
+            require_version("kv-pairs", version, KV_TRANSFER_VERSION)?;
             let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "KeyValueStore",
@@ -370,7 +371,7 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
                     "expected documents transfer artifact".to_owned(),
                 ));
             };
-            require_version(version)?;
+            require_version("documents", version, DOCUMENT_TRANSFER_VERSION)?;
             let docs = conn
                 .as_document()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -442,42 +443,65 @@ fn write_artifact(path: &Path, artifact: TransferArtifact) -> Result<()> {
 
 fn read_artifact(path: &Path) -> Result<TransferArtifact> {
     let bytes = fs::read(path).map_err(|e| Error::Config(e.to_string()))?;
-    serde_json::from_slice(&bytes).map_err(|e| Error::Serialization(e.to_string()))
+    let raw: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::Serialization(e.to_string()))?;
+    reject_legacy_value_codec_artifact(&raw)?;
+    serde_json::from_value(raw).map_err(|e| Error::Serialization(e.to_string()))
 }
 
-fn require_version(version: u32) -> Result<()> {
-    if version == TRANSFER_VERSION {
+fn require_version(kind: &str, version: u32, expected: u32) -> Result<()> {
+    if version == expected {
         Ok(())
     } else {
         Err(Error::Serialization(format!(
-            "unsupported transfer artifact version: {version}"
+            "unsupported {kind} transfer artifact version: {version}; expected {expected}"
         )))
     }
+}
+
+fn reject_legacy_value_codec_artifact(raw: &serde_json::Value) -> Result<()> {
+    let Some(kind) = raw.get("kind").and_then(serde_json::Value::as_str) else {
+        return Ok(());
+    };
+    let Some(version) = raw.get("version").and_then(serde_json::Value::as_u64) else {
+        return Ok(());
+    };
+
+    let legacy = match kind {
+        "sql-rows" => version < u64::from(SQL_TRANSFER_VERSION),
+        "documents" => version < u64::from(DOCUMENT_TRANSFER_VERSION),
+        _ => false,
+    };
+    if legacy {
+        return Err(legacy_value_codec_error(kind, version));
+    }
+    Ok(())
+}
+
+fn legacy_value_codec_error(kind: &str, version: u64) -> Error {
+    Error::Serialization(format!(
+        "refusing to import legacy {kind} v{version}: its untagged Value representation cannot distinguish bytes, timestamps, arrays, maps, and JSON; re-export from the source with a dbtool version that writes {}",
+        Value::WIRE_CODEC
+    ))
 }
 
 fn require_complete_sql_artifact(
     version: u32,
     truncated: Option<bool>,
-    accept_legacy_unmarked: bool,
+    _accept_legacy_unmarked: bool,
 ) -> Result<()> {
     match version {
         SQL_TRANSFER_VERSION => {
             let truncated = truncated.ok_or_else(|| {
                 Error::Serialization(
-                    "sql-rows v2 artifact is missing the required truncated integrity marker"
-                        .to_owned(),
+                    format!(
+                        "sql-rows v{SQL_TRANSFER_VERSION} artifact is missing the required truncated integrity marker"
+                    ),
                 )
             })?;
             reject_truncated_sql_artifact(truncated)
         }
-        TRANSFER_VERSION => match truncated {
-            Some(truncated) => reject_truncated_sql_artifact(truncated),
-            None if accept_legacy_unmarked => Ok(()),
-            None => Err(Error::Serialization(
-                "refusing to import an unmarked legacy sql-rows v1 artifact because it may be incomplete; inspect it and pass --accept-legacy-unmarked to override"
-                    .to_owned(),
-            )),
-        },
+        1 | 2 => Err(legacy_value_codec_error("sql-rows", u64::from(version))),
         version => Err(Error::Serialization(format!(
             "unsupported sql-rows transfer artifact version: {version}"
         ))),
@@ -547,11 +571,9 @@ fn sql_literal(value: &Value) -> Result<String> {
         Value::Text(value) => quote_sql_string(value),
         Value::Bytes(value) => format!("X'{}'", bytes_to_hex(value)),
         Value::Json(value) => quote_sql_string(&value.to_string()),
-        Value::Array(value) => quote_sql_string(
-            &serde_json::to_string(value).map_err(|e| Error::Serialization(e.to_string()))?,
-        ),
-        Value::Map(value) => quote_sql_string(
-            &serde_json::to_string(value).map_err(|e| Error::Serialization(e.to_string()))?,
+        Value::Array(_) | Value::Map(_) => quote_sql_string(
+            &serde_json::to_string(&value.to_plain_json()?)
+                .map_err(|e| Error::Serialization(e.to_string()))?,
         ),
     })
 }
@@ -617,6 +639,17 @@ mod tests {
         );
         assert_eq!(sql_literal(&Value::Bytes(vec![0, 255])).unwrap(), "X'00ff'");
         assert_eq!(
+            sql_literal(&Value::Array(vec![
+                Value::Int(1),
+                Value::Map(std::collections::BTreeMap::from([(
+                    "nested".to_owned(),
+                    Value::Bool(true),
+                )])),
+            ]))
+            .unwrap(),
+            "'[1,{\"nested\":true}]'"
+        );
+        assert_eq!(
             validate_identifier_path("main.people", "table").unwrap(),
             "main.people"
         );
@@ -624,24 +657,97 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sql_artifacts_are_unknown_and_require_an_explicit_override() {
-        let artifact: TransferArtifact = serde_json::from_value(serde_json::json!({
+    fn legacy_value_codec_artifacts_fail_closed_with_reexport_guidance() {
+        let sql = serde_json::json!({
             "kind": "sql-rows",
-            "version": 1,
+            "version": 2,
             "columns": ["id"],
             "rows": [[1]]
-        }))
-        .unwrap();
+        });
+        assert!(matches!(
+            reject_legacy_value_codec_artifact(&sql),
+            Err(Error::Serialization(message))
+                if message.contains("untagged Value")
+                    && message.contains("re-export")
+                    && message.contains(Value::WIRE_CODEC)
+        ));
+        assert!(matches!(
+            require_complete_sql_artifact(2, Some(false), true),
+            Err(Error::Serialization(message)) if message.contains("untagged Value")
+        ));
 
-        let TransferArtifact::SqlRows { truncated, .. } = artifact else {
+        let documents = serde_json::json!({
+            "kind": "documents",
+            "version": 1,
+            "documents": [{"id": 1}]
+        });
+        assert!(matches!(
+            reject_legacy_value_codec_artifact(&documents),
+            Err(Error::Serialization(message)) if message.contains("legacy documents v1")
+        ));
+    }
+
+    #[test]
+    fn current_sql_artifact_uses_value_wire_codec_v2_and_round_trips() {
+        let expected_rows = vec![vec![
+            Value::Timestamp(1_700_000_000_123),
+            Value::Bytes(vec![0, 255]),
+            Value::Array(vec![Value::Int(1)]),
+        ]];
+        let artifact = TransferArtifact::SqlRows {
+            version: SQL_TRANSFER_VERSION,
+            columns: vec![
+                "created_at".to_owned(),
+                "payload".to_owned(),
+                "items".to_owned(),
+            ],
+            rows: expected_rows.clone(),
+            truncated: Some(false),
+        };
+
+        let encoded = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(encoded["version"], SQL_TRANSFER_VERSION);
+        assert_eq!(encoded["rows"][0][0]["$dbtool"]["codec"], Value::WIRE_CODEC);
+        assert_eq!(encoded["rows"][0][0]["$dbtool"]["type"], "timestamp");
+        assert_eq!(encoded["rows"][0][1]["$dbtool"]["value"], "AP8=");
+
+        let decoded: TransferArtifact = serde_json::from_value(encoded).unwrap();
+        let TransferArtifact::SqlRows { rows, .. } = decoded else {
             panic!("expected sql-rows artifact");
         };
-        assert_eq!(truncated, None);
-        assert!(matches!(
-            require_complete_sql_artifact(1, truncated, false),
-            Err(Error::Serialization(message)) if message.contains("--accept-legacy-unmarked")
-        ));
-        require_complete_sql_artifact(1, truncated, true).unwrap();
+        assert_eq!(rows, expected_rows);
+    }
+
+    #[test]
+    fn current_document_artifact_versions_the_value_wire_codec() {
+        let expected_documents = vec![std::collections::BTreeMap::from([
+            ("name".to_owned(), Value::Text("alice".to_owned())),
+            (
+                "metadata".to_owned(),
+                Value::Map(std::collections::BTreeMap::from([(
+                    "payload".to_owned(),
+                    Value::Bytes(vec![1, 2, 3]),
+                )])),
+            ),
+        ])];
+        let artifact = TransferArtifact::Documents {
+            version: DOCUMENT_TRANSFER_VERSION,
+            collection: Some("users".to_owned()),
+            documents: expected_documents.clone(),
+        };
+
+        let encoded = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(encoded["version"], DOCUMENT_TRANSFER_VERSION);
+        assert_eq!(
+            encoded["documents"][0]["metadata"]["$dbtool"]["type"],
+            "map"
+        );
+
+        let decoded: TransferArtifact = serde_json::from_value(encoded).unwrap();
+        let TransferArtifact::Documents { documents, .. } = decoded else {
+            panic!("expected documents artifact");
+        };
+        assert_eq!(documents, expected_documents);
     }
 
     #[test]

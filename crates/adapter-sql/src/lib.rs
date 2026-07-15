@@ -25,9 +25,7 @@ pub(crate) fn timestamp_utc(value: i64, position: usize, backend: &str) -> Resul
 pub(crate) fn structured_json(value: &Value) -> Result<serde_json::Value> {
     match value {
         Value::Json(value) => Ok(value.clone()),
-        Value::Array(_) | Value::Map(_) => {
-            serde_json::to_value(value).map_err(|error| Error::Serialization(error.to_string()))
-        }
+        Value::Array(_) | Value::Map(_) => value.to_plain_json(),
         _ => Err(Error::Internal(
             "structured_json called for a scalar SQL parameter".into(),
         )),
