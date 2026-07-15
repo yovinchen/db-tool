@@ -173,6 +173,33 @@ MySQL 与 SQLite 使用 `?`，PostgreSQL 使用 `$1`、`$2`。参数不会插入
 `SqlQuerySchema` 的 `UNSUPPORTED_CAPABILITY`。表列表仍通过
 `sql tables --schema <name>` 使用已实现的 schema 过滤。
 
+## TimeSeries / Prometheus 查询范围
+
+`ts query` 有两种互斥的时间范围：
+
+```bash
+# 相对窗口；未写时默认最近 60 分钟
+dbtool --dsn "$PROMETHEUS_DSN" ts query 'rate(http_requests_total[5m])' \
+  --last-minutes 30
+
+# 精确闭区间；单位为 Unix epoch 毫秒，两个端点必须同时提供
+dbtool --dsn "$PROMETHEUS_DSN" ts query 'up' \
+  --start-ms 1710000000000 --end-ms 1710000060000
+```
+
+规范如下：
+
+- `--last-minutes` 必须大于零，且不能与显式端点混用；
+- `--start-ms` 与 `--end-ms` 必须成对出现，`start <= end`；
+- 全局 `--limit` 对所有 series 的样本总数生效，不是每个 series 各用一次；
+- TS 查询的样本预算为 `1..=1,000,000`，零值、超上限和时间运算溢出在连接前返回
+  `CONFIG_ERROR`；
+- 成功响应保持 `data.series`、`data.truncated` 与 `meta.truncated`，显式范围不会改变
+  JSON 契约。
+
+CLI mock 服务测试会核对发给 Prometheus 的秒级 `start/end`；Prometheus 2.55.1 Docker
+实测会写入两个带标签和精确时间戳的样本，再用相对窗口和显式 epoch-ms 窗口逐值读回。
+
 ## Search / OpenSearch / Elasticsearch
 
 完整文档生命周期使用稳定 ID；自动 ID 写入也会返回后端生成的 ID：

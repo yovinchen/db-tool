@@ -163,6 +163,25 @@ fn cli_help_documents_core_command_families() {
 }
 
 #[test]
+fn global_limit_rejects_zero_before_connecting() {
+    let output = dbtool(&[
+        "--dsn",
+        "postgres://127.0.0.1:1/unreachable",
+        "--limit",
+        "0",
+        "sql",
+        "query",
+        "select 1",
+    ]);
+
+    let error = stderr_json(&output);
+    assert_eq!(error["error"]["code"], "CONFIG_ERROR");
+    assert!(error["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("global --limit must be greater than zero")));
+}
+
+#[test]
 fn cli_generate_artifacts_writes_completion_and_manpage_files() {
     let root = std::env::temp_dir().join(format!(
         "dbtool-cli-artifacts-{}-{}",

@@ -7,10 +7,13 @@ use dbtool_core::{
 };
 use std::collections::HashMap;
 
+const DEFAULT_LAST_MINUTES: i64 = 60;
+const MAX_QUERY_SAMPLES: usize = 1_000_000;
+
 #[derive(Args)]
 #[command(
     about = "Read and write Prometheus-compatible time-series data.",
-    long_about = "Time-series commands list metric names, run bounded range queries, and write single samples through Prometheus remote write behind --allow-write."
+    long_about = "Time-series commands list metric names, run bounded range queries, and write single samples through Prometheus remote write behind --allow-write. Query ranges use either --last-minutes (60 by default) or an explicit --start-ms/--end-ms pair in Unix epoch milliseconds."
 )]
 pub struct TsCmd {
     #[command(subcommand)]
@@ -21,13 +24,22 @@ pub struct TsCmd {
 pub enum TsAction {
     /// List metric names from a Prometheus-compatible backend.
     Measurements,
-    /// Run a range query over the last N minutes.
+    /// Run a bounded range query.
+    #[command(
+        long_about = "Run a PromQL range query. Select either a relative window with --last-minutes (60 minutes by default) or an inclusive explicit range with both --start-ms and --end-ms in Unix epoch milliseconds. Explicit bounds cannot be combined with --last-minutes. The global --limit must be between 1 and 1,000,000 samples and is applied across all returned series."
+    )]
     Query {
         /// PromQL expression to evaluate over the requested range.
         query: String,
-        /// Number of minutes back from now to include in the range query.
-        #[arg(long, default_value = "60")]
-        last_minutes: i64,
+        /// Relative minutes back from now; defaults to 60 when no range is supplied.
+        #[arg(long, value_name = "MINUTES")]
+        last_minutes: Option<i64>,
+        /// Inclusive range start as Unix epoch milliseconds; requires --end-ms.
+        #[arg(long, value_name = "EPOCH_MILLIS")]
+        start_ms: Option<i64>,
+        /// Inclusive range end as Unix epoch milliseconds; requires --start-ms.
+        #[arg(long, value_name = "EPOCH_MILLIS")]
+        end_ms: Option<i64>,
     },
     /// Write one sample through Prometheus remote write.
     Write {
@@ -51,9 +63,18 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
     if matches!(cmd.action, TsAction::Write { .. }) {
         ensure_write_allowed(ctx)?;
     }
-    if let TsAction::Query { last_minutes, .. } = &cmd.action {
-        validate_last_minutes(*last_minutes)?;
-    }
+    let query_range = match &cmd.action {
+        TsAction::Query {
+            last_minutes,
+            start_ms,
+            end_ms,
+            ..
+        } => {
+            validate_query_limit(ctx.limit)?;
+            Some(resolve_query_range(*last_minutes, *start_ms, *end_ms)?)
+        }
+        _ => None,
+    };
 
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
@@ -75,9 +96,13 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
         ),
         TsAction::Query {
             query,
-            last_minutes,
+            last_minutes: _,
+            start_ms: _,
+            end_ms: _,
         } => {
-            let range = TimeRange::last_n_minutes(last_minutes);
+            let range = query_range.ok_or_else(|| {
+                Error::Internal("validated time-series query range is missing".into())
+            })?;
             let result = limit_series_set(ts.query_range(&query, range).await?, ctx.limit);
             let truncated = result.truncated;
             ctx.render_success(&kind, result, start.elapsed().as_millis() as u64, truncated)
@@ -116,10 +141,64 @@ fn validate_last_minutes(last_minutes: i64) -> Result<()> {
             "--last-minutes must be greater than zero".into(),
         ));
     }
-    last_minutes.checked_mul(60_000).ok_or_else(|| {
+    let window_ms = last_minutes.checked_mul(60_000).ok_or_else(|| {
         Error::Config("--last-minutes is too large to represent in milliseconds".into())
     })?;
+    now_millis().checked_sub(window_ms).ok_or_else(|| {
+        Error::Config("--last-minutes is too large to represent a valid time range".into())
+    })?;
     Ok(())
+}
+
+fn validate_query_limit(limit: usize) -> Result<()> {
+    if limit == 0 {
+        return Err(Error::Config(
+            "time-series query --limit must be greater than zero".into(),
+        ));
+    }
+    if limit > MAX_QUERY_SAMPLES {
+        return Err(Error::Config(format!(
+            "time-series query --limit must not exceed {MAX_QUERY_SAMPLES} samples"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_query_range(
+    last_minutes: Option<i64>,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+) -> Result<TimeRange> {
+    match (last_minutes, start_ms, end_ms) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(Error::Config(
+            "--last-minutes cannot be combined with --start-ms or --end-ms".into(),
+        )),
+        (None, Some(start), Some(end)) if start > end => Err(Error::Config(
+            "--start-ms must be less than or equal to --end-ms".into(),
+        )),
+        (None, Some(start), Some(end)) => Ok(TimeRange {
+            start: Some(start),
+            end: Some(end),
+        }),
+        (None, Some(_), None) | (None, None, Some(_)) => Err(Error::Config(
+            "--start-ms and --end-ms must be provided together".into(),
+        )),
+        (last_minutes, None, None) => {
+            let last_minutes = last_minutes.unwrap_or(DEFAULT_LAST_MINUTES);
+            validate_last_minutes(last_minutes)?;
+            let end = now_millis();
+            let window_ms = last_minutes.checked_mul(60_000).ok_or_else(|| {
+                Error::Config("--last-minutes is too large to represent in milliseconds".into())
+            })?;
+            let start = end.checked_sub(window_ms).ok_or_else(|| {
+                Error::Config("--last-minutes is too large to represent a valid time range".into())
+            })?;
+            Ok(TimeRange {
+                start: Some(start),
+                end: Some(end),
+            })
+        }
+    }
 }
 
 /// Apply the CLI row budget across all samples in all returned series.
@@ -230,6 +309,57 @@ mod tests {
             Err(Error::Config(message)) if message.contains("too large")
         ));
         assert!(validate_last_minutes(1).is_ok());
+    }
+
+    #[test]
+    fn resolves_relative_and_explicit_query_ranges() {
+        let relative = resolve_query_range(Some(5), None, None).unwrap();
+        assert_eq!(relative.end.unwrap() - relative.start.unwrap(), 300_000);
+
+        let default = resolve_query_range(None, None, None).unwrap();
+        assert_eq!(
+            default.end.unwrap() - default.start.unwrap(),
+            DEFAULT_LAST_MINUTES * 60_000
+        );
+
+        let explicit =
+            resolve_query_range(None, Some(1_710_000_000_000), Some(1_710_000_060_000)).unwrap();
+        assert_eq!(explicit.start, Some(1_710_000_000_000));
+        assert_eq!(explicit.end, Some(1_710_000_060_000));
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_invalid_explicit_ranges() {
+        assert!(matches!(
+            resolve_query_range(Some(5), Some(1), Some(2)),
+            Err(Error::Config(message)) if message.contains("cannot be combined")
+        ));
+        assert!(matches!(
+            resolve_query_range(None, Some(2), Some(1)),
+            Err(Error::Config(message)) if message.contains("less than or equal")
+        ));
+        assert!(matches!(
+            resolve_query_range(None, Some(1), None),
+            Err(Error::Config(message)) if message.contains("provided together")
+        ));
+        assert!(matches!(
+            resolve_query_range(None, None, Some(1)),
+            Err(Error::Config(message)) if message.contains("provided together")
+        ));
+    }
+
+    #[test]
+    fn validates_time_series_query_sample_budget() {
+        assert!(matches!(
+            validate_query_limit(0),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        assert!(validate_query_limit(1).is_ok());
+        assert!(validate_query_limit(MAX_QUERY_SAMPLES).is_ok());
+        assert!(matches!(
+            validate_query_limit(MAX_QUERY_SAMPLES + 1),
+            Err(Error::Config(message)) if message.contains("must not exceed")
+        ));
     }
 
     #[test]

@@ -62,7 +62,7 @@ usable.
 | NATS | `nats://`, `nats+tls://` | NATS | publish, subscribe, JetStream topics/detail/lag | NATS plain and TLS live tests |
 | OpenSearch | `opensearch://`, `opensearch+https://` | Search HTTP/HTTPS | index list/search/aggregations, auto-ID index, stable-ID put/get/update/delete, confirmed delete-index, hard limit/pagination | OpenSearch 2.17.1 full CRUD with exact metadata and zero residual indices; HTTPS fixture and security-plugin transport/auth evidence retained |
 | Elasticsearch | `elasticsearch://`, `elasticsearch+https://` | Search HTTP/HTTPS | OpenSearch-compatible list/search/aggregations and full document/index lifecycle | Elasticsearch 8.15.5 full CRUD with exact metadata and zero residual indices; product-native HTTPS remains explicit boundary |
-| Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list, bounded range query, and remote write | Exact two-series tagged/timestamped remote-write readback against Prometheus 2.55.1 |
+| Prometheus | `prometheus://`, `prometheus+http://` | Time series HTTP | metric list, bounded range query with recent-minutes or explicit epoch-ms bounds, and remote write | Exact two-series tagged/timestamped remote-write readback and explicit start/end range against Prometheus 2.55.1 |
 
 ## Docker Service Profiles
 
@@ -115,7 +115,7 @@ usable.
 | Transfer | `export sql`, `export kv`, `export doc`, `import sql`, `import kv`, `import doc` | all import commands require `--allow-write` before DSN resolution, artifact reads, or connecting |
 | Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write` |
 | Search | `search indices`, `search search`, `search index`, `search put`, `search get`, `search update`, `search delete`, `search delete-index` | all mutations require `--allow-write`; `delete-index` additionally requires a target-bound `--confirm` token |
-| Time series | `ts measurements`, `ts query`, `ts write` | Prometheus remote write is exposed through explicit `--allow-write`; remote write uses a minimal protobuf/snappy encoder with no new runtime dependency |
+| Time series | `ts measurements`, `ts query [--last-minutes N | --start-ms MS --end-ms MS]`, `ts write` | query validates range pairing/order and a 1..=1,000,000 sample budget before connecting; Prometheus remote write requires `--allow-write` |
 
 ## Explicit Boundaries
 

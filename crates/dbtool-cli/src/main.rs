@@ -29,7 +29,7 @@ struct Cli {
     #[arg(long, global = true, default_value = "json", value_enum)]
     format: OutputFormat,
 
-    /// Maximum rows/messages to return
+    /// Maximum rows/messages to return (must be greater than zero)
     #[arg(long, global = true, default_value = "100")]
     limit: usize,
 
@@ -225,6 +225,7 @@ async fn main() {
 }
 
 async fn run_data_command(ctx: &cmd::Context, command: Commands) -> dbtool_core::Result<String> {
+    ctx.ensure_positive_limit()?;
     match command {
         Commands::Ping => cmd::ping::run(ctx).await,
         Commands::Caps => cmd::caps::run(ctx).await,

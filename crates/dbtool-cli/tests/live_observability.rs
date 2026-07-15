@@ -675,6 +675,42 @@ fn prometheus_live_measurements_and_query() {
     assert_eq!(probed["meta"]["truncated"], false);
     assert_prometheus_samples(&probed, &metric, first_timestamp, second_timestamp, false);
 
+    // Use a one-second evaluation step so the short explicit range exercises
+    // both source timestamps without extending the query into the future.
+    let explicit_dsn = if dsn.contains('?') {
+        format!("{dsn}&step=1s")
+    } else {
+        format!("{dsn}?step=1s")
+    };
+    let explicit_start = first_timestamp.to_string();
+    let explicit_end = (second_timestamp + 1_000).to_string();
+    let explicit = stdout_json_retry(
+        &[
+            "--dsn",
+            &explicit_dsn,
+            "ts",
+            "query",
+            &metric,
+            "--start-ms",
+            &explicit_start,
+            "--end-ms",
+            &explicit_end,
+        ],
+        |value| {
+            value["data"]["series"].as_array().is_some_and(|series| {
+                series.len() == 2
+                    && series.iter().all(|item| {
+                        item["values"]
+                            .as_array()
+                            .is_some_and(|values| !values.is_empty())
+                    })
+            })
+        },
+    );
+    assert_eq!(explicit["data"]["truncated"], false);
+    assert_eq!(explicit["meta"]["truncated"], false);
+    assert_prometheus_samples(&explicit, &metric, first_timestamp, second_timestamp, false);
+
     let timestamp_query = format!("timestamp({metric})");
     let timestamps = stdout_json_retry(
         &[

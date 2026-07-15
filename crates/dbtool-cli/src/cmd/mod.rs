@@ -31,6 +31,15 @@ pub struct Context {
 }
 
 impl Context {
+    pub fn ensure_positive_limit(&self) -> dbtool_core::Result<()> {
+        if self.limit == 0 {
+            return Err(Error::Config(
+                "global --limit must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn ensure_write_allowed(&self) -> dbtool_core::Result<()> {
         if !self.allow_write {
             return Err(Error::WriteNotAllowed);
