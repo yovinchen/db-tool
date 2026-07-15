@@ -94,7 +94,7 @@ fn sqlite_full_crud() {
          payload blob)"
     );
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "sql", "exec", &create]));
-    assert_eq!(blocked["error"]["code"], "CONFIRM_REQUIRED");
+    assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
     assert_eq!(confirmed_sql_exec(&dsn, &create)["ok"], true);
     assert_eq!(
         confirmed_sql_exec(
