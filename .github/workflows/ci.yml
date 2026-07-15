@@ -131,11 +131,23 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Feature build matrix
+        run: ./scripts/validate-feature-matrix.sh
+
       - name: Clippy (default features)
         run: cargo clippy --workspace -- -D warnings
 
-      - name: Clippy (full)
-        run: cargo clippy --workspace --features dbtool-registry/full -- -D warnings
+      - name: Clippy (full pure Kafka CLI)
+        run: cargo clippy -p dbtool-cli --no-default-features --features full --all-targets -- -D warnings
+
+      - name: Clippy (portable release CLI)
+        run: cargo clippy -p dbtool-cli --no-default-features --features portable --all-targets -- -D warnings
+
+      - name: Clippy (full native Kafka CLI)
+        run: cargo clippy -p dbtool-cli --no-default-features --features full-native --all-targets -- -D warnings
+
+      - name: Clippy (full TUI)
+        run: cargo clippy -p dbtool-tui --no-default-features --features full --all-targets -- -D warnings
 
   compose-config:
     name: Compose config validation
@@ -545,12 +557,13 @@ jobs:
           mkdir -p /opt/ibm/db2odbc
           tar -xzf /tmp/db2odbc.tar.gz -C /opt/ibm/db2odbc --strip-components=1
           # Register driver with the system ODBC driver manager
-          cat >> /etc/odbcinst.ini <<EOF
+          sudo tee -a /etc/odbcinst.ini >/dev/null <<EOF
           [IBM DB2 ODBC DRIVER]
           Description = IBM DB2 ODBC Driver
           Driver      = /opt/ibm/db2odbc/lib/libdb2o.so
           FileUsage   = 1
           EOF
+          odbcinst -q -d
 
       - name: Run IBM Db2 integration tests
         run: ./scripts/integration-db2-test.sh

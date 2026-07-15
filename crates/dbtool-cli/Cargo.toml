@@ -15,13 +15,14 @@ path = "src/main.rs"
 default = ["dbtool-registry/default"]
 full    = ["dbtool-registry/full"]
 full-native = ["dbtool-registry/full-native"]
+portable = ["dbtool-registry/portable"]
 sqlserver = ["dbtool-registry/sqlserver"]
 cassandra = ["dbtool-registry/cassandra"]
 db2       = ["dbtool-registry/db2"]
 
 [dependencies]
 dbtool-core     = { path = "../dbtool-core" }
-dbtool-registry = { path = "../dbtool-registry" }
+dbtool-registry = { path = "../dbtool-registry", default-features = false }
 tokio           = { workspace = true }
 clap            = { workspace = true }
 serde           = { workspace = true }

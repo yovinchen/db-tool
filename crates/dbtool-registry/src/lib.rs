@@ -2,6 +2,8 @@ use dbtool_core::registry::Registry;
 
 /// Composition root: register adapters according to Cargo features (§6.3).
 pub fn build_registry() -> Registry {
+    // A deliberately empty registry is the contract for --no-default-features.
+    #[allow(unused_mut)]
     let mut r = Registry::new();
 
     #[cfg(feature = "sql")]
@@ -47,7 +49,7 @@ pub fn build_registry() -> Registry {
         r.register_family("prometheus", adapter_timeseries::factory);
     }
 
-    #[cfg(feature = "kafka")]
+    #[cfg(any(feature = "kafka", feature = "kafka-native"))]
     {
         r.register_family("kafka", adapter_kafka::factory);
     }

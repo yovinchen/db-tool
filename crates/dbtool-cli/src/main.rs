@@ -1,7 +1,7 @@
 mod artifacts;
 mod cmd;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use dbtool_core::config::LimitsConfig;
 use dbtool_core::service::{formatter::Format, FlowControl};
 use dbtool_registry::build_registry;
@@ -26,8 +26,8 @@ struct Cli {
     dsn: Option<String>,
 
     /// Output format: json | table | ndjson
-    #[arg(long, global = true, default_value = "json")]
-    format: String,
+    #[arg(long, global = true, default_value = "json", value_enum)]
+    format: OutputFormat,
 
     /// Maximum rows/messages to return
     #[arg(long, global = true, default_value = "100")]
@@ -71,6 +71,23 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Table,
+    Ndjson,
+}
+
+impl From<OutputFormat> for Format {
+    fn from(value: OutputFormat) -> Self {
+        match value {
+            OutputFormat::Json => Self::Json,
+            OutputFormat::Table => Self::Table,
+            OutputFormat::Ndjson => Self::Ndjson,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -171,7 +188,7 @@ async fn main() {
         registry,
         conn: cli.conn,
         dsn: cli.dsn,
-        format: cli.format.parse().unwrap_or(Format::Json),
+        format: cli.format.into(),
         limit: cli.limit,
         throttle_overrides: LimitsConfig {
             max_concurrency: cli.max_concurrency,

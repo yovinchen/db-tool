@@ -14,10 +14,11 @@ path = "src/main.rs"
 [features]
 default = ["dbtool-registry/default"]
 full    = ["dbtool-registry/full"]
+full-native = ["dbtool-registry/full-native"]
 
 [dependencies]
 dbtool-core     = { path = "../dbtool-core" }
-dbtool-registry = { path = "../dbtool-registry" }
+dbtool-registry = { path = "../dbtool-registry", default-features = false }
 tokio           = { workspace = true }
 ratatui         = { workspace = true }
 crossterm       = { workspace = true }

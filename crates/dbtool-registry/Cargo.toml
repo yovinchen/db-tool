@@ -31,8 +31,15 @@ kafka         = ["dep:adapter-kafka", "adapter-kafka/backend-pure"]
 kafka-native  = ["dep:adapter-kafka", "adapter-kafka/backend-native"]
 
 # ── Preset bundles ─────────────────────────────────────────────────────────────
-full        = ["sql", "sqlserver", "cassandra", "db2", "redis", "mongodb", "search", "timeseries", "mq", "kafka"]
-full-native = ["full", "kafka-native"]
+# Keep the common capability set independent from the mutually exclusive Kafka
+# implementation so full and full-native expose the same protocols without
+# compiling both backends into the native build.
+full-common = ["sql", "sqlserver", "cassandra", "redis", "mongodb", "search", "timeseries", "mq"]
+# Six-platform release bundle: all adapters that do not require a host ODBC
+# runtime or a native Kafka library.
+portable    = ["full-common", "kafka"]
+full        = ["full-common", "db2", "kafka"]
+full-native = ["full-common", "db2", "kafka-native"]
 
 [dependencies]
 dbtool-core   = { path = "../dbtool-core" }

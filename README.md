@@ -413,6 +413,11 @@ dbtool --dsn elasticsearch+https://elastic.example.com:9200 search search logs '
 
 Release builds compile each target once, upload raw binary artifacts, and reuse those artifacts for GitHub Release archives plus npm and pip/uv wrappers.
 
+The six-platform binary uses the `portable` feature bundle: SQL, SQL Server,
+Cassandra/ScyllaDB, Redis, MongoDB, search, Prometheus, AMQP, NATS, and pure
+Kafka are included. Db2 stays available through `--features full` because it
+requires a host ODBC runtime; native Kafka stays behind `full-native`.
+
 - GitHub Release assets: `dbtool-<tag>-<target>.tar.gz`
 - npm wrapper: `@yovinchen/dbtool`
 - pip/uv wrapper: `dbtool-bin`
@@ -428,4 +433,4 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; AMQPS and NATS TLS live paths, NATS JetStream admin, and RabbitMQ management-backed queue discovery are implemented.
 - TUI: connection picker, capability-aware forms/command dispatch, read limits, AST-based SQL write classification, readonly protection, one-shot write confirmation, history, and failure-safe terminal restoration are implemented.
-- Release packaging: GitHub Release archive, npm, pip/uv, and mise/ubi metadata are wired; signing/notarization is still future work.
+- Release packaging: tag/version validation, portable six-platform archives, npm and pip/uv install smokes, GitHub Release attachment, and mise/ubi metadata are wired; signing/notarization is still future work.

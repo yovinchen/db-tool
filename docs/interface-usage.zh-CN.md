@@ -113,3 +113,29 @@ exec DROP TABLE archived_users
 终端 raw mode 与 alternate screen 由 `TerminalSession` 管理。正常退出、运行时创建
 失败、draw/poll/read 错误、提前返回和 panic unwind 都会尝试先离开 alternate
 screen、再关闭 raw mode；即使第一步恢复失败，也仍继续执行第二步。
+
+## Cargo feature 与发布范式
+
+| 构建 | 命令 | 用途 |
+| --- | --- | --- |
+| 最小核心 | `cargo build -p dbtool-cli --no-default-features` | 不编译、不注册任何 adapter，用于嵌入式最小依赖验证 |
+| 默认 | `cargo build -p dbtool-cli` | 常用 SQL/KV/Document/Search/Timeseries 能力 |
+| 六平台自包含发布 | `cargo build -p dbtool-cli --no-default-features --features portable` | 完整自包含 adapter 集；pure Kafka；不含需要宿主 ODBC 的 Db2 |
+| 全功能 pure Kafka | `cargo build -p dbtool-cli --no-default-features --features full` | 在 portable 基础上增加 Db2 ODBC |
+| 全功能 native Kafka | `cargo build -p dbtool-cli --no-default-features --features full-native` | Db2 ODBC + librdkafka；不会同时编译 pure Kafka backend |
+
+`./scripts/validate-feature-matrix.sh` 同时检查编译、adapter 依赖树、Kafka backend
+互斥和支持 scheme。正式 tag 发布先执行：
+
+```bash
+./scripts/validate-release-version.sh v0.1.0
+```
+
+tag 必须严格等于 workspace 中 `dbtool-cli` 的版本。release workflow 只使用
+`portable` 生成六平台二进制；npm 的 Unix 子包在复制后强制设置 0755，npm 主包和
+Linux x64 子包会实际安装并执行 `dbtool --version`；Python musllinux wheel 在
+Alpine 容器中实际安装并执行。archives、`.tgz` 和 `.whl` 都附加到同一个
+GitHub Release。
+
+`--format` 由 Clap 枚举解析，只接受 `json`、`table`、`ndjson`。未知值在连接
+数据库之前直接以非零状态退出，不再回退成 JSON。

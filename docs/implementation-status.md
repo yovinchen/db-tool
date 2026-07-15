@@ -1,6 +1,6 @@
 # dbtool Implementation Status
 
-Last updated: 2026-06-18
+Last updated: 2026-07-16
 
 This document is the current implementation inventory for dbtool. It separates
 implemented behavior, compatibility that has been live-tested, compatibility
@@ -18,8 +18,8 @@ usable.
 | SQL safety | Implemented | Read statements are allowed, writes need `--allow-write`, destructive SQL needs a confirm token bound to the target. |
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`, then apply CLI overrides such as `--rate`, `--request-timeout`, and `--deadline`; CLI execution uses the one-shot path so writes are not replayed by retries. |
 | Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, observability, OpenSearch security-plugin TLS, and product-native Elasticsearch profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
-| CI | Implemented | Service-free verification runs by default; live Docker jobs are manual workflow inputs. |
-| Release artifacts | Implemented | Release archives and npm/Python wrapper packages include generated bash, zsh, and fish completions plus `dbtool.1` manpage artifacts derived from the clap command metadata. |
+| CI | Implemented | Service-free verification runs by default; feature-matrix gates prove minimal/default/portable/full/full-native composition and pure/native Kafka exclusivity; live Docker jobs are manual workflow inputs. |
+| Release artifacts | Implemented | Tags must equal the Cargo workspace version. Six-platform `portable` binaries contain every self-contained adapter while excluding host-ODBC Db2 and native Kafka; archives plus npm/Python wrappers include generated completions/manpage, enforce executable permissions, install-smoke the host package, and are all attached to GitHub Release. |
 | TUI | Implemented | Connection picker, capability-aware command dispatch, read limits, AST-based SQL write classification, readonly/one-shot confirmation, command history, per-capability forms, and RAII terminal restoration are covered by smoke and failure-path tests. |
 
 ## Usable Database And Protocol Matrix

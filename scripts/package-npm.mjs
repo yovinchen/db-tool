@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { copyFileSync, cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  cpSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -106,7 +114,11 @@ function findBinary(target) {
 function packPlatformPackage(target) {
   const dir = join(workDir, target.target);
   mkdirSync(join(dir, "bin"), { recursive: true });
-  copyFileSync(findBinary(target), join(dir, "bin", target.exe));
+  const packagedBinary = join(dir, "bin", target.exe);
+  copyFileSync(findBinary(target), packagedBinary);
+  if (target.os !== "win32") {
+    chmodSync(packagedBinary, 0o755);
+  }
   copyCliArtifacts(dir);
   writeFileSync(
     join(dir, "package.json"),

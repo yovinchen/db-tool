@@ -8,8 +8,19 @@ permissions:
   contents: write
 
 jobs:
+  validate-release:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Require tag to match workspace version
+        run: scripts/validate-release-version.sh "${{ github.ref_name }}"
+
   build-matrix:
     name: Build ${{ matrix.target }}
+    needs: validate-release
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -52,7 +63,8 @@ jobs:
         shell: bash
         run: |
           ${{ matrix.use_cross && 'cross' || 'cargo' }} build --release \
-            --target ${{ matrix.target }} -p dbtool-cli
+            --target ${{ matrix.target }} -p dbtool-cli \
+            --no-default-features --features portable
 
       - name: Prepare binary artifact
         shell: bash
@@ -109,6 +121,22 @@ jobs:
       - name: Package npm tarballs
         run: node scripts/package-npm.mjs artifacts npm-dist ${{ github.ref_name }}
 
+      - name: Install and run npm package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          work="$(mktemp -d)"
+          cd "$work"
+          export npm_config_cache="$work/.npm-cache"
+          npm init -y >/dev/null
+          npm install \
+            "$GITHUB_WORKSPACE/npm-dist/yovinchen-dbtool-linux-x64-${version}.tgz" \
+            --offline --no-audit --no-fund
+          npm install \
+            "$GITHUB_WORKSPACE/npm-dist/yovinchen-dbtool-${version}.tgz" \
+            --omit=optional --offline --no-audit --no-fund
+          ./node_modules/.bin/dbtool --version | grep -F "$version"
+
       - name: Upload npm packages
         uses: actions/upload-artifact@v4
         with:
@@ -129,6 +157,16 @@ jobs:
       - name: Package wheels
         run: python3 scripts/package-python-wheel.py artifacts python-dist ${{ github.ref_name }}
 
+      - name: Install and run Python wheel
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker run --rm \
+            -e DBTOOL_EXPECTED_VERSION="$version" \
+            -v "$PWD/python-dist:/dist:ro" \
+            python:3.12-alpine \
+            sh -ceu 'pip install --no-index /dist/dbtool_bin-*-musllinux_1_2_x86_64.whl; dbtool --version | grep -F "$DBTOOL_EXPECTED_VERSION"'
+
       - name: Upload Python wheels
         uses: actions/upload-artifact@v4
         with:
@@ -148,8 +186,21 @@ jobs:
           name: dbtool-release-archives
           path: release-dist
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: dbtool-npm-packages
+          path: npm-dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dbtool-python-wheels
+          path: python-dist
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-dist/*.tar.gz
+          files: |
+            release-dist/*.tar.gz
+            npm-dist/*.tgz
+            python-dist/*.whl
           generate_release_notes: true
