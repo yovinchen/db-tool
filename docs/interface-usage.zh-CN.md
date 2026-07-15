@@ -139,3 +139,36 @@ GitHub Release。
 
 `--format` 由 Clap 枚举解析，只接受 `json`、`table`、`ndjson`。未知值在连接
 数据库之前直接以非零状态退出，不再回退成 JSON。
+
+## SQL 参数绑定
+
+`sql query` 与 `sql exec` 都接受一个 JSON 数组：
+
+```bash
+dbtool --dsn "$POSTGRES_DSN" --allow-write \
+  sql exec \
+  'insert into events(id,note,payload,occurred_at,metadata) values ($1,$2,$3,$4,$5)' \
+  --params '[7,"O'"'"'Reilly",{"$bytes":[0,127,255]},{"$timestamp":1700000000123},{"$json":{"source":"api"}}]'
+```
+
+MySQL 与 SQLite 使用 `?`，PostgreSQL 使用 `$1`、`$2`。参数不会插入 SQL 字符串，
+包含单引号或看似 SQL 的文本仍按普通数据发送。
+
+| JSON 写法 | `Value` | 绑定语义 |
+| --- | --- | --- |
+| `null` | `Null` | SQL NULL；PostgreSQL 使用 unknown OID 由语句上下文推断类型 |
+| `true` / `false` | `Bool` | 布尔参数 |
+| `-42` | `Int` | 必须在 i64 范围内 |
+| `3.5` | `Float` | 有限浮点数 |
+| `"text"` | `Text` | UTF-8 文本 |
+| `{"$bytes":[0,127,255]}` | `Bytes` | 每个元素必须是 0..255 的整数 |
+| `{"$timestamp":1700000000123}` | `Timestamp` | UTC Unix epoch 毫秒；PG=`timestamptz`、MySQL=`datetime`、SQLite=chrono 文本绑定 |
+| `{"$json":{...}}` | `Json` | 原生 PostgreSQL json/jsonb、MySQL JSON；SQLite JSON 文本语义 |
+
+嵌入式调用方传入 `Value::Array` 或 `Value::Map` 时也按 JSON 参数绑定；无效时间范围
+和无法序列化的结构返回显式错误。SQL Server、Db2 和 Cassandra 当前不支持动态参数
+时继续返回机器可读的 `UNSUPPORTED_CAPABILITY`/query error，绝不忽略参数。
+
+`sql query --schema` 当前没有跨方言的执行语义，因此在连接前返回
+`SqlQuerySchema` 的 `UNSUPPORTED_CAPABILITY`。表列表仍通过
+`sql tables --schema <name>` 使用已实现的 schema 过滤。

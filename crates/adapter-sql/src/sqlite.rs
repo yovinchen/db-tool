@@ -10,16 +10,40 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
-use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{Column, Row, SqlitePool};
+use sqlx::query::Query;
+use sqlx::sqlite::{SqliteArguments, SqlitePoolOptions};
+use sqlx::{types::Json, Column, Row, Sqlite, SqlitePool};
 
 use crate::{
     identifier::{parse_table_ref, validate_optional_schema},
+    structured_json, timestamp_utc,
     value::{column_type_name, sqlite_value},
 };
 
 pub struct SqliteAdapter {
     pool: SqlitePool,
+}
+
+fn bind_sqlite_params<'q>(
+    sql: &'q str,
+    params: &[Value],
+) -> Result<Query<'q, Sqlite, SqliteArguments<'q>>> {
+    let mut query = sqlx::query::<Sqlite>(sql);
+    for (index, param) in params.iter().enumerate() {
+        query = match param {
+            Value::Null => query.bind(Option::<String>::None),
+            Value::Bool(value) => query.bind(*value),
+            Value::Int(value) => query.bind(*value),
+            Value::Timestamp(value) => query.bind(timestamp_utc(*value, index + 1, "SQLite")?),
+            Value::Float(value) => query.bind(*value),
+            Value::Text(value) => query.bind(value.clone()),
+            Value::Bytes(value) => query.bind(value.clone()),
+            Value::Json(_) | Value::Array(_) | Value::Map(_) => {
+                query.bind(Json(structured_json(param)?))
+            }
+        };
+    }
+    Ok(query)
 }
 
 pub fn sqlite_factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
@@ -67,8 +91,8 @@ impl Connector for SqliteAdapter {
 
 #[async_trait::async_trait]
 impl SqlEngine for SqliteAdapter {
-    async fn query(&self, sql: &str, _params: &[Value]) -> Result<ResultSet> {
-        let rows = sqlx::query(sql)
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
+        let rows = bind_sqlite_params(sql, params)?
             .fetch_all(&self.pool)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
@@ -100,8 +124,8 @@ impl SqlEngine for SqliteAdapter {
         })
     }
 
-    async fn execute(&self, sql: &str, _params: &[Value]) -> Result<ExecOutcome> {
-        let r = sqlx::query(sql)
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
+        let r = bind_sqlite_params(sql, params)?
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
@@ -307,5 +331,87 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Query(_)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_binds_all_supported_parameters_without_interpolation() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+
+        sql.execute(
+            "create table bound_values (
+                id integer primary key,
+                note text not null,
+                score real not null,
+                enabled boolean not null,
+                payload blob not null,
+                optional text
+            )",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let injection = "O'Reilly'); drop table bound_values; --";
+        let outcome = sql
+            .execute(
+                "insert into bound_values (id, note, score, enabled, payload, optional)
+                 values (?, ?, ?, ?, ?, ?)",
+                &[
+                    Value::Int(7),
+                    Value::Text(injection.into()),
+                    Value::Float(12.75),
+                    Value::Bool(true),
+                    Value::Bytes(vec![0, 0x7f, 0xff]),
+                    Value::Null,
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.rows_affected, 1);
+
+        let rows = sql
+            .query(
+                "select id, note, score, enabled, payload, optional
+                 from bound_values where id = ? and note = ?",
+                &[Value::Int(7), Value::Text(injection.into())],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rows.row_count(), 1);
+        assert_eq!(rows.rows[0][0], Value::Int(7));
+        assert_eq!(rows.rows[0][1], Value::Text(injection.into()));
+        assert_eq!(rows.rows[0][2], Value::Float(12.75));
+        assert_eq!(rows.rows[0][3], Value::Bool(true));
+        assert_eq!(rows.rows[0][4], Value::Bytes(vec![0, 0x7f, 0xff]));
+        assert_eq!(rows.rows[0][5], Value::Null);
+
+        let table_survived = sql
+            .query("select count(*) as total from bound_values", &[])
+            .await
+            .unwrap();
+        assert_eq!(table_survived.rows[0][0], Value::Int(1));
+    }
+
+    #[tokio::test]
+    async fn sqlite_binds_timestamp_and_json_parameters() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+
+        let rows = sql
+            .query(
+                "select CAST(strftime('%s', ?) AS INTEGER) * 1000 as timestamp_ms,
+                        json_extract(?, '$.id') as json_id",
+                &[
+                    Value::Timestamp(1_700_000_000_123),
+                    Value::Json(serde_json::json!({"id": 7})),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rows.rows[0][0], Value::Int(1_700_000_000_000));
+        assert_eq!(rows.rows[0][1], Value::Int(7));
     }
 }

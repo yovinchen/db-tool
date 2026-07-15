@@ -8,18 +8,44 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
-use sqlx::mysql::MySqlRow;
-use sqlx::{Column, MySqlPool, Row};
+use sqlx::mysql::{MySqlArguments, MySqlRow};
+use sqlx::query::Query;
+use sqlx::{types::Json, Column, MySql, MySqlPool, Row};
 
 use crate::{
     group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
+    structured_json, timestamp_utc,
     value::{column_type_name, mysql_value},
 };
 
 pub struct MySqlAdapter {
     pool: MySqlPool,
     kind: ConnectorKind,
+}
+
+fn bind_mysql_params<'q>(
+    sql: &'q str,
+    params: &[Value],
+) -> Result<Query<'q, MySql, MySqlArguments>> {
+    let mut query = sqlx::query::<MySql>(sql);
+    for (index, param) in params.iter().enumerate() {
+        query = match param {
+            Value::Null => query.bind(Option::<String>::None),
+            Value::Bool(value) => query.bind(*value),
+            Value::Int(value) => query.bind(*value),
+            Value::Timestamp(value) => {
+                query.bind(timestamp_utc(*value, index + 1, "MySQL")?.naive_utc())
+            }
+            Value::Float(value) => query.bind(*value),
+            Value::Text(value) => query.bind(value.clone()),
+            Value::Bytes(value) => query.bind(value.clone()),
+            Value::Json(_) | Value::Array(_) | Value::Map(_) => {
+                query.bind(Json(structured_json(param)?))
+            }
+        };
+    }
+    Ok(query)
 }
 
 pub fn mysql_factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
@@ -68,8 +94,8 @@ impl Connector for MySqlAdapter {
 
 #[async_trait::async_trait]
 impl SqlEngine for MySqlAdapter {
-    async fn query(&self, sql: &str, _params: &[Value]) -> Result<ResultSet> {
-        let rows = sqlx::query(sql)
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
+        let rows = bind_mysql_params(sql, params)?
             .fetch_all(&self.pool)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
@@ -102,8 +128,8 @@ impl SqlEngine for MySqlAdapter {
         })
     }
 
-    async fn execute(&self, sql: &str, _params: &[Value]) -> Result<ExecOutcome> {
-        let result = sqlx::query(sql)
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
+        let result = bind_mysql_params(sql, params)?
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
@@ -252,4 +278,26 @@ fn mysql_text(row: &MySqlRow, index: usize) -> Result<String> {
         .try_get::<Vec<u8>, _>(index)
         .map_err(|e| Error::Query(e.to_string()))?;
     String::from_utf8(bytes).map_err(|e| Error::Serialization(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mysql_parameter_builder_accepts_all_portable_values() {
+        let params = vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::Int(1),
+            Value::Float(2.5),
+            Value::Text("text".into()),
+            Value::Bytes(vec![0, 255]),
+            Value::Timestamp(1_700_000_000_123),
+            Value::Json(serde_json::json!({"source": "test"})),
+        ];
+        assert!(bind_mysql_params("select ?, ?, ?, ?, ?, ?, ?, ?", &params).is_ok());
+
+        assert!(bind_mysql_params("select ?", &[Value::Timestamp(i64::MAX)]).is_err());
+    }
 }

@@ -8,17 +8,63 @@ use dbtool_core::{
     },
 };
 use futures::future::BoxFuture;
-use sqlx::{Column, PgPool, Row};
+use sqlx::encode::IsNull;
+use sqlx::error::BoxDynError;
+use sqlx::postgres::{PgArgumentBuffer, PgArguments, PgTypeInfo};
+use sqlx::query::Query;
+use sqlx::{types::Json, Column, Encode, PgPool, Postgres, Row, Type};
 
 use crate::{
     group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
+    structured_json, timestamp_utc,
     value::{column_type_name, postgres_value},
 };
 
 pub struct PostgresAdapter {
     pool: PgPool,
     kind: ConnectorKind,
+}
+
+/// PostgreSQL OID 705 (`unknown`) lets the server infer a NULL parameter's
+/// concrete type from its SQL context instead of incorrectly forcing TEXT.
+struct PgNull;
+
+impl Type<Postgres> for PgNull {
+    fn type_info() -> PgTypeInfo {
+        PgTypeInfo::with_name("unknown")
+    }
+}
+
+impl<'q> Encode<'q, Postgres> for PgNull {
+    fn encode_by_ref(
+        &self,
+        _buffer: &mut PgArgumentBuffer,
+    ) -> std::result::Result<IsNull, BoxDynError> {
+        Ok(IsNull::Yes)
+    }
+}
+
+fn bind_postgres_params<'q>(
+    sql: &'q str,
+    params: &[Value],
+) -> Result<Query<'q, Postgres, PgArguments>> {
+    let mut query = sqlx::query::<Postgres>(sql);
+    for (index, param) in params.iter().enumerate() {
+        query = match param {
+            Value::Null => query.bind(PgNull),
+            Value::Bool(value) => query.bind(*value),
+            Value::Int(value) => query.bind(*value),
+            Value::Timestamp(value) => query.bind(timestamp_utc(*value, index + 1, "PostgreSQL")?),
+            Value::Float(value) => query.bind(*value),
+            Value::Text(value) => query.bind(value.clone()),
+            Value::Bytes(value) => query.bind(value.clone()),
+            Value::Json(_) | Value::Array(_) | Value::Map(_) => {
+                query.bind(Json(structured_json(param)?))
+            }
+        };
+    }
+    Ok(query)
 }
 
 pub fn postgres_factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
@@ -66,8 +112,8 @@ impl Connector for PostgresAdapter {
 
 #[async_trait::async_trait]
 impl SqlEngine for PostgresAdapter {
-    async fn query(&self, sql: &str, _params: &[Value]) -> Result<ResultSet> {
-        let rows = sqlx::query(sql)
+    async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
+        let rows = bind_postgres_params(sql, params)?
             .fetch_all(&self.pool)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
@@ -99,8 +145,8 @@ impl SqlEngine for PostgresAdapter {
         })
     }
 
-    async fn execute(&self, sql: &str, _params: &[Value]) -> Result<ExecOutcome> {
-        let result = sqlx::query(sql)
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
+        let result = bind_postgres_params(sql, params)?
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
@@ -209,5 +255,27 @@ impl SqlEngine for PostgresAdapter {
             columns,
             indexes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_parameter_builder_accepts_all_portable_values() {
+        let params = vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::Int(1),
+            Value::Float(2.5),
+            Value::Text("text".into()),
+            Value::Bytes(vec![0, 255]),
+            Value::Timestamp(1_700_000_000_123),
+            Value::Json(serde_json::json!({"source": "test"})),
+        ];
+        assert!(bind_postgres_params("select $1, $2, $3, $4, $5, $6, $7, $8", &params).is_ok());
+
+        assert!(bind_postgres_params("select $1", &[Value::Timestamp(i64::MAX)]).is_err());
     }
 }

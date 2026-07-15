@@ -26,8 +26,8 @@ usable.
 
 | Backend | DSN schemes | Adapter | Usable operations | Verification |
 | --- | --- | --- | --- | --- |
-| SQLite | `sqlite:` | SQL | `ping`, `sql query`, `sql exec`, `sql tables`, `sql schema` | In-memory unit and CLI tests |
-| PostgreSQL | `postgres://` | SQL | SQL query/exec/tables/schema with write safety | Base Docker live test |
+| SQLite | `sqlite:` | SQL | `ping`, parameterized query/exec, tables/schema; scalar/bytes/timestamp/JSON binding | In-memory unit and CLI injection-safety tests |
+| PostgreSQL | `postgres://` | SQL | parameterized query/exec/tables/schema with write safety; scalar/bytes/timestamptz/jsonb binding | Base Docker live test + full parameter lifecycle |
 | PostgreSQL alias | `postgresql://` | SQL | Same as Postgres adapter | Registry alias test only |
 | CockroachDB | `cockroach://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real CockroachDB compatibility live test |
 | TimescaleDB | `timescale://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real TimescaleDB compatibility live test |
@@ -36,7 +36,7 @@ usable.
 | IBM Db2 alias | `ibmdb2://`, `as400://` | Db2 ODBC | Same as Db2 adapter | Registry alias test only |
 | SQL Server | `sqlserver://`, `mssql://` | SQL Server/TDS | SQL query/exec/tables/schema, typed scalar values, result limiting | Service-free adapter tests plus real SQL Server Docker live test on GitHub Actions x86_64 runner |
 | Cassandra/ScyllaDB | `cassandra://`, `scylla://` | CQL | `ping`, `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema`, SQL-compatible CQL path, primitive/collection typed values | Adapter tests plus real Cassandra Docker live test |
-| MySQL | `mysql://` | SQL | SQL query/exec/tables/schema, typed values, result limiting | Base Docker live test |
+| MySQL | `mysql://` | SQL | parameterized query/exec/tables/schema; scalar/bytes/datetime/json binding; typed values and result limiting | Base Docker live test + full parameter lifecycle |
 | MariaDB | `mariadb://` | SQL | MySQL-family SQL lifecycle, typed values, result limiting | Real MariaDB compatibility live test |
 | TiDB | `tidb://` | SQL | MySQL-family SQL lifecycle, typed values, table listing, schema-qualified tables | Real PD/TiKV/TiDB live test |
 | TiDB secure HA | `tidb://` with TLS params | SQL | SQL TLS, component TLS, `REQUIRE SSL`, `REQUIRE X509`, insecure-login rejection, two SQL-node lifecycle | Real 3 PD + 2 TiKV + 2 TiDB live test |
@@ -107,7 +107,7 @@ usable.
 | --- | --- | --- |
 | Connection | `conn list` | Read-only |
 | General | `ping`, `caps` | Read-only |
-| SQL | `sql query`, `sql exec`, `sql tables`, `sql schema`, `sql schemas` | `sql exec` and unsafe SQL require `--allow-write` and sometimes `--confirm` |
+| SQL | `sql query`, `sql exec`, `sql tables`, `sql schema`, `sql schemas` | query/exec accept `--params JSON_ARRAY`; `sql exec` and unsafe SQL require `--allow-write` and sometimes `--confirm`; query `--schema` explicitly reports unsupported instead of being ignored |
 | CQL | `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema` | `cql exec` requires `--allow-write` |
 | Db2 | `db2 schemas`, `db2 tables`, `db2 schema`, `db2 sequences`, `db2 routines`, `db2 tablespaces`, `db2 foreign-keys`, `db2 ddl` | All read-only; no `--allow-write` required |
 | KV | `kv get`, `kv set`, `kv scan`, `kv del`, `kv raw` | `set`, `del`, and mutating raw commands require `--allow-write` |

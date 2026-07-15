@@ -48,6 +48,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # ── SQL ───────────────────────────────────────────────────────────────────────
 sqlx          = { version = "0.8", default-features = false, features = [
                     "runtime-tokio", "tls-rustls", "mysql", "postgres", "sqlite", "macros",
+                    "chrono", "json",
                 ] }
 tiberius      = { version = "0.12", default-features = false, features = [
                     "tds73", "tokio", "tokio-util", "rustls",

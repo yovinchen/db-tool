@@ -1,4 +1,6 @@
+use chrono::{DateTime, NaiveDateTime, Utc};
 use dbtool_core::model::Value;
+use sqlx::types::Json;
 use sqlx::{
     mysql::MySqlRow, postgres::PgRow, sqlite::SqliteRow, Column, Decode, MySql, Postgres, Row,
     Sqlite, Type, TypeInfo, ValueRef,
@@ -65,6 +67,18 @@ pub(crate) fn mysql_value(row: &MySqlRow, index: usize) -> Value {
         }
     }
 
+    if is_timestamp_type(&ty) {
+        if let Some(value) = mysql_get::<NaiveDateTime>(row, index) {
+            return Value::Timestamp(value.and_utc().timestamp_millis());
+        }
+    }
+
+    if is_json_type(&ty) {
+        if let Some(Json(value)) = mysql_get::<Json<serde_json::Value>>(row, index) {
+            return Value::Json(value);
+        }
+    }
+
     mysql_get::<String>(row, index)
         .map(|text| text_value(&ty, text))
         .or_else(|| mysql_get::<Vec<u8>>(row, index).map(Value::Bytes))
@@ -108,6 +122,21 @@ pub(crate) fn postgres_value(row: &PgRow, index: usize) -> Value {
     if is_binary_type(&ty) {
         if let Some(value) = postgres_get::<Vec<u8>>(row, index) {
             return Value::Bytes(value);
+        }
+    }
+
+    if is_timestamp_type(&ty) {
+        if let Some(value) = postgres_get::<DateTime<Utc>>(row, index) {
+            return Value::Timestamp(value.timestamp_millis());
+        }
+        if let Some(value) = postgres_get::<NaiveDateTime>(row, index) {
+            return Value::Timestamp(value.and_utc().timestamp_millis());
+        }
+    }
+
+    if is_json_type(&ty) {
+        if let Some(Json(value)) = postgres_get::<Json<serde_json::Value>>(row, index) {
+            return Value::Json(value);
         }
     }
 
@@ -169,6 +198,21 @@ pub(crate) fn sqlite_value(row: &SqliteRow, index: usize) -> Value {
     if is_binary_type(&ty) {
         if let Some(value) = sqlite_get::<Vec<u8>>(row, index) {
             return Value::Bytes(value);
+        }
+    }
+
+    if is_timestamp_type(&ty) {
+        if let Some(value) = sqlite_get::<DateTime<Utc>>(row, index) {
+            return Value::Timestamp(value.timestamp_millis());
+        }
+        if let Some(value) = sqlite_get::<NaiveDateTime>(row, index) {
+            return Value::Timestamp(value.and_utc().timestamp_millis());
+        }
+    }
+
+    if is_json_type(&ty) {
+        if let Some(Json(value)) = sqlite_get::<Json<serde_json::Value>>(row, index) {
+            return Value::Json(value);
         }
     }
 
@@ -330,4 +374,11 @@ fn is_binary_type(ty: &str) -> bool {
 
 fn is_json_type(ty: &str) -> bool {
     ty == "JSON" || ty == "JSONB"
+}
+
+fn is_timestamp_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "DATETIME"
+    )
 }

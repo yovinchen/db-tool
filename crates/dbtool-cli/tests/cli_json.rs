@@ -115,6 +115,11 @@ fn cli_help_documents_core_command_families() {
     assert!(sql_help.contains("shared safety path"));
     assert!(sql_help.contains("query"));
     assert!(sql_help.contains("schema"));
+    let sql_query_help = stdout_text(&dbtool(&["sql", "query", "--help"]));
+    assert!(sql_query_help.contains("--params"));
+    assert!(sql_query_help.contains("$bytes"));
+    assert!(sql_query_help.contains("$timestamp"));
+    assert!(sql_query_help.contains("$json"));
 
     let cql_help = stdout_text(&dbtool(&["cql", "--help"]));
     assert!(cql_help.contains("Cassandra-specific keyspace"));
@@ -323,6 +328,135 @@ fn sql_query_returns_typed_json_rows() {
     assert_eq!(value["data"]["columns"][0]["name"], "id");
     assert_eq!(value["data"]["rows"][0][0], 1);
     assert_eq!(value["data"]["rows"][0][1], "alice");
+}
+
+#[test]
+fn sql_cli_binds_json_parameters_to_sqlite_without_interpolation() {
+    let root = std::env::temp_dir().join(format!(
+        "dbtool-cli-sql-params-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::create_dir_all(&root).expect("SQL parameter temp dir should be created");
+    let db_file = root.join("params.db");
+    fs::File::create(&db_file).expect("SQLite database file should be created");
+    let dsn = format!("sqlite://{}", db_file.display());
+
+    confirmed_sql_exec(
+        &dsn,
+        "create table bound_values (
+            id integer primary key,
+            note text not null,
+            score real not null,
+            enabled boolean not null,
+            payload blob not null,
+            optional text
+        )",
+    );
+
+    let injection = "O'Reilly'); drop table bound_values; --";
+    let params = serde_json::json!([
+        7,
+        injection,
+        12.75,
+        true,
+        {"$bytes": [0, 127, 255]},
+        null
+    ])
+    .to_string();
+    let inserted = stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "sql",
+        "exec",
+        "insert into bound_values (id, note, score, enabled, payload, optional) values (?, ?, ?, ?, ?, ?)",
+        "--params",
+        &params,
+    ]));
+    assert_eq!(inserted["data"]["rows_affected"], 1);
+
+    let query_params = serde_json::json!([7, injection]).to_string();
+    let queried = stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "sql",
+        "query",
+        "select id, note, score, enabled, payload, optional from bound_values where id = ? and note = ?",
+        "--params",
+        &query_params,
+    ]));
+
+    assert_eq!(queried["data"]["rows"][0][0], 7);
+    assert_eq!(queried["data"]["rows"][0][1], injection);
+    assert_eq!(queried["data"]["rows"][0][2], 12.75);
+    assert_eq!(queried["data"]["rows"][0][3], true);
+    assert_eq!(
+        queried["data"]["rows"][0][4],
+        serde_json::json!([0, 127, 255])
+    );
+    assert_eq!(queried["data"]["rows"][0][5], Value::Null);
+
+    let tagged = stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "sql",
+        "query",
+        "select CAST(strftime('%s', ?) AS INTEGER) * 1000 as timestamp_ms, json_extract(?, '$.source') as source",
+        "--params",
+        r#"[{"$timestamp":1700000000123},{"$json":{"source":"cli"}}]"#,
+    ]));
+    assert_eq!(tagged["data"]["rows"][0][0], 1_700_000_000_000_i64);
+    assert_eq!(tagged["data"]["rows"][0][1], "cli");
+
+    let table_survived = stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "sql",
+        "query",
+        "select count(*) as total from bound_values",
+    ]));
+    assert_eq!(table_survived["data"]["rows"][0][0], 1);
+
+    cleanup_dir(&root);
+}
+
+#[test]
+fn sql_query_schema_is_explicitly_unsupported_instead_of_ignored() {
+    let error = stderr_json(&dbtool(&[
+        "--dsn",
+        "postgres://127.0.0.1:1/unreachable",
+        "sql",
+        "query",
+        "select 1",
+        "--schema",
+        "public",
+    ]));
+
+    assert_eq!(error["error"]["code"], "UNSUPPORTED_CAPABILITY");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("SqlQuerySchema"));
+}
+
+#[test]
+fn sql_params_validation_happens_before_connecting() {
+    let error = stderr_json(&dbtool(&[
+        "--dsn",
+        "postgres://127.0.0.1:1/unreachable",
+        "sql",
+        "query",
+        "select $1",
+        "--params",
+        r#"{"not":"an-array"}"#,
+    ]));
+
+    assert_eq!(error["error"]["code"], "CONFIG_ERROR");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("must be a JSON array"));
 }
 
 #[test]
