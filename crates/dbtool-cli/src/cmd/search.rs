@@ -110,23 +110,19 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
 
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
+    let kind = conn.kind().0.clone();
+    let (operation, needed) = search_operation_for_action(&cmd.action);
+    require_search_operation(&operations, operation, &kind, needed)?;
     let se = conn
         .as_search()
         .ok_or_else(|| Error::UnsupportedCapability {
-            kind: conn.kind().0.clone(),
+            kind: kind.clone(),
             needed: "SearchEngine",
         })?;
     let start = std::time::Instant::now();
-    let kind = conn.kind().0.clone();
 
     Ok(match cmd.action {
         SearchAction::Indices => {
-            require_search_operation(
-                &operations,
-                CapabilityOperation::SearchListIndicesBounded,
-                &kind,
-                "SearchEngine.list_indices_bounded",
-            )?;
             let indices = se.list_indices_bounded(ctx.limit).await?;
             let truncated = indices.truncated;
             ctx.render_success(
@@ -182,6 +178,40 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
             ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
         }
     })
+}
+
+fn search_operation_for_action(action: &SearchAction) -> (CapabilityOperation, &'static str) {
+    match action {
+        SearchAction::Indices => (
+            CapabilityOperation::SearchListIndicesBounded,
+            "SearchEngine.list_indices_bounded",
+        ),
+        SearchAction::Search { .. } => (CapabilityOperation::SearchSearch, "SearchEngine.search"),
+        SearchAction::Index { .. } => (
+            CapabilityOperation::SearchIndexDocument,
+            "SearchEngine.index_doc",
+        ),
+        SearchAction::Put { .. } => (
+            CapabilityOperation::SearchPutDocument,
+            "SearchEngine.put_doc",
+        ),
+        SearchAction::Get { .. } => (
+            CapabilityOperation::SearchGetDocument,
+            "SearchEngine.get_doc",
+        ),
+        SearchAction::Update { .. } => (
+            CapabilityOperation::SearchUpdateDocument,
+            "SearchEngine.update_doc",
+        ),
+        SearchAction::Delete { .. } => (
+            CapabilityOperation::SearchDeleteDocument,
+            "SearchEngine.delete_doc",
+        ),
+        SearchAction::DeleteIndex { .. } => (
+            CapabilityOperation::SearchDeleteIndex,
+            "SearchEngine.delete_index",
+        ),
+    }
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {

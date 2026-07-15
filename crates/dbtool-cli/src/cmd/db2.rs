@@ -74,16 +74,12 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
     let start = std::time::Instant::now();
     let kind = conn.kind().0.clone();
     let elapsed = || start.elapsed().as_millis() as u64;
+    let (operation, needed) = db2_operation_for_action(&cmd.action);
+    require_operation(&operations, operation, &kind, needed)?;
 
     match cmd.action {
         // ── Db2Engine-specific operations ────────────────────────────────────
         Db2Action::Sequences { schema } => {
-            require_operation(
-                &operations,
-                CapabilityOperation::Db2ListSequencesBounded,
-                &kind,
-                "Db2Engine.list_sequences_bounded",
-            )?;
             let db2 = require_db2(&*conn)?;
             let seqs = db2
                 .list_sequences_bounded(schema.as_deref(), ctx.limit)
@@ -91,12 +87,6 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
             Ok(ctx.render_success(&kind, seqs.items, elapsed(), seqs.truncated))
         }
         Db2Action::Routines { schema } => {
-            require_operation(
-                &operations,
-                CapabilityOperation::Db2ListRoutinesBounded,
-                &kind,
-                "Db2Engine.list_routines_bounded",
-            )?;
             let db2 = require_db2(&*conn)?;
             let routines = db2
                 .list_routines_bounded(schema.as_deref(), ctx.limit)
@@ -104,23 +94,11 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
             Ok(ctx.render_success(&kind, routines.items, elapsed(), routines.truncated))
         }
         Db2Action::Tablespaces => {
-            require_operation(
-                &operations,
-                CapabilityOperation::Db2ListTablespacesBounded,
-                &kind,
-                "Db2Engine.list_tablespaces_bounded",
-            )?;
             let db2 = require_db2(&*conn)?;
             let tablespaces = db2.list_tablespaces_bounded(ctx.limit).await?;
             Ok(ctx.render_success(&kind, tablespaces.items, elapsed(), tablespaces.truncated))
         }
         Db2Action::ForeignKeys { table } => {
-            require_operation(
-                &operations,
-                CapabilityOperation::Db2ListForeignKeysBounded,
-                &kind,
-                "Db2Engine.list_foreign_keys_bounded",
-            )?;
             let db2 = require_db2(&*conn)?;
             let foreign_keys = db2.list_foreign_keys_bounded(&table, ctx.limit).await?;
             Ok(ctx.render_success(&kind, foreign_keys.items, elapsed(), foreign_keys.truncated))
@@ -134,23 +112,11 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
 
         // ── SqlEngine operations (same surface as `sql` but Db2-flavoured) ──
         Db2Action::Schemas => {
-            require_operation(
-                &operations,
-                CapabilityOperation::SqlListSchemasBounded,
-                &kind,
-                "SqlEngine.list_schemas_bounded",
-            )?;
             let sql = require_sql(&*conn)?;
             let schemas = sql.list_schemas_bounded(ctx.limit).await?;
             Ok(ctx.render_success(&kind, schemas.items, elapsed(), schemas.truncated))
         }
         Db2Action::Tables { schema } => {
-            require_operation(
-                &operations,
-                CapabilityOperation::SqlListTablesBounded,
-                &kind,
-                "SqlEngine.list_tables_bounded",
-            )?;
             let sql = require_sql(&*conn)?;
             let tables = sql
                 .list_tables_bounded(schema.as_deref(), ctx.limit)
@@ -162,6 +128,43 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
             let schema = sql.describe_table(&table).await?;
             Ok(ctx.render_success(&kind, schema, elapsed(), false))
         }
+    }
+}
+
+fn db2_operation_for_action(action: &Db2Action) -> (CapabilityOperation, &'static str) {
+    match action {
+        Db2Action::Sequences { .. } => (
+            CapabilityOperation::Db2ListSequencesBounded,
+            "Db2Engine.list_sequences_bounded",
+        ),
+        Db2Action::Routines { .. } => (
+            CapabilityOperation::Db2ListRoutinesBounded,
+            "Db2Engine.list_routines_bounded",
+        ),
+        Db2Action::Tablespaces => (
+            CapabilityOperation::Db2ListTablespacesBounded,
+            "Db2Engine.list_tablespaces_bounded",
+        ),
+        Db2Action::ForeignKeys { .. } => (
+            CapabilityOperation::Db2ListForeignKeysBounded,
+            "Db2Engine.list_foreign_keys_bounded",
+        ),
+        Db2Action::Ddl { .. } => (
+            CapabilityOperation::Db2GenerateDdl,
+            "Db2Engine.generate_ddl",
+        ),
+        Db2Action::Schemas => (
+            CapabilityOperation::SqlListSchemasBounded,
+            "SqlEngine.list_schemas_bounded",
+        ),
+        Db2Action::Tables { .. } => (
+            CapabilityOperation::SqlListTablesBounded,
+            "SqlEngine.list_tables_bounded",
+        ),
+        Db2Action::Schema { .. } => (
+            CapabilityOperation::SqlDescribeTable,
+            "SqlEngine.describe_table",
+        ),
     }
 }
 
@@ -245,6 +248,28 @@ mod tests {
             Err(Error::UnsupportedCapability { needed, .. })
                 if needed == "Db2Engine.list_sequences_bounded"
         ));
+    }
+
+    #[test]
+    fn db2_ddl_and_sql_schema_have_distinct_exact_operations() {
+        assert_eq!(
+            db2_operation_for_action(&Db2Action::Ddl {
+                table: "APP.USERS".to_owned(),
+            }),
+            (
+                CapabilityOperation::Db2GenerateDdl,
+                "Db2Engine.generate_ddl"
+            )
+        );
+        assert_eq!(
+            db2_operation_for_action(&Db2Action::Schema {
+                table: "APP.USERS".to_owned(),
+            }),
+            (
+                CapabilityOperation::SqlDescribeTable,
+                "SqlEngine.describe_table"
+            )
+        );
     }
 
     #[tokio::test]

@@ -224,12 +224,14 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
     let dsn = ctx.resolve_dsn()?;
     let connection = ctx.safety_target(&dsn);
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let start = std::time::Instant::now();
     let kind = conn.kind().0.clone();
     let elapsed = || start.elapsed().as_millis() as u64;
 
     Ok(match cmd.action {
         ExportAction::Sql { query, out } => {
+            require_transfer_operation(&operations, CapabilityOperation::SqlQueryBounded, &kind)?;
             let sql = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "SqlEngine",
@@ -250,14 +252,11 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
             )
         }
         ExportAction::Kv { pattern, out } => {
-            if !conn
-                .operations()
-                .contains(&CapabilityOperation::KeyValueGetWithExpiry)
-            {
-                return Err(Error::UnsupportedCapability {
-                    kind: kind.clone(),
-                    needed: "kv.get_with_expiry",
-                });
+            for operation in [
+                CapabilityOperation::KeyValueScan,
+                CapabilityOperation::KeyValueGetWithExpiry,
+            ] {
+                require_transfer_operation(&operations, operation, &kind)?;
             }
             let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
@@ -321,6 +320,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
             filter,
             out,
         } => {
+            require_transfer_operation(&operations, CapabilityOperation::DocumentFind, &kind)?;
             let docs = conn
                 .as_document()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -379,6 +379,7 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
     let dsn = ctx.resolve_dsn()?;
     let safety_target = ctx.safety_target(&dsn);
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let start = std::time::Instant::now();
     let kind = conn.kind().0.clone();
     let elapsed = || start.elapsed().as_millis() as u64;
@@ -389,15 +390,11 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             columns,
             rows,
         } => {
-            if !conn
-                .operations()
-                .contains(&CapabilityOperation::SqlInsertRowsAtomic)
-            {
-                return Err(Error::UnsupportedCapability {
-                    kind: kind.clone(),
-                    needed: "sql.insert_rows_atomic",
-                });
-            }
+            require_transfer_operation(
+                &operations,
+                CapabilityOperation::SqlInsertRowsAtomic,
+                &kind,
+            )?;
             let sql = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "SqlEngine",
@@ -419,14 +416,13 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             entries,
             replace_existing,
         } => {
-            if !conn
-                .operations()
-                .contains(&CapabilityOperation::KeyValueRestoreWithExpiry)
-            {
-                return Err(Error::UnsupportedCapability {
-                    kind: kind.clone(),
-                    needed: "kv.restore_with_expiry",
-                });
+            require_transfer_operation(
+                &operations,
+                CapabilityOperation::KeyValueRestoreWithExpiry,
+                &kind,
+            )?;
+            if replace_existing {
+                require_transfer_operation(&operations, CapabilityOperation::KeyValueGet, &kind)?;
             }
             let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
@@ -509,6 +505,12 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             collection,
             documents,
         } => {
+            for operation in [
+                CapabilityOperation::DocumentFind,
+                CapabilityOperation::DocumentInsert,
+            ] {
+                require_transfer_operation(&operations, operation, &kind)?;
+            }
             let docs = conn
                 .as_document()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -533,6 +535,21 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             )
         }
     })
+}
+
+fn require_transfer_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed: operation.as_str(),
+        })
+    }
 }
 
 fn sql_rows_artifact(result: ResultSet) -> TransferArtifact {
@@ -1344,6 +1361,19 @@ mod tests {
             allow_write,
             confirm: None,
         }
+    }
+
+    #[test]
+    fn transfer_substeps_fail_closed_on_missing_exact_operations() {
+        assert!(matches!(
+            require_transfer_operation(
+                &[CapabilityOperation::DocumentFind],
+                CapabilityOperation::DocumentInsert,
+                "partial-document",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "partial-document" && needed == "document.insert"
+        ));
     }
 
     #[test]

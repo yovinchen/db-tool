@@ -85,23 +85,19 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
+    let kind = conn.kind().0.clone();
+    let (operation, needed) = time_series_operation_for_action(&cmd.action);
+    require_time_series_operation(&operations, operation, &kind, needed)?;
     let ts = conn
         .as_timeseries()
         .ok_or_else(|| Error::UnsupportedCapability {
-            kind: conn.kind().0.clone(),
+            kind: kind.clone(),
             needed: "TimeSeriesStore",
         })?;
     let start = std::time::Instant::now();
-    let kind = conn.kind().0.clone();
 
     Ok(match cmd.action {
         TsAction::Measurements => {
-            require_time_series_operation(
-                &operations,
-                CapabilityOperation::TimeSeriesListMeasurementsBounded,
-                &kind,
-                "TimeSeriesStore.list_measurements_bounded",
-            )?;
             let measurements = ts.list_measurements_bounded(ctx.limit).await?;
             let truncated = measurements.truncated;
             ctx.render_success(
@@ -146,6 +142,23 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
             )
         }
     })
+}
+
+fn time_series_operation_for_action(action: &TsAction) -> (CapabilityOperation, &'static str) {
+    match action {
+        TsAction::Measurements => (
+            CapabilityOperation::TimeSeriesListMeasurementsBounded,
+            "TimeSeriesStore.list_measurements_bounded",
+        ),
+        TsAction::Query { .. } => (
+            CapabilityOperation::TimeSeriesQueryRange,
+            "TimeSeriesStore.query_range",
+        ),
+        TsAction::Write { .. } => (
+            CapabilityOperation::TimeSeriesWritePoints,
+            "TimeSeriesStore.write_points",
+        ),
+    }
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {

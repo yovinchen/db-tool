@@ -319,6 +319,11 @@ async fn execute_tui_command(
             let table = parts
                 .next()
                 .ok_or_else(|| Error::Config("schema requires a table name".into()))?;
+            require_operation(
+                connector,
+                CapabilityOperation::SqlDescribeTable,
+                "SqlEngine.describe_table",
+            )?;
             let sql = connector
                 .as_sql()
                 .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
@@ -386,6 +391,11 @@ async fn run_sql_query(
     confirmed_write: bool,
 ) -> Result<String> {
     authorize_sql_statement(connection, sql_text, confirmed_write)?;
+    require_operation(
+        connector,
+        CapabilityOperation::SqlQueryBounded,
+        "SqlEngine.query_bounded",
+    )?;
     let sql = connector
         .as_sql()
         .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
@@ -400,6 +410,11 @@ async fn run_sql_exec(
     confirmed_write: bool,
 ) -> Result<String> {
     authorize_sql_statement(connection, sql_text, confirmed_write)?;
+    require_operation(
+        connector,
+        CapabilityOperation::SqlExecute,
+        "SqlEngine.execute",
+    )?;
     let sql = connector
         .as_sql()
         .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
@@ -411,12 +426,17 @@ async fn run_kv_command(
     command: &str,
     limit: usize,
 ) -> Result<String> {
-    let kv = connector
-        .as_kv()
-        .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
     let mut parts = command.split_whitespace();
     match parts.next() {
         Some("get") => {
+            require_operation(
+                connector,
+                CapabilityOperation::KeyValueGet,
+                "KeyValueStore.get",
+            )?;
+            let kv = connector
+                .as_kv()
+                .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
             let key = parts
                 .next()
                 .ok_or_else(|| Error::Config("kv get requires a key".into()))?;
@@ -427,10 +447,26 @@ async fn run_kv_command(
             render_json(serde_json::json!({ "key": key, "value": value }))
         }
         Some("scan") => {
+            require_operation(
+                connector,
+                CapabilityOperation::KeyValueScan,
+                "KeyValueStore.scan",
+            )?;
+            let kv = connector
+                .as_kv()
+                .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
             let pattern = parts.next().unwrap_or("*");
             render_json(kv.scan(pattern, limit).await?)
         }
         Some("set") => {
+            require_operation(
+                connector,
+                CapabilityOperation::KeyValueSet,
+                "KeyValueStore.set",
+            )?;
+            let kv = connector
+                .as_kv()
+                .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
             let key = parts
                 .next()
                 .ok_or_else(|| Error::Config("kv set requires a key".into()))?;
@@ -444,6 +480,14 @@ async fn run_kv_command(
             render_json(serde_json::json!({ "ok": true }))
         }
         Some("del") => {
+            require_operation(
+                connector,
+                CapabilityOperation::KeyValueDelete,
+                "KeyValueStore.delete",
+            )?;
+            let kv = connector
+                .as_kv()
+                .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
             let keys = parts.map(str::to_owned).collect::<Vec<_>>();
             if keys.is_empty() {
                 return Err(Error::Config("kv del requires at least one key".into()));
@@ -461,18 +505,26 @@ async fn run_doc_command(
     command: &str,
     limit: usize,
 ) -> Result<String> {
-    let doc = connector
-        .as_document()
-        .ok_or_else(|| unsupported(connector, "DocumentStore"))?;
     if command == "collections" {
         require_operation(
             connector,
             CapabilityOperation::DocumentListCollectionsBounded,
             "DocumentStore.list_collections_bounded",
         )?;
+        let doc = connector
+            .as_document()
+            .ok_or_else(|| unsupported(connector, "DocumentStore"))?;
         return render_bounded_list(doc.list_collections_bounded(limit).await?);
     }
     if let Some(rest) = command.strip_prefix("find ").map(str::trim) {
+        require_operation(
+            connector,
+            CapabilityOperation::DocumentFind,
+            "DocumentStore.find",
+        )?;
+        let doc = connector
+            .as_document()
+            .ok_or_else(|| unsupported(connector, "DocumentStore"))?;
         let (collection, filter) = rest
             .split_once(' ')
             .map(|(collection, filter)| (collection, filter.trim()))
@@ -500,17 +552,29 @@ async fn run_search_command(
     command: &str,
     limit: usize,
 ) -> Result<String> {
-    let search = connector
-        .as_search()
-        .ok_or_else(|| unsupported(connector, "SearchEngine"))?;
     if command == "indices" {
         require_operation(
             connector,
             CapabilityOperation::SearchListIndicesBounded,
             "SearchEngine.list_indices_bounded",
         )?;
+        let search = connector
+            .as_search()
+            .ok_or_else(|| unsupported(connector, "SearchEngine"))?;
         return render_bounded_list(search.list_indices_bounded(limit).await?);
     }
+    let (operation, needed) = if command.strip_prefix("index ").is_some() {
+        (
+            CapabilityOperation::SearchIndexDocument,
+            "SearchEngine.index_doc",
+        )
+    } else {
+        (CapabilityOperation::SearchSearch, "SearchEngine.search")
+    };
+    require_operation(connector, operation, needed)?;
+    let search = connector
+        .as_search()
+        .ok_or_else(|| unsupported(connector, "SearchEngine"))?;
     if let Some(rest) = command.strip_prefix("index ").map(str::trim) {
         let (index, doc) = rest
             .split_once(' ')
@@ -542,17 +606,32 @@ async fn run_ts_command(
     command: &str,
     limit: usize,
 ) -> Result<String> {
-    let ts = connector
-        .as_timeseries()
-        .ok_or_else(|| unsupported(connector, "TimeSeriesStore"))?;
     if command == "measurements" {
         require_operation(
             connector,
             CapabilityOperation::TimeSeriesListMeasurementsBounded,
             "TimeSeriesStore.list_measurements_bounded",
         )?;
+        let ts = connector
+            .as_timeseries()
+            .ok_or_else(|| unsupported(connector, "TimeSeriesStore"))?;
         return render_bounded_list(ts.list_measurements_bounded(limit).await?);
     }
+    let (operation, needed) = if command.strip_prefix("write ").is_some() {
+        (
+            CapabilityOperation::TimeSeriesWritePoints,
+            "TimeSeriesStore.write_points",
+        )
+    } else {
+        (
+            CapabilityOperation::TimeSeriesQueryRange,
+            "TimeSeriesStore.query_range",
+        )
+    };
+    require_operation(connector, operation, needed)?;
+    let ts = connector
+        .as_timeseries()
+        .ok_or_else(|| unsupported(connector, "TimeSeriesStore"))?;
     if let Some(rest) = command.strip_prefix("write ").map(str::trim) {
         let point = parse_tui_ts_point(rest)?;
         ts.write_points(vec![point]).await?;
@@ -843,6 +922,16 @@ mod tests {
 
     #[test]
     fn sql_catalog_commands_reject_legacy_only_declarations_without_fallback() {
+        assert!(matches!(
+            require_declared_operation(
+                &[CapabilityOperation::SqlQuery],
+                CapabilityOperation::SqlQueryBounded,
+                "legacy-sql".into(),
+                "SqlEngine.query_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "SqlEngine.query_bounded"
+        ));
         assert!(matches!(
             require_declared_operation(
                 CapabilityOperation::SQL,

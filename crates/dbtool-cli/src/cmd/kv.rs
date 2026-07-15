@@ -3,7 +3,7 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     model::{decode_canonical_base64, Value},
-    port::capability::SetOptions,
+    port::{capability::SetOptions, CapabilityOperation},
     service::{ResultLimiter, SafetyGuard},
     Result,
 };
@@ -107,14 +107,17 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
     }
 
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
+    let kind = conn.kind().0.clone();
+    let (operation, needed) = kv_operation_for_action(&cmd.action);
+    require_kv_operation(&operations, operation, &kind, needed)?;
     let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
-        kind: conn.kind().0.clone(),
+        kind: kind.clone(),
         needed: "KeyValueStore",
     })?;
 
     let start = std::time::Instant::now();
     let elapsed = || start.elapsed().as_millis() as u64;
-    let kind = conn.kind().0.clone();
 
     Ok(match cmd.action {
         KvAction::Get { key } => {
@@ -168,6 +171,35 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             ctx.render_success(&kind, val, elapsed(), false)
         }
     })
+}
+
+fn kv_operation_for_action(action: &KvAction) -> (CapabilityOperation, &'static str) {
+    match action {
+        KvAction::Get { .. } => (CapabilityOperation::KeyValueGet, "KeyValueStore.get"),
+        KvAction::Set { .. } => (CapabilityOperation::KeyValueSet, "KeyValueStore.set"),
+        KvAction::Scan { .. } => (CapabilityOperation::KeyValueScan, "KeyValueStore.scan"),
+        KvAction::Del { .. } => (CapabilityOperation::KeyValueDelete, "KeyValueStore.delete"),
+        KvAction::Raw { .. } => (
+            CapabilityOperation::KeyValueRawCommand,
+            "KeyValueStore.raw_command",
+        ),
+    }
+}
+
+fn require_kv_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+    needed: &'static str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed,
+        })
+    }
 }
 
 fn prepare_set_value(value: Option<&str>, value_base64: Option<&str>) -> Result<Vec<u8>> {
@@ -664,6 +696,30 @@ mod tests {
                 Err(Error::Config(_))
             ));
         }
+    }
+
+    #[test]
+    fn every_kv_action_requires_its_exact_operation_before_access() {
+        let action = KvAction::Raw {
+            args: strings(&["GET", "key"]),
+        };
+        assert_eq!(
+            kv_operation_for_action(&action),
+            (
+                CapabilityOperation::KeyValueRawCommand,
+                "KeyValueStore.raw_command"
+            )
+        );
+        assert!(matches!(
+            require_kv_operation(
+                &[CapabilityOperation::KeyValueGet],
+                CapabilityOperation::KeyValueRawCommand,
+                "partial-kv",
+                "KeyValueStore.raw_command",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "partial-kv" && needed == "KeyValueStore.raw_command"
+        ));
     }
 
     #[tokio::test]

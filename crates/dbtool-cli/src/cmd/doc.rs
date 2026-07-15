@@ -125,24 +125,21 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
 
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
+    let kind = conn.kind().0.clone();
+    if let Some((operation, needed)) = document_operation_for_action(&cmd.action) {
+        require_document_operation(&operations, operation, &kind, needed)?;
+    }
     let doc = conn
         .as_document()
         .ok_or_else(|| Error::UnsupportedCapability {
-            kind: conn.kind().0.clone(),
+            kind: kind.clone(),
             needed: "DocumentStore",
         })?;
     let start = std::time::Instant::now();
     let elapsed = || start.elapsed().as_millis() as u64;
-    let kind = conn.kind().0.clone();
 
     Ok(match cmd.action {
         DocAction::Collections => {
-            require_document_operation(
-                &operations,
-                CapabilityOperation::DocumentListCollectionsBounded,
-                &kind,
-                "DocumentStore.list_collections_bounded",
-            )?;
             let collections = doc.list_collections_bounded(ctx.limit).await?;
             let truncated = collections.truncated;
             ctx.render_success(&kind, collections.items, elapsed(), truncated)
@@ -183,18 +180,6 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
         } => {
             let filter = parse_nonempty_json_object(&filter, "--filter")?.into();
             let update = parse_json_object(&update, "--update")?.into();
-            let (operation, needed) = if many {
-                (
-                    CapabilityOperation::DocumentUpdateMany,
-                    "DocumentStore.update_many",
-                )
-            } else {
-                (
-                    CapabilityOperation::DocumentUpdateOne,
-                    "DocumentStore.update_one",
-                )
-            };
-            require_document_operation(&operations, operation, &kind, needed)?;
             let outcome = if many {
                 doc.update_many(&collection, filter, update).await?
             } else {
@@ -208,18 +193,6 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             many,
         } => {
             let filter = parse_nonempty_json_object(&filter, "--filter")?.into();
-            let (operation, needed) = if many {
-                (
-                    CapabilityOperation::DocumentDeleteMany,
-                    "DocumentStore.delete_many",
-                )
-            } else {
-                (
-                    CapabilityOperation::DocumentDeleteOne,
-                    "DocumentStore.delete_one",
-                )
-            };
-            require_document_operation(&operations, operation, &kind, needed)?;
             let deleted = if many {
                 doc.delete_many(&collection, filter).await?
             } else {
@@ -233,12 +206,6 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             )
         }
         DocAction::Drop { collection } => {
-            require_document_operation(
-                &operations,
-                CapabilityOperation::DocumentDropCollection,
-                &kind,
-                "DocumentStore.drop_collection",
-            )?;
             doc.drop_collection(&collection).await?;
             ctx.render_success(
                 &kind,
@@ -259,6 +226,45 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             ctx.render_success(&kind, docs, elapsed(), truncated)
         }
     })
+}
+
+fn document_operation_for_action(
+    action: &DocAction,
+) -> Option<(CapabilityOperation, &'static str)> {
+    match action {
+        DocAction::Collections => Some((
+            CapabilityOperation::DocumentListCollectionsBounded,
+            "DocumentStore.list_collections_bounded",
+        )),
+        DocAction::Update { many: true, .. } => Some((
+            CapabilityOperation::DocumentUpdateMany,
+            "DocumentStore.update_many",
+        )),
+        DocAction::Update { many: false, .. } => Some((
+            CapabilityOperation::DocumentUpdateOne,
+            "DocumentStore.update_one",
+        )),
+        DocAction::Delete { many: true, .. } => Some((
+            CapabilityOperation::DocumentDeleteMany,
+            "DocumentStore.delete_many",
+        )),
+        DocAction::Delete { many: false, .. } => Some((
+            CapabilityOperation::DocumentDeleteOne,
+            "DocumentStore.delete_one",
+        )),
+        DocAction::Drop { .. } => Some((
+            CapabilityOperation::DocumentDropCollection,
+            "DocumentStore.drop_collection",
+        )),
+        DocAction::Aggregate { .. } => Some((
+            CapabilityOperation::DocumentAggregateBounded,
+            "DocumentStore.aggregate_bounded",
+        )),
+        DocAction::Find { .. } => Some((CapabilityOperation::DocumentFind, "DocumentStore.find")),
+        DocAction::Insert { .. } => {
+            Some((CapabilityOperation::DocumentInsert, "DocumentStore.insert"))
+        }
+    }
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
@@ -1042,6 +1048,18 @@ mod tests {
             Err(Error::UnsupportedCapability { needed, .. })
                 if needed == "DocumentStore.drop_collection"
         ));
+
+        let aggregate = DocAction::Aggregate {
+            collection: "events".to_owned(),
+            pipeline: "[]".to_owned(),
+        };
+        assert_eq!(
+            document_operation_for_action(&aggregate),
+            Some((
+                CapabilityOperation::DocumentAggregateBounded,
+                "DocumentStore.aggregate_bounded"
+            ))
+        );
     }
 
     #[test]

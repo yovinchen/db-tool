@@ -94,8 +94,12 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
 
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
+    let kind = conn.kind().0.clone();
+    if let Some((operation, needed)) = sql_operation_for_action(&cmd.action) {
+        require_sql_operation(&operations, operation, &kind, needed)?;
+    }
     let sql_engine = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
-        kind: conn.kind().0.clone(),
+        kind: kind.clone(),
         needed: "SqlEngine",
     })?;
 
@@ -130,12 +134,6 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Tables { schema } => {
-            require_sql_catalog_operation(
-                &operations,
-                CapabilityOperation::SqlListTablesBounded,
-                conn.kind().0.as_str(),
-                "SqlEngine.list_tables_bounded",
-            )?;
             let tables = sql_engine
                 .list_tables_bounded(schema.as_deref(), ctx.limit)
                 .await?;
@@ -157,12 +155,6 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Schemas => {
-            require_sql_catalog_operation(
-                &operations,
-                CapabilityOperation::SqlListSchemasBounded,
-                conn.kind().0.as_str(),
-                "SqlEngine.list_schemas_bounded",
-            )?;
             let schemas = sql_engine.list_schemas_bounded(ctx.limit).await?;
             let truncated = schemas.truncated;
             ctx.render_success(
@@ -177,7 +169,29 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
     Ok(output)
 }
 
-fn require_sql_catalog_operation(
+fn sql_operation_for_action(action: &SqlAction) -> Option<(CapabilityOperation, &'static str)> {
+    match action {
+        SqlAction::Query { .. } => Some((
+            CapabilityOperation::SqlQueryBounded,
+            "SqlEngine.query_bounded",
+        )),
+        SqlAction::Tables { .. } => Some((
+            CapabilityOperation::SqlListTablesBounded,
+            "SqlEngine.list_tables_bounded",
+        )),
+        SqlAction::Schemas => Some((
+            CapabilityOperation::SqlListSchemasBounded,
+            "SqlEngine.list_schemas_bounded",
+        )),
+        SqlAction::Exec { .. } => Some((CapabilityOperation::SqlExecute, "SqlEngine.execute")),
+        SqlAction::Schema { .. } => Some((
+            CapabilityOperation::SqlDescribeTable,
+            "SqlEngine.describe_table",
+        )),
+    }
+}
+
+fn require_sql_operation(
     operations: &[CapabilityOperation],
     operation: CapabilityOperation,
     kind: &str,
@@ -331,7 +345,7 @@ mod tests {
     fn metadata_lists_require_explicit_bounded_operations_without_legacy_fallback() {
         let legacy_only = CapabilityOperation::SQL;
         assert!(matches!(
-            require_sql_catalog_operation(
+            require_sql_operation(
                 legacy_only,
                 CapabilityOperation::SqlListTablesBounded,
                 "legacy-sql",
@@ -346,12 +360,37 @@ mod tests {
             CapabilityOperation::SqlListSchemasBounded,
             CapabilityOperation::SqlListTablesBounded,
         ]);
-        assert!(require_sql_catalog_operation(
+        assert!(require_sql_operation(
             &explicit,
             CapabilityOperation::SqlListSchemasBounded,
             "sqlite",
             "SqlEngine.list_schemas_bounded",
         )
         .is_ok());
+    }
+
+    #[test]
+    fn bounded_sql_query_is_selected_before_engine_access() {
+        let action = SqlAction::Query {
+            sql: "select 1".to_owned(),
+            params: "[]".to_owned(),
+        };
+        assert_eq!(
+            sql_operation_for_action(&action),
+            Some((
+                CapabilityOperation::SqlQueryBounded,
+                "SqlEngine.query_bounded"
+            ))
+        );
+        assert!(matches!(
+            require_sql_operation(
+                &[CapabilityOperation::SqlQuery],
+                CapabilityOperation::SqlQueryBounded,
+                "legacy-sql",
+                "SqlEngine.query_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "SqlEngine.query_bounded"
+        ));
     }
 }

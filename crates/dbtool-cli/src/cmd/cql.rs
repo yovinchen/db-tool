@@ -71,12 +71,15 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
 
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
+    let kind = conn.kind().0.clone();
+    if let Some((operation, needed)) = cql_operation_for_action(&cmd.action) {
+        require_cql_operation(&operations, operation, &kind, needed)?;
+    }
     let cql = conn.as_cql().ok_or_else(|| Error::UnsupportedCapability {
-        kind: conn.kind().0.clone(),
+        kind: kind.clone(),
         needed: "CqlEngine",
     })?;
     let start = std::time::Instant::now();
-    let kind = conn.kind().0.clone();
     let elapsed = || start.elapsed().as_millis() as u64;
 
     Ok(match cmd.action {
@@ -90,23 +93,11 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
         CqlAction::Keyspaces => {
-            require_cql_catalog_operation(
-                &operations,
-                CapabilityOperation::CqlListKeyspacesBounded,
-                &kind,
-                "CqlEngine.list_keyspaces_bounded",
-            )?;
             let keyspaces = cql.list_keyspaces_bounded(ctx.limit).await?;
             let truncated = keyspaces.truncated;
             ctx.render_success(&kind, keyspaces.items, elapsed(), truncated)
         }
         CqlAction::Tables { keyspace } => {
-            require_cql_catalog_operation(
-                &operations,
-                CapabilityOperation::CqlListTablesBounded,
-                &kind,
-                "CqlEngine.list_cql_tables_bounded",
-            )?;
             let tables = cql
                 .list_cql_tables_bounded(keyspace.as_deref(), ctx.limit)
                 .await?;
@@ -121,7 +112,29 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
     })
 }
 
-fn require_cql_catalog_operation(
+fn cql_operation_for_action(action: &CqlAction) -> Option<(CapabilityOperation, &'static str)> {
+    match action {
+        CqlAction::Query { .. } => Some((
+            CapabilityOperation::CqlQueryBounded,
+            "CqlEngine.query_cql_bounded",
+        )),
+        CqlAction::Keyspaces => Some((
+            CapabilityOperation::CqlListKeyspacesBounded,
+            "CqlEngine.list_keyspaces_bounded",
+        )),
+        CqlAction::Tables { .. } => Some((
+            CapabilityOperation::CqlListTablesBounded,
+            "CqlEngine.list_cql_tables_bounded",
+        )),
+        CqlAction::Exec { .. } => Some((CapabilityOperation::CqlExecute, "CqlEngine.execute_cql")),
+        CqlAction::Schema { .. } => Some((
+            CapabilityOperation::CqlDescribeTable,
+            "CqlEngine.describe_cql_table",
+        )),
+    }
+}
+
+fn require_cql_operation(
     operations: &[CapabilityOperation],
     operation: CapabilityOperation,
     kind: &str,
@@ -249,7 +262,7 @@ mod tests {
     #[test]
     fn cql_catalogs_require_explicit_bounded_operations_without_fallback() {
         assert!(matches!(
-            require_cql_catalog_operation(
+            require_cql_operation(
                 CapabilityOperation::CQL,
                 CapabilityOperation::CqlListKeyspacesBounded,
                 "legacy-cql",
@@ -261,12 +274,36 @@ mod tests {
 
         let mut operations = CapabilityOperation::CQL.to_vec();
         operations.push(CapabilityOperation::CqlListTablesBounded);
-        assert!(require_cql_catalog_operation(
+        assert!(require_cql_operation(
             &operations,
             CapabilityOperation::CqlListTablesBounded,
             "cassandra",
             "CqlEngine.list_cql_tables_bounded",
         )
         .is_ok());
+    }
+
+    #[test]
+    fn bounded_cql_query_is_selected_before_engine_access() {
+        let action = CqlAction::Query {
+            cql: "select now() from system.local".to_owned(),
+        };
+        assert_eq!(
+            cql_operation_for_action(&action),
+            Some((
+                CapabilityOperation::CqlQueryBounded,
+                "CqlEngine.query_cql_bounded"
+            ))
+        );
+        assert!(matches!(
+            require_cql_operation(
+                &[CapabilityOperation::CqlQuery],
+                CapabilityOperation::CqlQueryBounded,
+                "legacy-cql",
+                "CqlEngine.query_cql_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "CqlEngine.query_cql_bounded"
+        ));
     }
 }

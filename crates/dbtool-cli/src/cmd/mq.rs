@@ -282,17 +282,17 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             ack: _,
         } => {
             require_message_operation(&operations, CapabilityOperation::MessageConsume, &kind)?;
+            let request = consume_request.ok_or_else(|| {
+                Error::Internal("validated message consumer options are missing".into())
+            })?;
+            let opts = request.options;
+            require_consume_operations(&operations, &opts, &kind)?;
             let consumer = conn
                 .as_consumer()
                 .ok_or_else(|| Error::UnsupportedCapability {
                     kind: kind.clone(),
                     needed: "MessageConsumer",
                 })?;
-            let request = consume_request.ok_or_else(|| {
-                Error::Internal("validated message consumer options are missing".into())
-            })?;
-            let opts = request.options;
-            require_consume_operations(&operations, &opts, &kind)?;
             let max = opts.max;
             let msgs = consumer.consume(&topic, opts).await?;
             // Reaching the requested count proves only that the CLI budget was
