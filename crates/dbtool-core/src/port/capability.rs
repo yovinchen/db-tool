@@ -2,9 +2,9 @@ use crate::{
     model::{
         BoundedList, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, Document,
         ExecOutcome, FindOptions, ForeignKeyInfo, InsertOutcome, KeyExpiry, KeyValueRestoreOutcome,
-        KeyValueSnapshot, LagInfo, Message, MessageResource, Point, ProduceOutcome, ResultSet,
-        RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema, TablespaceInfo, TimeRange,
-        TopicDetail, TopicInfo, UpdateOutcome, Value,
+        KeyValueSnapshot, LagInfo, Message, MessageResource, MetadataBudget, Point, ProduceOutcome,
+        ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema, TablespaceInfo,
+        TimeRange, TopicDetail, TopicInfo, UpdateOutcome, Value,
     },
     Result,
 };
@@ -91,6 +91,22 @@ pub trait SqlEngine: Connector {
         })
     }
     async fn describe_table(&self, table: &str) -> Result<TableSchema>;
+    /// Return one complete table schema within caller item/byte budgets.
+    ///
+    /// Implementations must apply an N+1 bound while reading columns and index
+    /// memberships. Exceeding the budget is an error; returning a partial
+    /// [`TableSchema`] is forbidden. This optional method requires the explicit
+    /// `sql.describe_table_bounded` operation.
+    async fn describe_table_bounded(
+        &self,
+        _table: &str,
+        _budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SqlEngine.describe_table_bounded",
+        })
+    }
 }
 
 #[async_trait]
@@ -120,6 +136,17 @@ pub trait CqlEngine: Connector {
         })
     }
     async fn describe_cql_table(&self, table: &str) -> Result<TableSchema>;
+    /// Return a complete CQL table schema within caller item/byte budgets.
+    async fn describe_cql_table_bounded(
+        &self,
+        _table: &str,
+        _budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "CqlEngine.describe_cql_table_bounded",
+        })
+    }
 }
 
 #[async_trait]
@@ -351,7 +378,29 @@ pub trait AdminInspect: Connector {
         })
     }
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail>;
+    /// Return complete topic config/watermarks within caller budgets.
+    async fn topic_detail_bounded(
+        &self,
+        _name: &str,
+        _budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "AdminInspect.topic_detail_bounded",
+        })
+    }
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>>;
+    /// Return complete per-partition lag within caller budgets.
+    async fn consumer_lag_bounded(
+        &self,
+        _group: &str,
+        _budget: MetadataBudget,
+    ) -> Result<Vec<LagInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "AdminInspect.consumer_lag_bounded",
+        })
+    }
 }
 
 /// Destructive lifecycle operations for persistent messaging resources.
@@ -423,6 +472,14 @@ pub trait Db2Engine: Connector {
     }
     /// Generate a CREATE TABLE DDL statement from the Db2 catalog.
     async fn generate_ddl(&self, table: &str) -> Result<String>;
+    /// Generate DDL only when every required nested catalog item fits the
+    /// caller budget. Partial DDL is never returned.
+    async fn generate_ddl_bounded(&self, _table: &str, _budget: MetadataBudget) -> Result<String> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.generate_ddl_bounded",
+        })
+    }
 }
 
 #[cfg(test)]
@@ -712,8 +769,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_catalog_defaults_never_materialize_legacy_lists() {
+    async fn bounded_metadata_defaults_never_materialize_legacy_methods() {
         let connector = LegacyCatalogs::new();
+        let metadata_budget = MetadataBudget::with_default_bytes(10).unwrap();
 
         assert_unsupported(
             SqlEngine::list_schemas_bounded(&connector, 10).await,
@@ -763,9 +821,32 @@ mod tests {
             Db2Engine::list_foreign_keys_bounded(&connector, "app.orders", 10).await,
             "Db2Engine.list_foreign_keys_bounded",
         );
+        assert_unsupported(
+            SqlEngine::describe_table_bounded(&connector, "app.orders", metadata_budget).await,
+            "SqlEngine.describe_table_bounded",
+        );
+        assert_unsupported(
+            CqlEngine::describe_cql_table_bounded(&connector, "app.orders", metadata_budget).await,
+            "CqlEngine.describe_cql_table_bounded",
+        );
+        assert_unsupported(
+            AdminInspect::topic_detail_bounded(&connector, "events", metadata_budget).await,
+            "AdminInspect.topic_detail_bounded",
+        );
+        assert_unsupported(
+            AdminInspect::consumer_lag_bounded(&connector, "workers", metadata_budget).await,
+            "AdminInspect.consumer_lag_bounded",
+        );
+        assert_unsupported(
+            Db2Engine::generate_ddl_bounded(&connector, "app.orders", metadata_budget).await,
+            "Db2Engine.generate_ddl_bounded",
+        );
 
         assert_eq!(connector.unbounded_calls.load(Ordering::SeqCst), 0);
         assert!(CapabilityOperation::BOUNDED_CATALOGS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::BOUNDED_NESTED_METADATA
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
     }

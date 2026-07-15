@@ -43,6 +43,7 @@ capability_operations! {
     SqlListTables => "sql.list_tables",
     SqlListTablesBounded => "sql.list_tables_bounded",
     SqlDescribeTable => "sql.describe_table",
+    SqlDescribeTableBounded => "sql.describe_table_bounded",
     CqlQuery => "cql.query",
     CqlQueryBounded => "cql.query_bounded",
     CqlExecute => "cql.execute",
@@ -51,6 +52,7 @@ capability_operations! {
     CqlListTables => "cql.list_tables",
     CqlListTablesBounded => "cql.list_tables_bounded",
     CqlDescribeTable => "cql.describe_table",
+    CqlDescribeTableBounded => "cql.describe_table_bounded",
     Db2ListSequences => "db2.list_sequences",
     Db2ListSequencesBounded => "db2.list_sequences_bounded",
     Db2ListRoutines => "db2.list_routines",
@@ -60,6 +62,7 @@ capability_operations! {
     Db2ListForeignKeys => "db2.list_foreign_keys",
     Db2ListForeignKeysBounded => "db2.list_foreign_keys_bounded",
     Db2GenerateDdl => "db2.generate_ddl",
+    Db2GenerateDdlBounded => "db2.generate_ddl_bounded",
     KeyValueGet => "kv.get",
     KeyValueGetWithExpiry => "kv.get_with_expiry",
     KeyValueSet => "kv.set",
@@ -101,7 +104,9 @@ capability_operations! {
     MessageAdminListTopics => "message.admin.list_topics",
     MessageAdminListTopicsBounded => "message.admin.list_topics_bounded",
     MessageAdminTopicDetail => "message.admin.topic_detail",
+    MessageAdminTopicDetailBounded => "message.admin.topic_detail_bounded",
     MessageAdminConsumerLag => "message.admin.consumer_lag",
+    MessageAdminConsumerLagBounded => "message.admin.consumer_lag_bounded",
     MessageAdminDelete => "message.admin.delete",
 }
 
@@ -183,7 +188,9 @@ impl CapabilityOperation {
     pub const MESSAGE_ADMIN: &'static [Self] = &[
         Self::MessageAdminListTopics,
         Self::MessageAdminTopicDetail,
+        Self::MessageAdminTopicDetailBounded,
         Self::MessageAdminConsumerLag,
+        Self::MessageAdminConsumerLagBounded,
         Self::MessageAdminDelete,
     ];
     /// Bounded catalog operations require backend-aware N+1 reads and are
@@ -201,6 +208,16 @@ impl CapabilityOperation {
         Self::TimeSeriesListMeasurementsBounded,
         Self::SearchListIndicesBounded,
         Self::MessageAdminListTopicsBounded,
+    ];
+    /// Complete-object metadata methods that enforce both nested-item and byte
+    /// budgets. These are optional and never inferred from legacy booleans or
+    /// their unbounded compatibility methods.
+    pub const BOUNDED_NESTED_METADATA: &'static [Self] = &[
+        Self::SqlDescribeTableBounded,
+        Self::CqlDescribeTableBounded,
+        Self::Db2GenerateDdlBounded,
+        Self::MessageAdminTopicDetailBounded,
+        Self::MessageAdminConsumerLagBounded,
     ];
 }
 
@@ -590,6 +607,7 @@ mod tests {
                     && !CapabilityOperation::KEY_VALUE_LIFETIME.contains(operation)
                     && !CapabilityOperation::DOCUMENT_LIFECYCLE.contains(operation)
                     && !CapabilityOperation::BOUNDED_CATALOGS.contains(operation)
+                    && !CapabilityOperation::BOUNDED_NESTED_METADATA.contains(operation)
                     && ![
                         CapabilityOperation::DocumentUpdateOne,
                         CapabilityOperation::DocumentUpdateMany,
@@ -618,6 +636,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BOUNDED_CATALOGS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::BOUNDED_NESTED_METADATA
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         for operation in [

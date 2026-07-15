@@ -1,7 +1,8 @@
 use crate::{
-    model::{BoundedList, ResultSet},
+    model::{BoundedList, MetadataBudget, ResultSet},
     Error, Result,
 };
+use serde::Serialize;
 
 fn checked_probe_limit(limit: usize, subject: &str) -> Result<usize> {
     if limit == 0 {
@@ -92,6 +93,89 @@ impl Default for ResultLimiter {
     }
 }
 
+/// Enforces a budget while building one semantically complete metadata object.
+///
+/// Unlike [`ListLimiter`], this limiter never returns a truncated value. Every
+/// nested item is observed before insertion; an N+1 probe or byte overflow
+/// fails closed so callers cannot mistake a partial schema/detail for a
+/// complete one.
+pub struct MetadataLimiter {
+    budget: MetadataBudget,
+    subject: String,
+    observed_items: usize,
+    observed_bytes: usize,
+}
+
+impl MetadataLimiter {
+    pub fn new(budget: MetadataBudget, subject: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            budget: budget.validate()?,
+            subject: subject.into(),
+            observed_items: 0,
+            observed_bytes: 0,
+        })
+    }
+
+    /// Return the remaining item budget plus one probe item.
+    ///
+    /// Adapters pass this value to their next backend query/page. Even after
+    /// the item budget is exactly consumed, a one-item probe is required to
+    /// prove that no additional nested metadata exists.
+    pub fn probe_items(&self) -> Result<usize> {
+        self.budget
+            .max_items
+            .saturating_sub(self.observed_items)
+            .checked_add(1)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "{} item budget is too large to reserve a probe item",
+                    self.subject
+                ))
+            })
+    }
+
+    /// Account for one nested item before retaining it.
+    pub fn observe<T: Serialize + ?Sized>(&mut self, item: &T) -> Result<()> {
+        if self.observed_items >= self.budget.max_items {
+            return Err(Error::Query(format!(
+                "{} exceeds the {}-item metadata budget; increase the caller limit",
+                self.subject, self.budget.max_items
+            )));
+        }
+        let encoded =
+            serde_json::to_vec(item).map_err(|error| Error::Serialization(error.to_string()))?;
+        self.observed_bytes = self
+            .observed_bytes
+            .checked_add(encoded.len())
+            .ok_or_else(|| Error::Query(format!("{} metadata size overflow", self.subject)))?;
+        if self.observed_bytes > self.budget.max_bytes {
+            return Err(Error::Query(format!(
+                "{} exceeds the {}-byte metadata budget",
+                self.subject, self.budget.max_bytes
+            )));
+        }
+        self.observed_items += 1;
+        Ok(())
+    }
+
+    /// Verify the complete serialized object, including container overhead.
+    pub fn ensure_complete<T: Serialize + ?Sized>(&self, value: &T) -> Result<()> {
+        let encoded =
+            serde_json::to_vec(value).map_err(|error| Error::Serialization(error.to_string()))?;
+        if encoded.len() > self.budget.max_bytes {
+            return Err(Error::Query(format!(
+                "{} complete response exceeds the {}-byte metadata budget",
+                self.subject, self.budget.max_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn observed_items(&self) -> usize {
+        self.observed_items
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +257,32 @@ mod tests {
             ListLimiter::new(usize::MAX - 1).probe_items().unwrap(),
             usize::MAX
         );
+    }
+
+    #[test]
+    fn metadata_limiter_requires_complete_items_and_bytes() {
+        let budget = MetadataBudget::new(2, 64).unwrap();
+        let mut limiter = MetadataLimiter::new(budget, "table schema").unwrap();
+        assert_eq!(limiter.probe_items().unwrap(), 3);
+
+        limiter.observe("id").unwrap();
+        assert_eq!(limiter.probe_items().unwrap(), 2);
+        limiter.observe("name").unwrap();
+        assert_eq!(limiter.probe_items().unwrap(), 1);
+        assert!(matches!(limiter.observe("probe"), Err(Error::Query(_))));
+        assert_eq!(limiter.observed_items(), 2);
+
+        limiter.ensure_complete(&vec!["id", "name"]).unwrap();
+    }
+
+    #[test]
+    fn metadata_limiter_fails_closed_on_byte_budget() {
+        let budget = MetadataBudget::new(3, 8).unwrap();
+        let mut limiter = MetadataLimiter::new(budget, "topic detail").unwrap();
+        assert!(matches!(
+            limiter.observe("0123456789"),
+            Err(Error::Query(_))
+        ));
+        assert_eq!(limiter.observed_items(), 0);
     }
 }

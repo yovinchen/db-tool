@@ -8,7 +8,7 @@ pub mod search;
 pub mod series;
 pub mod value;
 
-pub use bounded::BoundedList;
+pub use bounded::{BoundedList, MetadataBudget, DEFAULT_METADATA_BYTES, MAX_METADATA_BYTES};
 pub use document::{Document, FindOptions, InsertOutcome, UpdateOutcome};
 pub use kv::{KeyExpiry, KeyValueRestoreOutcome, KeyValueSnapshot};
 pub use message::{
