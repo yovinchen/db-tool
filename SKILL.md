@@ -88,7 +88,7 @@ Use `--dsn` for an explicit one-off target. Use `--conn <name>` for configured t
 1. `DBTOOL_CONN_<NAME>`
 2. `connections.toml`
 
-DSNs may reference environment variables as `${VAR}`. Never print raw DSNs with credentials; use redacted output from `conn list`.
+DSNs may reference environment variables as `${VAR}`. Never print raw DSNs with credentials; use redacted output from `conn list`. `conn add` requires `--allow-write`; replacing an existing file entry or `conn remove` additionally uses the returned target/content-bound confirmation token. Environment-managed `DBTOOL_CONN_*` entries cannot be changed by these commands.
 
 ## Local Integration Runs
 

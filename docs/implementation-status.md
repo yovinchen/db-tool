@@ -105,7 +105,7 @@ usable.
 
 | Command family | Implemented commands | Write guard |
 | --- | --- | --- |
-| Connection | `conn list` | Read-only |
+| Connection | `conn list`, `conn add`, `conn remove` | list is read-only; add requires `--allow-write`; replace/remove also require a config-path/name/content-bound confirmation; file writes use same-directory 0600 temp + atomic replacement and never expose raw DSNs |
 | General | `ping`, `caps` | Read-only |
 | SQL | `sql query`, `sql exec`, `sql tables`, `sql schema`, `sql schemas` | query/exec accept `--params JSON_ARRAY`; query is adapter-bounded by positive `--limit` and strictly read-only; writes use `sql exec` with `--allow-write` and sometimes `--confirm`; the dead `sql query --schema` option has been removed, while table metadata uses reusable schema-qualified identities and exact list truncation |
 | CQL | `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema` | query is adapter-page-bounded by positive `--limit`; `cql exec` requires `--allow-write` |

@@ -70,6 +70,7 @@ Examples:
 ```bash
 cargo run -p dbtool-cli -- --dsn sqlite::memory: ping
 cargo run -p dbtool-cli -- conn list
+cargo run -p dbtool-cli -- --allow-write conn add local-sqlite sqlite:local.db
 cargo run -p dbtool-cli -- --dsn sqlite::memory: sql query "select 1"
 cargo run -p dbtool-cli -- --dsn sqlite::memory: --format table sql query "select 1 as id"
 cargo run -p dbtool-cli -- --dsn sqlite::memory: --format ndjson sql query "select 1 as id"

@@ -13,6 +13,45 @@
 - 错误通过稳定的 `error.code` 返回。接口不适用时返回
   `UNSUPPORTED_CAPABILITY`，不得用空数组或成功响应伪装。
 
+## 命名连接配置 CRUD
+
+`conn` 只修改默认 `connections.toml`；`DBTOOL_CONN_*` 环境连接由进程环境管理，CLI
+会列出但拒绝覆盖或删除。新增普通条目要求显式写权限：
+
+```bash
+dbtool --allow-write conn add local-pg \
+  'postgres://app:${DB_PASSWORD}@127.0.0.1:5432/app' --readonly
+
+dbtool conn list
+```
+
+`${ENV_NAME}` 在校验时替换为不含 secret 的哨兵，确认 scheme 已由当前 feature 集注册后，
+原模板逐字保存；不会把当前环境变量值写入文件或响应。name 固定为 1..=64 个小写 ASCII
+字母、数字和内部连字符，避免文件 key 与 `DBTOOL_CONN_<NAME>` 映射歧义。
+
+重复 name 默认返回 `CONFIG_ERROR`。覆盖和删除是两段式破坏性操作：
+
+```bash
+# 第一次分别返回 CONFIRM_REQUIRED
+dbtool --allow-write conn add local-pg 'postgres://new-host/app' --replace
+dbtool --allow-write conn remove local-pg
+
+# 第二次必须重放完全相同的 action、name 和条目内容
+dbtool --allow-write --confirm '<token>' \
+  conn add local-pg 'postgres://new-host/app' --replace
+dbtool --allow-write --confirm '<token>' conn remove local-pg
+```
+
+replace token 绑定配置绝对目标、name、原条目和新条目；remove token 绑定目标、name 和当前
+条目，因此不能跨动作、条目或内容复用。replace 不暴露 limits 编辑面，会保留原条目的
+限流策略；`readonly` 以本次参数为准。
+
+写入先在同目录创建独占临时文件，Unix mode 为 `0600`，完整写入并同步后才原子替换目标；
+Unix 再同步父目录，Windows 使用 replace-existing + write-through。替换前失败会删除 temp
+并保留旧文件。当前 typed TOML model 会保留 defaults、connections 和 limits，但无法保留
+注释/排版；成功响应以 `serialization.comments_preserved=false` 明确这一边界。所有 DSN
+输出均脱敏，配置解析错误也不会回显含凭证的源行。
+
 ## KV / Redis SCAN
 
 ```bash

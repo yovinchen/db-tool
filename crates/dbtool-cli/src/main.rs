@@ -150,7 +150,7 @@ enum Commands {
     /// Manage named connections
     #[command(
         about = "Manage named connections",
-        long_about = "Connection commands read DBTOOL_CONN_* environment entries and the default connections.toml path, redact DSNs, and report supported schemes from the active registry."
+        long_about = "Connection commands list DBTOOL_CONN_* environment entries and atomically add, replace, or remove file-managed entries in the default connections.toml. Commands redact DSNs in every output; configuration writes require --allow-write, while replacement and removal also require target- and content-bound confirmation."
     )]
     Conn(cmd::conn::ConnCmd),
     /// Generate release artifact files from clap command metadata
