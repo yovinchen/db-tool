@@ -2,14 +2,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ColumnMeta, ExecOutcome, ForeignKeyInfo, IndexInfo, ResultSet, RoutineInfo, RoutineKind,
-        SequenceInfo, TableInfo, TableKind, TableSchema, TablespaceInfo, Value,
+        BoundedList, ColumnMeta, ExecOutcome, ForeignKeyInfo, IndexInfo, ResultSet, RoutineInfo,
+        RoutineKind, SequenceInfo, TableInfo, TableKind, TableSchema, TablespaceInfo, Value,
     },
     port::{
         capability::{Db2Engine, SqlEngine},
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ResultLimiter,
+    service::limiter::{ListLimiter, ResultLimiter},
 };
 use futures::future::BoxFuture;
 use odbc_api::{
@@ -77,6 +77,10 @@ impl Connector for Db2Adapter {
             db2: true,
             ..Default::default()
         }
+    }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        db2_operations(self.capabilities())
     }
 
     async fn ping(&self) -> Result<()> {
@@ -174,6 +178,26 @@ impl SqlEngine for Db2Adapter {
             .collect())
     }
 
+    async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        let (limiter, fetch_first) = db2_catalog_limit(max_items)?;
+        let result = self
+            .query(
+                &format!(
+                    "SELECT SCHEMANAME FROM SYSCAT.SCHEMATA \
+                     WHERE SCHEMANAME NOT LIKE 'SYS%' ORDER BY SCHEMANAME \
+                     FETCH FIRST {fetch_first} ROWS ONLY"
+                ),
+                &[],
+            )
+            .await?;
+        let schemas = result
+            .rows
+            .into_iter()
+            .map(|row| required_catalog_text(&row, 0, "schema name"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(schemas))
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
         let sql = format!(
@@ -200,6 +224,41 @@ impl SqlEngine for Db2Adapter {
                 })
             })
             .collect())
+    }
+
+    async fn list_tables_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (limiter, fetch_first) = db2_catalog_limit(max_items)?;
+        let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
+        let sql = format!(
+            "SELECT TABSCHEMA, TABNAME, TYPE FROM SYSCAT.TABLES \
+             WHERE TABSCHEMA = '{}' AND TYPE IN ('T','V') ORDER BY TABNAME \
+             FETCH FIRST {fetch_first} ROWS ONLY",
+            schema.to_uppercase()
+        );
+        let result = self.query(&sql, &[]).await?;
+        let tables = result
+            .rows
+            .into_iter()
+            .map(|row| {
+                let schema = required_catalog_text(&row, 0, "table schema")?;
+                let name = required_catalog_text(&row, 1, "table name")?;
+                let kind = required_catalog_text(&row, 2, "table type")?;
+                Ok(TableInfo {
+                    schema: Some(schema),
+                    name,
+                    kind: if kind == "V" {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(tables))
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -338,6 +397,30 @@ impl Db2Engine for Db2Adapter {
             .collect())
     }
 
+    async fn list_sequences_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<SequenceInfo>> {
+        let (limiter, fetch_first) = db2_catalog_limit(max_items)?;
+        let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
+        let sql = format!(
+            "SELECT SEQSCHEMA, SEQNAME, DATATYPEID, START, INCREMENT, \
+                    MINVALUE, MAXVALUE, CYCLE, CACHE \
+             FROM SYSCAT.SEQUENCES \
+             WHERE SEQSCHEMA = '{}' AND SEQTYPE = 'S' \
+             ORDER BY SEQNAME FETCH FIRST {fetch_first} ROWS ONLY",
+            schema.to_uppercase()
+        );
+        let result = self.query(&sql, &[]).await?;
+        let sequences = result
+            .rows
+            .into_iter()
+            .map(parse_sequence_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(sequences))
+    }
+
     async fn list_routines(&self, schema: Option<&str>) -> Result<Vec<RoutineInfo>> {
         let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
         let sql = format!(
@@ -377,6 +460,29 @@ impl Db2Engine for Db2Adapter {
             .collect())
     }
 
+    async fn list_routines_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<RoutineInfo>> {
+        let (limiter, fetch_first) = db2_catalog_limit(max_items)?;
+        let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
+        let sql = format!(
+            "SELECT ROUTINESCHEMA, ROUTINENAME, ROUTINETYPE, LANGUAGE, PARMS \
+             FROM SYSCAT.ROUTINES \
+             WHERE ROUTINESCHEMA = '{}' AND ROUTINETYPE IN ('P','F') \
+             ORDER BY ROUTINENAME FETCH FIRST {fetch_first} ROWS ONLY",
+            schema.to_uppercase()
+        );
+        let result = self.query(&sql, &[]).await?;
+        let routines = result
+            .rows
+            .into_iter()
+            .map(parse_routine_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(routines))
+    }
+
     async fn list_tablespaces(&self) -> Result<Vec<TablespaceInfo>> {
         let sql = "SELECT TBSPACE, TBSPACETYPE, PAGESIZE, EXTENTSIZE, PREFETCHSIZE \
                    FROM SYSCAT.TABLESPACES \
@@ -407,6 +513,25 @@ impl Db2Engine for Db2Adapter {
                 })
             })
             .collect())
+    }
+
+    async fn list_tablespaces_bounded(
+        &self,
+        max_items: usize,
+    ) -> Result<BoundedList<TablespaceInfo>> {
+        let (limiter, fetch_first) = db2_catalog_limit(max_items)?;
+        let sql = format!(
+            "SELECT TBSPACE, TBSPACETYPE, PAGESIZE, EXTENTSIZE, PREFETCHSIZE \
+             FROM SYSCAT.TABLESPACES \
+             ORDER BY TBSPACE FETCH FIRST {fetch_first} ROWS ONLY"
+        );
+        let result = self.query(&sql, &[]).await?;
+        let tablespaces = result
+            .rows
+            .into_iter()
+            .map(parse_tablespace_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(tablespaces))
     }
 
     async fn list_foreign_keys(&self, table: &str) -> Result<Vec<ForeignKeyInfo>> {
@@ -495,6 +620,50 @@ impl Db2Engine for Db2Adapter {
             }
         }
         Ok(fk_map)
+    }
+
+    async fn list_foreign_keys_bounded(
+        &self,
+        table: &str,
+        max_items: usize,
+    ) -> Result<BoundedList<ForeignKeyInfo>> {
+        let (limiter, fetch_first) = db2_catalog_limit(max_items)?;
+        let tref = parse_table_ref(table)?;
+        let schema_uc = tref.schema.as_deref().unwrap_or("DB2INST1").to_uppercase();
+        let name_uc = tref.name.to_uppercase();
+
+        // Limit constraint identities first. Limiting the joined key-column
+        // rows would split a composite foreign key and falsely report it as a
+        // complete constraint.
+        let sql = format!(
+            "WITH LIMITED_CONSTRAINTS AS ( \
+               SELECT CONSTNAME, TABSCHEMA, TABNAME \
+               FROM SYSCAT.REFERENCES \
+               WHERE TABSCHEMA = '{schema_uc}' AND TABNAME = '{name_uc}' \
+               ORDER BY CONSTNAME \
+               FETCH FIRST {fetch_first} ROWS ONLY \
+             ) \
+             SELECT r.CONSTNAME, kc.COLNAME, r.REFTABSCHEMA, r.REFTABNAME, \
+                    rkc.COLNAME AS REFCOL, r.UPDATERULE, r.DELETERULE \
+             FROM LIMITED_CONSTRAINTS limited \
+             JOIN SYSCAT.REFERENCES r \
+               ON r.CONSTNAME = limited.CONSTNAME \
+              AND r.TABSCHEMA = limited.TABSCHEMA \
+              AND r.TABNAME = limited.TABNAME \
+             JOIN SYSCAT.KEYCOLUSE kc \
+               ON kc.CONSTNAME = r.CONSTNAME \
+              AND kc.TABSCHEMA = r.TABSCHEMA \
+              AND kc.TABNAME = r.TABNAME \
+             JOIN SYSCAT.KEYCOLUSE rkc \
+               ON rkc.CONSTNAME = r.REFKEYNAME \
+              AND rkc.TABSCHEMA = r.REFTABSCHEMA \
+              AND rkc.TABNAME = r.REFTABNAME \
+              AND rkc.COLSEQ = kc.COLSEQ \
+             ORDER BY r.CONSTNAME, kc.COLSEQ"
+        );
+        let result = self.query(&sql, &[]).await?;
+        let foreign_keys = group_foreign_key_rows(result.rows)?;
+        Ok(limiter.finish(foreign_keys))
     }
 
     async fn generate_ddl(&self, table: &str) -> Result<String> {
@@ -666,6 +835,136 @@ fn query_result_set_with_bound(
     })
 }
 
+fn db2_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::Db2ListSequencesBounded,
+        CapabilityOperation::Db2ListRoutinesBounded,
+        CapabilityOperation::Db2ListTablespacesBounded,
+        CapabilityOperation::Db2ListForeignKeysBounded,
+    ]);
+    operations
+}
+
+fn db2_catalog_limit(max_items: usize) -> Result<(ListLimiter, i64)> {
+    let limiter = ListLimiter::new(max_items);
+    let probe_items = limiter.probe_items()?;
+    let fetch_first = i64::try_from(probe_items).map_err(|_| {
+        Error::Config("Db2 catalog limit exceeds the FETCH FIRST integer range".to_owned())
+    })?;
+    Ok((limiter, fetch_first))
+}
+
+fn required_catalog_text(row: &[Value], index: usize, field: &str) -> Result<String> {
+    match row.get(index) {
+        Some(Value::Text(value)) => Ok(value.trim().to_owned()),
+        _ => Err(Error::Serialization(format!(
+            "Db2 catalog {field} is missing or is not text"
+        ))),
+    }
+}
+
+fn required_catalog_i64(row: &[Value], index: usize, field: &str) -> Result<i64> {
+    let value = required_catalog_text(row, index, field)?;
+    value.parse().map_err(|_| {
+        Error::Serialization(format!("Db2 catalog {field} is not a valid 64-bit integer"))
+    })
+}
+
+fn required_catalog_i32(row: &[Value], index: usize, field: &str) -> Result<i32> {
+    let value = required_catalog_text(row, index, field)?;
+    value.parse().map_err(|_| {
+        Error::Serialization(format!("Db2 catalog {field} is not a valid 32-bit integer"))
+    })
+}
+
+fn parse_sequence_row(row: Vec<Value>) -> Result<SequenceInfo> {
+    Ok(SequenceInfo {
+        schema: required_catalog_text(&row, 0, "sequence schema")?,
+        name: required_catalog_text(&row, 1, "sequence name")?,
+        data_type: required_catalog_text(&row, 2, "sequence data type")?,
+        start: required_catalog_text(&row, 3, "sequence start")?,
+        increment: required_catalog_text(&row, 4, "sequence increment")?,
+        min_value: required_catalog_text(&row, 5, "sequence minimum")?,
+        max_value: required_catalog_text(&row, 6, "sequence maximum")?,
+        cycle: required_catalog_text(&row, 7, "sequence cycle flag")? == "Y",
+        cache: required_catalog_i64(&row, 8, "sequence cache")?,
+    })
+}
+
+fn parse_routine_row(row: Vec<Value>) -> Result<RoutineInfo> {
+    let routine_type = required_catalog_text(&row, 2, "routine type")?;
+    let kind = match routine_type.as_str() {
+        "P" => RoutineKind::Procedure,
+        "F" => RoutineKind::Function,
+        _ => {
+            return Err(Error::Serialization(format!(
+                "Db2 catalog returned unknown routine type '{routine_type}'"
+            )))
+        }
+    };
+    Ok(RoutineInfo {
+        schema: required_catalog_text(&row, 0, "routine schema")?,
+        name: required_catalog_text(&row, 1, "routine name")?,
+        kind,
+        language: required_catalog_text(&row, 3, "routine language")?,
+        parms: required_catalog_i32(&row, 4, "routine parameter count")?,
+    })
+}
+
+fn parse_tablespace_row(row: Vec<Value>) -> Result<TablespaceInfo> {
+    Ok(TablespaceInfo {
+        name: required_catalog_text(&row, 0, "tablespace name")?,
+        kind: required_catalog_text(&row, 1, "tablespace type")?,
+        page_size: required_catalog_i64(&row, 2, "tablespace page size")?,
+        extent_size: required_catalog_i64(&row, 3, "tablespace extent size")?,
+        prefetch_size: required_catalog_i64(&row, 4, "tablespace prefetch size")?,
+    })
+}
+
+fn group_foreign_key_rows(rows: Vec<Vec<Value>>) -> Result<Vec<ForeignKeyInfo>> {
+    let mut foreign_keys: Vec<ForeignKeyInfo> = Vec::new();
+    for row in rows {
+        let constraint_name = required_catalog_text(&row, 0, "foreign-key constraint name")?;
+        let column = required_catalog_text(&row, 1, "foreign-key column")?;
+        let ref_schema = required_catalog_text(&row, 2, "foreign-key referenced schema")?;
+        let ref_table = required_catalog_text(&row, 3, "foreign-key referenced table")?;
+        let ref_column = required_catalog_text(&row, 4, "foreign-key referenced column")?;
+        let update_rule = required_catalog_text(&row, 5, "foreign-key update rule")?;
+        let delete_rule = required_catalog_text(&row, 6, "foreign-key delete rule")?;
+
+        if let Some(existing) = foreign_keys
+            .iter_mut()
+            .find(|foreign_key| foreign_key.constraint_name == constraint_name)
+        {
+            if existing.ref_schema != ref_schema
+                || existing.ref_table != ref_table
+                || existing.update_rule != update_rule
+                || existing.delete_rule != delete_rule
+            {
+                return Err(Error::Serialization(format!(
+                    "Db2 catalog returned inconsistent rows for foreign key '{constraint_name}'"
+                )));
+            }
+            existing.columns.push(column);
+            existing.ref_columns.push(ref_column);
+        } else {
+            foreign_keys.push(ForeignKeyInfo {
+                constraint_name,
+                columns: vec![column],
+                ref_schema,
+                ref_table,
+                ref_columns: vec![ref_column],
+                update_rule,
+                delete_rule,
+            });
+        }
+    }
+    Ok(foreign_keys)
+}
+
 // ── DSN helpers ──────────────────────────────────────────────────────────────
 
 fn build_connection_string(dsn: &Dsn) -> Result<String> {
@@ -791,6 +1090,59 @@ mod tests {
         assert!(parse_table_ref("DB2INST1.EMP;DROP").is_err());
         assert!(validate_opt_schema(Some("DB2INST1")).is_ok());
         assert!(validate_opt_schema(Some("DB2;DROP")).is_err());
+    }
+
+    #[test]
+    fn advertises_every_bounded_db2_catalog_operation() {
+        let operations = db2_operations(Capabilities {
+            sql: true,
+            db2: true,
+            ..Default::default()
+        });
+        for operation in [
+            CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListTablesBounded,
+            CapabilityOperation::Db2ListSequencesBounded,
+            CapabilityOperation::Db2ListRoutinesBounded,
+            CapabilityOperation::Db2ListTablespacesBounded,
+            CapabilityOperation::Db2ListForeignKeysBounded,
+        ] {
+            assert!(operations.contains(&operation), "missing {operation:?}");
+        }
+    }
+
+    #[test]
+    fn validates_catalog_limits_before_backend_access() {
+        assert!(matches!(db2_catalog_limit(0), Err(Error::Config(_))));
+        assert!(matches!(
+            db2_catalog_limit(usize::MAX),
+            Err(Error::Config(_))
+        ));
+        assert_eq!(db2_catalog_limit(2).unwrap().1, 3);
+    }
+
+    #[test]
+    fn groups_composite_foreign_keys_without_splitting_constraints() {
+        let row = |column: &str, ref_column: &str| {
+            vec![
+                Value::Text("FK_ORDER_CUSTOMER".to_owned()),
+                Value::Text(column.to_owned()),
+                Value::Text("APP".to_owned()),
+                Value::Text("CUSTOMER".to_owned()),
+                Value::Text(ref_column.to_owned()),
+                Value::Text("A".to_owned()),
+                Value::Text("R".to_owned()),
+            ]
+        };
+        let grouped = group_foreign_key_rows(vec![
+            row("CUSTOMER_ID", "ID"),
+            row("CUSTOMER_REGION", "REGION"),
+        ])
+        .unwrap();
+
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].columns, ["CUSTOMER_ID", "CUSTOMER_REGION"]);
+        assert_eq!(grouped[0].ref_columns, ["ID", "REGION"]);
     }
 
     #[test]

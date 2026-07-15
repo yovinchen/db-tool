@@ -1,13 +1,14 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{error::Error, Result};
+use dbtool_core::{error::Error, port::CapabilityOperation, service::limiter::ListLimiter, Result};
 
 #[derive(Args)]
 #[command(
     about = "IBM Db2 schema inspection (sequences / routines / tablespaces / fk / ddl).",
     long_about = "Db2 commands query the SYSCAT catalog to expose Db2-specific metadata: \
                   sequences, stored procedures/UDFs, tablespaces, foreign-key constraints, \
-                  and generated DDL. All commands are read-only and do not require --allow-write."
+                  and generated DDL. Catalog lists honor the global --limit and report truncation. \
+                  All commands are read-only and do not require --allow-write."
 )]
 pub struct Db2Cmd {
     #[command(subcommand)]
@@ -56,8 +57,20 @@ pub enum Db2Action {
 }
 
 pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
+    match &cmd.action {
+        Db2Action::Sequences { .. }
+        | Db2Action::Routines { .. }
+        | Db2Action::Tablespaces
+        | Db2Action::ForeignKeys { .. }
+        | Db2Action::Schemas
+        | Db2Action::Tables { .. } => {
+            ListLimiter::new(ctx.limit).probe_items()?;
+        }
+        Db2Action::Ddl { .. } | Db2Action::Schema { .. } => {}
+    }
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let start = std::time::Instant::now();
     let kind = conn.kind().0.clone();
     let elapsed = || start.elapsed().as_millis() as u64;
@@ -65,24 +78,52 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
     match cmd.action {
         // ── Db2Engine-specific operations ────────────────────────────────────
         Db2Action::Sequences { schema } => {
+            require_operation(
+                &operations,
+                CapabilityOperation::Db2ListSequencesBounded,
+                &kind,
+                "Db2Engine.list_sequences_bounded",
+            )?;
             let db2 = require_db2(&*conn)?;
-            let seqs = db2.list_sequences(schema.as_deref()).await?;
-            Ok(ctx.render_success(&kind, seqs, elapsed(), false))
+            let seqs = db2
+                .list_sequences_bounded(schema.as_deref(), ctx.limit)
+                .await?;
+            Ok(ctx.render_success(&kind, seqs.items, elapsed(), seqs.truncated))
         }
         Db2Action::Routines { schema } => {
+            require_operation(
+                &operations,
+                CapabilityOperation::Db2ListRoutinesBounded,
+                &kind,
+                "Db2Engine.list_routines_bounded",
+            )?;
             let db2 = require_db2(&*conn)?;
-            let routines = db2.list_routines(schema.as_deref()).await?;
-            Ok(ctx.render_success(&kind, routines, elapsed(), false))
+            let routines = db2
+                .list_routines_bounded(schema.as_deref(), ctx.limit)
+                .await?;
+            Ok(ctx.render_success(&kind, routines.items, elapsed(), routines.truncated))
         }
         Db2Action::Tablespaces => {
+            require_operation(
+                &operations,
+                CapabilityOperation::Db2ListTablespacesBounded,
+                &kind,
+                "Db2Engine.list_tablespaces_bounded",
+            )?;
             let db2 = require_db2(&*conn)?;
-            let ts = db2.list_tablespaces().await?;
-            Ok(ctx.render_success(&kind, ts, elapsed(), false))
+            let tablespaces = db2.list_tablespaces_bounded(ctx.limit).await?;
+            Ok(ctx.render_success(&kind, tablespaces.items, elapsed(), tablespaces.truncated))
         }
         Db2Action::ForeignKeys { table } => {
+            require_operation(
+                &operations,
+                CapabilityOperation::Db2ListForeignKeysBounded,
+                &kind,
+                "Db2Engine.list_foreign_keys_bounded",
+            )?;
             let db2 = require_db2(&*conn)?;
-            let fks = db2.list_foreign_keys(&table).await?;
-            Ok(ctx.render_success(&kind, fks, elapsed(), false))
+            let foreign_keys = db2.list_foreign_keys_bounded(&table, ctx.limit).await?;
+            Ok(ctx.render_success(&kind, foreign_keys.items, elapsed(), foreign_keys.truncated))
         }
         Db2Action::Ddl { table } => {
             let db2 = require_db2(&*conn)?;
@@ -93,20 +134,50 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
 
         // ── SqlEngine operations (same surface as `sql` but Db2-flavoured) ──
         Db2Action::Schemas => {
+            require_operation(
+                &operations,
+                CapabilityOperation::SqlListSchemasBounded,
+                &kind,
+                "SqlEngine.list_schemas_bounded",
+            )?;
             let sql = require_sql(&*conn)?;
-            let schemas = sql.list_schemas().await?;
-            Ok(ctx.render_success(&kind, schemas, elapsed(), false))
+            let schemas = sql.list_schemas_bounded(ctx.limit).await?;
+            Ok(ctx.render_success(&kind, schemas.items, elapsed(), schemas.truncated))
         }
         Db2Action::Tables { schema } => {
+            require_operation(
+                &operations,
+                CapabilityOperation::SqlListTablesBounded,
+                &kind,
+                "SqlEngine.list_tables_bounded",
+            )?;
             let sql = require_sql(&*conn)?;
-            let tables = sql.list_tables(schema.as_deref()).await?;
-            Ok(ctx.render_success(&kind, tables, elapsed(), false))
+            let tables = sql
+                .list_tables_bounded(schema.as_deref(), ctx.limit)
+                .await?;
+            Ok(ctx.render_success(&kind, tables.items, elapsed(), tables.truncated))
         }
         Db2Action::Schema { table } => {
             let sql = require_sql(&*conn)?;
             let schema = sql.describe_table(&table).await?;
             Ok(ctx.render_success(&kind, schema, elapsed(), false))
         }
+    }
+}
+
+fn require_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+    needed: &'static str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed,
+        })
     }
 }
 
@@ -131,6 +202,7 @@ fn require_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbtool_core::port::Capabilities;
     use dbtool_core::service::formatter::Format;
 
     fn test_context() -> Context {
@@ -152,5 +224,42 @@ mod tests {
         // guard. We test the inner helper with a mock connector below.
         let ctx = test_context();
         assert!(ctx.resolve_dsn().is_err());
+    }
+
+    #[test]
+    fn legacy_db2_capabilities_do_not_authorize_bounded_catalog_calls() {
+        let operations = Capabilities {
+            sql: true,
+            db2: true,
+            ..Default::default()
+        }
+        .operations();
+
+        assert!(matches!(
+            require_operation(
+                &operations,
+                CapabilityOperation::Db2ListSequencesBounded,
+                "legacy-db2",
+                "Db2Engine.list_sequences_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "Db2Engine.list_sequences_bounded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn catalog_limit_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context();
+        ctx.limit = usize::MAX;
+        let error = run(
+            &ctx,
+            Db2Cmd {
+                action: Db2Action::Tablespaces,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Config(message) if message.contains("too large")));
     }
 }
