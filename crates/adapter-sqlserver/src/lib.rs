@@ -2,14 +2,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind,
-        TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ResultSet, TableInfo,
+        TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
     },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, ResultLimiter},
+    service::limiter::{ListLimiter, MetadataLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, TryStreamExt};
 use tiberius::{AuthMethod, Client, Column, ColumnData, Config, EncryptionLevel, QueryItem, Row};
@@ -17,11 +17,64 @@ use tokio::{net::TcpStream, sync::Mutex};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 type SqlServerClient = Client<Compat<TcpStream>>;
+const LEGACY_SCHEMA_MAX_ITEMS: usize = 100_000;
 
 pub struct SqlServerAdapter {
     client: Mutex<Option<SqlServerClient>>,
     dsn: Dsn,
     kind: ConnectorKind,
+}
+
+impl SqlServerAdapter {
+    async fn describe_table_complete(
+        &self,
+        table: &str,
+        budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        let table_ref = parse_table_ref(table)?;
+        let schema = table_ref.schema.as_deref().unwrap_or("dbo");
+        let mut limiter = MetadataLimiter::new(budget, "SQL Server table schema")?;
+
+        let column_top = metadata_top(&limiter)?;
+        let col_result = self
+            .query(
+                &sqlserver_columns_sql(schema, &table_ref.name, column_top),
+                &[],
+            )
+            .await?;
+        if col_result.rows.is_empty() {
+            return Err(Error::Query(format!(
+                "SQL Server table or view does not exist or exposes no columns: {schema}.{}",
+                table_ref.name
+            )));
+        }
+        let mut columns = Vec::with_capacity(col_result.rows.len());
+        for row in col_result.rows {
+            let column = parse_sqlserver_column(&row)?;
+            limiter.observe(&column)?;
+            columns.push(column);
+        }
+
+        let index_top = metadata_top(&limiter)?;
+        let idx_result = self
+            .query(
+                &sqlserver_indexes_sql(schema, &table_ref.name, index_top),
+                &[],
+            )
+            .await?;
+        let mut indexes = Vec::new();
+        for row in idx_result.rows {
+            accumulate_sqlserver_index(&mut indexes, &mut limiter, &row)?;
+        }
+
+        let table_schema = TableSchema {
+            name: table_ref.name,
+            columns,
+            indexes,
+        };
+        limiter.ensure_complete(&table_schema)?;
+        Ok(table_schema)
+    }
 }
 
 pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
@@ -299,94 +352,19 @@ impl SqlEngine for SqlServerAdapter {
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
-        let table_ref = parse_table_ref(table)?;
-        let schema = table_ref.schema.as_deref().unwrap_or("dbo");
+        self.describe_table_complete(
+            table,
+            MetadataBudget::new(LEGACY_SCHEMA_MAX_ITEMS, DEFAULT_METADATA_BYTES)?,
+        )
+        .await
+    }
 
-        let col_sql = format!(
-            "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, \
-                    CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS is_pk \
-             FROM INFORMATION_SCHEMA.COLUMNS c \
-             LEFT JOIN ( \
-                 SELECT kcu.COLUMN_NAME \
-                 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
-                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
-                     ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
-                     AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA \
-                     AND tc.TABLE_NAME = kcu.TABLE_NAME \
-                 WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' \
-                   AND tc.TABLE_SCHEMA = '{schema}' AND tc.TABLE_NAME = '{name}' \
-             ) pk ON c.COLUMN_NAME = pk.COLUMN_NAME \
-             WHERE c.TABLE_SCHEMA = '{schema}' AND c.TABLE_NAME = '{name}' \
-             ORDER BY c.ORDINAL_POSITION",
-            schema = schema,
-            name = table_ref.name,
-        );
-        let col_result = self.query(&col_sql, &[]).await?;
-
-        let columns = col_result
-            .rows
-            .into_iter()
-            .filter_map(|row| {
-                let name = value_text(row.first()?)?.to_owned();
-                let data_type = value_text(row.get(1)?)?.to_owned();
-                let nullable = value_text(row.get(2)?)? == "YES";
-                let default_value = match row.get(3)? {
-                    Value::Text(s) => Some(s.clone()),
-                    _ => None,
-                };
-                let primary_key = matches!(row.get(4)?, Value::Int(1));
-                Some(ColumnMeta {
-                    name,
-                    type_name: data_type,
-                    nullable,
-                    primary_key,
-                    default_value,
-                })
-            })
-            .collect();
-
-        let idx_sql = format!(
-            "SELECT i.name, i.is_unique, i.is_primary_key, c.name \
-             FROM sys.indexes i \
-             JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
-             JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
-             JOIN sys.tables t ON i.object_id = t.object_id \
-             JOIN sys.schemas s ON t.schema_id = s.schema_id \
-             WHERE t.name = '{name}' AND s.name = '{schema}' AND i.type > 0 \
-             ORDER BY i.name, ic.key_ordinal",
-            schema = schema,
-            name = table_ref.name,
-        );
-        let idx_result = self.query(&idx_sql, &[]).await?;
-
-        let mut indexes: Vec<IndexInfo> = Vec::new();
-        for row in idx_result.rows {
-            let idx_name = match row.first() {
-                Some(Value::Text(s)) => s.clone(),
-                _ => continue,
-            };
-            let unique = matches!(row.get(1), Some(Value::Bool(true)));
-            let primary = matches!(row.get(2), Some(Value::Bool(true)));
-            let col = match row.get(3) {
-                Some(Value::Text(s)) => s.clone(),
-                _ => continue,
-            };
-            match indexes.last_mut() {
-                Some(idx) if idx.name == idx_name => idx.columns.push(col),
-                _ => indexes.push(IndexInfo {
-                    name: idx_name,
-                    columns: vec![col],
-                    unique,
-                    primary,
-                }),
-            }
-        }
-
-        Ok(TableSchema {
-            name: table_ref.name,
-            columns,
-            indexes,
-        })
+    async fn describe_table_bounded(
+        &self,
+        table: &str,
+        budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        self.describe_table_complete(table, budget).await
     }
 }
 
@@ -501,8 +479,152 @@ fn sqlserver_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> 
     operations.extend([
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::SqlDescribeTableBounded,
     ]);
     operations
+}
+
+fn metadata_top(limiter: &MetadataLimiter) -> Result<i64> {
+    i64::try_from(limiter.probe_items()?).map_err(|_| {
+        Error::Config("SQL Server metadata budget exceeds the TOP integer range".to_owned())
+    })
+}
+
+fn sqlserver_columns_sql(schema: &str, name: &str, top: i64) -> String {
+    format!(
+        "SELECT TOP ({top}) c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, \
+                CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END AS is_pk \
+         FROM INFORMATION_SCHEMA.COLUMNS c \
+         LEFT JOIN ( \
+             SELECT kcu.COLUMN_NAME \
+             FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
+             JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
+                 ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
+                 AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA \
+                 AND tc.TABLE_NAME = kcu.TABLE_NAME \
+             WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' \
+               AND tc.TABLE_SCHEMA = '{schema}' AND tc.TABLE_NAME = '{name}' \
+         ) pk ON c.COLUMN_NAME = pk.COLUMN_NAME \
+         WHERE c.TABLE_SCHEMA = '{schema}' AND c.TABLE_NAME = '{name}' \
+         ORDER BY c.ORDINAL_POSITION"
+    )
+}
+
+fn sqlserver_indexes_sql(schema: &str, name: &str, top: i64) -> String {
+    format!(
+        "SELECT TOP ({top}) i.name, i.is_unique, i.is_primary_key, c.name \
+         FROM sys.indexes i \
+         JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id \
+         JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
+         JOIN sys.tables t ON i.object_id = t.object_id \
+         JOIN sys.schemas s ON t.schema_id = s.schema_id \
+         WHERE t.name = '{name}' AND s.name = '{schema}' AND i.type > 0 \
+         ORDER BY i.name, ic.key_ordinal"
+    )
+}
+
+fn parse_sqlserver_column(row: &[Value]) -> Result<ColumnMeta> {
+    let name = row
+        .first()
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("SQL Server column name is not text".to_owned()))?;
+    let data_type = row
+        .get(1)
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("SQL Server column type is not text".to_owned()))?;
+    let nullable = match row.get(2).and_then(value_text) {
+        Some("YES") => true,
+        Some("NO") => false,
+        _ => {
+            return Err(Error::Serialization(
+                "SQL Server column nullable flag is invalid".to_owned(),
+            ))
+        }
+    };
+    let default_value = match row.get(3) {
+        Some(Value::Text(value)) => Some(value.clone()),
+        Some(Value::Null) => None,
+        _ => {
+            return Err(Error::Serialization(
+                "SQL Server column default is neither text nor null".to_owned(),
+            ))
+        }
+    };
+    let primary_key = match row.get(4) {
+        Some(Value::Int(0)) => false,
+        Some(Value::Int(1)) => true,
+        _ => {
+            return Err(Error::Serialization(
+                "SQL Server primary-key flag is invalid".to_owned(),
+            ))
+        }
+    };
+    Ok(ColumnMeta {
+        name: name.to_owned(),
+        type_name: data_type.to_owned(),
+        nullable,
+        primary_key,
+        default_value,
+    })
+}
+
+fn accumulate_sqlserver_index(
+    indexes: &mut Vec<IndexInfo>,
+    limiter: &mut MetadataLimiter,
+    row: &[Value],
+) -> Result<()> {
+    let name = row
+        .first()
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("SQL Server index name is not text".to_owned()))?;
+    let unique = match row.get(1) {
+        Some(Value::Bool(value)) => *value,
+        _ => {
+            return Err(Error::Serialization(
+                "SQL Server index uniqueness flag is not boolean".to_owned(),
+            ))
+        }
+    };
+    let primary = match row.get(2) {
+        Some(Value::Bool(value)) => *value,
+        _ => {
+            return Err(Error::Serialization(
+                "SQL Server index primary flag is not boolean".to_owned(),
+            ))
+        }
+    };
+    let column = row
+        .get(3)
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("SQL Server index column is not text".to_owned()))?;
+
+    let is_new = match indexes.last() {
+        Some(index) => index.name != name,
+        None => true,
+    };
+    if is_new {
+        limiter.observe(&("index", name, unique, primary))?;
+        indexes.push(IndexInfo {
+            name: name.to_owned(),
+            columns: Vec::new(),
+            unique,
+            primary,
+        });
+    } else if indexes
+        .last()
+        .is_some_and(|index| index.unique != unique || index.primary != primary)
+    {
+        return Err(Error::Serialization(format!(
+            "SQL Server index metadata changed within index {name}"
+        )));
+    }
+    limiter.observe(&("index-column", column))?;
+    indexes
+        .last_mut()
+        .expect("an index was created or already existed")
+        .columns
+        .push(column.to_owned());
+    Ok(())
 }
 
 fn sqlserver_catalog_limit(max_items: usize) -> Result<(ListLimiter, i64)> {
@@ -603,12 +725,68 @@ mod tests {
         });
         assert!(operations.contains(&CapabilityOperation::SqlListSchemasBounded));
         assert!(operations.contains(&CapabilityOperation::SqlListTablesBounded));
+        assert!(operations.contains(&CapabilityOperation::SqlDescribeTableBounded));
         assert!(matches!(sqlserver_catalog_limit(0), Err(Error::Config(_))));
         assert!(matches!(
             sqlserver_catalog_limit(usize::MAX),
             Err(Error::Config(_))
         ));
         assert_eq!(sqlserver_catalog_limit(2).unwrap().1, 3);
+    }
+
+    #[test]
+    fn bounded_schema_sql_pushes_remaining_probe_to_top() {
+        let columns = sqlserver_columns_sql("dbo", "users", 4);
+        let indexes = sqlserver_indexes_sql("dbo", "users", 2);
+        assert!(columns.starts_with("SELECT TOP (4)"));
+        assert!(indexes.starts_with("SELECT TOP (2)"));
+        assert!(columns.contains("ORDER BY c.ORDINAL_POSITION"));
+        assert!(indexes.contains("ORDER BY i.name, ic.key_ordinal"));
+    }
+
+    #[test]
+    fn bounded_schema_parsing_is_strict_and_counts_nested_index_items() {
+        let column = parse_sqlserver_column(&[
+            Value::Text("id".into()),
+            Value::Text("int".into()),
+            Value::Text("NO".into()),
+            Value::Null,
+            Value::Int(1),
+        ])
+        .unwrap();
+        assert!(column.primary_key);
+
+        let budget = MetadataBudget::new(2, DEFAULT_METADATA_BYTES).unwrap();
+        let mut limiter = MetadataLimiter::new(budget, "test schema").unwrap();
+        let mut indexes = Vec::new();
+        accumulate_sqlserver_index(
+            &mut indexes,
+            &mut limiter,
+            &[
+                Value::Text("ix_users".into()),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Text("name".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(limiter.observed_items(), 2);
+        assert_eq!(indexes[0].columns, ["name"]);
+        assert!(matches!(
+            accumulate_sqlserver_index(
+                &mut indexes,
+                &mut limiter,
+                &[
+                    Value::Text("ix_users".into()),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Text("email".into()),
+                ],
+            ),
+            Err(Error::MetadataBudgetExceeded { unit: "items", .. })
+        ));
+
+        assert!(parse_sqlserver_column(&[Value::Text("id".into())]).is_err());
     }
 
     #[test]
