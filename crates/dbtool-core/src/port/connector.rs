@@ -226,6 +226,7 @@ pub struct Capabilities {
 pub struct CapabilityReport {
     #[serde(flatten)]
     pub legacy: Capabilities,
+    #[serde(default)]
     pub operations: Vec<CapabilityOperation>,
 }
 
@@ -548,6 +549,22 @@ mod tests {
         assert_eq!(value["sql"], true);
         assert_eq!(value["operations"][0], "sql.execute");
         assert!(value.get("legacy").is_none());
+
+        let legacy_only: CapabilityReport = serde_json::from_value(serde_json::json!({
+            "sql": true,
+            "cql": false,
+            "db2": false,
+            "key_value": false,
+            "document": false,
+            "time_series": false,
+            "search": false,
+            "producer": false,
+            "consumer": false,
+            "admin": false
+        }))
+        .unwrap();
+        assert!(legacy_only.legacy.sql);
+        assert!(legacy_only.operations.is_empty());
     }
 
     #[test]
