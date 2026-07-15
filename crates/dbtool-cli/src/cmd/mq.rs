@@ -1,6 +1,7 @@
 use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
+    dsn::Dsn,
     error::Error,
     model::{ConsumeOptions, Message},
     Result,
@@ -13,7 +14,7 @@ use std::{
 #[derive(Args)]
 #[command(
     about = "Produce, consume, and inspect bounded message queue workflows.",
-    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write; consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
+    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write. AMQP/AMQPS consume also requires --allow-write because successful delivery is ACKed and removed from the queue. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
 )]
 pub struct MqCmd {
     #[command(subcommand)]
@@ -43,7 +44,7 @@ pub enum MqAction {
     },
     /// Consume messages (always bounded)
     #[command(
-        long_about = "Consume a bounded batch of messages. Both --max and --timeout must be greater than zero. A JSON meta.truncated value of true means the returned count reached --max; it does not prove that another message exists in the backend. Optional --partition and --offset values must be non-negative."
+        long_about = "Consume a bounded batch of messages. Both --max and --timeout must be greater than zero. AMQP/AMQPS consume requires the global --allow-write flag because each successful delivery is ACKed and removed from the queue. A JSON meta.truncated value of true means the returned count reached --max; it does not prove that another message exists in the backend. Optional --partition and --offset values must be non-negative."
     )]
     Consume {
         /// Topic, stream, subject, or queue name.
@@ -109,6 +110,9 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
     };
 
     let dsn = ctx.resolve_dsn()?;
+    if matches!(cmd.action, MqAction::Consume { .. }) && consume_requires_write(&dsn)? {
+        ensure_write_allowed(ctx)?;
+    }
     let conn = ctx.registry.connect(&dsn).await?;
     let start = std::time::Instant::now();
     let elapsed = || start.elapsed().as_millis() as u64;
@@ -193,6 +197,11 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
     ctx.ensure_write_allowed()
+}
+
+fn consume_requires_write(raw_dsn: &str) -> Result<bool> {
+    let dsn = Dsn::parse(raw_dsn)?;
+    Ok(matches!(dsn.scheme.as_str(), "amqp" | "amqps"))
 }
 
 fn build_message(
@@ -364,5 +373,14 @@ mod tests {
             build_message("payload", None, &[], Some(-1), None),
             Err(Error::Config(message)) if message.contains("--partition")
         ));
+    }
+
+    #[test]
+    fn only_ack_destructive_amqp_consumers_require_write_permission() {
+        assert!(consume_requires_write("amqp://127.0.0.1:5672/%2f").unwrap());
+        assert!(consume_requires_write("amqps://127.0.0.1:5671/%2f").unwrap());
+        assert!(!consume_requires_write("redis://127.0.0.1:6379").unwrap());
+        assert!(!consume_requires_write("nats://127.0.0.1:4222").unwrap());
+        assert!(!consume_requires_write("kafka://127.0.0.1:9092").unwrap());
     }
 }

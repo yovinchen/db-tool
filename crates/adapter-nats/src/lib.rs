@@ -12,7 +12,7 @@ use dbtool_core::{
 };
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
 use tokio::time::{timeout, Instant};
 
 pub struct NatsAdapter {
@@ -81,12 +81,23 @@ impl Connector for NatsAdapter {
 impl MessageProducer for NatsAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
         validate_subject(target)?;
+        for message in &messages {
+            validate_produce_message(message)?;
+        }
         let mut produced = 0;
         for message in messages {
-            self.client
-                .publish(target.to_owned(), message.payload)
-                .await
-                .map_err(|e| Error::Query(e.to_string()))?;
+            let headers = nats_headers_from_core(&message.headers)?;
+            if headers.is_empty() {
+                self.client
+                    .publish(target.to_owned(), message.payload)
+                    .await
+                    .map_err(|e| Error::Query(e.to_string()))?;
+            } else {
+                self.client
+                    .publish_with_headers(target.to_owned(), headers, message.payload)
+                    .await
+                    .map_err(|e| Error::Query(e.to_string()))?;
+            }
             produced += 1;
         }
         self.client
@@ -105,10 +116,12 @@ impl MessageProducer for NatsAdapter {
 impl MessageConsumer for NatsAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_subject(source)?;
+        validate_consume_position(&options)?;
         if options.max == 0 {
             return Ok(vec![]);
         }
 
+        let deadline = checked_deadline(options.timeout)?;
         let mut subscriber = self
             .client
             .subscribe(source.to_owned())
@@ -119,7 +132,6 @@ impl MessageConsumer for NatsAdapter {
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
-        let deadline = Instant::now() + options.timeout;
         let mut messages = Vec::new();
         while messages.len() < options.max {
             let now = Instant::now();
@@ -128,14 +140,17 @@ impl MessageConsumer for NatsAdapter {
             }
 
             match timeout(deadline - now, subscriber.next()).await {
-                Ok(Some(message)) => messages.push(Message {
-                    key: None,
-                    payload: message.payload,
-                    headers: HashMap::new(),
-                    partition: None,
-                    offset: None,
-                    timestamp: None,
-                }),
+                Ok(Some(message)) => {
+                    let headers = nats_headers_to_core(message.headers.as_ref())?;
+                    messages.push(Message {
+                        key: None,
+                        payload: message.payload,
+                        headers,
+                        partition: None,
+                        offset: None,
+                        timestamp: None,
+                    });
+                }
                 Ok(None) => break,
                 Err(_) => break,
             }
@@ -240,6 +255,91 @@ fn validate_subject(subject: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_produce_message(message: &Message) -> Result<()> {
+    if message.key.is_some() {
+        return Err(Error::Config(
+            "Core NATS producer does not support message keys".into(),
+        ));
+    }
+    if message.partition.is_some() {
+        return Err(Error::Config(
+            "Core NATS producer does not support partitions".into(),
+        ));
+    }
+    if message.offset.is_some() {
+        return Err(Error::Config(
+            "Core NATS producer does not support producer offsets".into(),
+        ));
+    }
+    if message.timestamp.is_some() {
+        return Err(Error::Config(
+            "Core NATS producer does not support producer timestamps".into(),
+        ));
+    }
+
+    // Validate header syntax before any message is published so a batch cannot
+    // partially succeed due to a later invalid header.
+    nats_headers_from_core(&message.headers)?;
+    Ok(())
+}
+
+fn validate_consume_position(options: &ConsumeOptions) -> Result<()> {
+    if options.partition.is_some() {
+        return Err(Error::Config(
+            "Core NATS consumer does not support partitions".into(),
+        ));
+    }
+    if options.offset.is_some() {
+        return Err(Error::Config(
+            "Core NATS consumer does not support offsets".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn nats_headers_from_core(headers: &HashMap<String, String>) -> Result<async_nats::HeaderMap> {
+    let mut mapped = async_nats::HeaderMap::new();
+    for (key, value) in headers {
+        let name = async_nats::HeaderName::from_str(key).map_err(|error| {
+            Error::Config(format!("invalid Core NATS header name {key:?}: {error}"))
+        })?;
+        let value = async_nats::HeaderValue::from_str(value).map_err(|error| {
+            Error::Config(format!(
+                "invalid Core NATS header value for {key:?}: {error}"
+            ))
+        })?;
+        mapped.insert(name, value);
+    }
+    Ok(mapped)
+}
+
+fn nats_headers_to_core(
+    headers: Option<&async_nats::HeaderMap>,
+) -> Result<HashMap<String, String>> {
+    let Some(headers) = headers else {
+        return Ok(HashMap::new());
+    };
+
+    headers
+        .iter()
+        .map(|(name, values)| {
+            if values.len() != 1 {
+                return Err(Error::Serialization(format!(
+                    "Core NATS header {name:?} has {} values; the message model requires exactly one",
+                    values.len()
+                )));
+            }
+            Ok((name.to_string(), values[0].as_str().to_owned()))
+        })
+        .collect()
+}
+
+fn checked_deadline(timeout: std::time::Duration) -> Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        Error::Config("Core NATS consume timeout is too large for this platform".into())
+    })
+}
+
 fn validate_jetstream_name(kind: &str, name: &str) -> Result<()> {
     if name.is_empty()
         || name
@@ -323,6 +423,20 @@ fn usize_to_i16(value: usize) -> i16 {
 mod tests {
     use super::*;
 
+    fn message() -> Message {
+        Message {
+            key: None,
+            payload: bytes::Bytes::from_static(b"payload"),
+            headers: HashMap::from([
+                ("trace".to_owned(), "abc".to_owned()),
+                ("content-type".to_owned(), "text/plain".to_owned()),
+            ]),
+            partition: None,
+            offset: None,
+            timestamp: None,
+        }
+    }
+
     #[test]
     fn nats_tls_alias_rewrites_to_async_nats_tls_scheme() {
         let dsn = Dsn::parse("nats+tls://127.0.0.1:4222?tls-ca=/tmp/ca.pem").unwrap();
@@ -340,5 +454,92 @@ mod tests {
         assert!(validate_jetstream_name("stream", "events.data").is_err());
         assert!(validate_jetstream_name("stream", "events.*").is_err());
         assert!(validate_jetstream_name("stream", "").is_err());
+    }
+
+    #[test]
+    fn core_nats_string_headers_round_trip_exactly() {
+        let message = message();
+        let mapped = nats_headers_from_core(&message.headers).unwrap();
+
+        assert_eq!(
+            nats_headers_to_core(Some(&mapped)).unwrap(),
+            message.headers
+        );
+    }
+
+    #[test]
+    fn core_nats_rejects_unrepresentable_metadata_and_positions() {
+        let mut candidate = message();
+        candidate.key = Some(bytes::Bytes::from_static(b"key"));
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("message keys")
+        ));
+
+        let mut candidate = message();
+        candidate.partition = Some(0);
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("partitions")
+        ));
+
+        let mut candidate = message();
+        candidate.offset = Some(1);
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("producer offsets")
+        ));
+
+        let mut candidate = message();
+        candidate.timestamp = Some(1_710_000_000_123);
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("producer timestamps")
+        ));
+
+        assert!(matches!(
+            validate_consume_position(&ConsumeOptions {
+                max: 1,
+                timeout: std::time::Duration::from_secs(1),
+                partition: Some(0),
+                offset: None,
+            }),
+            Err(Error::Config(message)) if message.contains("partitions")
+        ));
+        assert!(matches!(
+            validate_consume_position(&ConsumeOptions {
+                max: 1,
+                timeout: std::time::Duration::from_secs(1),
+                partition: None,
+                offset: Some(0),
+            }),
+            Err(Error::Config(message)) if message.contains("offsets")
+        ));
+    }
+
+    #[test]
+    fn core_nats_rejects_invalid_or_multi_value_headers() {
+        assert!(matches!(
+            nats_headers_from_core(&HashMap::from([(
+                "bad:name".to_owned(),
+                "value".to_owned()
+            )])),
+            Err(Error::Config(message)) if message.contains("header name")
+        ));
+        assert!(matches!(
+            nats_headers_from_core(&HashMap::from([(
+                "trace".to_owned(),
+                "bad\nvalue".to_owned()
+            )])),
+            Err(Error::Config(message)) if message.contains("header value")
+        ));
+
+        let mut headers = async_nats::HeaderMap::new();
+        headers.append("trace", "one");
+        headers.append("trace", "two");
+        assert!(matches!(
+            nats_headers_to_core(Some(&headers)),
+            Err(Error::Serialization(message)) if message.contains("2 values")
+        ));
     }
 }

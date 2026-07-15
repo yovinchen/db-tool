@@ -166,8 +166,18 @@ fn redis_set_command(key: &str, value: &[u8], options: SetOptions) -> redis::Cmd
 impl MessageProducer for RedisAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
         match parse_message_target(target)? {
-            RedisMessageTarget::Stream(stream) => self.produce_stream(stream, messages).await,
-            RedisMessageTarget::PubSub(channel) => self.publish_pubsub(channel, messages).await,
+            RedisMessageTarget::Stream(stream) => {
+                for message in &messages {
+                    validate_stream_produce_message(message)?;
+                }
+                self.produce_stream(stream, messages).await
+            }
+            RedisMessageTarget::PubSub(channel) => {
+                for message in &messages {
+                    validate_pubsub_produce_message(message)?;
+                }
+                self.publish_pubsub(channel, messages).await
+            }
         }
     }
 }
@@ -176,8 +186,14 @@ impl MessageProducer for RedisAdapter {
 impl MessageConsumer for RedisAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         match parse_message_target(source)? {
-            RedisMessageTarget::Stream(stream) => self.consume_stream(stream, options).await,
-            RedisMessageTarget::PubSub(channel) => self.consume_pubsub(channel, options).await,
+            RedisMessageTarget::Stream(stream) => {
+                validate_stream_consume_options(&options)?;
+                self.consume_stream(stream, options).await
+            }
+            RedisMessageTarget::PubSub(channel) => {
+                validate_pubsub_consume_options(&options)?;
+                self.consume_pubsub(channel, options).await
+            }
         }
     }
 }
@@ -327,7 +343,7 @@ impl RedisAdapter {
             .offset
             .map(|offset| format!("{offset}-0"))
             .unwrap_or_else(|| "0-0".to_owned());
-        let block_ms = duration_millis_usize(options.timeout);
+        let block_ms = duration_millis_usize(options.timeout)?;
         let mut c = self.conn.lock().await;
         let reply: StreamReadReply = redis::cmd("XREAD")
             .arg("COUNT")
@@ -355,6 +371,7 @@ impl RedisAdapter {
             return Ok(vec![]);
         }
 
+        let deadline = checked_deadline(options.timeout)?;
         let mut pubsub = self
             .client
             .get_async_pubsub()
@@ -365,7 +382,6 @@ impl RedisAdapter {
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
 
-        let deadline = Instant::now() + options.timeout;
         let mut stream = pubsub.on_message();
         let mut messages = Vec::new();
 
@@ -504,6 +520,84 @@ fn validate_redis_name(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_stream_produce_message(message: &Message) -> Result<()> {
+    validate_stream_partition(message.partition, "producer")?;
+    if message.offset.is_some() {
+        return Err(Error::Config(
+            "Redis Stream producer does not support producer offsets".into(),
+        ));
+    }
+    if message.timestamp.is_some() {
+        return Err(Error::Config(
+            "Redis Stream producer does not support caller-supplied timestamps".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pubsub_produce_message(message: &Message) -> Result<()> {
+    if message.key.is_some() {
+        return Err(Error::Config(
+            "Redis PubSub producer supports payload only; message keys are not supported".into(),
+        ));
+    }
+    if !message.headers.is_empty() {
+        return Err(Error::Config(
+            "Redis PubSub producer supports payload only; headers are not supported".into(),
+        ));
+    }
+    if message.partition.is_some() {
+        return Err(Error::Config(
+            "Redis PubSub producer supports payload only; partitions are not supported".into(),
+        ));
+    }
+    if message.offset.is_some() {
+        return Err(Error::Config(
+            "Redis PubSub producer supports payload only; producer offsets are not supported"
+                .into(),
+        ));
+    }
+    if message.timestamp.is_some() {
+        return Err(Error::Config(
+            "Redis PubSub producer supports payload only; timestamps are not supported".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_consume_options(options: &ConsumeOptions) -> Result<()> {
+    validate_stream_partition(options.partition, "consumer")?;
+    if options.offset.is_some_and(|offset| offset < 0) {
+        return Err(Error::Config(
+            "Redis Stream consumer offset must be greater than or equal to zero".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pubsub_consume_options(options: &ConsumeOptions) -> Result<()> {
+    if options.partition.is_some() {
+        return Err(Error::Config(
+            "Redis PubSub consumer does not support partitions".into(),
+        ));
+    }
+    if options.offset.is_some() {
+        return Err(Error::Config(
+            "Redis PubSub consumer does not support offsets".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_partition(partition: Option<i32>, operation: &str) -> Result<()> {
+    if partition.is_some_and(|partition| partition != 0) {
+        return Err(Error::Config(format!(
+            "Redis Stream {operation} supports only partition 0"
+        )));
+    }
+    Ok(())
+}
+
 fn stream_id_to_message(entry: StreamId) -> Message {
     let payload = entry.get::<Vec<u8>>("payload").unwrap_or_default();
     let key = entry.get::<Vec<u8>>("key").map(bytes::Bytes::from);
@@ -546,8 +640,29 @@ fn redis_stream_timestamp(id: &str) -> Option<i64> {
     Some(redis_stream_offset(id)).filter(|value| *value > 0)
 }
 
-fn duration_millis_usize(duration: std::time::Duration) -> usize {
-    duration.as_millis().clamp(1, usize::MAX as u128) as usize
+fn duration_millis_usize(duration: std::time::Duration) -> Result<usize> {
+    if duration.is_zero() {
+        return Err(Error::Config(
+            "Redis message timeout must be greater than zero".into(),
+        ));
+    }
+
+    let sub_millisecond = duration
+        .subsec_nanos()
+        .checked_rem(1_000_000)
+        .is_some_and(|remainder| remainder != 0);
+    let milliseconds = duration
+        .as_millis()
+        .checked_add(u128::from(sub_millisecond))
+        .ok_or_else(|| Error::Config("Redis message timeout is too large".into()))?;
+    usize::try_from(milliseconds)
+        .map_err(|_| Error::Config("Redis message timeout is too large for this platform".into()))
+}
+
+fn checked_deadline(timeout: std::time::Duration) -> Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        Error::Config("Redis PubSub consume timeout is too large for this platform".into())
+    })
 }
 
 fn redis_value_to_core(value: redis::Value) -> Value {
@@ -611,6 +726,17 @@ fn bytes_to_value(bytes: Vec<u8>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message() -> Message {
+        Message {
+            key: None,
+            payload: bytes::Bytes::from_static(b"payload"),
+            headers: HashMap::new(),
+            partition: None,
+            offset: None,
+            timestamp: None,
+        }
+    }
 
     #[test]
     fn raw_command_validation_blocks_global_destructive_commands() {
@@ -683,5 +809,130 @@ mod tests {
         );
         assert_eq!(redis_stream_offset("bad-id"), 0);
         assert_eq!(redis_stream_timestamp("bad-id"), None);
+    }
+
+    #[test]
+    fn redis_stream_preserves_supported_metadata_and_rejects_the_rest() {
+        let mut supported = message();
+        supported.key = Some(bytes::Bytes::from_static(b"key"));
+        supported
+            .headers
+            .insert("trace".to_owned(), "abc".to_owned());
+        supported.partition = Some(0);
+        assert!(validate_stream_produce_message(&supported).is_ok());
+
+        let mut unsupported = message();
+        unsupported.partition = Some(1);
+        assert!(matches!(
+            validate_stream_produce_message(&unsupported),
+            Err(Error::Config(message)) if message.contains("partition 0")
+        ));
+
+        let mut unsupported = message();
+        unsupported.offset = Some(1);
+        assert!(matches!(
+            validate_stream_produce_message(&unsupported),
+            Err(Error::Config(message)) if message.contains("producer offsets")
+        ));
+
+        let mut unsupported = message();
+        unsupported.timestamp = Some(1_710_000_000_123);
+        assert!(matches!(
+            validate_stream_produce_message(&unsupported),
+            Err(Error::Config(message)) if message.contains("timestamps")
+        ));
+    }
+
+    #[test]
+    fn redis_pubsub_rejects_every_non_payload_field_and_position() {
+        let mut unsupported = message();
+        unsupported.key = Some(bytes::Bytes::from_static(b"key"));
+        assert!(matches!(
+            validate_pubsub_produce_message(&unsupported),
+            Err(Error::Config(message)) if message.contains("message keys")
+        ));
+
+        let mut unsupported = message();
+        unsupported
+            .headers
+            .insert("trace".to_owned(), "abc".to_owned());
+        assert!(matches!(
+            validate_pubsub_produce_message(&unsupported),
+            Err(Error::Config(message)) if message.contains("headers")
+        ));
+
+        for field in ["partitions", "producer offsets", "timestamps"] {
+            let mut unsupported = message();
+            match field {
+                "partitions" => unsupported.partition = Some(0),
+                "producer offsets" => unsupported.offset = Some(0),
+                "timestamps" => unsupported.timestamp = Some(0),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                validate_pubsub_produce_message(&unsupported),
+                Err(Error::Config(message)) if message.contains(field)
+            ));
+        }
+
+        assert!(matches!(
+            validate_pubsub_consume_options(&ConsumeOptions {
+                max: 1,
+                timeout: std::time::Duration::from_secs(1),
+                partition: Some(0),
+                offset: None,
+            }),
+            Err(Error::Config(message)) if message.contains("partitions")
+        ));
+        assert!(matches!(
+            validate_pubsub_consume_options(&ConsumeOptions {
+                max: 1,
+                timeout: std::time::Duration::from_secs(1),
+                partition: None,
+                offset: Some(0),
+            }),
+            Err(Error::Config(message)) if message.contains("offsets")
+        ));
+    }
+
+    #[test]
+    fn redis_stream_consumer_accepts_only_partition_zero() {
+        let options = |partition| ConsumeOptions {
+            max: 1,
+            timeout: std::time::Duration::from_secs(1),
+            partition,
+            offset: Some(42),
+        };
+
+        assert!(validate_stream_consume_options(&options(None)).is_ok());
+        assert!(validate_stream_consume_options(&options(Some(0))).is_ok());
+        assert!(matches!(
+            validate_stream_consume_options(&options(Some(1))),
+            Err(Error::Config(message)) if message.contains("partition 0")
+        ));
+
+        let mut negative_offset = options(Some(0));
+        negative_offset.offset = Some(-1);
+        assert!(matches!(
+            validate_stream_consume_options(&negative_offset),
+            Err(Error::Config(message)) if message.contains("greater than or equal to zero")
+        ));
+    }
+
+    #[test]
+    fn redis_timeout_conversion_rounds_up_and_rejects_overflow() {
+        assert!(matches!(
+            duration_millis_usize(std::time::Duration::ZERO),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        assert_eq!(
+            duration_millis_usize(std::time::Duration::from_micros(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            duration_millis_usize(std::time::Duration::from_millis(1500)).unwrap(),
+            1500
+        );
+        assert!(duration_millis_usize(std::time::Duration::MAX).is_err());
     }
 }

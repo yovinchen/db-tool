@@ -15,7 +15,7 @@ use lapin::{
     },
     publisher_confirm::Confirmation,
     tcp::OwnedTLSConfig,
-    types::FieldTable,
+    types::{AMQPValue, FieldTable},
     BasicProperties, Connection, ConnectionProperties,
 };
 use std::{collections::HashMap, fs};
@@ -94,6 +94,9 @@ impl Connector for AmqpAdapter {
 impl MessageProducer for AmqpAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
         validate_queue(target)?;
+        for message in &messages {
+            validate_produce_message(message)?;
+        }
         if messages.is_empty() {
             return Ok(ProduceOutcome {
                 produced: 0,
@@ -110,13 +113,14 @@ impl MessageProducer for AmqpAdapter {
 
         let mut produced = 0;
         for message in messages {
+            let properties = properties_with_headers(&message.headers)?;
             let confirm = channel
                 .basic_publish(
                     "",
                     target,
                     BasicPublishOptions::default(),
                     &message.payload,
-                    BasicProperties::default(),
+                    properties,
                 )
                 .await
                 .map_err(|e| Error::Query(e.to_string()))?
@@ -148,14 +152,18 @@ impl MessageProducer for AmqpAdapter {
 impl MessageConsumer for AmqpAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_queue(source)?;
+        validate_consume_position(&options)?;
         if options.max == 0 {
             return Ok(vec![]);
         }
 
+        let deadline = checked_deadline(options.timeout)?;
         let channel = self.channel().await?;
-        declare_queue(&channel, source, false).await?;
+        // Consuming is not a queue-creation operation. Passive declaration
+        // makes a missing queue an explicit broker error instead of mutating
+        // broker state as a side effect of a read-shaped command.
+        declare_queue(&channel, source, true).await?;
 
-        let deadline = Instant::now() + options.timeout;
         let mut messages = Vec::new();
         while messages.len() < options.max && Instant::now() < deadline {
             match channel
@@ -164,7 +172,7 @@ impl MessageConsumer for AmqpAdapter {
                 .map_err(|e| Error::Query(e.to_string()))?
             {
                 Some(delivery) => {
-                    let delivery_tag = delivery.delivery.delivery_tag as i64;
+                    let headers = headers_from_properties(&delivery.delivery.properties)?;
                     let payload = delivery.delivery.data.clone();
                     delivery
                         .delivery
@@ -174,9 +182,11 @@ impl MessageConsumer for AmqpAdapter {
                     messages.push(Message {
                         key: None,
                         payload: payload.into(),
-                        headers: HashMap::new(),
+                        headers,
                         partition: None,
-                        offset: Some(delivery_tag),
+                        // AMQP delivery tags are channel-scoped ACK handles,
+                        // not stable consumer offsets.
+                        offset: None,
                         timestamp: None,
                     });
                 }
@@ -265,6 +275,119 @@ pub(crate) fn validate_queue(queue: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_produce_message(message: &Message) -> Result<()> {
+    if message.key.is_some() {
+        return Err(Error::Config(
+            "AMQP producer does not support an exact message key mapping".into(),
+        ));
+    }
+    if message.partition.is_some() {
+        return Err(Error::Config(
+            "AMQP producer does not support partitions".into(),
+        ));
+    }
+    if message.offset.is_some() {
+        return Err(Error::Config(
+            "AMQP producer does not support producer offsets".into(),
+        ));
+    }
+    if message.timestamp.is_some() {
+        return Err(Error::Config(
+            "AMQP producer does not support an exact millisecond timestamp mapping".into(),
+        ));
+    }
+
+    for (key, value) in &message.headers {
+        if key.len() > u8::MAX as usize {
+            return Err(Error::Config(format!(
+                "AMQP header name exceeds the 255-byte protocol limit: {key:?}"
+            )));
+        }
+        if value.len() > u32::MAX as usize {
+            return Err(Error::Config(format!(
+                "AMQP header value exceeds the protocol limit for {key:?}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_consume_position(options: &ConsumeOptions) -> Result<()> {
+    if options.partition.is_some() {
+        return Err(Error::Config(
+            "AMQP consumer does not support partitions".into(),
+        ));
+    }
+    if options.offset.is_some() {
+        return Err(Error::Config(
+            "AMQP consumer does not support offsets".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn properties_with_headers(headers: &HashMap<String, String>) -> Result<BasicProperties> {
+    let mut table = FieldTable::default();
+    for (key, value) in headers {
+        if key.len() > u8::MAX as usize {
+            return Err(Error::Config(format!(
+                "AMQP header name exceeds the 255-byte protocol limit: {key:?}"
+            )));
+        }
+        if value.len() > u32::MAX as usize {
+            return Err(Error::Config(format!(
+                "AMQP header value exceeds the protocol limit for {key:?}"
+            )));
+        }
+        table.insert(
+            key.as_str().into(),
+            AMQPValue::LongString(value.as_bytes().to_vec().into()),
+        );
+    }
+
+    Ok(if table.inner().is_empty() {
+        BasicProperties::default()
+    } else {
+        BasicProperties::default().with_headers(table)
+    })
+}
+
+fn headers_from_properties(properties: &BasicProperties) -> Result<HashMap<String, String>> {
+    let Some(table) = properties.headers() else {
+        return Ok(HashMap::new());
+    };
+
+    table
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match value {
+                AMQPValue::LongString(value) => std::str::from_utf8(value.as_bytes())
+                    .map_err(|error| {
+                        Error::Serialization(format!(
+                            "AMQP header {key:?} is not valid UTF-8: {error}"
+                        ))
+                    })?
+                    .to_owned(),
+                AMQPValue::ShortString(value) => value.as_str().to_owned(),
+                other => {
+                    return Err(Error::Serialization(format!(
+                        "AMQP header {key:?} has unsupported non-string type {:?}",
+                        other.get_type()
+                    )))
+                }
+            };
+            Ok((key.as_str().to_owned(), value))
+        })
+        .collect()
+}
+
+fn checked_deadline(timeout: std::time::Duration) -> Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::Config("AMQP consume timeout is too large for this platform".into()))
+}
+
 fn amqp_driver_url(dsn: &Dsn) -> Result<String> {
     let mut url = Url::parse(&dsn.raw).map_err(|e| Error::Dsn(format!("invalid URL: {e}")))?;
     match url.scheme() {
@@ -320,6 +443,20 @@ fn is_tls_ca_param(key: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn message() -> Message {
+        Message {
+            key: None,
+            payload: bytes::Bytes::from_static(b"payload"),
+            headers: HashMap::from([
+                ("trace".to_owned(), "abc".to_owned()),
+                ("content-type".to_owned(), "text/plain".to_owned()),
+            ]),
+            partition: None,
+            offset: None,
+            timestamp: None,
+        }
+    }
+
     #[test]
     fn amqps_driver_url_strips_dbtool_tls_ca_param() {
         let dsn = Dsn::parse(
@@ -332,5 +469,90 @@ mod tests {
             "amqps://user:pass@127.0.0.1:5671/vhost?connection_timeout=5000"
         );
         assert_eq!(amqp_tls_ca(&dsn), Some("/tmp/ca.pem"));
+    }
+
+    #[test]
+    fn amqp_string_headers_round_trip_through_basic_properties() {
+        let message = message();
+        let properties = properties_with_headers(&message.headers).unwrap();
+
+        assert_eq!(
+            headers_from_properties(&properties).unwrap(),
+            message.headers
+        );
+    }
+
+    #[test]
+    fn amqp_rejects_metadata_without_an_exact_protocol_mapping() {
+        let mut candidate = message();
+        candidate.key = Some(bytes::Bytes::from_static(b"key"));
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("message key")
+        ));
+
+        let mut candidate = message();
+        candidate.partition = Some(0);
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("partitions")
+        ));
+
+        let mut candidate = message();
+        candidate.offset = Some(1);
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("producer offsets")
+        ));
+
+        let mut candidate = message();
+        candidate.timestamp = Some(1_710_000_000_123);
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("millisecond timestamp")
+        ));
+    }
+
+    #[test]
+    fn amqp_rejects_consumer_positions_and_non_string_headers() {
+        assert!(matches!(
+            validate_consume_position(&ConsumeOptions {
+                max: 1,
+                timeout: std::time::Duration::from_secs(1),
+                partition: Some(0),
+                offset: None,
+            }),
+            Err(Error::Config(message)) if message.contains("partitions")
+        ));
+        assert!(matches!(
+            validate_consume_position(&ConsumeOptions {
+                max: 1,
+                timeout: std::time::Duration::from_secs(1),
+                partition: None,
+                offset: Some(0),
+            }),
+            Err(Error::Config(message)) if message.contains("offsets")
+        ));
+
+        let mut table = FieldTable::default();
+        table.insert("attempt".into(), AMQPValue::LongInt(3));
+        let properties = BasicProperties::default().with_headers(table);
+        assert!(matches!(
+            headers_from_properties(&properties),
+            Err(Error::Serialization(message)) if message.contains("non-string")
+        ));
+    }
+
+    #[test]
+    fn amqp_header_names_respect_short_string_wire_limit() {
+        let mut candidate = message();
+        candidate
+            .headers
+            .insert("x".repeat(256), "value".to_owned());
+
+        assert!(matches!(
+            validate_produce_message(&candidate),
+            Err(Error::Config(message)) if message.contains("255-byte")
+        ));
     }
 }

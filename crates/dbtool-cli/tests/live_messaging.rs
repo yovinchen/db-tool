@@ -161,6 +161,12 @@ fn redis_live_stream_produce_detail_and_consume() {
         "produce",
         &stream,
         "redis-stream-payload",
+        "--key",
+        "redis-stream-key",
+        "--header",
+        "trace=redis-stream",
+        "--partition",
+        "0",
     ]));
     assert_eq!(produced["data"]["produced"], 1);
 
@@ -188,6 +194,9 @@ fn redis_live_stream_produce_detail_and_consume() {
         "5",
     ]));
     assert_eq!(payload_text(&consumed["data"][0]), "redis-stream-payload");
+    assert_eq!(bytes_text(&consumed["data"][0]["key"]), "redis-stream-key");
+    assert_eq!(consumed["data"][0]["headers"]["trace"], "redis-stream");
+    assert_eq!(consumed["data"][0]["partition"], 0);
     assert!(consumed["data"][0]["headers"]["redis_stream_id"]
         .as_str()
         .expect("stream id header should be present")
@@ -497,12 +506,29 @@ fn amqp_live_queue_produce_detail_and_consume() {
         "produce",
         &queue,
         "amqp-payload",
+        "--header",
+        "trace=amqp",
     ]);
     assert_eq!(produced["data"]["produced"], 1);
 
     let detail = stdout_json_retry(&["--dsn", &dsn, "mq", "detail", &queue]);
     assert_eq!(detail["data"]["info"]["name"], queue);
     assert_eq!(detail["data"]["config"]["message_count"], "1");
+
+    let blocked_consume = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "mq",
+        "consume",
+        &queue,
+        "--max",
+        "1",
+        "--timeout",
+        "1",
+    ]));
+    assert_eq!(blocked_consume["error"]["code"], "WRITE_NOT_ALLOWED");
+    let unchanged = stdout_json_retry(&["--dsn", &dsn, "mq", "detail", &queue]);
+    assert_eq!(unchanged["data"]["config"]["message_count"], "1");
 
     let topics = stderr_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
     assert_eq!(topics["error"]["code"], "UNSUPPORTED_CAPABILITY");
@@ -512,6 +538,7 @@ fn amqp_live_queue_produce_detail_and_consume() {
     let consumed = stdout_json_retry(&[
         "--dsn",
         &dsn,
+        "--allow-write",
         "mq",
         "consume",
         &queue,
@@ -521,6 +548,7 @@ fn amqp_live_queue_produce_detail_and_consume() {
         "5",
     ]);
     assert_eq!(payload_text(&consumed["data"][0]), "amqp-payload");
+    assert_eq!(consumed["data"][0]["headers"]["trace"], "amqp");
 
     let drained = stdout_json_retry_until(&["--dsn", &dsn, "mq", "detail", &queue], |value| {
         value["data"]["config"]["message_count"] == "0"
@@ -549,6 +577,8 @@ fn rabbitmq_management_live_lists_detail_and_queue_lag() {
         "produce",
         &queue,
         "rabbitmq-management-payload",
+        "--header",
+        "trace=rabbitmq-management",
     ]);
     assert_eq!(produced["data"]["produced"], 1);
 
@@ -596,6 +626,7 @@ fn rabbitmq_management_live_lists_detail_and_queue_lag() {
     let consumed = stdout_json_retry(&[
         "--dsn",
         &amqp_dsn,
+        "--allow-write",
         "mq",
         "consume",
         &queue,
@@ -607,6 +638,10 @@ fn rabbitmq_management_live_lists_detail_and_queue_lag() {
     assert_eq!(
         payload_text(&consumed["data"][0]),
         "rabbitmq-management-payload"
+    );
+    assert_eq!(
+        consumed["data"][0]["headers"]["trace"],
+        "rabbitmq-management"
     );
 
     let drained_detail = stdout_json_retry_until(
@@ -648,6 +683,8 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
         "produce",
         &queue,
         "amqps-payload",
+        "--header",
+        "trace=amqps",
     ]);
     assert_eq!(produced["data"]["produced"], 1);
 
@@ -663,6 +700,7 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
     let consumed = stdout_json_retry(&[
         "--dsn",
         &dsn,
+        "--allow-write",
         "mq",
         "consume",
         &queue,
@@ -672,6 +710,7 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
         "5",
     ]);
     assert_eq!(payload_text(&consumed["data"][0]), "amqps-payload");
+    assert_eq!(consumed["data"][0]["headers"]["trace"], "amqps");
 
     let drained = stdout_json_retry_until(&["--dsn", &dsn, "mq", "detail", &queue], |value| {
         value["data"]["config"]["message_count"] == "0"
@@ -720,6 +759,8 @@ fn nats_live_publish_and_subscribe_round_trip() {
         "produce",
         &subject,
         "nats-payload",
+        "--header",
+        "trace=nats",
     ]));
     assert_eq!(produced["data"]["produced"], 1);
 
@@ -728,6 +769,7 @@ fn nats_live_publish_and_subscribe_round_trip() {
         .expect("NATS consume command should finish");
     let consumed = stdout_json(output);
     assert_eq!(payload_text(&consumed["data"][0]), "nats-payload");
+    assert_eq!(consumed["data"][0]["headers"]["trace"], "nats");
 }
 
 #[test]
@@ -865,6 +907,8 @@ fn nats_mq_tls_live_publish_subscribe_and_jetstream_admin() {
         "produce",
         &subject,
         "nats-tls-payload",
+        "--header",
+        "trace=nats-tls",
     ]));
     assert_eq!(produced["data"]["produced"], 1);
 
@@ -873,6 +917,7 @@ fn nats_mq_tls_live_publish_subscribe_and_jetstream_admin() {
         .expect("NATS TLS consume command should finish");
     let consumed = stdout_json(output);
     assert_eq!(payload_text(&consumed["data"][0]), "nats-tls-payload");
+    assert_eq!(consumed["data"][0]["headers"]["trace"], "nats-tls");
 
     let stream = unique_name("DBTOOL_IT_NATS_TLS_STREAM").to_ascii_uppercase();
     let stream_subject = format!("{}.events", stream.to_ascii_lowercase());

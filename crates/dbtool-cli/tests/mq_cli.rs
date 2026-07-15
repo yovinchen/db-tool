@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::process::{Command, Output};
 
 const UNREACHABLE_DSN: &str = "kafka://127.0.0.1:1";
+const UNREACHABLE_AMQP_DSN: &str = "amqp://127.0.0.1:1/%2f";
 
 fn dbtool(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dbtool"))
@@ -57,12 +58,33 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
     assert!(produce_help.contains("--timestamp-ms <EPOCH_MILLIS>"));
 
     let consume_help = stdout_text(dbtool(&["mq", "consume", "--help"]));
+    assert!(consume_help.contains("AMQP/AMQPS consume requires"));
+    assert!(consume_help.contains("--allow-write"));
     assert!(consume_help.contains("reached --max"));
     assert!(consume_help.contains("does not prove that another message exists"));
     assert!(consume_help.contains("--max <MAX>"));
     assert!(consume_help.contains("--timeout <TIMEOUT>"));
     assert!(consume_help.contains("--partition <PARTITION>"));
     assert!(consume_help.contains("--offset <OFFSET>"));
+}
+
+#[test]
+fn ack_destructive_amqp_consume_requires_write_permission_before_connecting() {
+    assert_error(
+        &[
+            "--dsn",
+            UNREACHABLE_AMQP_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--max",
+            "1",
+            "--timeout",
+            "1",
+        ],
+        "WRITE_NOT_ALLOWED",
+        "require --allow-write",
+    );
 }
 
 #[test]
