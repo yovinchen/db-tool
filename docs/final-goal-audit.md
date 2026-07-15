@@ -1,6 +1,6 @@
 # dbtool Final Goal Audit
 
-Last updated: 2026-06-16
+Last updated: 2026-07-16
 
 This audit maps the final objective to current, repo-verifiable evidence. It is
 not a replacement for optional live Docker drills, but it proves the codebase has
@@ -9,7 +9,7 @@ together.
 
 ## Verdict
 
-The repo satisfies the stated dbtool objective at the project level:
+The repo satisfies the original dbtool baseline objective at the project level:
 
 - one shared Rust core supports CLI/Claude Skill, TUI, and embedded-library use;
 - adapters are registered by protocol family and reuse aliases for compatible
@@ -24,6 +24,18 @@ The repo satisfies the stated dbtool objective at the project level:
 Product-specific production-readiness exercises remain explicit boundaries in
 [implementation-status.md](implementation-status.md), not missing pieces of this
 objective.
+
+The real-product validation campaign is reported separately: 22 tasks are
+`COMPLETE`, 2 are `BLOCKED`, 2 are `EXTERNAL`, and 1 is `PARTIAL`.
+Those five non-complete products are not silently counted as passes.
+
+## Active Interface Completion Campaign
+
+The baseline verdict does not claim that every newly identified interface and
+release-hardening enhancement is already complete. The active Chinese task
+board is [interface-completion-tasks.zh-CN.md](interface-completion-tasks.zh-CN.md).
+It tracks declared-interface gaps, Cargo feature correctness, TUI safety, CLI
+strictness, packaging/install smoke, and explicit external boundaries.
 
 ## Requirement Evidence
 
@@ -57,4 +69,6 @@ Run:
 
 `validate-final-goal.sh` is service-free. It checks that target matrices,
 package wrappers, safety evidence, protocol aliases, task status, and this audit
-remain synchronized.
+remain synchronized. It reports the baseline result and the active interface
+campaign status separately instead of treating an active enhancement queue as a
+failure of the already-proven baseline.

@@ -166,7 +166,7 @@ require_pattern "crates/dbtool-registry/tests/embedded_library.rs" "FlowControl"
 require_pattern "crates/dbtool-tui/src/state.rs" "CommandFormState"
 require_pattern "crates/dbtool-tui/src/app.rs" "pending_write"
 
-if grep -Ev '^\| T42 Real backend completeness campaign ' "$ROOT/docs/tasks.md" \
+if grep -Ev '^\| IF-T43–IF-T55 Interface completion campaign ' "$ROOT/docs/tasks.md" \
   | grep -Eq 'Pending|In progress|Deferred|\[ \]'; then
   fail "docs/tasks.md still contains an unfinished implementation task marker"
 fi
@@ -187,8 +187,13 @@ require_no_pattern "docs/implementation-status.md" "Not live-tested against Reds
 require_no_pattern "docs/implementation-status.md" "Cassandra trait split"
 require_no_pattern "docs/extended-backends.md" 'A future `CqlEngine` can be added'
 
-require_pattern "docs/final-goal-audit.md" "The repo satisfies the stated dbtool objective"
+require_pattern "docs/final-goal-audit.md" "The repo satisfies the original dbtool baseline objective"
 require_pattern "docs/final-goal-audit.md" "Product-specific production-readiness exercises remain explicit boundaries"
+require_pattern "docs/final-goal-audit.md" "Active Interface Completion Campaign"
+require_pattern "docs/final-goal-audit.md" "22 tasks are"
+require_pattern "docs/tasks.md" "IF-T43–IF-T55 Interface completion campaign"
+require_pattern "docs/interface-completion-tasks.zh-CN.md" "IF-T43 SQL 参数绑定"
+require_pattern "docs/interface-completion-tasks.zh-CN.md" "IF-T55 CLI/发布严格性"
 require_pattern "docs/implementation-status.md" "export sql"
 require_pattern "docs/implementation-status.md" "integration-elasticsearch-test.sh"
 require_pattern "docs/implementation-status.md" "integration-opensearch-security-test.sh"
@@ -204,4 +209,5 @@ require_pattern "docs/tasks.md" "T37 Vendor Kafka-compatible smoke profiles"
 require_pattern "docs/tasks.md" "T38 OpenSearch security-plugin TLS profile"
 require_pattern "docs/tasks.md" "T39 External Redshift compatibility smoke"
 
-echo "final goal validation passed"
+echo "baseline goal validation passed"
+echo "interface completion campaign: active (docs/interface-completion-tasks.zh-CN.md)"
