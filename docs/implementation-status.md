@@ -107,7 +107,7 @@ usable.
 | --- | --- | --- |
 | Connection | `conn list` | Read-only |
 | General | `ping`, `caps` | Read-only |
-| SQL | `sql query`, `sql exec`, `sql tables`, `sql schema`, `sql schemas` | query/exec accept `--params JSON_ARRAY`; query is adapter-bounded by positive `--limit` and strictly read-only; writes use `sql exec` with `--allow-write` and sometimes `--confirm`; query `--schema` explicitly reports unsupported instead of being ignored |
+| SQL | `sql query`, `sql exec`, `sql tables`, `sql schema`, `sql schemas` | query/exec accept `--params JSON_ARRAY`; query is adapter-bounded by positive `--limit` and strictly read-only; writes use `sql exec` with `--allow-write` and sometimes `--confirm`; the dead `sql query --schema` option has been removed, while table metadata uses reusable schema-qualified identities and exact list truncation |
 | CQL | `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema` | query is adapter-page-bounded by positive `--limit`; `cql exec` requires `--allow-write` |
 | Db2 | `db2 schemas`, `db2 tables`, `db2 schema`, `db2 sequences`, `db2 routines`, `db2 tablespaces`, `db2 foreign-keys`, `db2 ddl` | All read-only; no `--allow-write` required |
 | KV | `kv get`, `kv set`, `kv scan`, `kv del`, `kv raw` | `set`, `del`, and mutating raw commands require `--allow-write` |

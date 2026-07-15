@@ -228,14 +228,18 @@ impl SqlEngine for MySqlAdapter {
         let schema = validate_optional_schema(schema)?;
         let rows = if let Some(schema) = schema {
             sqlx::query(
-                "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
+                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+                 FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
             )
             .bind(schema)
             .fetch_all(&self.pool)
             .await
         } else {
             sqlx::query(
-                "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+                 FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
             )
             .fetch_all(&self.pool)
             .await
@@ -245,10 +249,11 @@ impl SqlEngine for MySqlAdapter {
         Ok(rows
             .iter()
             .map(|r| {
-                let name = mysql_text(r, 0)?;
-                let table_type = mysql_text(r, 1)?;
+                let effective_schema = mysql_text(r, 0)?;
+                let name = mysql_text(r, 1)?;
+                let table_type = mysql_text(r, 2)?;
                 Ok(TableInfo {
-                    schema: schema.map(str::to_owned),
+                    schema: Some(effective_schema),
                     name,
                     kind: if table_type.contains("VIEW") {
                         TableKind::View
@@ -294,7 +299,7 @@ impl SqlEngine for MySqlAdapter {
                     type_name: mysql_text(r, 1)?,
                     nullable: mysql_text(r, 2)? == "YES",
                     primary_key: mysql_text(r, 3)? == "PRI",
-                    default_value: r.try_get::<Option<String>, _>(4).ok().flatten(),
+                    default_value: mysql_optional_text(r, 4)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -357,6 +362,20 @@ fn mysql_text(row: &MySqlRow, index: usize) -> Result<String> {
     String::from_utf8(bytes).map_err(|e| Error::Serialization(e.to_string()))
 }
 
+fn mysql_optional_text(row: &MySqlRow, index: usize) -> Result<Option<String>> {
+    if let Ok(value) = row.try_get::<Option<String>, _>(index) {
+        return Ok(value);
+    }
+
+    let bytes = row
+        .try_get::<Option<Vec<u8>>, _>(index)
+        .map_err(|error| Error::Query(error.to_string()))?;
+    bytes
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|error| Error::Serialization(error.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +395,58 @@ mod tests {
         assert!(bind_mysql_params("select ?, ?, ?, ?, ?, ?, ?, ?", &params).is_ok());
 
         assert!(bind_mysql_params("select ?", &[Value::Timestamp(i64::MAX)]).is_err());
+    }
+
+    #[tokio::test]
+    async fn mysql_live_metadata_exposes_effective_schema_and_reusable_identity() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MYSQL_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = format!("dbtool_meta_{suffix}");
+        let connector = mysql_factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
+        let sql = connector.as_sql().unwrap();
+
+        sql.execute(
+            &format!(
+                "CREATE TABLE {table} (\
+                    id bigint PRIMARY KEY, \
+                    code varchar(32) NOT NULL DEFAULT 'new')"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let metadata = async {
+            let default_tables = sql.list_tables(None).await?;
+            let item = default_tables
+                .iter()
+                .find(|item| item.name == table)
+                .ok_or_else(|| Error::Query("created MySQL table was not listed".into()))?;
+            let schema = item
+                .schema
+                .clone()
+                .ok_or_else(|| Error::Query("MySQL table omitted its effective schema".into()))?;
+            let explicit_tables = sql.list_tables(Some(&schema)).await?;
+            let described = sql.describe_table(&item.qualified_name()).await?;
+            Ok::<_, Error>((schema, explicit_tables, described))
+        }
+        .await;
+
+        sql.execute(&format!("DROP TABLE {table}"), &[])
+            .await
+            .unwrap();
+
+        let (schema, explicit_tables, described) = metadata.unwrap();
+        assert!(!schema.is_empty());
+        assert!(explicit_tables
+            .iter()
+            .any(|item| item.name == table && item.schema.as_deref() == Some(schema.as_str())));
+        assert!(described.columns[0].primary_key);
+        assert_eq!(described.columns[1].default_value.as_deref(), Some("new"));
     }
 }

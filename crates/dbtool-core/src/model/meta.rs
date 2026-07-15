@@ -20,11 +20,25 @@ pub struct TableInfo {
     pub kind: TableKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl TableInfo {
+    /// Return a dotted schema-qualified representation of this table.
+    ///
+    /// SQL adapters accept this value in `describe_table` when both components
+    /// use the portable unquoted-identifier grammar.
+    pub fn qualified_name(&self) -> String {
+        match self.schema.as_deref() {
+            Some(schema) => format!("{schema}.{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TableKind {
     Table,
     View,
+    #[serde(rename = "materialized-view")]
     MaterializedView,
 }
 
@@ -125,4 +139,30 @@ pub struct LagInfo {
     pub committed: i64,
     pub latest: i64,
     pub lag: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_info_reconstructs_the_describe_identifier() {
+        let qualified = TableInfo {
+            schema: Some("analytics".to_owned()),
+            name: "daily_totals".to_owned(),
+            kind: TableKind::MaterializedView,
+        };
+        assert_eq!(qualified.qualified_name(), "analytics.daily_totals");
+        assert_eq!(
+            serde_json::to_value(qualified.kind).unwrap(),
+            "materialized-view"
+        );
+
+        let unqualified = TableInfo {
+            schema: None,
+            name: "users".to_owned(),
+            kind: TableKind::Table,
+        };
+        assert_eq!(unqualified.qualified_name(), "users");
+    }
 }

@@ -33,7 +33,17 @@ pub trait SqlEngine: Connector {
         max_rows: usize,
     ) -> Result<ResultSet>;
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome>;
+    /// Return the complete schema catalog visible to this connection.
+    ///
+    /// The current portable metadata API has no server-side page argument.
+    /// Interactive callers must therefore apply their own result budget and
+    /// report whether the returned list was truncated.
     async fn list_schemas(&self) -> Result<Vec<String>>;
+    /// Return the complete table/view catalog for `schema`.
+    ///
+    /// Every returned [`TableInfo`] should carry its effective schema when the
+    /// backend supports namespaces so portable unquoted names can be sent back
+    /// to [`Self::describe_table`] without ambiguity.
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>>;
     async fn describe_table(&self, table: &str) -> Result<TableSchema>;
 }

@@ -169,9 +169,9 @@ MySQL 与 SQLite 使用 `?`，PostgreSQL 使用 `$1`、`$2`。参数不会插入
 和无法序列化的结构返回显式错误。SQL Server、Db2 和 Cassandra 当前不支持动态参数
 时继续返回机器可读的 `UNSUPPORTED_CAPABILITY`/query error，绝不忽略参数。
 
-`sql query --schema` 当前没有跨方言的执行语义，因此在连接前返回
-`SqlQuerySchema` 的 `UNSUPPORTED_CAPABILITY`。表列表仍通过
-`sql tables --schema <name>` 使用已实现的 schema 过滤。
+`sql query --schema` 没有跨方言的执行语义，现已从 CLI 删除，避免一个被接受却不参与
+查询的死参数。表列表继续通过 `sql tables --schema <name>` 过滤，表结构使用
+`sql schema <schema.table>` 的可往返限定名。
 
 ## SQL / CQL 有界读取范式
 

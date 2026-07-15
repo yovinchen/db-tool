@@ -164,6 +164,16 @@ fn cli_help_documents_core_command_families() {
 }
 
 #[test]
+fn sql_query_help_omits_the_dead_schema_option() {
+    let help = stdout_text(&dbtool(&["sql", "query", "--help"]));
+    assert!(help.contains("--params"));
+    assert!(
+        !help.contains("--schema"),
+        "query must not advertise a schema option without cross-dialect semantics"
+    );
+}
+
+#[test]
 fn global_limit_rejects_zero_before_connecting() {
     let output = dbtool(&[
         "--dsn",
@@ -328,6 +338,47 @@ fn sql_schemas_returns_list_for_sqlite() {
 }
 
 #[test]
+fn sql_metadata_lists_respect_limit_and_expose_effective_schema() {
+    let root = std::env::temp_dir().join(format!(
+        "dbtool-cli-metadata-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::create_dir_all(&root).expect("temporary directory should be created");
+    let db_file = root.join("metadata.db");
+    fs::File::create(&db_file).expect("sqlite database file should be created");
+    let dsn = format!("sqlite://{}", db_file.display());
+
+    confirmed_sql_exec(&dsn, "create table alpha (id integer primary key)");
+    confirmed_sql_exec(&dsn, "create table beta (id integer primary key)");
+    confirmed_sql_exec(&dsn, "create view alpha_ids as select id from alpha");
+
+    let limited = stdout_json(&dbtool(&[
+        "--dsn", &dsn, "--limit", "2", "sql", "tables", "--schema", "main",
+    ]));
+    assert_eq!(limited["data"].as_array().map(Vec::len), Some(2));
+    assert_eq!(limited["meta"]["truncated"], true);
+    assert!(limited["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|table| table["schema"] == "main"));
+
+    let complete = stdout_json(&dbtool(&[
+        "--dsn", &dsn, "--limit", "3", "sql", "tables", "--schema", "main",
+    ]));
+    assert_eq!(complete["data"].as_array().map(Vec::len), Some(3));
+    assert_eq!(complete["meta"]["truncated"], false);
+    assert!(complete["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|table| table["name"] == "alpha_ids" && table["kind"] == "view"));
+
+    cleanup_dir(&root);
+}
+
+#[test]
 fn ping_and_caps_emit_success_envelopes() {
     let ping = stdout_json(&dbtool(&["--dsn", "sqlite::memory:", "ping"]));
     assert_eq!(ping["ok"], true);
@@ -445,25 +496,6 @@ fn sql_cli_binds_json_parameters_to_sqlite_without_interpolation() {
     assert_eq!(table_survived["data"]["rows"][0][0], 1);
 
     cleanup_dir(&root);
-}
-
-#[test]
-fn sql_query_schema_is_explicitly_unsupported_instead_of_ignored() {
-    let error = stderr_json(&dbtool(&[
-        "--dsn",
-        "postgres://127.0.0.1:1/unreachable",
-        "sql",
-        "query",
-        "select 1",
-        "--schema",
-        "public",
-    ]));
-
-    assert_eq!(error["error"]["code"], "UNSUPPORTED_CAPABILITY");
-    assert!(error["error"]["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("SqlQuerySchema"));
 }
 
 #[test]

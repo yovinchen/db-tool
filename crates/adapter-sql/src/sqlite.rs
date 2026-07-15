@@ -190,22 +190,24 @@ impl SqlEngine for SqliteAdapter {
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
-        Ok(vec!["main".to_owned()])
+        let rows = sqlx::query("PRAGMA database_list")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                row.try_get::<String, _>(1)
+                    .map_err(|error| Error::Query(error.to_string()))
+            })
+            .collect()
     }
 
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
-        let schema = validate_optional_schema(schema)?;
-        let catalog = match schema {
-            None | Some("main") => "sqlite_master",
-            Some("temp") => "sqlite_temp_master",
-            Some(other) => {
-                return Err(Error::Query(format!(
-                    "unsupported SQLite schema for table listing: {other}"
-                )))
-            }
-        };
+        let schema = validate_optional_schema(schema)?.unwrap_or("main");
+        let catalog = sqlite_catalog(schema);
         let rows = sqlx::query(&format!(
-            "SELECT name, type FROM {catalog} WHERE type IN ('table','view') ORDER BY name"
+            "SELECT name, type FROM {catalog} \
+             WHERE type IN ('table','view') ORDER BY name"
         ))
         .fetch_all(&self.pool)
         .await
@@ -213,7 +215,7 @@ impl SqlEngine for SqliteAdapter {
         Ok(rows
             .iter()
             .map(|r| TableInfo {
-                schema: None,
+                schema: Some(schema.to_owned()),
                 name: r.get(0),
                 kind: if r.get::<String, _>(1) == "view" {
                     TableKind::View
@@ -226,62 +228,122 @@ impl SqlEngine for SqliteAdapter {
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
         let table_ref = parse_table_ref(table)?;
+        let schema = table_ref.schema.as_deref().unwrap_or("main");
+        let catalog = sqlite_catalog(schema);
 
-        let col_rows =
-            sqlx::query("SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?)")
-                .bind(&table_ref.name)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| Error::Query(e.to_string()))?;
+        let relation = sqlx::query(&format!(
+            "SELECT name, type FROM {catalog} \
+             WHERE name = ? COLLATE NOCASE AND type IN ('table','view')"
+        ))
+        .bind(&table_ref.name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?;
+        let Some(relation) = relation else {
+            return Err(Error::Query(format!(
+                "SQLite table or view does not exist: {schema}.{}",
+                table_ref.name
+            )));
+        };
+        let relation_name = relation
+            .try_get::<String, _>(0)
+            .map_err(|error| Error::Query(error.to_string()))?;
 
-        let columns: Vec<ColumnMeta> = col_rows
+        let col_rows = sqlx::query(
+            "SELECT name, type, \"notnull\", dflt_value, pk \
+             FROM pragma_table_xinfo(?, ?) ORDER BY cid",
+        )
+        .bind(&relation_name)
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?;
+
+        let raw_columns = col_rows
             .iter()
-            .map(|r| ColumnMeta {
-                name: r.get(0),
-                type_name: r.get(1),
-                nullable: r.get::<i32, _>(2) == 0,
-                default_value: r.get::<Option<String>, _>(3),
-                primary_key: r.get::<i32, _>(4) > 0,
+            .map(|r| {
+                Ok((
+                    r.try_get::<String, _>(0)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                    r.try_get::<String, _>(1)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                    r.try_get::<i32, _>(2)
+                        .map_err(|error| Error::Query(error.to_string()))?
+                        != 0,
+                    r.try_get::<Option<String>, _>(3)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                    r.try_get::<i32, _>(4)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        let idx_list = sqlx::query("SELECT name, \"unique\" FROM pragma_index_list(?)")
-            .bind(&table_ref.name)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?;
+        let idx_list = sqlx::query(
+            "SELECT name, \"unique\", origin \
+             FROM pragma_index_list(?, ?) ORDER BY seq",
+        )
+        .bind(&relation_name)
+        .bind(schema)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?;
 
         let mut indexes: Vec<IndexInfo> = Vec::new();
         for idx_row in &idx_list {
-            let idx_name: String = idx_row.get(0);
-            let is_unique: bool = idx_row.get(1);
-            let col_rows = sqlx::query("SELECT name FROM pragma_index_info(?)")
-                .bind(&idx_name)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| Error::Query(e.to_string()))?;
-            let cols: Vec<String> = col_rows
+            let idx_name = idx_row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let is_unique = idx_row
+                .try_get::<i32, _>(1)
+                .map_err(|error| Error::Query(error.to_string()))?
+                != 0;
+            let origin = idx_row
+                .try_get::<String, _>(2)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let col_rows =
+                sqlx::query("SELECT seqno, name FROM pragma_index_info(?, ?) ORDER BY seqno")
+                    .bind(&idx_name)
+                    .bind(schema)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| Error::Query(e.to_string()))?;
+            let cols = col_rows
                 .iter()
-                .filter_map(|r| r.try_get::<Option<String>, _>(0).ok().flatten())
-                .collect();
+                .map(|row| {
+                    let sequence = row
+                        .try_get::<i32, _>(0)
+                        .map_err(|error| Error::Query(error.to_string()))?;
+                    Ok(row
+                        .try_get::<Option<String>, _>(1)
+                        .map_err(|error| Error::Query(error.to_string()))?
+                        .unwrap_or_else(|| format!("<expression:{sequence}>")))
+                })
+                .collect::<Result<Vec<_>>>()?;
             indexes.push(IndexInfo {
-                primary: false,
+                primary: origin == "pk",
                 name: idx_name,
                 columns: cols,
                 unique: is_unique,
             });
         }
 
-        let pk_cols: Vec<String> = columns
+        let mut pk_cols = raw_columns
             .iter()
-            .filter(|c| c.primary_key)
-            .map(|c| c.name.clone())
-            .collect();
-        if !pk_cols.is_empty() {
+            .filter(|(_, _, _, _, position)| *position > 0)
+            .map(|(name, _, _, _, position)| (*position, name.clone()))
+            .collect::<Vec<_>>();
+        pk_cols.sort_by_key(|(position, _)| *position);
+        let pk_cols = pk_cols
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>();
+        let has_primary_index = indexes.iter().any(|index| index.primary);
+        let rowid_primary_key = !pk_cols.is_empty() && !has_primary_index;
+        if rowid_primary_key {
             indexes.insert(
                 0,
                 IndexInfo {
-                    name: format!("{}_pkey", table_ref.name),
+                    name: format!("{relation_name}_pkey"),
                     columns: pk_cols,
                     unique: true,
                     primary: true,
@@ -289,12 +351,29 @@ impl SqlEngine for SqliteAdapter {
             );
         }
 
+        let columns = raw_columns
+            .into_iter()
+            .map(
+                |(name, type_name, declared_not_null, default_value, pk_position)| ColumnMeta {
+                    name,
+                    type_name,
+                    nullable: !(declared_not_null || (rowid_primary_key && pk_position > 0)),
+                    default_value,
+                    primary_key: pk_position > 0,
+                },
+            )
+            .collect();
+
         Ok(TableSchema {
-            name: table_ref.name,
+            name: relation_name,
             columns,
             indexes,
         })
     }
+}
+
+fn sqlite_catalog(schema: &str) -> String {
+    format!("\"{schema}\".sqlite_schema")
 }
 
 #[cfg(test)]
@@ -350,6 +429,8 @@ mod tests {
 
         let tables = sql.list_tables(None).await.unwrap();
         assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].schema.as_deref(), Some("main"));
+        assert_eq!(tables[0].qualified_name(), "main.users");
         assert_eq!(tables[0].name, "users");
         assert!(matches!(tables[0].kind, TableKind::Table));
 
@@ -385,6 +466,148 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Query(_)));
+    }
+
+    #[tokio::test]
+    async fn sqlite_qualified_metadata_uses_the_requested_attached_schema() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+
+        sql.execute("attach database ':memory:' as aux", &[])
+            .await
+            .unwrap();
+        sql.execute("create table main.users (main_id integer)", &[])
+            .await
+            .unwrap();
+        sql.execute(
+            "create table aux.users (aux_id integer primary key, note text not null)",
+            &[],
+        )
+        .await
+        .unwrap();
+        sql.execute(
+            "create view aux.user_notes as select aux_id, note from users",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let schemas = sql.list_schemas().await.unwrap();
+        assert!(schemas.iter().any(|schema| schema == "main"));
+        assert!(schemas.iter().any(|schema| schema == "aux"));
+
+        let aux_tables = sql.list_tables(Some("aux")).await.unwrap();
+        assert_eq!(aux_tables.len(), 2);
+        assert!(aux_tables
+            .iter()
+            .all(|table| table.schema.as_deref() == Some("aux")));
+        assert!(aux_tables.iter().any(|table| {
+            table.qualified_name() == "aux.users" && table.kind == TableKind::Table
+        }));
+        assert!(aux_tables.iter().any(|table| {
+            table.qualified_name() == "aux.user_notes" && table.kind == TableKind::View
+        }));
+
+        let main = sql.describe_table("main.users").await.unwrap();
+        assert_eq!(main.columns[0].name, "main_id");
+
+        let aux = sql.describe_table("aux.users").await.unwrap();
+        assert_eq!(aux.columns[0].name, "aux_id");
+        assert_eq!(aux.columns[1].name, "note");
+
+        assert!(matches!(
+            sql.list_tables(Some("missing")).await,
+            Err(Error::Query(_))
+        ));
+        assert!(matches!(
+            sql.describe_table("missing.users").await,
+            Err(Error::Query(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_schema_reports_exact_defaults_nullability_and_primary_indexes() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+
+        sql.execute(
+            "create table inventory (
+                id integer primary key,
+                code text not null default 'new',
+                base integer,
+                generated integer generated always as (base + 1)
+            )",
+            &[],
+        )
+        .await
+        .unwrap();
+        sql.execute(
+            "create unique index inventory_code_lower on inventory(lower(code))",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let inventory = sql.describe_table("main.inventory").await.unwrap();
+        assert_eq!(
+            inventory.columns.len(),
+            4,
+            "generated columns must be visible"
+        );
+        assert_eq!(inventory.columns[0].type_name, "INTEGER");
+        assert!(inventory.columns[0].primary_key);
+        assert!(!inventory.columns[0].nullable);
+        assert_eq!(inventory.columns[1].type_name, "TEXT");
+        assert!(!inventory.columns[1].nullable);
+        assert_eq!(inventory.columns[1].default_value.as_deref(), Some("'new'"));
+        assert_eq!(
+            inventory
+                .indexes
+                .iter()
+                .filter(|index| index.primary)
+                .count(),
+            1,
+            "rowid primary keys should have one synthetic portable index"
+        );
+        assert!(inventory.indexes.iter().any(|index| {
+            index.name == "inventory_code_lower"
+                && index.unique
+                && index.columns == ["<expression:0>"]
+        }));
+
+        sql.execute(
+            "create table composite (
+                tenant text,
+                id integer,
+                primary key (tenant, id)
+            )",
+            &[],
+        )
+        .await
+        .unwrap();
+        let composite = sql.describe_table("composite").await.unwrap();
+        let primary = composite
+            .indexes
+            .iter()
+            .filter(|index| index.primary)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            primary.len(),
+            1,
+            "SQLite autoindexes must not be duplicated"
+        );
+        assert_eq!(primary[0].columns, ["tenant", "id"]);
+        assert!(
+            composite.columns[0].nullable,
+            "ordinary SQLite rowid tables permit NULL in non-INTEGER primary keys"
+        );
+
+        sql.execute("create table MixedCase (id integer primary key)", &[])
+            .await
+            .unwrap();
+        let mixed = sql.describe_table("mixedcase").await.unwrap();
+        assert_eq!(mixed.name, "MixedCase");
+        assert_eq!(mixed.columns[0].name, "id");
     }
 
     #[tokio::test]

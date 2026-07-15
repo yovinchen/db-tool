@@ -1,7 +1,6 @@
 use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
-    dsn::Dsn,
     error::Error,
     model::Value,
     service::{
@@ -14,7 +13,7 @@ use dbtool_core::{
 #[derive(Args)]
 #[command(
     about = "Run SQL queries, writes, and schema inspection commands.",
-    long_about = "SQL commands use the shared safety path: read queries run directly, writes require --allow-write, and destructive statements may return a target-bound confirmation token."
+    long_about = "SQL commands use the shared safety path: read queries run directly, writes require --allow-write, and destructive statements may return a target-bound confirmation token. Table and schema lists honor the global --limit and report truncation in JSON metadata."
 )]
 pub struct SqlCmd {
     #[command(subcommand)]
@@ -31,9 +30,6 @@ pub enum SqlAction {
         /// {"$bytes":[0,255]}, {"$timestamp":<epoch_ms>}, or {"$json":...}.
         #[arg(long, default_value = "[]", value_name = "JSON_ARRAY")]
         params: String,
-        /// Optional schema/database qualifier (currently unsupported for query execution).
-        #[arg(long)]
-        schema: Option<String>,
     },
     /// Execute a non-SELECT statement
     Exec {
@@ -44,7 +40,7 @@ pub enum SqlAction {
         #[arg(long, default_value = "[]", value_name = "JSON_ARRAY")]
         params: String,
     },
-    /// List tables in the current database / schema
+    /// List a bounded set of tables and views in the current database / schema
     Tables {
         /// Optional schema/database qualifier.
         #[arg(long)]
@@ -55,12 +51,15 @@ pub enum SqlAction {
         /// Table name, optionally schema-qualified where the backend supports it.
         table: String,
     },
-    /// List schemas (databases) available on the backend
+    /// List a bounded set of schemas (databases) available on the backend
     Schemas,
 }
 
 pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
-    if matches!(&cmd.action, SqlAction::Query { .. }) {
+    if matches!(
+        &cmd.action,
+        SqlAction::Query { .. } | SqlAction::Tables { .. } | SqlAction::Schemas
+    ) {
         ResultLimiter::new(ctx.limit).probe_rows()?;
     }
     let dsn = ctx.resolve_dsn()?;
@@ -87,19 +86,6 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             }
         }
         SqlAction::Tables { .. } | SqlAction::Schema { .. } | SqlAction::Schemas => {}
-    }
-
-    if matches!(
-        &cmd.action,
-        SqlAction::Query {
-            schema: Some(_),
-            ..
-        }
-    ) {
-        return Err(Error::UnsupportedCapability {
-            kind: Dsn::parse(&dsn)?.scheme,
-            needed: "SqlQuerySchema",
-        });
     }
 
     let conn = ctx.registry.connect(&dsn).await?;
@@ -139,12 +125,13 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Tables { schema } => {
-            let tables = sql_engine.list_tables(schema.as_deref()).await?;
+            let (tables, truncated) =
+                limit_metadata(sql_engine.list_tables(schema.as_deref()).await?, ctx.limit)?;
             ctx.render_success(
                 conn.kind().0.as_str(),
                 tables,
                 start.elapsed().as_millis() as u64,
-                false,
+                truncated,
             )
         }
         SqlAction::Schema { table } => {
@@ -157,17 +144,24 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Schemas => {
-            let schemas = sql_engine.list_schemas().await?;
+            let (schemas, truncated) = limit_metadata(sql_engine.list_schemas().await?, ctx.limit)?;
             ctx.render_success(
                 conn.kind().0.as_str(),
                 schemas,
                 start.elapsed().as_millis() as u64,
-                false,
+                truncated,
             )
         }
     };
 
     Ok(output)
+}
+
+fn limit_metadata<T>(mut items: Vec<T>, limit: usize) -> Result<(Vec<T>, bool)> {
+    ResultLimiter::new(limit).probe_rows()?;
+    let truncated = items.len() > limit;
+    items.truncate(limit);
+    Ok((items, truncated))
 }
 
 fn parse_sql_params(raw: &str) -> Result<Vec<Value>> {
@@ -302,5 +296,22 @@ mod tests {
         ] {
             assert!(parse_sql_params(raw).is_err(), "{raw} should be rejected");
         }
+    }
+
+    #[test]
+    fn metadata_lists_are_bounded_and_mark_exact_truncation() {
+        let (exact, exact_truncated) = limit_metadata(vec![1, 2], 2).unwrap();
+        assert_eq!(exact, [1, 2]);
+        assert!(!exact_truncated);
+
+        let (limited, limited_truncated) = limit_metadata(vec![1, 2, 3], 2).unwrap();
+        assert_eq!(limited, [1, 2]);
+        assert!(limited_truncated);
+
+        assert!(matches!(limit_metadata(vec![1], 0), Err(Error::Config(_))));
+        assert!(matches!(
+            limit_metadata(vec![1], usize::MAX),
+            Err(Error::Config(_))
+        ));
     }
 }

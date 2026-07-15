@@ -244,47 +244,69 @@ impl SqlEngine for PostgresAdapter {
 
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let s = validate_optional_schema(schema)?.unwrap_or("public");
+        if self.kind.0 == "redshift" {
+            return redshift_list_tables(&self.pool, s).await;
+        }
         let rows = sqlx::query(
-            "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = $1",
+            "SELECT n.nspname, c.relname, c.relkind::text \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+             ORDER BY c.relname",
         )
         .bind(s)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(rows
-            .iter()
-            .map(|r| TableInfo {
-                schema: Some(s.to_owned()),
-                name: r.get(0),
-                kind: if r.get::<String, _>(1).contains("VIEW") {
-                    TableKind::View
-                } else {
-                    TableKind::Table
-                },
+        rows.iter()
+            .map(|r| {
+                let schema = r
+                    .try_get::<String, _>(0)
+                    .map_err(|error| Error::Query(error.to_string()))?;
+                let name = r
+                    .try_get::<String, _>(1)
+                    .map_err(|error| Error::Query(error.to_string()))?;
+                let relkind = r
+                    .try_get::<String, _>(2)
+                    .map_err(|error| Error::Query(error.to_string()))?;
+                Ok(TableInfo {
+                    schema: Some(schema),
+                    name,
+                    kind: postgres_table_kind(&relkind)?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
         let table_ref = parse_table_ref(table)?;
         let schema = table_ref.schema.as_deref().unwrap_or("public");
+        if self.kind.0 == "redshift" {
+            return redshift_describe_table(&self.pool, schema, &table_ref.name).await;
+        }
 
         let col_rows = sqlx::query(
-            "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
-                    (kcu.column_name IS NOT NULL) AS is_pk \
-             FROM information_schema.columns c \
-             LEFT JOIN ( \
-                 SELECT kcu.column_name \
-                 FROM information_schema.table_constraints tc \
-                 JOIN information_schema.key_column_usage kcu \
-                     ON tc.constraint_name = kcu.constraint_name \
-                     AND tc.table_schema = kcu.table_schema \
-                     AND tc.table_name = kcu.table_name \
-                 WHERE tc.constraint_type = 'PRIMARY KEY' \
-                   AND tc.table_schema = $1 AND tc.table_name = $2 \
-             ) kcu ON c.column_name = kcu.column_name \
-             WHERE c.table_schema = $1 AND c.table_name = $2 \
-             ORDER BY c.ordinal_position",
+            "SELECT a.attname, \
+                    pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                    a.attnotnull, \
+                    CASE WHEN a.attgenerated = '' \
+                         THEN pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) \
+                         ELSE NULL \
+                    END, \
+                    EXISTS ( \
+                        SELECT 1 FROM pg_catalog.pg_constraint con \
+                        WHERE con.conrelid = c.oid AND con.contype = 'p' \
+                          AND a.attnum = ANY(con.conkey) \
+                    ) AS is_pk \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid \
+             LEFT JOIN pg_catalog.pg_attrdef ad \
+                    ON ad.adrelid = c.oid AND ad.adnum = a.attnum \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
         )
         .bind(schema)
         .bind(&table_ref.name)
@@ -294,14 +316,26 @@ impl SqlEngine for PostgresAdapter {
 
         let columns = col_rows
             .iter()
-            .map(|r| ColumnMeta {
-                name: r.get(0),
-                type_name: r.get(1),
-                nullable: r.get::<String, _>(2) == "YES",
-                primary_key: r.get::<bool, _>(4),
-                default_value: r.get::<Option<String>, _>(3),
+            .map(|r| {
+                Ok(ColumnMeta {
+                    name: r
+                        .try_get(0)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                    type_name: r
+                        .try_get(1)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                    nullable: !r
+                        .try_get::<bool, _>(2)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                    default_value: r
+                        .try_get(3)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                    primary_key: r
+                        .try_get(4)
+                        .map_err(|error| Error::Query(error.to_string()))?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let idx_rows = sqlx::query(
             "SELECT i.relname, ix.indisunique, ix.indisprimary, a.attname \
@@ -309,9 +343,11 @@ impl SqlEngine for PostgresAdapter {
              JOIN pg_index ix ON t.oid = ix.indrelid \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
-             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) \
+             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS indexed_key(attnum, ord) \
+                  ON indexed_key.ord <= ix.indnkeyatts \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = indexed_key.attnum \
              WHERE t.relname = $1 AND n.nspname = $2 \
-             ORDER BY i.relname, array_position(ix.indkey, a.attnum)",
+             ORDER BY i.relname, indexed_key.ord",
         )
         .bind(&table_ref.name)
         .bind(schema)
@@ -335,6 +371,108 @@ impl SqlEngine for PostgresAdapter {
     }
 }
 
+async fn redshift_list_tables(pool: &PgPool, schema: &str) -> Result<Vec<TableInfo>> {
+    let rows = sqlx::query(
+        "SELECT table_schema, table_name, table_type \
+         FROM information_schema.tables \
+         WHERE table_schema = $1 ORDER BY table_name",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| Error::Query(error.to_string()))?;
+
+    rows.iter()
+        .map(|row| {
+            let schema = row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let name = row
+                .try_get::<String, _>(1)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let table_type = row
+                .try_get::<String, _>(2)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            Ok(TableInfo {
+                schema: Some(schema),
+                name,
+                kind: if table_type.contains("VIEW") {
+                    TableKind::View
+                } else {
+                    TableKind::Table
+                },
+            })
+        })
+        .collect()
+}
+
+async fn redshift_describe_table(pool: &PgPool, schema: &str, table: &str) -> Result<TableSchema> {
+    let rows = sqlx::query(
+        "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, \
+                (kcu.column_name IS NOT NULL) AS is_pk \
+         FROM information_schema.columns c \
+         LEFT JOIN ( \
+             SELECT kcu.column_name \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON tc.constraint_name = kcu.constraint_name \
+              AND tc.table_schema = kcu.table_schema \
+              AND tc.table_name = kcu.table_name \
+             WHERE tc.constraint_type = 'PRIMARY KEY' \
+               AND tc.table_schema = $1 AND tc.table_name = $2 \
+         ) kcu ON c.column_name = kcu.column_name \
+         WHERE c.table_schema = $1 AND c.table_name = $2 \
+         ORDER BY c.ordinal_position",
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| Error::Query(error.to_string()))?;
+
+    let columns = rows
+        .iter()
+        .map(|row| {
+            Ok(ColumnMeta {
+                name: row
+                    .try_get(0)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+                type_name: row
+                    .try_get(1)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+                nullable: row
+                    .try_get::<String, _>(2)
+                    .map_err(|error| Error::Query(error.to_string()))?
+                    == "YES",
+                default_value: row
+                    .try_get(3)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+                primary_key: row
+                    .try_get(4)
+                    .map_err(|error| Error::Query(error.to_string()))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(TableSchema {
+        name: table.to_owned(),
+        columns,
+        // Amazon Redshift does not implement PostgreSQL secondary indexes.
+        indexes: vec![],
+    })
+}
+
+fn postgres_table_kind(relkind: &str) -> Result<TableKind> {
+    match relkind {
+        "v" => Ok(TableKind::View),
+        "m" => Ok(TableKind::MaterializedView),
+        "r" | "p" | "f" => Ok(TableKind::Table),
+        other => Err(Error::Query(format!(
+            "unsupported PostgreSQL relation kind in table metadata: {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +492,100 @@ mod tests {
         assert!(bind_postgres_params("select $1, $2, $3, $4, $5, $6, $7, $8", &params).is_ok());
 
         assert!(bind_postgres_params("select $1", &[Value::Timestamp(i64::MAX)]).is_err());
+    }
+
+    #[test]
+    fn postgres_relation_kinds_preserve_materialized_views() {
+        assert_eq!(postgres_table_kind("r").unwrap(), TableKind::Table);
+        assert_eq!(postgres_table_kind("p").unwrap(), TableKind::Table);
+        assert_eq!(postgres_table_kind("f").unwrap(), TableKind::Table);
+        assert_eq!(postgres_table_kind("v").unwrap(), TableKind::View);
+        assert_eq!(
+            postgres_table_kind("m").unwrap(),
+            TableKind::MaterializedView
+        );
+        assert!(postgres_table_kind("S").is_err());
+    }
+
+    #[tokio::test]
+    async fn postgres_live_metadata_distinguishes_primary_include_generated_and_matview() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_POSTGRES_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = format!("dbtool_meta_{suffix}");
+        let view = format!("dbtool_meta_mv_{suffix}");
+        let connector = postgres_factory(Dsn::parse(&raw_dsn).unwrap())
+            .await
+            .unwrap();
+        let sql = connector.as_sql().unwrap();
+
+        sql.execute(
+            &format!(
+                "CREATE TABLE {table} (\
+                    id bigint, base integer, payload text, \
+                    generated integer GENERATED ALWAYS AS (base + 1) STORED, \
+                    PRIMARY KEY (id) INCLUDE (payload))"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        sql.execute(
+            &format!("CREATE MATERIALIZED VIEW {view} AS SELECT id, generated FROM {table}"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let metadata = async {
+            Ok::<_, Error>((
+                sql.describe_table(&table).await?,
+                sql.describe_table(&view).await?,
+                sql.list_tables(Some("public")).await?,
+            ))
+        }
+        .await;
+
+        let view_cleanup = sql
+            .execute(&format!("DROP MATERIALIZED VIEW {view}"), &[])
+            .await;
+        let table_cleanup = sql.execute(&format!("DROP TABLE {table}"), &[]).await;
+        view_cleanup.unwrap();
+        table_cleanup.unwrap();
+
+        let (table_schema, view_schema, tables) = metadata.unwrap();
+
+        let id = table_schema
+            .columns
+            .iter()
+            .find(|column| column.name == "id")
+            .unwrap();
+        let payload = table_schema
+            .columns
+            .iter()
+            .find(|column| column.name == "payload")
+            .unwrap();
+        let generated = table_schema
+            .columns
+            .iter()
+            .find(|column| column.name == "generated")
+            .unwrap();
+        assert!(id.primary_key);
+        assert!(!payload.primary_key);
+        assert_eq!(generated.default_value, None);
+        let primary = table_schema
+            .indexes
+            .iter()
+            .find(|index| index.primary)
+            .unwrap();
+        assert_eq!(primary.columns, ["id"]);
+        assert_eq!(view_schema.columns.len(), 2);
+        assert!(tables
+            .iter()
+            .any(|item| { item.name == view && item.kind == TableKind::MaterializedView }));
     }
 }
