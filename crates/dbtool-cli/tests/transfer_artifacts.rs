@@ -409,7 +409,7 @@ fn redis_artifact_roundtrip_proves_completeness_and_replace_confirmation() {
         "--dsn",
         &dsn,
         "--limit",
-        "10",
+        "2",
         "export",
         "kv",
         "--pattern",

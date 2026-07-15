@@ -13,6 +13,26 @@
 - 错误通过稳定的 `error.code` 返回。接口不适用时返回
   `UNSUPPORTED_CAPABILITY`，不得用空数组或成功响应伪装。
 
+## KV / Redis SCAN
+
+```bash
+dbtool --dsn "$REDIS_DSN" --limit 100 kv scan 'app:*'
+```
+
+CLI 会向 `KeyValueStore::scan` 传入 `limit + 1`。Redis adapter 不使用会隐藏后续分页
+错误的高层迭代器，而是显式执行 `SCAN cursor MATCH pattern COUNT n`，直到取得探测
+key、服务端 cursor 返回 `0`，或任一页失败。返回值遵循以下固定合同：
+
+1. 只有找到第 N+1 个不同 key 时，输出才设置 `meta.truncated=true`；刚好 N 个为
+   `false`。
+2. Redis 在遍历期间可能重复 key；adapter 跨页去重，重复项不占调用方预算。
+3. 非零 cursor 在归零前重复视为服务端分页环，返回 `QUERY_ERROR`，不得返回已收集的
+   部分结果。
+4. portable KV key 接口当前要求 UTF-8；遇到二进制 key 返回
+   `SERIALIZATION_ERROR`，不会用替换字符篡改身份。
+5. SCAN 是并发修改下的 best-effort 遍历，不是 Redis 数据库快照；需要恢复用途时还要
+   检查 artifact 的 `complete/truncated/source_changed` 字段。
+
 ## Document / MongoDB
 
 ### 完整查询选项

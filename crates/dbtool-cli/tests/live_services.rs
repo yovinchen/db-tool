@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env,
     process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
@@ -1408,11 +1409,9 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let raw_key = unique_name("dbtool_it_redis_raw");
     let counter_key = unique_name("dbtool_it_redis_counter");
     let scan_prefix = unique_name("dbtool_it_redis_scan");
-    let scan_keys = [
-        format!("{scan_prefix}:1"),
-        format!("{scan_prefix}:2"),
-        format!("{scan_prefix}:3"),
-    ];
+    let scan_keys = (1..=25)
+        .map(|index| format!("{scan_prefix}:{index:02}"))
+        .collect::<Vec<_>>();
     eprintln!(
         "dbtool test resources: redis keys={}",
         [
@@ -1560,7 +1559,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     let nx_ttl = nx_ttl["data"].as_i64().expect("NX TTL should be numeric");
     assert!((1..=30).contains(&nx_ttl), "unexpected NX TTL: {nx_ttl}");
 
-    for scan_key in &scan_keys {
+    for scan_key in &scan_keys[..2] {
         stdout_json(dbtool(&[
             "--dsn",
             &dsn,
@@ -1571,6 +1570,27 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
             "scan-value",
         ]));
     }
+    let exact_scan = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--limit",
+        "2",
+        "kv",
+        "scan",
+        &format!("{scan_prefix}:*"),
+    ]));
+    assert_eq!(exact_scan["data"].as_array().unwrap().len(), 2);
+    assert_eq!(exact_scan["meta"]["truncated"], false);
+
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &scan_keys[2],
+        "scan-value",
+    ]));
     let scan = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
@@ -1582,6 +1602,39 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
     ]));
     assert_eq!(scan["data"].as_array().unwrap().len(), 2);
     assert_eq!(scan["meta"]["truncated"], true);
+
+    for scan_key in &scan_keys[3..] {
+        stdout_json(dbtool(&[
+            "--dsn",
+            &dsn,
+            "--allow-write",
+            "kv",
+            "set",
+            scan_key,
+            "scan-value",
+        ]));
+    }
+    let complete_scan = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--limit",
+        "30",
+        "kv",
+        "scan",
+        &format!("{scan_prefix}:*"),
+    ]));
+    assert_eq!(complete_scan["data"].as_array().unwrap().len(), 25);
+    assert_eq!(complete_scan["meta"]["truncated"], false);
+    let actual_scan_keys = complete_scan["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual_scan_keys,
+        scan_keys.iter().cloned().collect::<BTreeSet<_>>()
+    );
 
     let fixture_values = [
         (&key, "alice-updated"),
@@ -1620,7 +1673,7 @@ fn redis_live_kv_lifecycle_and_raw_safety() {
         delete_args.push(scan_key);
     }
     let deleted = stdout_json(dbtool(&delete_args));
-    assert_eq!(deleted["data"]["deleted"], 8);
+    assert_eq!(deleted["data"]["deleted"], 30);
 
     for (fixture_key, _) in fixture_values {
         let missing = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", fixture_key]));

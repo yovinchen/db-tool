@@ -19,8 +19,10 @@ use redis::{
     streams::{StreamId, StreamInfoGroupsReply, StreamInfoStreamReply, StreamReadReply},
     AsyncCommands, Client,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::time::{timeout, Instant};
+
+const REDIS_SCAN_COUNT: usize = 10;
 
 pub struct RedisAdapter {
     client: Client,
@@ -131,19 +133,27 @@ impl KeyValueStore for RedisAdapter {
     }
 
     async fn scan(&self, pattern: &str, limit: usize) -> Result<Vec<String>> {
+        let count = redis_scan_count(limit)?;
         let mut c = self.conn.lock().await;
-        let mut keys: Vec<String> = Vec::new();
-        let mut iter: redis::AsyncIter<String> = c
-            .scan_match(pattern)
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-        while let Some(k) = iter.next_item().await {
-            keys.push(k);
-            if keys.len() >= limit {
-                break;
+        let mut cursor = 0_u64;
+        let mut collector = ScanCollector::new(limit)?;
+
+        loop {
+            let (next_cursor, page): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(count)
+                .query_async(&mut *c)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+
+            match collector.push_page(next_cursor, page)? {
+                ScanProgress::Complete => return Ok(collector.into_keys()),
+                ScanProgress::Continue(next_cursor) => cursor = next_cursor,
             }
         }
-        Ok(keys)
     }
 
     async fn raw_command(&self, args: &[String]) -> Result<Value> {
@@ -158,6 +168,80 @@ impl KeyValueStore for RedisAdapter {
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
         Ok(redis_value_to_core(val))
+    }
+}
+
+fn redis_scan_count(limit: usize) -> Result<u64> {
+    if limit == 0 {
+        return Err(Error::Config(
+            "Redis SCAN limit must be greater than zero".to_owned(),
+        ));
+    }
+
+    u64::try_from(limit.min(REDIS_SCAN_COUNT))
+        .map_err(|_| Error::Config("Redis SCAN page size exceeds the u64 range".to_owned()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScanProgress {
+    Complete,
+    Continue(u64),
+}
+
+struct ScanCollector {
+    limit: usize,
+    keys: Vec<String>,
+    seen_keys: HashSet<String>,
+    seen_cursors: HashSet<u64>,
+}
+
+impl ScanCollector {
+    fn new(limit: usize) -> Result<Self> {
+        redis_scan_count(limit)?;
+        Ok(Self {
+            limit,
+            keys: Vec::new(),
+            seen_keys: HashSet::new(),
+            seen_cursors: HashSet::new(),
+        })
+    }
+
+    fn push_page(&mut self, next_cursor: u64, raw_keys: Vec<Vec<u8>>) -> Result<ScanProgress> {
+        let page = raw_keys
+            .into_iter()
+            .map(|key| {
+                String::from_utf8(key).map_err(|_| {
+                    Error::Serialization(
+                        "Redis SCAN returned a non-UTF-8 key; the portable key API requires UTF-8"
+                            .to_owned(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for key in page {
+            if self.seen_keys.insert(key.clone()) {
+                self.keys.push(key);
+                if self.keys.len() == self.limit {
+                    return Ok(ScanProgress::Complete);
+                }
+            }
+        }
+
+        if next_cursor == 0 {
+            return Ok(ScanProgress::Complete);
+        }
+        if !self.seen_cursors.insert(next_cursor) {
+            return Err(Error::Query(format!(
+                "Redis SCAN cursor {next_cursor} repeated before reaching cursor 0"
+            )));
+        }
+
+        Ok(ScanProgress::Continue(next_cursor))
+    }
+
+    fn into_keys(self) -> Vec<String> {
+        self.keys
     }
 }
 
@@ -978,6 +1062,121 @@ mod tests {
             packed,
             "*6\r\n$3\r\nSET\r\n$6\r\nuser:1\r\n$5\r\nalice\r\n$2\r\nEX\r\n$2\r\n30\r\n$2\r\nNX\r\n"
         );
+    }
+
+    #[test]
+    fn scan_collector_deduplicates_across_pages_and_stops_at_zero() {
+        let mut collector = ScanCollector::new(4).unwrap();
+        assert_eq!(
+            collector
+                .push_page(17, vec![b"one".to_vec(), b"two".to_vec()])
+                .unwrap(),
+            ScanProgress::Continue(17)
+        );
+        assert_eq!(
+            collector
+                .push_page(
+                    0,
+                    vec![b"two".to_vec(), b"three".to_vec(), b"three".to_vec()]
+                )
+                .unwrap(),
+            ScanProgress::Complete
+        );
+        assert_eq!(collector.into_keys(), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn scan_collector_counts_unique_keys_toward_the_limit() {
+        let mut collector = ScanCollector::new(3).unwrap();
+        assert_eq!(
+            collector
+                .push_page(9, vec![b"one".to_vec(), b"one".to_vec()])
+                .unwrap(),
+            ScanProgress::Continue(9)
+        );
+        assert_eq!(
+            collector
+                .push_page(11, vec![b"two".to_vec(), b"three".to_vec()])
+                .unwrap(),
+            ScanProgress::Complete
+        );
+        assert_eq!(collector.into_keys(), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn scan_collector_rejects_non_utf8_without_returning_a_partial_page() {
+        let mut collector = ScanCollector::new(3).unwrap();
+        assert!(matches!(
+            collector.push_page(0, vec![b"valid".to_vec(), vec![0xff]]),
+            Err(Error::Serialization(message)) if message.contains("non-UTF-8 key")
+        ));
+        assert!(collector.keys.is_empty());
+    }
+
+    #[test]
+    fn scan_collector_rejects_cursor_cycles() {
+        let mut collector = ScanCollector::new(3).unwrap();
+        assert_eq!(
+            collector.push_page(7, vec![]).unwrap(),
+            ScanProgress::Continue(7)
+        );
+        assert!(matches!(
+            collector.push_page(7, vec![]),
+            Err(Error::Query(message)) if message.contains("repeated")
+        ));
+    }
+
+    #[test]
+    fn scan_limits_are_positive_and_platform_overflow_safe() {
+        assert!(matches!(redis_scan_count(0), Err(Error::Config(_))));
+        assert_eq!(redis_scan_count(1).unwrap(), 1);
+        assert_eq!(
+            redis_scan_count(usize::MAX).unwrap(),
+            u64::try_from(REDIS_SCAN_COUNT).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_live_scan_rejects_non_utf8_keys_without_partial_success() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("dbtool_it_non_utf8_{suffix}:");
+        let mut binary_key = prefix.as_bytes().to_vec();
+        binary_key.push(0xff);
+
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let driver_url = dsn.raw_with_scheme("redis").unwrap();
+        let client = Client::open(driver_url.as_str()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("SET")
+            .arg(&binary_key)
+            .arg(b"value")
+            .query_async::<()>(&mut direct)
+            .await
+            .unwrap();
+
+        let connector = factory(dsn).await.unwrap();
+        let result = connector
+            .as_kv()
+            .unwrap()
+            .scan(&format!("{prefix}*"), 10)
+            .await;
+
+        let deleted = redis::cmd("DEL")
+            .arg(&binary_key)
+            .query_async::<u64>(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(matches!(
+            result,
+            Err(Error::Serialization(message)) if message.contains("non-UTF-8 key")
+        ));
     }
 
     #[test]

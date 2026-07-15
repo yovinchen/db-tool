@@ -1,6 +1,6 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{error::Error, port::capability::SetOptions, Result};
+use dbtool_core::{error::Error, port::capability::SetOptions, service::ResultLimiter, Result};
 
 #[derive(Args)]
 pub struct KvCmd {
@@ -28,7 +28,7 @@ pub enum KvAction {
         #[arg(long)]
         nx: bool,
     },
-    /// Scan keys matching a pattern, bounded by the global --limit.
+    /// Scan keys matching a pattern up to --limit and probe one extra key for exact truncation.
     Scan {
         /// Redis glob-style pattern.
         #[arg(default_value = "*")]
@@ -95,8 +95,9 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             ctx.render_success(&kind, serde_json::json!({"ok": true}), elapsed(), false)
         }
         KvAction::Scan { pattern } => {
-            let keys = kv.scan(&pattern, ctx.limit).await?;
-            let truncated = keys.len() >= ctx.limit;
+            let probe_limit = ResultLimiter::new(ctx.limit).probe_rows()?;
+            let keys = kv.scan(&pattern, probe_limit).await?;
+            let (keys, truncated) = limit_scan_keys(keys, ctx.limit);
             ctx.render_success(&kind, keys, elapsed(), truncated)
         }
         KvAction::Del { keys } => {
@@ -108,6 +109,12 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             ctx.render_success(&kind, val, elapsed(), false)
         }
     })
+}
+
+fn limit_scan_keys(mut keys: Vec<String>, limit: usize) -> (Vec<String>, bool) {
+    let truncated = keys.len() > limit;
+    keys.truncate(limit);
+    (keys, truncated)
 }
 
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
@@ -172,5 +179,26 @@ mod tests {
         assert!(!is_readonly_raw_command("set"));
         assert!(!is_readonly_raw_command("incr"));
         assert!(!is_readonly_raw_command("xadd"));
+    }
+
+    #[test]
+    fn scan_truncation_requires_a_probe_key() {
+        let (exact, exact_truncated) = limit_scan_keys(vec!["one".to_owned(), "two".to_owned()], 2);
+        assert_eq!(exact, ["one", "two"]);
+        assert!(!exact_truncated);
+
+        let (limited, limited_truncated) = limit_scan_keys(
+            vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+            2,
+        );
+        assert_eq!(limited, ["one", "two"]);
+        assert!(limited_truncated);
+    }
+
+    #[test]
+    fn scan_probe_limit_rejects_zero_and_overflow() {
+        assert!(ResultLimiter::new(0).probe_rows().is_err());
+        assert!(ResultLimiter::new(usize::MAX).probe_rows().is_err());
+        assert_eq!(ResultLimiter::new(2).probe_rows().unwrap(), 3);
     }
 }
