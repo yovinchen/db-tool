@@ -9,13 +9,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind, TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind,
+        TableSchema, Value,
     },
     port::{
         capability::{CqlEngine, SqlEngine},
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ResultLimiter,
+    service::limiter::{ListLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, StreamExt};
 use scylla::{
@@ -91,6 +92,10 @@ impl Connector for CassandraAdapter {
         }
     }
 
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        cassandra_operations(self.capabilities())
+    }
+
     async fn ping(&self) -> Result<()> {
         self.session
             .query_unpaged("SELECT release_version FROM system.local", &[])
@@ -110,6 +115,65 @@ impl Connector for CassandraAdapter {
     fn as_cql(&self) -> Option<&dyn CqlEngine> {
         Some(self)
     }
+}
+
+impl CassandraAdapter {
+    async fn query_catalog_bounded<T, F>(
+        &self,
+        cql: &str,
+        max_items: usize,
+        mut convert: F,
+    ) -> Result<BoundedList<T>>
+    where
+        F: FnMut(Vec<Value>) -> Result<Option<T>>,
+    {
+        let (limiter, probe_items, page_size) = bounded_catalog_plan(max_items)?;
+        let statement = Statement::new(cql).with_page_size(page_size);
+        let pager = self
+            .session
+            .query_iter(statement, &[])
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let mut rows = pager
+            .rows_stream::<Row>()
+            .map_err(|error| Error::Query(error.to_string()))?;
+
+        // The caller's logical budget can be much larger than the actual
+        // catalog. Do not reserve that entire amount up front: each server
+        // page and the initial allocation stay capped while the loop still
+        // stops exactly at the N+1 probe item.
+        let mut items = Vec::with_capacity(probe_items.min(256));
+        while items.len() < probe_items {
+            let Some(row) = rows.next().await else {
+                break;
+            };
+            let row = row.map_err(|error| Error::Query(error.to_string()))?;
+            if let Some(item) = convert(cql_row_values(row))? {
+                items.push(item);
+            }
+        }
+        drop(rows);
+        Ok(limiter.finish(items))
+    }
+}
+
+fn cassandra_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::CqlListKeyspacesBounded,
+        CapabilityOperation::CqlListTablesBounded,
+    ]);
+    operations
+}
+
+fn bounded_catalog_plan(max_items: usize) -> Result<(ListLimiter, usize, i32)> {
+    let limiter = ListLimiter::new(max_items);
+    let probe_items = limiter.probe_items()?;
+    let page_size = i32::try_from(probe_items.min(256))
+        .map_err(|_| Error::Internal("bounded CQL catalog page size overflow".to_owned()))?;
+    Ok((limiter, probe_items, page_size))
 }
 
 #[async_trait::async_trait]
@@ -211,6 +275,25 @@ impl SqlEngine for CassandraAdapter {
         Ok(schemas)
     }
 
+    async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        self.query_catalog_bounded(
+            "SELECT keyspace_name FROM system_schema.keyspaces",
+            max_items,
+            |row| {
+                row.first()
+                    .and_then(value_text)
+                    .map(str::to_owned)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        Error::Serialization(
+                            "Cassandra catalog keyspace_name is not text".to_owned(),
+                        )
+                    })
+            },
+        )
+        .await
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let result = if let Some(keyspace) = optional_keyspace(schema)? {
             self.query(
@@ -261,6 +344,45 @@ impl SqlEngine for CassandraAdapter {
                 .then_with(|| left.name.cmp(&right.name))
         });
         Ok(tables)
+    }
+
+    async fn list_tables_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        let selected_keyspace = optional_keyspace(schema)?
+            .map(str::to_owned)
+            .or_else(|| self.keyspace.clone());
+        let sql = match selected_keyspace.as_deref() {
+            Some(keyspace) => format!(
+                "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name = '{}'",
+                validate_identifier(keyspace, "keyspace")?
+            ),
+            None => "SELECT keyspace_name, table_name FROM system_schema.tables".to_owned(),
+        };
+
+        self.query_catalog_bounded(&sql, max_items, |row| {
+            let Some(keyspace) = row.first().and_then(value_text) else {
+                return Err(Error::Serialization(
+                    "Cassandra catalog keyspace_name is not text".to_owned(),
+                ));
+            };
+            if selected_keyspace.is_none() && is_system_keyspace(keyspace) {
+                return Ok(None);
+            }
+            let Some(name) = row.get(1).and_then(value_text) else {
+                return Err(Error::Serialization(
+                    "Cassandra catalog table_name is not text".to_owned(),
+                ));
+            };
+            Ok(Some(TableInfo {
+                schema: Some(keyspace.to_owned()),
+                name: name.to_owned(),
+                kind: TableKind::Table,
+            }))
+        })
+        .await
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -364,8 +486,20 @@ impl CqlEngine for CassandraAdapter {
         <Self as SqlEngine>::list_schemas(self).await
     }
 
+    async fn list_keyspaces_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        <Self as SqlEngine>::list_schemas_bounded(self, max_items).await
+    }
+
     async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>> {
         <Self as SqlEngine>::list_tables(self, keyspace).await
+    }
+
+    async fn list_cql_tables_bounded(
+        &self,
+        keyspace: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        <Self as SqlEngine>::list_tables_bounded(self, keyspace, max_items).await
     }
 
     async fn describe_cql_table(&self, table: &str) -> Result<TableSchema> {
@@ -735,6 +869,33 @@ fn is_system_keyspace(keyspace: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_catalog_contract_is_explicit_and_validated_before_access() {
+        let operations = cassandra_operations(Capabilities {
+            sql: true,
+            cql: true,
+            ..Default::default()
+        });
+        for operation in [
+            CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListTablesBounded,
+            CapabilityOperation::CqlListKeyspacesBounded,
+            CapabilityOperation::CqlListTablesBounded,
+        ] {
+            assert!(operations.contains(&operation));
+        }
+
+        assert!(matches!(bounded_catalog_plan(0), Err(Error::Config(_))));
+        assert!(matches!(
+            bounded_catalog_plan(usize::MAX),
+            Err(Error::Config(_))
+        ));
+        let (_, probe_items, page_size) = bounded_catalog_plan(2).unwrap();
+        assert_eq!((probe_items, page_size), (3, 3));
+        let (_, probe_items, page_size) = bounded_catalog_plan(1_000).unwrap();
+        assert_eq!((probe_items, page_size), (1_001, 256));
+    }
 
     #[test]
     fn contact_point_defaults_port_and_host() {

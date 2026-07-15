@@ -2,8 +2,9 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
+    port::CapabilityOperation,
     service::{
-        limiter::ResultLimiter,
+        limiter::{ListLimiter, ResultLimiter},
         safety::{SafetyGuard, StatementKind},
     },
     Result,
@@ -50,8 +51,14 @@ pub enum CqlAction {
 }
 
 pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
-    if matches!(&cmd.action, CqlAction::Query { .. }) {
-        ResultLimiter::new(ctx.limit).probe_rows()?;
+    match &cmd.action {
+        CqlAction::Query { .. } => {
+            ResultLimiter::new(ctx.limit).probe_rows()?;
+        }
+        CqlAction::Keyspaces | CqlAction::Tables { .. } => {
+            ListLimiter::new(ctx.limit).probe_items()?;
+        }
+        CqlAction::Exec { .. } | CqlAction::Schema { .. } => {}
     }
     let dsn = ctx.resolve_dsn()?;
     let target = ctx.safety_target(&dsn);
@@ -63,6 +70,7 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
     }
 
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let cql = conn.as_cql().ok_or_else(|| Error::UnsupportedCapability {
         kind: conn.kind().0.clone(),
         needed: "CqlEngine",
@@ -82,12 +90,28 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
         CqlAction::Keyspaces => {
-            let keyspaces = cql.list_keyspaces().await?;
-            ctx.render_success(&kind, keyspaces, elapsed(), false)
+            require_cql_catalog_operation(
+                &operations,
+                CapabilityOperation::CqlListKeyspacesBounded,
+                &kind,
+                "CqlEngine.list_keyspaces_bounded",
+            )?;
+            let keyspaces = cql.list_keyspaces_bounded(ctx.limit).await?;
+            let truncated = keyspaces.truncated;
+            ctx.render_success(&kind, keyspaces.items, elapsed(), truncated)
         }
         CqlAction::Tables { keyspace } => {
-            let tables = cql.list_cql_tables(keyspace.as_deref()).await?;
-            ctx.render_success(&kind, tables, elapsed(), false)
+            require_cql_catalog_operation(
+                &operations,
+                CapabilityOperation::CqlListTablesBounded,
+                &kind,
+                "CqlEngine.list_cql_tables_bounded",
+            )?;
+            let tables = cql
+                .list_cql_tables_bounded(keyspace.as_deref(), ctx.limit)
+                .await?;
+            let truncated = tables.truncated;
+            ctx.render_success(&kind, tables.items, elapsed(), truncated)
         }
         CqlAction::Schema { table, keyspace } => {
             let table = cql_table_ref(&table, keyspace.as_deref())?;
@@ -95,6 +119,22 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
             ctx.render_success(&kind, schema, elapsed(), false)
         }
     })
+}
+
+fn require_cql_catalog_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+    needed: &'static str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed,
+        })
+    }
 }
 
 fn cql_table_ref(table: &str, keyspace: Option<&str>) -> Result<String> {
@@ -204,5 +244,29 @@ mod tests {
             cql_table_ref("users", Some("bad.keyspace")),
             Err(Error::Config(message)) if message.contains("must not contain a dot")
         ));
+    }
+
+    #[test]
+    fn cql_catalogs_require_explicit_bounded_operations_without_fallback() {
+        assert!(matches!(
+            require_cql_catalog_operation(
+                CapabilityOperation::CQL,
+                CapabilityOperation::CqlListKeyspacesBounded,
+                "legacy-cql",
+                "CqlEngine.list_keyspaces_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "CqlEngine.list_keyspaces_bounded"
+        ));
+
+        let mut operations = CapabilityOperation::CQL.to_vec();
+        operations.push(CapabilityOperation::CqlListTablesBounded);
+        assert!(require_cql_catalog_operation(
+            &operations,
+            CapabilityOperation::CqlListTablesBounded,
+            "cassandra",
+            "CqlEngine.list_cql_tables_bounded",
+        )
+        .is_ok());
     }
 }
