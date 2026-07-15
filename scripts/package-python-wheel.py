@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +38,11 @@ def main() -> int:
     package_src = repo_root / "dist" / "python" / DIST_NAME
     work_dir = out_dir / ".work"
     cli_artifacts = work_dir / "cli-artifacts"
+    selected_targets = select_targets()
+    selected_binaries = {
+        target: find_binary(artifact_root, target, exe)
+        for target, _tag, exe in selected_targets
+    }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("*.whl"):
@@ -45,25 +52,43 @@ def main() -> int:
     work_dir.mkdir(parents=True)
     generate_cli_artifacts(repo_root, artifact_root, cli_artifacts)
 
-    for target, tag, exe in TARGETS:
+    for target, tag, exe in selected_targets:
         build_wheel(
-            artifact_root,
             out_dir,
             package_src,
             cli_artifacts,
             version,
-            target,
             tag,
             exe,
+            selected_binaries[target],
         )
 
     return 0
 
 
+def select_targets() -> list[tuple[str, str, str]]:
+    requested = os.environ.get("DBTOOL_PACKAGE_TARGETS")
+    if not requested:
+        return TARGETS
+    names = requested.split(",")
+    if any(not name for name in names):
+        raise ValueError(
+            "DBTOOL_PACKAGE_TARGETS must be a comma-separated list without empty entries"
+        )
+    if len(set(names)) != len(names):
+        raise ValueError("DBTOOL_PACKAGE_TARGETS must not contain duplicate targets")
+    by_name = {entry[0]: entry for entry in TARGETS}
+    selected = []
+    for name in names:
+        if name not in by_name:
+            raise ValueError(f"unsupported DBTOOL_PACKAGE_TARGETS entry: {name}")
+        selected.append(by_name[name])
+    return selected
+
+
 def normalize_version(ref_name: str) -> str:
     version = ref_name[1:] if ref_name.startswith("v") else ref_name
-    parts = version.split(".")
-    if len(parts) < 3 or not all(part[:1].isdigit() for part in parts[:3]):
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
         raise ValueError(f"release ref {ref_name} does not look like a package version")
     return version
 
@@ -72,7 +97,6 @@ def find_binary(artifact_root: Path, target: str, exe: str) -> Path:
     candidates = [
         artifact_root / f"dbtool-bin-{target}" / exe,
         artifact_root / target / exe,
-        artifact_root / exe,
     ]
     for candidate in candidates:
         if candidate.is_file():
@@ -89,14 +113,13 @@ def generate_cli_artifacts(repo_root: Path, artifact_root: Path, out_dir: Path) 
 
 
 def build_wheel(
-    artifact_root: Path,
     out_dir: Path,
     package_src: Path,
     cli_artifacts: Path,
     version: str,
-    target: str,
     tag: str,
     exe: str,
+    binary: Path,
 ) -> None:
     dist_info = f"{DIST_NAME}-{version}.dist-info"
     wheel_name = f"{DIST_NAME}-{version}-py3-none-{tag}.whl"
@@ -109,7 +132,7 @@ def build_wheel(
     )
     files.append((f"{DIST_NAME}/__init__.py", init_py.encode(), 0o644))
     files.append((f"{DIST_NAME}/cli.py", (package_src / "cli.py").read_bytes(), 0o644))
-    files.append((f"{DIST_NAME}/{exe}", find_binary(artifact_root, target, exe).read_bytes(), 0o755))
+    files.append((f"{DIST_NAME}/{exe}", binary.read_bytes(), 0o755))
     for relative in [
         "completions/dbtool.bash",
         "completions/dbtool.zsh",
@@ -182,4 +205,8 @@ def write_wheel(
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (FileNotFoundError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None

@@ -255,6 +255,21 @@ Linux x64 子包会实际安装并执行 `dbtool --version`；Python musllinux w
 Alpine 容器中实际安装并执行。archives、`.tgz` 和 `.whl` 都附加到同一个
 GitHub Release。
 
+四个打包入口默认都要求六个平台的 target 专属 artifact 同时存在，不能从 artifact
+根目录拿一个宿主机 `dbtool` 冒充其它目标。只做本机烟测时，必须显式选择目标：
+
+```bash
+export DBTOOL_PACKAGE_TARGETS=aarch64-apple-darwin
+./scripts/package-release.sh artifacts release-dist v0.1.0
+./scripts/smoke-release-artifacts.sh release-dist
+node scripts/package-npm.mjs artifacts npm-dist v0.1.0
+python3 scripts/package-python-wheel.py artifacts python-dist v0.1.0
+```
+
+目标值必须来自发布矩阵，可用英文逗号选择多个；未知目标、空项和重复项都会在生成
+任何包之前失败。该环境变量只是测试过滤器，不改变正式 release workflow 的六平台
+完整性要求。
+
 `--format` 由 Clap 枚举解析，只接受 `json`、`table`、`ndjson`。未知值在连接
 数据库之前直接以非零状态退出，不再回退成 JSON。
 

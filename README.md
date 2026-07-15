@@ -434,4 +434,4 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; AMQPS and NATS TLS live paths, NATS JetStream admin, and RabbitMQ management-backed queue discovery are implemented.
 - TUI: connection picker, capability-aware forms/command dispatch, read limits, AST-based SQL write classification, readonly protection, one-shot write confirmation, history, and failure-safe terminal restoration are implemented.
-- Release packaging: tag/version validation, portable six-platform archives, npm and pip/uv install smokes, GitHub Release attachment, and mise/ubi metadata are wired; signing/notarization is still future work.
+- Release packaging: tag/version validation, target-specific preflight for portable six-platform archives, npm and pip/uv install smokes, GitHub Release attachment, and mise/ubi metadata are wired; a host binary cannot be reused as another target, while signing/notarization is still future work.

@@ -13,8 +13,51 @@ targets=(
   "aarch64-pc-windows-msvc:.exe"
 )
 
+validate_selected_targets() {
+  local requested="${DBTOOL_PACKAGE_TARGETS:-}"
+  local name entry found seen=","
+  local requested_targets=()
+  if [[ -z "$requested" ]]; then
+    return 0
+  fi
+
+  case "$requested" in
+    ,*|*,|*,,*)
+      echo "DBTOOL_PACKAGE_TARGETS must be a comma-separated list without empty entries" >&2
+      return 1
+      ;;
+  esac
+
+  IFS=',' read -r -a requested_targets <<< "$requested"
+  for name in "${requested_targets[@]}"; do
+    if [[ "$seen" == *",$name,"* ]]; then
+      echo "DBTOOL_PACKAGE_TARGETS must not contain duplicate target: $name" >&2
+      return 1
+    fi
+    seen="${seen}${name},"
+    found=0
+    for entry in "${targets[@]}"; do
+      if [[ "${entry%%:*}" == "$name" ]]; then
+        found=1
+        break
+      fi
+    done
+    if [[ "$found" == "0" ]]; then
+      echo "unsupported DBTOOL_PACKAGE_TARGETS entry: $name" >&2
+      return 1
+    fi
+  done
+}
+
+target_selected() {
+  [[ -z "${DBTOOL_PACKAGE_TARGETS:-}" ]] ||
+    [[ ",${DBTOOL_PACKAGE_TARGETS}," == *",$1,"* ]]
+}
+
+validate_selected_targets
 for entry in "${targets[@]}"; do
   target="${entry%%:*}"
+  target_selected "$target" || continue
   suffix="${entry#*:}"
   archive="$(find "$ARCHIVE_DIR" -name "dbtool-*-$target.tar.gz" -type f -print -quit)"
   if [[ -z "$archive" ]]; then

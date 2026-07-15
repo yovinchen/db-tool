@@ -7,10 +7,17 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+process.on("uncaughtException", (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`error: ${message}`);
+  process.exit(1);
+});
 
 const targets = [
   {
@@ -70,6 +77,10 @@ const outDir = resolve(outDirArg);
 const workDir = join(outDir, ".work");
 const cliArtifactsDir = join(workDir, "cli-artifacts");
 const version = normalizeVersion(refNameArg);
+const selectedTargets = selectTargets(targets, process.env.DBTOOL_PACKAGE_TARGETS);
+const selectedBinaries = new Map(
+  selectedTargets.map((target) => [target.target, findBinary(target)]),
+);
 
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
@@ -77,12 +88,33 @@ mkdirSync(workDir, { recursive: true });
 generateCliArtifacts();
 
 const optionalDependencies = {};
-for (const target of targets) {
+for (const target of selectedTargets) {
   optionalDependencies[target.packageName] = version;
   packPlatformPackage(target);
 }
 
 packMainPackage(optionalDependencies);
+
+function selectTargets(available, requested) {
+  if (!requested) {
+    return available;
+  }
+  const names = requested.split(",");
+  if (names.some((name) => !name)) {
+    throw new Error("DBTOOL_PACKAGE_TARGETS must be a comma-separated list without empty entries");
+  }
+  if (new Set(names).size !== names.length) {
+    throw new Error("DBTOOL_PACKAGE_TARGETS must not contain duplicate targets");
+  }
+  const byName = new Map(available.map((target) => [target.target, target]));
+  return names.map((name) => {
+    const target = byName.get(name);
+    if (!target) {
+      throw new Error(`unsupported DBTOOL_PACKAGE_TARGETS entry: ${name}`);
+    }
+    return target;
+  });
+}
 
 function normalizeVersion(refName) {
   const version = refName.replace(/^v/, "");
@@ -96,11 +128,10 @@ function findBinary(target) {
   const candidates = [
     join(artifactRoot, `dbtool-bin-${target.target}`, target.exe),
     join(artifactRoot, target.target, target.exe),
-    join(artifactRoot, target.exe),
   ];
   const found = candidates.find((candidate) => {
     try {
-      return readFileSync(candidate).length >= 0;
+      return statSync(candidate).isFile();
     } catch {
       return false;
     }
@@ -115,7 +146,7 @@ function packPlatformPackage(target) {
   const dir = join(workDir, target.target);
   mkdirSync(join(dir, "bin"), { recursive: true });
   const packagedBinary = join(dir, "bin", target.exe);
-  copyFileSync(findBinary(target), packagedBinary);
+  copyFileSync(selectedBinaries.get(target.target), packagedBinary);
   if (target.os !== "win32") {
     chmodSync(packagedBinary, 0o755);
   }
