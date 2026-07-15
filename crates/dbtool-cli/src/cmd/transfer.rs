@@ -221,6 +221,10 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
     if let ExportAction::Sql { query, .. } = &cmd.action {
         ensure_readonly_export_query(query)?;
     }
+    let document_filter = match &cmd.action {
+        ExportAction::Doc { filter, .. } => Some(parse_json_value(filter)?),
+        ExportAction::Sql { .. } | ExportAction::Kv { .. } => None,
+    };
     let dsn = ctx.resolve_dsn()?;
     let connection = ctx.safety_target(&dsn);
     let conn = ctx.registry.connect(&dsn).await?;
@@ -317,7 +321,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
         }
         ExportAction::Doc {
             collection,
-            filter,
+            filter: _,
             out,
         } => {
             require_transfer_operation(&operations, CapabilityOperation::DocumentFind, &kind)?;
@@ -327,7 +331,9 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                     kind: kind.clone(),
                     needed: "DocumentStore",
                 })?;
-            let filter = parse_json_value(&filter)?;
+            let filter = document_filter.ok_or_else(|| {
+                Error::Internal("validated document export filter is missing".into())
+            })?;
             let options = FindOptions {
                 limit: Some(probe_limit),
                 ..Default::default()
@@ -505,10 +511,7 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             collection,
             documents,
         } => {
-            for operation in [
-                CapabilityOperation::DocumentFind,
-                CapabilityOperation::DocumentInsert,
-            ] {
+            for operation in document_import_operations(&documents) {
                 require_transfer_operation(&operations, operation, &kind)?;
             }
             let docs = conn
@@ -535,6 +538,21 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             )
         }
     })
+}
+
+fn document_import_operations(documents: &[Document]) -> Vec<CapabilityOperation> {
+    if documents.is_empty() {
+        return Vec::new();
+    }
+    let mut operations = Vec::with_capacity(2);
+    if documents
+        .iter()
+        .any(|document| document.contains_key("_id"))
+    {
+        operations.push(CapabilityOperation::DocumentFind);
+    }
+    operations.push(CapabilityOperation::DocumentInsert);
+    operations
 }
 
 fn require_transfer_operation(
@@ -1374,6 +1392,39 @@ mod tests {
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "partial-document" && needed == "document.insert"
         ));
+
+        assert!(document_import_operations(&[]).is_empty());
+        assert_eq!(
+            document_import_operations(&[Document::from([(
+                "name".to_owned(),
+                Value::Text("without-id".to_owned()),
+            )])]),
+            [CapabilityOperation::DocumentInsert]
+        );
+        assert_eq!(
+            document_import_operations(&[Document::from([("_id".to_owned(), Value::Int(1),)])]),
+            [
+                CapabilityOperation::DocumentFind,
+                CapabilityOperation::DocumentInsert
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_document_export_filter_fails_before_connection_resolution() {
+        let error = run_export(
+            &test_context(false),
+            ExportCmd {
+                action: ExportAction::Doc {
+                    collection: "users".to_owned(),
+                    filter: "{".to_owned(),
+                    out: PathBuf::from("unused.json"),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Serialization(_)));
     }
 
     #[test]
