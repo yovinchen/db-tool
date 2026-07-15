@@ -10,7 +10,7 @@ use dbtool_core::{
     },
     port::{
         capability::{AdminInspect, MessageConsumer, MessageProducer},
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
 };
 use futures::future::BoxFuture;
@@ -63,6 +63,15 @@ impl Connector for RskafkaAdapter {
             admin: true,
             ..Default::default()
         }
+    }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        let mut operations = self.capabilities().operations();
+        operations.extend([
+            CapabilityOperation::MessageAdminListTopics,
+            CapabilityOperation::MessageAdminTopicDetail,
+        ]);
+        operations
     }
 
     async fn ping(&self) -> Result<()> {
@@ -155,10 +164,15 @@ impl MessageConsumer for RskafkaAdapter {
             return Ok(vec![]);
         }
 
-        let topics = self.topic_infos().await?;
-        let Some(topic) = topics.into_iter().find(|topic| topic.name == source) else {
+        let deadline = consume_deadline(options.timeout)?;
+        let Some(remaining) = remaining_until(deadline) else {
             return Ok(vec![]);
         };
+        let topics = match tokio::time::timeout(remaining, self.topic_infos()).await {
+            Ok(result) => result?,
+            Err(_) => return Ok(vec![]),
+        };
+        let topic = require_topic(topics, source)?;
 
         let mut messages = Vec::new();
         let partitions = if let Some(partition) = options.partition {
@@ -166,9 +180,6 @@ impl MessageConsumer for RskafkaAdapter {
         } else {
             (0..topic.partitions).collect()
         };
-        let deadline = Instant::now().checked_add(options.timeout).ok_or_else(|| {
-            Error::Config("Kafka consume timeout is too large for this platform".to_owned())
-        })?;
 
         for partition in partitions {
             if messages.len() >= options.max {
@@ -364,6 +375,19 @@ fn kafka_timestamp(timestamp: Option<i64>) -> Result<DateTime<Utc>> {
     }
 }
 
+fn consume_deadline(timeout: Duration) -> Result<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        Error::Config("Kafka consume timeout is too large for this platform".to_owned())
+    })
+}
+
+fn require_topic(topics: Vec<TopicInfo>, name: &str) -> Result<TopicInfo> {
+    topics
+        .into_iter()
+        .find(|topic| topic.name == name)
+        .ok_or_else(|| Error::Query(format!("topic not found: {name}")))
+}
+
 fn remaining_until(deadline: Instant) -> Option<Duration> {
     deadline
         .checked_duration_since(Instant::now())
@@ -447,5 +471,13 @@ mod tests {
         let remaining = remaining_until(deadline).unwrap();
         assert!(remaining > Duration::ZERO);
         assert!(remaining <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn missing_topic_is_a_query_error() {
+        let error = require_topic(vec![], "missing-topic").unwrap_err();
+
+        assert!(matches!(error, Error::Query(_)));
+        assert!(error.to_string().contains("missing-topic"));
     }
 }

@@ -43,6 +43,11 @@ fn validate_produce_message(message: &Message) -> Result<()> {
 }
 
 fn validate_consume_position(partition: Option<i32>, offset: Option<i64>) -> Result<()> {
+    if offset.is_some() && partition.is_none() {
+        return Err(Error::Config(
+            "Kafka consume offset requires an explicit partition".to_owned(),
+        ));
+    }
     if partition.is_some_and(|partition| partition < 0) {
         return Err(Error::Config(
             "Kafka partition must be greater than or equal to zero".to_owned(),
@@ -101,5 +106,13 @@ mod tests {
         validate_produce_message(&message(Some(0), None)).unwrap();
         validate_consume_position(None, None).unwrap();
         validate_consume_position(Some(3), Some(42)).unwrap();
+    }
+
+    #[test]
+    fn consumer_offset_requires_explicit_partition() {
+        let error = validate_consume_position(None, Some(42)).unwrap_err();
+
+        assert!(matches!(error, Error::Config(_)));
+        assert!(error.to_string().contains("explicit partition"));
     }
 }
