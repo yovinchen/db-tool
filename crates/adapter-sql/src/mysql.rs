@@ -4,7 +4,7 @@ use dbtool_core::{
     model::{ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value},
     port::{
         capability::SqlEngine,
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
     service::limiter::ResultLimiter,
 };
@@ -15,8 +15,8 @@ use sqlx::{types::Json, Column, MySql, MySqlPool, Row};
 
 use crate::{
     group_index_rows,
-    identifier::{parse_table_ref, validate_optional_schema},
-    structured_json, timestamp_utc,
+    identifier::{parse_table_ref, validate_optional_schema, TableRef},
+    quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, mysql_value},
 };
 
@@ -49,6 +49,52 @@ fn bind_mysql_params<'q>(
     Ok(query)
 }
 
+async fn ensure_transactional_mysql_table(pool: &MySqlPool, table: &TableRef) -> Result<()> {
+    let row = if let Some(schema) = &table.schema {
+        sqlx::query(
+            "SELECT t.ENGINE, e.TRANSACTIONS \
+             FROM information_schema.TABLES t \
+             LEFT JOIN information_schema.ENGINES e ON e.ENGINE = t.ENGINE \
+             WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ? AND t.TABLE_TYPE = 'BASE TABLE'",
+        )
+        .bind(schema)
+        .bind(&table.name)
+        .fetch_optional(pool)
+        .await
+    } else {
+        sqlx::query(
+            "SELECT t.ENGINE, e.TRANSACTIONS \
+             FROM information_schema.TABLES t \
+             LEFT JOIN information_schema.ENGINES e ON e.ENGINE = t.ENGINE \
+             WHERE t.TABLE_SCHEMA = DATABASE() AND t.TABLE_NAME = ? \
+               AND t.TABLE_TYPE = 'BASE TABLE'",
+        )
+        .bind(&table.name)
+        .fetch_optional(pool)
+        .await
+    }
+    .map_err(|error| Error::Query(error.to_string()))?
+    .ok_or_else(|| {
+        Error::Query(format!(
+            "MySQL atomic insert target is not an existing base table: {}",
+            quoted_table(table, '`')
+        ))
+    })?;
+
+    let engine = mysql_optional_text(&row, 0)?
+        .ok_or_else(|| Error::Query("MySQL target table did not report a storage engine".into()))?;
+    let transactions = mysql_optional_text(&row, 1)?;
+    if !transactions
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("YES"))
+    {
+        return Err(Error::Query(format!(
+            "MySQL storage engine {engine} does not guarantee transactions; atomic insert refused before writing"
+        )));
+    }
+    Ok(())
+}
+
 pub fn mysql_factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
         let driver_url = dsn.raw_with_scheme("mysql")?;
@@ -73,6 +119,12 @@ impl Connector for MySqlAdapter {
             sql: true,
             ..Default::default()
         }
+    }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        let mut operations = CapabilityOperation::SQL.to_vec();
+        operations.push(CapabilityOperation::SqlInsertRowsAtomic);
+        operations
     }
 
     async fn ping(&self) -> Result<()> {
@@ -214,6 +266,79 @@ impl SqlEngine for MySqlAdapter {
             rows_affected: result.rows_affected(),
             last_insert_id: Some(result.last_insert_id()),
         })
+    }
+
+    async fn insert_rows_atomic(
+        &self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+    ) -> Result<u64> {
+        let table = validate_atomic_insert(table, columns, rows)?;
+        ensure_transactional_mysql_table(&self.pool, &table).await?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let statement = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            quoted_table(&table, '`'),
+            columns
+                .iter()
+                .map(|column| quoted_identifier(column, '`'))
+                .collect::<Vec<_>>()
+                .join(", "),
+            vec!["?"; columns.len()].join(", ")
+        );
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+
+        for row in rows {
+            let query = match bind_mysql_params(&statement, row) {
+                Ok(query) => query,
+                Err(error) => {
+                    return match transaction.rollback().await {
+                        Ok(()) => Err(error),
+                        Err(rollback) => Err(Error::Query(format!(
+                            "{error}; MySQL transaction rollback also failed: {rollback}"
+                        ))),
+                    };
+                }
+            };
+            let result = match query.execute(&mut *transaction).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return match transaction.rollback().await {
+                        Ok(()) => Err(Error::Query(error.to_string())),
+                        Err(rollback) => Err(Error::Query(format!(
+                            "{error}; MySQL transaction rollback also failed: {rollback}"
+                        ))),
+                    };
+                }
+            };
+            if result.rows_affected() != 1 {
+                let error = Error::Query(format!(
+                    "atomic MySQL insert expected one affected row, got {}",
+                    result.rows_affected()
+                ));
+                return match transaction.rollback().await {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(Error::Query(format!(
+                        "{error}; MySQL transaction rollback also failed: {rollback}"
+                    ))),
+                };
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        u64::try_from(rows.len())
+            .map_err(|_| Error::Internal("MySQL inserted row count exceeded u64".into()))
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
@@ -448,5 +573,138 @@ mod tests {
             .any(|item| item.name == table && item.schema.as_deref() == Some(schema.as_str())));
         assert!(described.columns[0].primary_key);
         assert_eq!(described.columns[1].default_value.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn mysql_live_atomic_insert_rolls_back_typed_rows_and_rejects_myisam() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MYSQL_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = format!("dbtool_atomic_{suffix}");
+        let myisam = format!("dbtool_atomic_myisam_{suffix}");
+        let connector = mysql_factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlInsertRowsAtomic));
+        let sql = connector.as_sql().unwrap();
+        sql.execute(
+            &format!(
+                "CREATE TABLE {table} (\
+                    id bigint PRIMARY KEY, note text NOT NULL, payload blob NOT NULL, \
+                    happened_at datetime(3) NOT NULL, metadata json NOT NULL) ENGINE=InnoDB"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+        sql.execute(
+            &format!("CREATE TABLE {myisam} (id bigint PRIMARY KEY) ENGINE=MyISAM"),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let columns = vec![
+            "id".into(),
+            "note".into(),
+            "payload".into(),
+            "happened_at".into(),
+            "metadata".into(),
+        ];
+        let timestamp = 1_700_000_000_123;
+        let injection = "O'Reilly'); drop table dbtool_atomic; --";
+        let exercise = async {
+            let error = sql
+                .insert_rows_atomic(
+                    &table,
+                    &columns,
+                    &[
+                        vec![
+                            Value::Int(1),
+                            Value::Text(injection.into()),
+                            Value::Bytes(vec![0, 127, 255]),
+                            Value::Timestamp(timestamp),
+                            Value::Json(serde_json::json!({"attempt": 1})),
+                        ],
+                        vec![
+                            Value::Int(1),
+                            Value::Text("duplicate".into()),
+                            Value::Bytes(vec![1]),
+                            Value::Timestamp(timestamp),
+                            Value::Json(serde_json::json!({"attempt": 2})),
+                        ],
+                    ],
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Query(_)));
+            let empty = sql
+                .query(&format!("SELECT count(*) AS total FROM {table}"), &[])
+                .await?;
+            assert_eq!(empty.rows[0][0], Value::Int(0));
+
+            assert_eq!(
+                sql.insert_rows_atomic(
+                    &table,
+                    &columns,
+                    &[vec![
+                        Value::Int(2),
+                        Value::Text(injection.into()),
+                        Value::Bytes(vec![0, 127, 255]),
+                        Value::Timestamp(timestamp),
+                        Value::Json(serde_json::json!({"kept": true})),
+                    ]],
+                )
+                .await?,
+                1
+            );
+            let row = sql
+                .query(
+                    &format!(
+                        "SELECT note, payload, happened_at, metadata FROM {table} WHERE id = 2"
+                    ),
+                    &[],
+                )
+                .await?;
+            assert_eq!(row.rows[0][0], Value::Text(injection.into()));
+            assert_eq!(row.rows[0][1], Value::Bytes(vec![0, 127, 255]));
+            assert_eq!(row.rows[0][2], Value::Timestamp(timestamp));
+            assert_eq!(
+                row.rows[0][3],
+                Value::Json(serde_json::json!({"kept": true}))
+            );
+
+            let error = sql
+                .insert_rows_atomic(&myisam, &["id".into()], &[vec![Value::Int(1)]])
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::Query(message)
+                    if message.contains("does not guarantee transactions")
+            ));
+            assert!(matches!(
+                sql.insert_rows_atomic(&myisam, &["id".into()], &[])
+                    .await,
+                Err(Error::Query(message))
+                    if message.contains("does not guarantee transactions")
+            ));
+            let myisam_empty = sql
+                .query(&format!("SELECT count(*) AS total FROM {myisam}"), &[])
+                .await?;
+            assert_eq!(myisam_empty.rows[0][0], Value::Int(0));
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        let cleanup_myisam = sql.execute(&format!("DROP TABLE {myisam}"), &[]).await;
+        let cleanup_table = sql.execute(&format!("DROP TABLE {table}"), &[]).await;
+        cleanup_myisam.unwrap();
+        cleanup_table.unwrap();
+        exercise.unwrap();
     }
 }

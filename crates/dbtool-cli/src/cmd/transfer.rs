@@ -3,7 +3,7 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     model::{Document, FindOptions, ResultSet, Value},
-    port::capability::SetOptions,
+    port::{capability::SetOptions, CapabilityOperation},
     service::{
         limiter::ResultLimiter,
         safety::{SafetyGuard, StatementKind},
@@ -70,7 +70,7 @@ pub enum ExportAction {
 #[derive(Args)]
 #[command(
     about = "Import a dbtool JSON artifact into a backend.",
-    long_about = "Import commands are write operations and require --allow-write before reading the artifact, resolving the DSN, or connecting. They read at most 256 MiB, process at most the global --limit item budget, and accept only current, internally consistent, complete dbtool artifacts. SQL currently inserts one row per request; KV and document adapters likewise do not expose a cross-request transaction contract. Successful responses therefore report atomic=false."
+    long_about = "Import commands are write operations and require --allow-write before reading the artifact, resolving the DSN, or connecting. They read at most 256 MiB, process at most the global --limit item budget, and accept only current, internally consistent, complete dbtool artifacts. SQLite, PostgreSQL, and MySQL SQL imports bind every value and commit the complete batch in one transaction, reporting atomic=true. Other SQL adapters reject that optional capability explicitly. KV and document imports do not expose a portable cross-request transaction contract and report atomic=false."
 )]
 pub struct ImportCmd {
     #[command(subcommand)]
@@ -80,6 +80,9 @@ pub struct ImportCmd {
 #[derive(Subcommand)]
 pub enum ImportAction {
     /// Import sql-rows into an existing table.
+    #[command(
+        long_about = "Import a complete sql-rows artifact into an existing table. The target adapter must advertise sql.insert_rows_atomic. Every value is sent as a bound parameter and all rows commit in one transaction; any bind, constraint, or affected-row error rolls back the complete batch."
+    )]
     Sql {
         /// Target table. Use a safe table or schema.table identifier.
         #[arg(long)]
@@ -378,29 +381,27 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             columns,
             rows,
         } => {
+            if !conn
+                .operations()
+                .contains(&CapabilityOperation::SqlInsertRowsAtomic)
+            {
+                return Err(Error::UnsupportedCapability {
+                    kind: kind.clone(),
+                    needed: "sql.insert_rows_atomic",
+                });
+            }
             let sql = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "SqlEngine",
             })?;
-            let statement_prefix = format!("INSERT INTO {table} ({}) VALUES ", columns.join(", "));
-            let mut inserted = 0_u64;
-            for row in rows {
-                let values = row
-                    .iter()
-                    .map(sql_literal)
-                    .collect::<Result<Vec<_>>>()?
-                    .join(", ");
-                sql.execute(&format!("{statement_prefix}({values})"), &[])
-                    .await?;
-                inserted += 1;
-            }
+            let inserted = sql.insert_rows_atomic(&table, &columns, &rows).await?;
             ctx.render_success(
                 &kind,
                 serde_json::json!({
                     "kind": "sql-rows",
                     "inserted": inserted,
                     "table": table,
-                    "atomic": false,
+                    "atomic": true,
                 }),
                 elapsed(),
                 false,
@@ -643,9 +644,6 @@ fn prepare_import(
                         row.len(),
                         columns.len()
                     )));
-                }
-                for value in row {
-                    sql_literal(value)?;
                 }
             }
             Ok(PreparedImport::Sql {
@@ -1133,6 +1131,16 @@ fn canonical_document_id(id: &Value) -> Result<serde_json::Value> {
     })
 }
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn canonical_json_document_id(value: &serde_json::Value) -> Result<serde_json::Value> {
     Ok(match value {
         serde_json::Value::Null => serde_json::json!({"type": "null"}),
@@ -1252,43 +1260,6 @@ fn validate_identifier_path(value: &str, label: &str) -> Result<String> {
         .map(|parts| parts.join("."))
 }
 
-fn sql_literal(value: &Value) -> Result<String> {
-    Ok(match value {
-        Value::Null => "NULL".to_owned(),
-        Value::Bool(value) => value.to_string(),
-        Value::Int(value) | Value::Timestamp(value) => value.to_string(),
-        Value::Float(value) => {
-            if !value.is_finite() {
-                return Err(Error::Serialization(
-                    "non-finite floats cannot be imported into SQL".to_owned(),
-                ));
-            }
-            value.to_string()
-        }
-        Value::Text(value) => quote_sql_string(value),
-        Value::Bytes(value) => format!("X'{}'", bytes_to_hex(value)),
-        Value::Json(value) => quote_sql_string(&value.to_string()),
-        Value::Array(_) | Value::Map(_) => quote_sql_string(
-            &serde_json::to_string(&value.to_plain_json()?)
-                .map_err(|e| Error::Serialization(e.to_string()))?,
-        ),
-    })
-}
-
-fn quote_sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1353,23 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_literals_escape_values_and_validate_identifiers() {
-        assert_eq!(
-            sql_literal(&Value::Text("O'Reilly".to_owned())).unwrap(),
-            "'O''Reilly'"
-        );
-        assert_eq!(sql_literal(&Value::Bytes(vec![0, 255])).unwrap(), "X'00ff'");
-        assert_eq!(
-            sql_literal(&Value::Array(vec![
-                Value::Int(1),
-                Value::Map(std::collections::BTreeMap::from([(
-                    "nested".to_owned(),
-                    Value::Bool(true),
-                )])),
-            ]))
-            .unwrap(),
-            "'[1,{\"nested\":true}]'"
-        );
+    fn sql_import_validates_identifiers_without_rendering_value_literals() {
         assert_eq!(
             validate_identifier_path("main.people", "table").unwrap(),
             "main.people"

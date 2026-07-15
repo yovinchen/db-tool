@@ -4,7 +4,7 @@ use dbtool_core::{
     model::{ColumnMeta, ExecOutcome, ResultSet, TableInfo, TableKind, TableSchema, Value},
     port::{
         capability::SqlEngine,
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
     service::limiter::ResultLimiter,
 };
@@ -18,7 +18,7 @@ use sqlx::{types::Json, Column, Encode, PgPool, Postgres, Row, Type};
 use crate::{
     group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
-    structured_json, timestamp_utc,
+    quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, postgres_value},
 };
 
@@ -91,6 +91,12 @@ impl Connector for PostgresAdapter {
             sql: true,
             ..Default::default()
         }
+    }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        let mut operations = CapabilityOperation::SQL.to_vec();
+        operations.push(CapabilityOperation::SqlInsertRowsAtomic);
+        operations
     }
 
     async fn ping(&self) -> Result<()> {
@@ -231,6 +237,81 @@ impl SqlEngine for PostgresAdapter {
             rows_affected: result.rows_affected(),
             last_insert_id: None,
         })
+    }
+
+    async fn insert_rows_atomic(
+        &self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+    ) -> Result<u64> {
+        let table = validate_atomic_insert(table, columns, rows)?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let placeholders = (1..=columns.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = format!(
+            "INSERT INTO {} ({}) VALUES ({placeholders})",
+            quoted_table(&table, '"'),
+            columns
+                .iter()
+                .map(|column| quoted_identifier(column, '"'))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+
+        for row in rows {
+            let query = match bind_postgres_params(&statement, row) {
+                Ok(query) => query,
+                Err(error) => {
+                    return match transaction.rollback().await {
+                        Ok(()) => Err(error),
+                        Err(rollback) => Err(Error::Query(format!(
+                            "{error}; PostgreSQL transaction rollback also failed: {rollback}"
+                        ))),
+                    };
+                }
+            };
+            let result = match query.execute(&mut *transaction).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return match transaction.rollback().await {
+                        Ok(()) => Err(Error::Query(error.to_string())),
+                        Err(rollback) => Err(Error::Query(format!(
+                            "{error}; PostgreSQL transaction rollback also failed: {rollback}"
+                        ))),
+                    };
+                }
+            };
+            if result.rows_affected() != 1 {
+                let error = Error::Query(format!(
+                    "atomic PostgreSQL insert expected one affected row, got {}",
+                    result.rows_affected()
+                ));
+                return match transaction.rollback().await {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(Error::Query(format!(
+                        "{error}; PostgreSQL transaction rollback also failed: {rollback}"
+                    ))),
+                };
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        u64::try_from(rows.len())
+            .map_err(|_| Error::Internal("PostgreSQL inserted row count exceeded u64".into()))
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
@@ -587,5 +668,111 @@ mod tests {
         assert!(tables
             .iter()
             .any(|item| { item.name == view && item.kind == TableKind::MaterializedView }));
+    }
+
+    #[tokio::test]
+    async fn postgres_live_atomic_insert_rolls_back_and_preserves_typed_values() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_POSTGRES_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = format!("dbtool_atomic_{suffix}");
+        let connector = postgres_factory(Dsn::parse(&raw_dsn).unwrap())
+            .await
+            .unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlInsertRowsAtomic));
+        let sql = connector.as_sql().unwrap();
+        sql.execute(
+            &format!(
+                "CREATE TABLE {table} (\
+                    id bigint PRIMARY KEY, note text NOT NULL, payload bytea NOT NULL, \
+                    happened_at timestamptz NOT NULL, metadata jsonb NOT NULL)"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let columns = vec![
+            "id".into(),
+            "note".into(),
+            "payload".into(),
+            "happened_at".into(),
+            "metadata".into(),
+        ];
+        let timestamp = 1_700_000_000_123;
+        let injection = "O'Reilly'); drop table dbtool_atomic; --";
+        let exercise = async {
+            let error = sql
+                .insert_rows_atomic(
+                    &table,
+                    &columns,
+                    &[
+                        vec![
+                            Value::Int(1),
+                            Value::Text(injection.into()),
+                            Value::Bytes(vec![0, 127, 255]),
+                            Value::Timestamp(timestamp),
+                            Value::Json(serde_json::json!({"attempt": 1})),
+                        ],
+                        vec![
+                            Value::Int(1),
+                            Value::Text("duplicate".into()),
+                            Value::Bytes(vec![1]),
+                            Value::Timestamp(timestamp),
+                            Value::Json(serde_json::json!({"attempt": 2})),
+                        ],
+                    ],
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Query(_)));
+            let empty = sql
+                .query(&format!("SELECT count(*) AS total FROM {table}"), &[])
+                .await?;
+            assert_eq!(empty.rows[0][0], Value::Int(0));
+
+            assert_eq!(
+                sql.insert_rows_atomic(
+                    &table,
+                    &columns,
+                    &[vec![
+                        Value::Int(2),
+                        Value::Text(injection.into()),
+                        Value::Bytes(vec![0, 127, 255]),
+                        Value::Timestamp(timestamp),
+                        Value::Json(serde_json::json!({"kept": true})),
+                    ]],
+                )
+                .await?,
+                1
+            );
+            let row = sql
+                .query(
+                    &format!(
+                        "SELECT note, payload, happened_at, metadata FROM {table} WHERE id = 2"
+                    ),
+                    &[],
+                )
+                .await?;
+            assert_eq!(row.rows[0][0], Value::Text(injection.into()));
+            assert_eq!(row.rows[0][1], Value::Bytes(vec![0, 127, 255]));
+            assert_eq!(row.rows[0][2], Value::Timestamp(timestamp));
+            assert_eq!(
+                row.rows[0][3],
+                Value::Json(serde_json::json!({"kept": true}))
+            );
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        let cleanup = sql.execute(&format!("DROP TABLE {table}"), &[]).await;
+        cleanup.unwrap();
+        exercise.unwrap();
     }
 }

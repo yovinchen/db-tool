@@ -33,6 +33,25 @@ pub trait SqlEngine: Connector {
         max_rows: usize,
     ) -> Result<ResultSet>;
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome>;
+    /// Insert a complete row batch using bound parameters in one transaction.
+    ///
+    /// This is an optional capability. Implementations must validate the target
+    /// identifiers and every row width independently of the caller, require
+    /// exactly one affected row per input row, and roll back the whole batch on
+    /// any error. Connectors that implement it must explicitly advertise
+    /// `sql.insert_rows_atomic`; the coarse `sql=true` capability never implies
+    /// this stronger transactional contract.
+    async fn insert_rows_atomic(
+        &self,
+        _table: &str,
+        _columns: &[String],
+        _rows: &[Vec<Value>],
+    ) -> Result<u64> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SqlEngine.insert_rows_atomic",
+        })
+    }
     /// Return the complete schema catalog visible to this connection.
     ///
     /// The current portable metadata API has no server-side page argument.
@@ -198,4 +217,91 @@ pub trait Db2Engine: Connector {
     async fn list_foreign_keys(&self, table: &str) -> Result<Vec<ForeignKeyInfo>>;
     /// Generate a CREATE TABLE DDL statement from the Db2 catalog.
     async fn generate_ddl(&self, table: &str) -> Result<String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        port::{Capabilities, CapabilityOperation, ConnectorKind},
+        Error,
+    };
+
+    struct LegacySql;
+
+    #[async_trait]
+    impl Connector for LegacySql {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind("legacy-sql".into())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                sql: true,
+                ..Default::default()
+            }
+        }
+
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        fn as_sql(&self) -> Option<&dyn SqlEngine> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl SqlEngine for LegacySql {
+        async fn query(&self, _sql: &str, _params: &[Value]) -> Result<ResultSet> {
+            Ok(ResultSet::empty())
+        }
+
+        async fn query_bounded(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+            _max_rows: usize,
+        ) -> Result<ResultSet> {
+            Ok(ResultSet::empty())
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<ExecOutcome> {
+            Ok(ExecOutcome {
+                rows_affected: 0,
+                last_insert_id: None,
+            })
+        }
+
+        async fn list_schemas(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_tables(&self, _schema: Option<&str>) -> Result<Vec<TableInfo>> {
+            Ok(vec![])
+        }
+
+        async fn describe_table(&self, _table: &str) -> Result<TableSchema> {
+            Err(Error::Query("unused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_sql_connectors_do_not_claim_or_inherit_atomic_import() {
+        let connector = LegacySql;
+        assert!(!connector
+            .operations()
+            .contains(&CapabilityOperation::SqlInsertRowsAtomic));
+        assert!(matches!(
+            connector
+                .insert_rows_atomic("target", &["id".into()], &[vec![Value::Int(1)]])
+                .await,
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-sql" && needed == "SqlEngine.insert_rows_atomic"
+        ));
+    }
 }

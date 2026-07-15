@@ -6,7 +6,7 @@ use dbtool_core::{
     },
     port::{
         capability::SqlEngine,
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
     service::limiter::ResultLimiter,
 };
@@ -17,7 +17,7 @@ use sqlx::{types::Json, Column, Row, Sqlite, SqlitePool};
 
 use crate::{
     identifier::{parse_table_ref, validate_optional_schema},
-    structured_json, timestamp_utc,
+    quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, sqlite_value},
 };
 
@@ -70,6 +70,12 @@ impl Connector for SqliteAdapter {
             sql: true,
             ..Default::default()
         }
+    }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        let mut operations = CapabilityOperation::SQL.to_vec();
+        operations.push(CapabilityOperation::SqlInsertRowsAtomic);
+        operations
     }
 
     async fn ping(&self) -> Result<()> {
@@ -187,6 +193,78 @@ impl SqlEngine for SqliteAdapter {
             rows_affected: r.rows_affected(),
             last_insert_id: Some(r.last_insert_rowid() as u64),
         })
+    }
+
+    async fn insert_rows_atomic(
+        &self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+    ) -> Result<u64> {
+        let table = validate_atomic_insert(table, columns, rows)?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let statement = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            quoted_table(&table, '"'),
+            columns
+                .iter()
+                .map(|column| quoted_identifier(column, '"'))
+                .collect::<Vec<_>>()
+                .join(", "),
+            vec!["?"; columns.len()].join(", ")
+        );
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+
+        for row in rows {
+            let query = match bind_sqlite_params(&statement, row) {
+                Ok(query) => query,
+                Err(error) => {
+                    return match transaction.rollback().await {
+                        Ok(()) => Err(error),
+                        Err(rollback) => Err(Error::Query(format!(
+                            "{error}; SQLite transaction rollback also failed: {rollback}"
+                        ))),
+                    };
+                }
+            };
+            let result = match query.execute(&mut *transaction).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return match transaction.rollback().await {
+                        Ok(()) => Err(Error::Query(error.to_string())),
+                        Err(rollback) => Err(Error::Query(format!(
+                            "{error}; SQLite transaction rollback also failed: {rollback}"
+                        ))),
+                    };
+                }
+            };
+            if result.rows_affected() != 1 {
+                let error = Error::Query(format!(
+                    "atomic SQLite insert expected one affected row, got {}",
+                    result.rows_affected()
+                ));
+                return match transaction.rollback().await {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(Error::Query(format!(
+                        "{error}; SQLite transaction rollback also failed: {rollback}"
+                    ))),
+                };
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        u64::try_from(rows.len())
+            .map_err(|_| Error::Internal("SQLite inserted row count exceeded u64".into()))
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
@@ -690,6 +768,77 @@ mod tests {
 
         assert_eq!(rows.rows[0][0], Value::Int(1_700_000_000_000));
         assert_eq!(rows.rows[0][1], Value::Int(7));
+    }
+
+    #[tokio::test]
+    async fn sqlite_atomic_insert_binds_injection_text_and_rolls_back_every_row() {
+        let connector = memory_sqlite().await;
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlInsertRowsAtomic));
+        let sql = connector.as_sql().unwrap();
+
+        sql.execute(
+            "create table atomic_rows (id integer primary key, note text not null)",
+            &[],
+        )
+        .await
+        .unwrap();
+        let injection = "O'Reilly'); drop table atomic_rows; --";
+        let error = sql
+            .insert_rows_atomic(
+                "atomic_rows",
+                &["id".into(), "note".into()],
+                &[
+                    vec![Value::Int(1), Value::Text(injection.into())],
+                    vec![Value::Int(1), Value::Text("duplicate".into())],
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Query(_)));
+
+        let empty = sql
+            .query("select count(*) as total from atomic_rows", &[])
+            .await
+            .unwrap();
+        assert_eq!(empty.rows[0][0], Value::Int(0));
+
+        assert_eq!(
+            sql.insert_rows_atomic(
+                "atomic_rows",
+                &["id".into(), "note".into()],
+                &[vec![Value::Int(2), Value::Text(injection.into())]],
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let preserved = sql
+            .query("select note from atomic_rows where id = 2", &[])
+            .await
+            .unwrap();
+        assert_eq!(preserved.rows[0][0], Value::Text(injection.into()));
+
+        for (table, columns, rows) in [
+            ("bad-table", vec!["id".into()], vec![vec![Value::Int(3)]]),
+            ("atomic_rows", Vec::new(), vec![Vec::new()]),
+            (
+                "atomic_rows",
+                vec!["id".into(), "ID".into()],
+                vec![vec![Value::Int(3), Value::Int(4)]],
+            ),
+            (
+                "atomic_rows",
+                vec!["id".into(), "note".into()],
+                vec![vec![Value::Int(3)]],
+            ),
+        ] {
+            assert!(sql
+                .insert_rows_atomic(table, &columns, &rows)
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]

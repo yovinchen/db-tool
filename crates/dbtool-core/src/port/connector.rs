@@ -37,6 +37,7 @@ capability_operations! {
     SqlQuery => "sql.query",
     SqlQueryBounded => "sql.query_bounded",
     SqlExecute => "sql.execute",
+    SqlInsertRowsAtomic => "sql.insert_rows_atomic",
     SqlListSchemas => "sql.list_schemas",
     SqlListTables => "sql.list_tables",
     SqlDescribeTable => "sql.describe_table",
@@ -443,13 +444,19 @@ mod tests {
         let expected = CapabilityOperation::ALL
             .iter()
             .copied()
-            .filter(|operation| !CapabilityOperation::MESSAGE_ADMIN.contains(operation))
+            .filter(|operation| {
+                !CapabilityOperation::MESSAGE_ADMIN.contains(operation)
+                    && *operation != CapabilityOperation::SqlInsertRowsAtomic
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(connector.operations(), expected);
         assert!(CapabilityOperation::MESSAGE_ADMIN
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
+        assert!(!connector
+            .operations()
+            .contains(&CapabilityOperation::SqlInsertRowsAtomic));
 
         let admin_only = LegacyConnector(Capabilities {
             admin: true,

@@ -13,6 +13,61 @@ use dbtool_core::{
     error::{Error, Result},
     model::{IndexInfo, Value},
 };
+use std::collections::BTreeSet;
+
+use crate::identifier::{parse_table_ref, validate_identifier, TableRef};
+
+pub(crate) fn validate_atomic_insert(
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Value>],
+) -> Result<TableRef> {
+    let table = parse_table_ref(table)?;
+    if columns.is_empty() {
+        return Err(Error::Query(
+            "atomic SQL insert requires at least one target column".into(),
+        ));
+    }
+
+    let mut normalized = BTreeSet::new();
+    for column in columns {
+        validate_identifier(column)?;
+        if !normalized.insert(column.to_ascii_lowercase()) {
+            return Err(Error::Query(format!(
+                "duplicate SQL insert column: {column}"
+            )));
+        }
+    }
+
+    for (index, row) in rows.iter().enumerate() {
+        if row.len() != columns.len() {
+            return Err(Error::Query(format!(
+                "atomic SQL insert row {} has {} values but {} columns were supplied",
+                index + 1,
+                row.len(),
+                columns.len()
+            )));
+        }
+    }
+
+    Ok(table)
+}
+
+pub(crate) fn quoted_identifier(identifier: &str, quote: char) -> String {
+    debug_assert!(matches!(quote, '"' | '`'));
+    format!("{quote}{identifier}{quote}")
+}
+
+pub(crate) fn quoted_table(table: &TableRef, quote: char) -> String {
+    match &table.schema {
+        Some(schema) => format!(
+            "{}.{}",
+            quoted_identifier(schema, quote),
+            quoted_identifier(&table.name, quote)
+        ),
+        None => quoted_identifier(&table.name, quote),
+    }
+}
 
 pub(crate) fn timestamp_utc(value: i64, position: usize, backend: &str) -> Result<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(value).ok_or_else(|| {

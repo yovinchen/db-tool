@@ -31,7 +31,7 @@ successful service run are intentionally different states.
 
 | Family | Required operations for a complete result |
 | --- | --- |
-| SQL | ping/caps, schemas/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/index metadata, typed values, limit/truncation, write guard/confirm, cleanup |
+| SQL | ping/caps, schemas/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/index metadata, typed values, limit/truncation, bound-parameter import with whole-batch rollback where advertised, write guard/confirm, cleanup |
 | CQL | ping/caps, keyspaces/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/primary-key metadata, typed values, limit, write guard, cleanup |
 | KV/cache | ping/caps, SET, GET, overwrite, TTL, exact N/N+1 SCAN, multi-page/error propagation, raw read, raw write guard, DELETE, post-delete read, cleanup |
 | Document | ping/caps, collections, INSERT, FIND, UPDATE, aggregate, targeted DELETE, empty result verification, cleanup |
@@ -48,9 +48,9 @@ and test-hardening commits remain listed inside each evidence file.
 
 | Task | Family | Product / scheme | Environment | Harness | Live result | Evidence | Commit / boundary |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DB-SQLITE-001 | SQL | SQLite `sqlite:` | service-free | Ready | COMPLETE | `docs/test-evidence/sqlite.md` | `d6bd18b` |
-| DB-POSTGRES-001 | SQL | PostgreSQL `postgres://` | Docker base | Ready | COMPLETE | `docs/test-evidence/postgresql.md` | `fe7cfb9` |
-| DB-MYSQL-001 | SQL | MySQL `mysql://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mysql.md` | `fe7cfb9` |
+| DB-SQLITE-001 | SQL | SQLite `sqlite:` | service-free | Ready | COMPLETE | `docs/test-evidence/sqlite.md` | `d6bd18b`, IF-T58 atomic import refresh |
+| DB-POSTGRES-001 | SQL | PostgreSQL `postgres://` | Docker base | Ready | COMPLETE | `docs/test-evidence/postgresql.md` | `fe7cfb9`, IF-T58 atomic import refresh |
+| DB-MYSQL-001 | SQL | MySQL `mysql://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mysql.md` | `fe7cfb9`, IF-T58 atomic/MyISAM refresh |
 | DB-MARIADB-001 | SQL | MariaDB `mariadb://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/mariadb.md` | `6f423fb` |
 | DB-TIDB-001 | SQL | TiDB `tidb://` | Docker tidb | Ready | COMPLETE | `docs/test-evidence/tidb.md` | `4c2faa8`; basic, secure, transfer, TiProxy, SQL/PD resilience, TiKV boundary, and cold cert regeneration passed |
 | DB-COCKROACH-001 | SQL | CockroachDB `cockroach://` | Docker pg-compat | Ready | COMPLETE | `docs/test-evidence/cockroachdb.md` | `a776d20`; single-node insecure SQL surface |

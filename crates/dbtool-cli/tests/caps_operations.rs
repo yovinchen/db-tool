@@ -29,6 +29,7 @@ fn caps_preserves_legacy_booleans_and_adds_sorted_sql_operations() {
         serde_json::json!([
             "sql.describe_table",
             "sql.execute",
+            "sql.insert_rows_atomic",
             "sql.list_schemas",
             "sql.list_tables",
             "sql.query",

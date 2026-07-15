@@ -164,6 +164,14 @@ fn cli_help_documents_core_command_families() {
 }
 
 #[test]
+fn sql_import_help_documents_the_atomic_bound_parameter_contract() {
+    let help = stdout_text(&dbtool(&["import", "sql", "--help"]));
+    assert!(help.contains("sql.insert_rows_atomic"));
+    assert!(help.contains("bound parameter"));
+    assert!(help.contains("one transaction"));
+}
+
+#[test]
 fn sql_query_help_omits_the_dead_schema_option() {
     let help = stdout_text(&dbtool(&["sql", "query", "--help"]));
     assert!(help.contains("--params"));
@@ -309,6 +317,7 @@ fn export_import_sql_round_trips_sqlite_rows() {
         &export_arg,
     ]));
     assert_eq!(imported["data"]["inserted"], 2);
+    assert_eq!(imported["data"]["atomic"], true);
 
     let rows = stdout_json(&dbtool(&[
         "--dsn",
@@ -319,6 +328,62 @@ fn export_import_sql_round_trips_sqlite_rows() {
     ]));
     assert_eq!(rows["data"]["rows"][0][0], "alice");
     assert_eq!(rows["data"]["rows"][1][0], "bob");
+
+    cleanup_dir(&root);
+}
+
+#[test]
+fn sql_import_rolls_back_the_complete_sqlite_artifact_on_late_constraint_error() {
+    let root = std::env::temp_dir().join(format!(
+        "dbtool-cli-atomic-import-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    fs::create_dir_all(&root).expect("temporary directory should be created");
+    let db_file = root.join("atomic.db");
+    fs::File::create(&db_file).expect("sqlite db file should be created");
+    let artifact = root.join("rows.json");
+    let dsn = format!("sqlite://{}", db_file.display());
+    let injection = "O'Reilly'); drop table atomic_rows; --";
+
+    confirmed_sql_exec(
+        &dsn,
+        "create table atomic_rows (id integer primary key, note text not null)",
+    );
+    fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "kind": "sql-rows",
+            "version": 3,
+            "columns": ["id", "note"],
+            "rows": [[1, injection], [1, "duplicate"]],
+            "truncated": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let rejected = stderr_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "import",
+        "sql",
+        "--table",
+        "atomic_rows",
+        "--input",
+        &artifact.to_string_lossy(),
+    ]));
+    assert_eq!(rejected["error"]["code"], "QUERY_ERROR");
+
+    let count = stdout_json(&dbtool(&[
+        "--dsn",
+        &dsn,
+        "sql",
+        "query",
+        "select count(*) as total from atomic_rows",
+    ]));
+    assert_eq!(count["data"]["rows"][0][0], 0);
 
     cleanup_dir(&root);
 }
