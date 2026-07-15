@@ -62,6 +62,10 @@ capability_operations! {
     DocumentInsert => "document.insert",
     DocumentUpdate => "document.update",
     DocumentDelete => "document.delete",
+    DocumentUpdateOne => "document.update_one",
+    DocumentUpdateMany => "document.update_many",
+    DocumentDeleteOne => "document.delete_one",
+    DocumentDeleteMany => "document.delete_many",
     DocumentAggregate => "document.aggregate",
     DocumentAggregateBounded => "document.aggregate_bounded",
     DocumentDropCollection => "document.drop_collection",
@@ -447,6 +451,13 @@ mod tests {
             .filter(|operation| {
                 !CapabilityOperation::MESSAGE_ADMIN.contains(operation)
                     && *operation != CapabilityOperation::SqlInsertRowsAtomic
+                    && ![
+                        CapabilityOperation::DocumentUpdateOne,
+                        CapabilityOperation::DocumentUpdateMany,
+                        CapabilityOperation::DocumentDeleteOne,
+                        CapabilityOperation::DocumentDeleteMany,
+                    ]
+                    .contains(operation)
             })
             .collect::<Vec<_>>();
 
@@ -457,6 +468,14 @@ mod tests {
         assert!(!connector
             .operations()
             .contains(&CapabilityOperation::SqlInsertRowsAtomic));
+        for operation in [
+            CapabilityOperation::DocumentUpdateOne,
+            CapabilityOperation::DocumentUpdateMany,
+            CapabilityOperation::DocumentDeleteOne,
+            CapabilityOperation::DocumentDeleteMany,
+        ] {
+            assert!(!connector.operations().contains(&operation));
+        }
 
         let admin_only = LegacyConnector(Capabilities {
             admin: true,

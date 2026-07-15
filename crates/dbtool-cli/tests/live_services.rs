@@ -1788,6 +1788,18 @@ fn mongo_live_document_lifecycle() {
 
     let caps = stdout_json(dbtool(&["--dsn", &dsn, "caps"]));
     assert_eq!(caps["data"]["document"], true);
+    for operation in [
+        "document.update_one",
+        "document.update_many",
+        "document.delete_one",
+        "document.delete_many",
+    ] {
+        assert!(caps["data"]["operations"]
+            .as_array()
+            .expect("MongoDB operations should be an array")
+            .iter()
+            .any(|value| value.as_str() == Some(operation)));
+    }
 
     let blocked_insert = stderr_json(dbtool(&[
         "--dsn",
@@ -1982,7 +1994,7 @@ fn mongo_live_document_lifecycle() {
         "--filter",
         "{}",
     ]));
-    assert_eq!(unbounded_delete["error"]["code"], "QUERY_ERROR");
+    assert_eq!(unbounded_delete["error"]["code"], "CONFIG_ERROR");
 
     let deleted_bob = stdout_json(dbtool(&[
         "--dsn",

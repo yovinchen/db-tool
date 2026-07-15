@@ -119,8 +119,32 @@ dbtool --dsn "$MONGO_DSN" --allow-write \
   doc delete users --filter '{"id":42}'
 ```
 
-`update` 和 `delete` 都拒绝空过滤器 `{}`。如需全量变更，应使用显式、可审计的
-匹配条件，不能依赖空条件绕过安全边界。
+CLI 默认调用 `document.update_one` / `document.delete_one`，即使过滤器匹配多条也只
+变更一条。需要对全部匹配项执行变更时，必须显式增加 `--many`，先取得确认令牌，再以
+完全相同的连接、集合、操作、过滤器和更新内容执行第二次命令：
+
+```bash
+dbtool --dsn "$MONGO_DSN" --allow-write \
+  doc update users --filter '{"tenant":"acme"}' \
+  --update '{"active":false}' --many
+
+dbtool --dsn "$MONGO_DSN" --allow-write --confirm '<confirm_token>' \
+  doc update users --filter '{"tenant":"acme"}' \
+  --update '{"active":false}' --many
+```
+
+令牌摘要绑定脱敏连接目标、集合、操作类型、many 模式、规范化后的顶层 JSON 与完整
+嵌套内容；修改过滤器/更新内容、切换 update/delete、改变连接或集合均会拒绝旧令牌。
+单条模式不接受无关的 `--confirm`，避免调用者误以为令牌授权了不同语义。
+
+`update` 和 `delete` 的过滤器都必须是非空 JSON 对象；更新内容也必须是 JSON 对象。
+CLI 会在连接前拒绝 `{}`、数组、`null`、空集合名和 NUL 字符，MongoDB adapter 在协议
+边界再次拒绝空过滤器。
+
+嵌入式兼容说明：历史 `DocumentStore::update/delete` 继续保持批量语义，不做破坏性
+改名；新代码应先从 `Connector::operations()` 协商四个显式 operation，再调用
+`update_one/update_many/delete_one/delete_many`。粗粒度 `document=true` 不代表这些
+可选方法已实现，未声明时必须得到 `UNSUPPORTED_CAPABILITY`。
 
 ### 删除集合
 

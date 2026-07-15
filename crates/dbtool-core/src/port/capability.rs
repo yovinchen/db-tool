@@ -108,9 +108,72 @@ pub trait DocumentStore: Connector {
         options: FindOptions,
     ) -> Result<Vec<Document>>;
     async fn insert(&self, collection: &str, docs: Vec<Document>) -> Result<InsertOutcome>;
+    /// Compatibility bulk-update entry point retained for embedded callers.
+    ///
+    /// This method keeps the historical dbtool contract: every matching
+    /// document may be updated. New callers should negotiate and invoke
+    /// [`Self::update_one`] or [`Self::update_many`] so cardinality is explicit.
     async fn update(&self, collection: &str, filter: Value, update: Value)
         -> Result<UpdateOutcome>;
+    /// Compatibility bulk-delete entry point retained for embedded callers.
+    ///
+    /// This method keeps the historical dbtool contract: every matching
+    /// document may be deleted. New callers should negotiate and invoke
+    /// [`Self::delete_one`] or [`Self::delete_many`] so cardinality is explicit.
     async fn delete(&self, collection: &str, filter: Value) -> Result<u64>;
+
+    /// Update at most one matching document.
+    ///
+    /// This is optional and therefore is never inferred from the coarse
+    /// `document=true` capability. Implementations must advertise
+    /// `document.update_one` before callers may rely on it.
+    async fn update_one(
+        &self,
+        _collection: &str,
+        _filter: Value,
+        _update: Value,
+    ) -> Result<UpdateOutcome> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "DocumentStore.update_one",
+        })
+    }
+
+    /// Update every matching document.
+    ///
+    /// The default deliberately delegates to the historical bulk-update
+    /// method so existing embedded implementations keep their old behavior.
+    /// It is not advertised automatically; connectors must explicitly declare
+    /// `document.update_many` once that legacy behavior has been verified.
+    async fn update_many(
+        &self,
+        collection: &str,
+        filter: Value,
+        update: Value,
+    ) -> Result<UpdateOutcome> {
+        self.update(collection, filter, update).await
+    }
+
+    /// Delete at most one matching document.
+    ///
+    /// This is optional and therefore is never inferred from the coarse
+    /// `document=true` capability. Implementations must advertise
+    /// `document.delete_one` before callers may rely on it.
+    async fn delete_one(&self, _collection: &str, _filter: Value) -> Result<u64> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "DocumentStore.delete_one",
+        })
+    }
+
+    /// Delete every matching document.
+    ///
+    /// The default delegates to the historical bulk-delete method for embedded
+    /// compatibility, but connectors must explicitly advertise
+    /// `document.delete_many` after verifying that behavior.
+    async fn delete_many(&self, collection: &str, filter: Value) -> Result<u64> {
+        self.delete(collection, filter).await
+    }
     async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>>;
 
     /// Run an aggregation while bounding the number of documents read and
@@ -302,6 +365,135 @@ mod tests {
                 .await,
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "legacy-sql" && needed == "SqlEngine.insert_rows_atomic"
+        ));
+    }
+
+    struct LegacyDocument;
+
+    #[async_trait]
+    impl Connector for LegacyDocument {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind("legacy-document".into())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                document: true,
+                ..Default::default()
+            }
+        }
+
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        fn as_document(&self) -> Option<&dyn DocumentStore> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl DocumentStore for LegacyDocument {
+        async fn list_collections(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn find(
+            &self,
+            _collection: &str,
+            _filter: Value,
+            _options: FindOptions,
+        ) -> Result<Vec<Document>> {
+            Ok(vec![])
+        }
+
+        async fn insert(&self, _collection: &str, _docs: Vec<Document>) -> Result<InsertOutcome> {
+            Ok(InsertOutcome {
+                inserted: 0,
+                ids: vec![],
+            })
+        }
+
+        async fn update(
+            &self,
+            _collection: &str,
+            _filter: Value,
+            _update: Value,
+        ) -> Result<UpdateOutcome> {
+            Ok(UpdateOutcome {
+                matched: 3,
+                modified: 2,
+            })
+        }
+
+        async fn delete(&self, _collection: &str, _filter: Value) -> Result<u64> {
+            Ok(4)
+        }
+
+        async fn aggregate(
+            &self,
+            _collection: &str,
+            _pipeline: Vec<Value>,
+        ) -> Result<Vec<Document>> {
+            Ok(vec![])
+        }
+
+        async fn aggregate_bounded(
+            &self,
+            _collection: &str,
+            _pipeline: Vec<Value>,
+            _max_items: usize,
+        ) -> Result<Vec<Document>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_document_bulk_methods_keep_their_mapping_without_claiming_optional_modes() {
+        let connector = LegacyDocument;
+        for operation in [
+            CapabilityOperation::DocumentUpdateOne,
+            CapabilityOperation::DocumentUpdateMany,
+            CapabilityOperation::DocumentDeleteOne,
+            CapabilityOperation::DocumentDeleteMany,
+        ] {
+            assert!(!connector.operations().contains(&operation));
+        }
+
+        let filter = Value::Json(serde_json::json!({ "tenant": "one" }));
+        let update = Value::Json(serde_json::json!({ "$set": { "active": true } }));
+        let legacy_update = connector
+            .update("users", filter.clone(), update.clone())
+            .await
+            .unwrap();
+        let explicit_many = connector
+            .update_many("users", filter.clone(), update.clone())
+            .await
+            .unwrap();
+        assert_eq!(legacy_update.matched, explicit_many.matched);
+        assert_eq!(legacy_update.modified, explicit_many.modified);
+        assert_eq!(connector.delete("users", filter.clone()).await.unwrap(), 4);
+        assert_eq!(
+            connector
+                .delete_many("users", filter.clone())
+                .await
+                .unwrap(),
+            4
+        );
+
+        assert!(matches!(
+            connector.update_one("users", filter.clone(), update).await,
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-document" && needed == "DocumentStore.update_one"
+        ));
+        assert!(matches!(
+            connector.delete_one("users", filter).await,
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-document" && needed == "DocumentStore.delete_one"
         ));
     }
 }

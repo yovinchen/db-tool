@@ -34,7 +34,7 @@ successful service run are intentionally different states.
 | SQL | ping/caps, schemas/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/index metadata, typed values, limit/truncation, bound-parameter import with whole-batch rollback where advertised, write guard/confirm, cleanup |
 | CQL | ping/caps, keyspaces/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/primary-key metadata, typed values, limit, write guard, cleanup |
 | KV/cache | ping/caps, SET, GET, overwrite, TTL, exact N/N+1 SCAN, multi-page/error propagation, raw read, raw write guard, DELETE, post-delete read, cleanup |
-| Document | ping/caps, collections, INSERT, FIND, UPDATE, aggregate, targeted DELETE, empty result verification, cleanup |
+| Document | ping/caps with explicit one/many operations, collections, INSERT, FIND, single UPDATE/DELETE, confirmed multi UPDATE/DELETE with exact counts, aggregate, empty result verification, cleanup |
 | Search | ping/caps, write guard, index document, list indices, search/readback; update/delete are recorded `UNSUPPORTED` until the public capability exposes them |
 | Time series | ping/caps, write guard, remote write, measurement list, range readback; update/delete are not applicable to the Prometheus model |
 | Messaging | ping/caps, write guard, produce/publish, bounded consume, list/detail/lag where the protocol supports them, timeout/ack behavior, cleanup where the public API supports it |
@@ -64,7 +64,7 @@ and test-hardening commits remain listed inside each evidence file.
 | DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | `1ceffc8`; atomic NX+TTL refreshed |
 | DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | `1ceffc8`; atomic NX+TTL refreshed |
 | DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | `1ceffc8`; atomic NX+TTL refreshed |
-| DB-MONGO-001 | Document | MongoDB `mongodb://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mongodb.md` | `fe7cfb9`; public API empties collections and volume teardown drops them |
+| DB-MONGO-001 | Document | MongoDB `mongodb://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mongodb.md` | `fe7cfb9`, IF-T61; explicit one/many counts, confirmation binding and zero collection residual |
 | DB-OPENSEARCH-001 | Search | OpenSearch `opensearch://` | Docker observability | Ready | COMPLETE | `docs/test-evidence/opensearch.md` | IF-T45; auto/stable ID writes, get/update/delete, aggregation, confirmed delete-index, zero residual test indices |
 | DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | COMPLETE | `docs/test-evidence/opensearch-security.md` | `b9dd9fd`; real plugin, CA/auth positive and negative checks |
 | DB-ELASTICSEARCH-001 | Search | Elasticsearch `elasticsearch://` | Docker elasticsearch | Ready | COMPLETE | `docs/test-evidence/elasticsearch.md` | IF-T45; full document/index CRUD and aggregation on 8.15.5; product-native HTTPS not covered |

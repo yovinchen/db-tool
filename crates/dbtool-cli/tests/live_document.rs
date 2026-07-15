@@ -41,6 +41,40 @@ fn stderr_json(output: std::process::Output) -> Value {
     serde_json::from_slice(&output.stderr).expect("stderr should contain JSON")
 }
 
+struct CollectionCleanup {
+    dsn: String,
+    collection: String,
+}
+
+impl Drop for CollectionCleanup {
+    fn drop(&mut self) {
+        let confirmation = dbtool(&[
+            "--dsn",
+            &self.dsn,
+            "--allow-write",
+            "doc",
+            "drop",
+            &self.collection,
+        ]);
+        let Ok(error) = serde_json::from_slice::<Value>(&confirmation.stderr) else {
+            return;
+        };
+        let Some(token) = error["error"]["confirm_token"].as_str() else {
+            return;
+        };
+        let _ = dbtool(&[
+            "--dsn",
+            &self.dsn,
+            "--allow-write",
+            "--confirm",
+            token,
+            "doc",
+            "drop",
+            &self.collection,
+        ]);
+    }
+}
+
 #[test]
 fn mongo_live_full_find_options_bounded_aggregate_and_drop() {
     if !integration_enabled() {
@@ -49,11 +83,30 @@ fn mongo_live_full_find_options_bounded_aggregate_and_drop() {
 
     let dsn = mongo_dsn();
     let collection = unique_collection();
+    let _cleanup = CollectionCleanup {
+        dsn: dsn.clone(),
+        collection: collection.clone(),
+    };
+    let caps = stdout_json(dbtool(&["--dsn", &dsn, "caps"]));
+    let operations = caps["data"]["operations"]
+        .as_array()
+        .expect("MongoDB caps operations should be an array");
+    for operation in [
+        "document.update_one",
+        "document.update_many",
+        "document.delete_one",
+        "document.delete_many",
+    ] {
+        assert!(operations
+            .iter()
+            .any(|value| value.as_str() == Some(operation)));
+    }
     for (name, rank, active) in [("alice", 1, true), ("bob", 2, true), ("carol", 3, false)] {
         let document = serde_json::json!({
             "name": name,
             "rank": rank,
             "active": active,
+            "batch": "all",
             "secret": format!("secret-{name}"),
         })
         .to_string();
@@ -120,6 +173,187 @@ fn mongo_live_full_find_options_bounded_aggregate_and_drop() {
     assert_eq!(aggregate["data"].as_array().map(Vec::len), Some(2));
     assert_eq!(aggregate["meta"]["truncated"], true);
 
+    let single_update = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "update",
+        &collection,
+        "--filter",
+        r#"{"batch":"all"}"#,
+        "--update",
+        r#"{"single_updated":true}"#,
+    ]));
+    assert_eq!(single_update["data"]["matched"], 1);
+    assert_eq!(single_update["data"]["modified"], 1);
+    let single_updated = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &collection,
+        "--filter",
+        r#"{"single_updated":true}"#,
+    ]));
+    assert_eq!(single_updated["data"].as_array().map(Vec::len), Some(1));
+
+    let many_update_confirmation = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "update",
+        &collection,
+        "--filter",
+        r#"{"batch":"all"}"#,
+        "--update",
+        r#"{"many_updated":true}"#,
+        "--many",
+    ]));
+    assert_eq!(
+        many_update_confirmation["error"]["code"],
+        "CONFIRM_REQUIRED"
+    );
+    assert_eq!(
+        many_update_confirmation["error"]["impact"]["op"],
+        "DOCUMENT_UPDATE_MANY"
+    );
+    let many_update_token = many_update_confirmation["error"]["confirm_token"]
+        .as_str()
+        .expect("update many should return a confirmation token");
+
+    let changed_update = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "--confirm",
+        many_update_token,
+        "doc",
+        "update",
+        &collection,
+        "--filter",
+        r#"{"batch":"all"}"#,
+        "--update",
+        r#"{"many_updated":"different"}"#,
+        "--many",
+    ]));
+    assert_eq!(changed_update["error"]["code"], "INTERNAL_ERROR");
+    assert!(changed_update["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("mismatch")));
+
+    let cross_operation = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "--confirm",
+        many_update_token,
+        "doc",
+        "delete",
+        &collection,
+        "--filter",
+        r#"{"batch":"all"}"#,
+        "--many",
+    ]));
+    assert_eq!(cross_operation["error"]["code"], "INTERNAL_ERROR");
+
+    let many_update = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "--confirm",
+        many_update_token,
+        "doc",
+        "update",
+        &collection,
+        "--filter",
+        r#" { "batch": "all" } "#,
+        "--update",
+        r#" { "many_updated": true } "#,
+        "--many",
+    ]));
+    assert_eq!(many_update["data"]["matched"], 3);
+    assert_eq!(many_update["data"]["modified"], 3);
+    let many_updated = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &collection,
+        "--filter",
+        r#"{"many_updated":true}"#,
+    ]));
+    assert_eq!(many_updated["data"].as_array().map(Vec::len), Some(3));
+
+    let single_delete = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "delete",
+        &collection,
+        "--filter",
+        r#"{"batch":"all"}"#,
+    ]));
+    assert_eq!(single_delete["data"]["deleted"], 1);
+    let after_single_delete = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &collection,
+        "--filter",
+        r#"{"batch":"all"}"#,
+    ]));
+    assert_eq!(
+        after_single_delete["data"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    let many_delete_confirmation = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "doc",
+        "delete",
+        &collection,
+        "--filter",
+        r#"{"batch":"all"}"#,
+        "--many",
+    ]));
+    assert_eq!(
+        many_delete_confirmation["error"]["code"],
+        "CONFIRM_REQUIRED"
+    );
+    let many_delete_token = many_delete_confirmation["error"]["confirm_token"]
+        .as_str()
+        .expect("delete many should return a confirmation token");
+    let many_delete = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "--confirm",
+        many_delete_token,
+        "doc",
+        "delete",
+        &collection,
+        "--filter",
+        r#" { "batch": "all" } "#,
+        "--many",
+    ]));
+    assert_eq!(many_delete["data"]["deleted"], 2);
+    let after_many_delete = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "doc",
+        "find",
+        &collection,
+        "--filter",
+        r#"{"batch":"all"}"#,
+    ]));
+    assert_eq!(after_many_delete["data"].as_array().map(Vec::len), Some(0));
+
     let empty_update = stderr_json(dbtool(&[
         "--dsn",
         &dsn,
@@ -132,10 +366,10 @@ fn mongo_live_full_find_options_bounded_aggregate_and_drop() {
         "--update",
         r#"{"active":false}"#,
     ]));
-    assert_eq!(empty_update["error"]["code"], "QUERY_ERROR");
+    assert_eq!(empty_update["error"]["code"], "CONFIG_ERROR");
     assert!(empty_update["error"]["message"]
         .as_str()
-        .is_some_and(|message| message.contains("without a filter")));
+        .is_some_and(|message| message.contains("non-empty JSON object")));
 
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "doc", "drop", &collection]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");

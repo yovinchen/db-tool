@@ -4,7 +4,7 @@ use dbtool_core::{
     model::{Document, FindOptions, InsertOutcome, UpdateOutcome, Value},
     port::{
         capability::DocumentStore,
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
 };
 use futures::future::BoxFuture;
@@ -39,6 +39,10 @@ impl Connector for MongoAdapter {
             document: true,
             ..Default::default()
         }
+    }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        mongo_operations(self.capabilities())
     }
 
     async fn ping(&self) -> Result<()> {
@@ -128,29 +132,39 @@ impl DocumentStore for MongoAdapter {
         filter: Value,
         update: Value,
     ) -> Result<UpdateOutcome> {
-        let col = self.db.collection::<mongodb::bson::Document>(collection);
-        let filter = value_to_document(filter)?;
-        ensure_nonempty_filter(&filter, "update")?;
-        let update = update_document(update)?;
-        let result = col
-            .update_many(filter, update)
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(UpdateOutcome {
-            matched: result.matched_count,
-            modified: result.modified_count,
-        })
+        self.update_many(collection, filter, update).await
     }
 
     async fn delete(&self, collection: &str, filter: Value) -> Result<u64> {
-        let col = self.db.collection::<mongodb::bson::Document>(collection);
-        let filter = value_to_document(filter)?;
-        ensure_nonempty_filter(&filter, "delete")?;
-        let r = col
-            .delete_many(filter)
+        self.delete_many(collection, filter).await
+    }
+
+    async fn update_one(
+        &self,
+        collection: &str,
+        filter: Value,
+        update: Value,
+    ) -> Result<UpdateOutcome> {
+        self.update_documents(collection, filter, update, false)
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(r.deleted_count)
+    }
+
+    async fn update_many(
+        &self,
+        collection: &str,
+        filter: Value,
+        update: Value,
+    ) -> Result<UpdateOutcome> {
+        self.update_documents(collection, filter, update, true)
+            .await
+    }
+
+    async fn delete_one(&self, collection: &str, filter: Value) -> Result<u64> {
+        self.delete_documents(collection, filter, false).await
+    }
+
+    async fn delete_many(&self, collection: &str, filter: Value) -> Result<u64> {
+        self.delete_documents(collection, filter, true).await
     }
 
     async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>> {
@@ -177,6 +191,42 @@ impl DocumentStore for MongoAdapter {
 }
 
 impl MongoAdapter {
+    async fn update_documents(
+        &self,
+        collection: &str,
+        filter: Value,
+        update: Value,
+        many: bool,
+    ) -> Result<UpdateOutcome> {
+        let col = self.db.collection::<mongodb::bson::Document>(collection);
+        let filter = value_to_document(filter)?;
+        ensure_nonempty_filter(&filter, if many { "update many" } else { "update one" })?;
+        let update = update_document(update)?;
+        let result = if many {
+            col.update_many(filter, update).await
+        } else {
+            col.update_one(filter, update).await
+        }
+        .map_err(|e| Error::Query(e.to_string()))?;
+        Ok(UpdateOutcome {
+            matched: result.matched_count,
+            modified: result.modified_count,
+        })
+    }
+
+    async fn delete_documents(&self, collection: &str, filter: Value, many: bool) -> Result<u64> {
+        let col = self.db.collection::<mongodb::bson::Document>(collection);
+        let filter = value_to_document(filter)?;
+        ensure_nonempty_filter(&filter, if many { "delete many" } else { "delete one" })?;
+        let result = if many {
+            col.delete_many(filter).await
+        } else {
+            col.delete_one(filter).await
+        }
+        .map_err(|e| Error::Query(e.to_string()))?;
+        Ok(result.deleted_count)
+    }
+
     async fn aggregate_with_limit(
         &self,
         collection: &str,
@@ -209,6 +259,17 @@ impl MongoAdapter {
         }
         Ok(docs)
     }
+}
+
+fn mongo_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::DocumentUpdateOne,
+        CapabilityOperation::DocumentUpdateMany,
+        CapabilityOperation::DocumentDeleteOne,
+        CapabilityOperation::DocumentDeleteMany,
+    ]);
+    operations
 }
 
 fn optional_document(value: Option<Value>) -> Result<Option<bson::Document>> {
@@ -371,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_update_and_delete_reject_empty_filters() {
+    fn every_update_and_delete_mode_rejects_empty_filters() {
         let filter = bson::Document::new();
 
         let update_error = ensure_nonempty_filter(&filter, "update").unwrap_err();
@@ -385,6 +446,25 @@ mod tests {
             delete_error,
             Error::Query(message) if message.contains("delete documents without a filter")
         ));
+    }
+
+    #[test]
+    fn mongo_declares_explicit_document_cardinality_operations() {
+        let operations = mongo_operations(Capabilities {
+            document: true,
+            ..Default::default()
+        });
+
+        for operation in [
+            CapabilityOperation::DocumentUpdateOne,
+            CapabilityOperation::DocumentUpdateMany,
+            CapabilityOperation::DocumentDeleteOne,
+            CapabilityOperation::DocumentDeleteMany,
+        ] {
+            assert!(operations.contains(&operation));
+        }
+        assert!(operations.contains(&CapabilityOperation::DocumentUpdate));
+        assert!(operations.contains(&CapabilityOperation::DocumentDelete));
     }
 
     #[test]

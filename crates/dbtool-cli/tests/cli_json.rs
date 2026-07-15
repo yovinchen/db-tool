@@ -138,7 +138,9 @@ fn cli_help_documents_core_command_families() {
     assert!(doc_help.contains("List document collections"));
     assert!(doc_help.contains("Find documents with a JSON filter"));
     assert!(doc_help.contains("Insert one JSON document"));
-    assert!(doc_help.contains("Run a JSON aggregation pipeline"));
+    assert!(doc_help.contains("Update one document by default"));
+    assert!(doc_help.contains("Delete one document by default"));
+    assert!(doc_help.contains("Run a bounded JSON aggregation pipeline"));
 
     let search_help = stdout_text(&dbtool(&["search", "--help"]));
     assert!(search_help.contains("OpenSearch/Elasticsearch-compatible"));
@@ -169,6 +171,85 @@ fn sql_import_help_documents_the_atomic_bound_parameter_contract() {
     assert!(help.contains("sql.insert_rows_atomic"));
     assert!(help.contains("bound parameter"));
     assert!(help.contains("one transaction"));
+}
+
+#[test]
+fn document_mutation_help_exposes_safe_one_and_many_modes() {
+    let update = stdout_text(&dbtool(&["doc", "update", "--help"]));
+    assert!(update.contains("--many"));
+    assert!(update.contains("Update every matching document"));
+
+    let delete = stdout_text(&dbtool(&["doc", "delete", "--help"]));
+    assert!(delete.contains("--many"));
+    assert!(delete.contains("Delete every matching document"));
+}
+
+#[test]
+fn document_many_mutations_confirm_before_connecting_and_reject_token_reuse() {
+    let dsn = "mongodb://dbtool:secret@127.0.0.1:1/app";
+    let blocked = stderr_json(&dbtool(&[
+        "--dsn",
+        dsn,
+        "doc",
+        "update",
+        "users",
+        "--filter",
+        r#"{"tenant":"one"}"#,
+        "--update",
+        r#"{"active":true}"#,
+        "--many",
+    ]));
+    assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let confirmation = stderr_json(&dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "doc",
+        "update",
+        "users",
+        "--filter",
+        r#"{"tenant":"one"}"#,
+        "--update",
+        r#"{"active":true}"#,
+        "--many",
+    ]));
+    assert_eq!(confirmation["error"]["code"], "CONFIRM_REQUIRED");
+    let token = confirmation["error"]["confirm_token"]
+        .as_str()
+        .expect("update many should expose a confirmation token");
+    assert!(!token.contains("mongodb://"));
+    assert!(!token.contains("secret"));
+
+    let reused = stderr_json(&dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "--confirm",
+        token,
+        "doc",
+        "delete",
+        "users",
+        "--filter",
+        r#"{"tenant":"one"}"#,
+        "--many",
+    ]));
+    assert_eq!(reused["error"]["code"], "INTERNAL_ERROR");
+    assert!(reused["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("mismatch")));
+
+    let empty = stderr_json(&dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "doc",
+        "delete",
+        "users",
+        "--filter",
+        "{}",
+    ]));
+    assert_eq!(empty["error"]["code"], "CONFIG_ERROR");
 }
 
 #[test]

@@ -4,6 +4,7 @@ use dbtool_core::{
     dsn::Dsn,
     error::Error,
     model::{Document, FindOptions, Value},
+    port::CapabilityOperation,
     service::safety::SafetyGuard,
     Result,
 };
@@ -42,7 +43,7 @@ pub enum DocAction {
         /// JSON document object.
         doc: String,
     },
-    /// Update documents matching a JSON filter.
+    /// Update one document by default, or every match with --many and confirmation.
     Update {
         /// Collection name.
         collection: String,
@@ -52,14 +53,20 @@ pub enum DocAction {
         /// JSON update document; plain objects are wrapped in `$set` by MongoDB adapter.
         #[arg(long)]
         update: String,
+        /// Update every matching document after target/content-bound confirmation.
+        #[arg(long)]
+        many: bool,
     },
-    /// Delete documents matching a non-empty JSON filter.
+    /// Delete one document by default, or every match with --many and confirmation.
     Delete {
         /// Collection name.
         collection: String,
         /// JSON filter object.
         #[arg(long)]
         filter: String,
+        /// Delete every matching document after target/content-bound confirmation.
+        #[arg(long)]
+        many: bool,
     },
     /// Drop one collection after target-bound confirmation.
     Drop {
@@ -81,9 +88,18 @@ pub enum DocAction {
 pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
     let dsn = ctx.resolve_dsn()?;
     match &cmd.action {
-        DocAction::Insert { .. } | DocAction::Update { .. } | DocAction::Delete { .. } => {
-            ensure_write_allowed(ctx)?;
-        }
+        DocAction::Insert { .. } => ensure_write_allowed(ctx)?,
+        DocAction::Update {
+            collection,
+            filter,
+            update,
+            many,
+        } => check_update_safety(ctx, &dsn, collection, filter, update, *many)?,
+        DocAction::Delete {
+            collection,
+            filter,
+            many,
+        } => check_delete_safety(ctx, &dsn, collection, filter, *many)?,
         DocAction::Drop { collection } => {
             ensure_write_allowed(ctx)?;
             SafetyGuard::check_destructive_operation(
@@ -105,6 +121,7 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
     }
 
     let conn = ctx.registry.connect(&dsn).await?;
+    let operations = conn.operations();
     let doc = conn
         .as_document()
         .ok_or_else(|| Error::UnsupportedCapability {
@@ -151,15 +168,52 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             collection,
             filter,
             update,
+            many,
         } => {
-            let filter = parse_json_value(&filter)?;
-            let update = parse_json_value(&update)?;
-            let outcome = doc.update(&collection, filter, update).await?;
+            let filter = parse_nonempty_json_object(&filter, "--filter")?.into();
+            let update = parse_json_object(&update, "--update")?.into();
+            let (operation, needed) = if many {
+                (
+                    CapabilityOperation::DocumentUpdateMany,
+                    "DocumentStore.update_many",
+                )
+            } else {
+                (
+                    CapabilityOperation::DocumentUpdateOne,
+                    "DocumentStore.update_one",
+                )
+            };
+            require_document_operation(&operations, operation, &kind, needed)?;
+            let outcome = if many {
+                doc.update_many(&collection, filter, update).await?
+            } else {
+                doc.update_one(&collection, filter, update).await?
+            };
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
-        DocAction::Delete { collection, filter } => {
-            let filter = parse_json_value(&filter)?;
-            let deleted = doc.delete(&collection, filter).await?;
+        DocAction::Delete {
+            collection,
+            filter,
+            many,
+        } => {
+            let filter = parse_nonempty_json_object(&filter, "--filter")?.into();
+            let (operation, needed) = if many {
+                (
+                    CapabilityOperation::DocumentDeleteMany,
+                    "DocumentStore.delete_many",
+                )
+            } else {
+                (
+                    CapabilityOperation::DocumentDeleteOne,
+                    "DocumentStore.delete_one",
+                )
+            };
+            require_document_operation(&operations, operation, &kind, needed)?;
+            let deleted = if many {
+                doc.delete_many(&collection, filter).await?
+            } else {
+                doc.delete_one(&collection, filter).await?
+            };
             ctx.render_success(
                 &kind,
                 serde_json::json!({ "deleted": deleted }),
@@ -194,10 +248,134 @@ fn ensure_write_allowed(ctx: &Context) -> Result<()> {
     ctx.ensure_write_allowed()
 }
 
-fn parse_json_value(raw: &str) -> Result<Value> {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .map(Value::Json)
-        .map_err(|e| Error::Serialization(e.to_string()))
+fn check_update_safety(
+    ctx: &Context,
+    dsn: &str,
+    collection: &str,
+    filter: &str,
+    update: &str,
+    many: bool,
+) -> Result<()> {
+    ensure_write_allowed(ctx)?;
+    validate_mutation_collection(collection)?;
+    let filter = parse_nonempty_json_object(filter, "--filter")?;
+    let update = parse_json_object(update, "--update")?;
+    check_many_confirmation(
+        ctx,
+        dsn,
+        "document_update",
+        collection,
+        &filter,
+        Some(&update),
+        many,
+    )
+}
+
+fn check_delete_safety(
+    ctx: &Context,
+    dsn: &str,
+    collection: &str,
+    filter: &str,
+    many: bool,
+) -> Result<()> {
+    ensure_write_allowed(ctx)?;
+    validate_mutation_collection(collection)?;
+    let filter = parse_nonempty_json_object(filter, "--filter")?;
+    check_many_confirmation(ctx, dsn, "document_delete", collection, &filter, None, many)
+}
+
+fn check_many_confirmation(
+    ctx: &Context,
+    dsn: &str,
+    operation: &str,
+    collection: &str,
+    filter: &serde_json::Value,
+    update: Option<&serde_json::Value>,
+    many: bool,
+) -> Result<()> {
+    if !many {
+        if ctx.confirm.is_some() {
+            return Err(Error::Config(
+                "--confirm is not accepted for single-document update/delete; omit it or use --many"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let normalized_filter = normalize_document_for_confirmation(filter);
+    let normalized_update = update.map(normalize_document_for_confirmation);
+    let scope = SafetyGuard::confirmation_scope_digest(&(
+        "document-mutation-v1",
+        operation,
+        collection,
+        normalized_filter,
+        normalized_update,
+        "many",
+    ))?;
+    SafetyGuard::check_destructive_operation_with_scope(
+        &format!("{operation}_many"),
+        collection,
+        &ctx.safety_target(dsn),
+        &scope,
+        ctx.allow_write,
+        ctx.confirm.as_deref(),
+    )
+}
+
+fn normalize_document_for_confirmation(value: &serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(map) = value else {
+        return value.clone();
+    };
+    let sorted = map
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    serde_json::Value::Object(sorted.into_iter().collect())
+}
+
+fn validate_mutation_collection(collection: &str) -> Result<()> {
+    if collection.trim().is_empty() || collection.contains('\0') {
+        return Err(Error::Config(
+            "document mutation collection must be non-empty and contain no NUL bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_nonempty_json_object(raw: &str, option: &str) -> Result<serde_json::Value> {
+    let value = parse_json_object(raw, option)?;
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Err(Error::Config(format!(
+            "{option} must be a non-empty JSON object"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_json_object(raw: &str, option: &str) -> Result<serde_json::Value> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| Error::Serialization(e.to_string()))?;
+    if !value.is_object() {
+        return Err(Error::Config(format!("{option} must be a JSON object")));
+    }
+    Ok(value)
+}
+
+fn require_document_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+    needed: &'static str,
+) -> Result<()> {
+    if operations.contains(&operation) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed,
+        })
+    }
 }
 
 fn parse_optional_json_object(raw: Option<&str>, option: &str) -> Result<Option<Value>> {
@@ -659,6 +837,218 @@ mod tests {
             allow_write,
             confirm: None,
         }
+    }
+
+    #[test]
+    fn mutation_filters_are_validated_offline_and_must_be_nonempty_objects() {
+        let ctx = test_context(true, "mongodb://127.0.0.1:1/app");
+
+        for filter in ["{}", "[]", "null"] {
+            assert!(check_update_safety(
+                &ctx,
+                "mongodb://127.0.0.1:1/app",
+                "users",
+                filter,
+                r#"{"active":true}"#,
+                false,
+            )
+            .is_err());
+            assert!(
+                check_delete_safety(&ctx, "mongodb://127.0.0.1:1/app", "users", filter, true,)
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            check_update_safety(
+                &ctx,
+                "mongodb://127.0.0.1:1/app",
+                "users",
+                r#"{"id":1}"#,
+                "[]",
+                false,
+            ),
+            Err(Error::Config(message)) if message.contains("--update")
+        ));
+    }
+
+    #[test]
+    fn confirmation_normalization_preserves_nested_document_order() {
+        let root_first = parse_json_object(
+            r#"{"z":9,"embedded":{"first":1,"second":2},"a":1}"#,
+            "--filter",
+        )
+        .unwrap();
+        let root_reordered = parse_json_object(
+            r#"{"a":1,"embedded":{"first":1,"second":2},"z":9}"#,
+            "--filter",
+        )
+        .unwrap();
+        let nested_reordered = parse_json_object(
+            r#"{"a":1,"embedded":{"second":2,"first":1},"z":9}"#,
+            "--filter",
+        )
+        .unwrap();
+
+        let digest = |value: &serde_json::Value| {
+            SafetyGuard::confirmation_scope_digest(&normalize_document_for_confirmation(value))
+                .unwrap()
+        };
+        assert_eq!(digest(&root_first), digest(&root_reordered));
+        assert_ne!(digest(&root_first), digest(&nested_reordered));
+    }
+
+    #[test]
+    fn many_confirmation_is_normalized_target_bound_and_not_reusable() {
+        let dsn = "mongodb://dbtool:top-secret@localhost:27017/app";
+        let mut ctx = test_context(true, dsn);
+        let error = check_update_safety(
+            &ctx,
+            dsn,
+            "users",
+            r#"{"b":2,"a":1}"#,
+            r#"{"$set":{"status":"ready","count":2}}"#,
+            true,
+        )
+        .unwrap_err();
+        let token = match error {
+            Error::ConfirmRequired {
+                confirm_token,
+                impact,
+            } => {
+                assert_eq!(impact["op"], "DOCUMENT_UPDATE_MANY");
+                assert_eq!(impact["resource"], "users");
+                let target = impact["target"].as_str().unwrap();
+                assert!(!target.contains("top-secret"));
+                assert!(!confirm_token.contains("mongodb://"));
+                assert!(!confirm_token.contains("top-secret"));
+                confirm_token
+            }
+            other => panic!("expected confirmation requirement, got {other:?}"),
+        };
+        ctx.confirm = Some(token);
+
+        assert!(check_update_safety(
+            &ctx,
+            dsn,
+            "users",
+            r#" { "a": 1, "b": 2 } "#,
+            r#"{"$set":{"status":"ready","count":2}}"#,
+            true,
+        )
+        .is_ok());
+
+        for changed in [
+            check_update_safety(
+                &ctx,
+                dsn,
+                "users",
+                r#"{"a":9,"b":2}"#,
+                r#"{"$set":{"status":"ready","count":2}}"#,
+                true,
+            ),
+            check_update_safety(
+                &ctx,
+                dsn,
+                "users",
+                r#"{"a":1,"b":2}"#,
+                r#"{"$set":{"status":"ready","count":3}}"#,
+                true,
+            ),
+            check_update_safety(
+                &ctx,
+                dsn,
+                "other",
+                r#"{"a":1,"b":2}"#,
+                r#"{"$set":{"status":"ready","count":2}}"#,
+                true,
+            ),
+            check_update_safety(
+                &ctx,
+                "mongodb://localhost:27017/other",
+                "users",
+                r#"{"a":1,"b":2}"#,
+                r#"{"$set":{"status":"ready","count":2}}"#,
+                true,
+            ),
+            check_delete_safety(&ctx, dsn, "users", r#"{"a":1,"b":2}"#, true),
+        ] {
+            assert!(matches!(
+                changed,
+                Err(Error::Internal(message)) if message.contains("mismatch")
+            ));
+        }
+
+        assert!(matches!(
+            check_update_safety(
+                &ctx,
+                dsn,
+                "users",
+                r#"{"a":1,"b":2}"#,
+                r#"{"$set":{"status":"ready","count":2}}"#,
+                false,
+            ),
+            Err(Error::Config(message)) if message.contains("single-document")
+        ));
+    }
+
+    #[test]
+    fn coarse_document_capability_does_not_authorize_optional_cardinality_methods() {
+        let coarse = CapabilityOperation::DOCUMENT;
+        assert!(matches!(
+            require_document_operation(
+                coarse,
+                CapabilityOperation::DocumentUpdateOne,
+                "legacy-document",
+                "DocumentStore.update_one",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-document" && needed == "DocumentStore.update_one"
+        ));
+
+        let mut explicit = coarse.to_vec();
+        explicit.push(CapabilityOperation::DocumentDeleteMany);
+        assert!(require_document_operation(
+            &explicit,
+            CapabilityOperation::DocumentDeleteMany,
+            "mongodb",
+            "DocumentStore.delete_many",
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn mutation_validation_and_many_confirmation_happen_before_connecting() {
+        let dsn = "mongodb://127.0.0.1:1/app";
+        let ctx = test_context(true, dsn);
+
+        let empty = run(
+            &ctx,
+            DocCmd {
+                action: DocAction::Update {
+                    collection: "users".to_owned(),
+                    filter: "{}".to_owned(),
+                    update: r#"{"active":true}"#.to_owned(),
+                    many: false,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(empty, Error::Config(message) if message.contains("non-empty")));
+
+        let confirmation = run(
+            &ctx,
+            DocCmd {
+                action: DocAction::Delete {
+                    collection: "users".to_owned(),
+                    filter: r#"{"active":true}"#.to_owned(),
+                    many: true,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(confirmation, Error::ConfirmRequired { .. }));
     }
 
     #[test]
