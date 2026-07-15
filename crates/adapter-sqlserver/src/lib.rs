@@ -2,13 +2,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind, TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind,
+        TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
-        connector::{Capabilities, Connector, ConnectorKind},
+        connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ResultLimiter,
+    service::limiter::{ListLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, TryStreamExt};
 use tiberius::{AuthMethod, Client, Column, ColumnData, Config, EncryptionLevel, QueryItem, Row};
@@ -61,6 +62,10 @@ impl Connector for SqlServerAdapter {
             sql: true,
             ..Default::default()
         }
+    }
+
+    fn operations(&self) -> Vec<CapabilityOperation> {
+        sqlserver_operations(self.capabilities())
     }
 
     async fn ping(&self) -> Result<()> {
@@ -200,6 +205,27 @@ impl SqlEngine for SqlServerAdapter {
             .collect())
     }
 
+    async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        let (limiter, top) = sqlserver_catalog_limit(max_items)?;
+        let result = self
+            .query(
+                &format!("SELECT TOP ({top}) name FROM sys.schemas ORDER BY name"),
+                &[],
+            )
+            .await?;
+        let schemas = result
+            .rows
+            .into_iter()
+            .map(|row| match row.first() {
+                Some(Value::Text(value)) => Ok(value.clone()),
+                _ => Err(Error::Serialization(
+                    "SQL Server catalog schema name is not text".to_owned(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(schemas))
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let schema = validate_optional_schema(schema)?.unwrap_or("dbo");
         let sql = format!(
@@ -229,6 +255,47 @@ impl SqlEngine for SqlServerAdapter {
                 })
             })
             .collect())
+    }
+
+    async fn list_tables_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (limiter, top) = sqlserver_catalog_limit(max_items)?;
+        let schema = validate_optional_schema(schema)?.unwrap_or("dbo");
+        let sql = format!(
+            "SELECT TOP ({top}) TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+             FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = '{schema}' \
+             ORDER BY TABLE_NAME"
+        );
+        let result = self.query(&sql, &[]).await?;
+        let tables = result
+            .rows
+            .into_iter()
+            .map(|row| {
+                let schema = row.first().and_then(value_text).ok_or_else(|| {
+                    Error::Serialization("SQL Server catalog table schema is not text".to_owned())
+                })?;
+                let name = row.get(1).and_then(value_text).ok_or_else(|| {
+                    Error::Serialization("SQL Server catalog table name is not text".to_owned())
+                })?;
+                let table_type = row.get(2).and_then(value_text).ok_or_else(|| {
+                    Error::Serialization("SQL Server catalog table type is not text".to_owned())
+                })?;
+                Ok(TableInfo {
+                    schema: Some(schema.to_owned()),
+                    name: name.to_owned(),
+                    kind: if table_type.contains("VIEW") {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(limiter.finish(tables))
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -429,6 +496,24 @@ fn column_data_value(value: ColumnData<'static>) -> Value {
     }
 }
 
+fn sqlserver_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListTablesBounded,
+    ]);
+    operations
+}
+
+fn sqlserver_catalog_limit(max_items: usize) -> Result<(ListLimiter, i64)> {
+    let limiter = ListLimiter::new(max_items);
+    let probe_items = limiter.probe_items()?;
+    let top = i64::try_from(probe_items).map_err(|_| {
+        Error::Config("SQL Server catalog limit exceeds the TOP integer range".to_owned())
+    })?;
+    Ok((limiter, top))
+}
+
 #[derive(Debug)]
 struct TableRef {
     schema: Option<String>,
@@ -509,6 +594,22 @@ fn dsn_bool(dsn: &Dsn, names: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_catalog_operations_and_top_limit_are_explicit() {
+        let operations = sqlserver_operations(Capabilities {
+            sql: true,
+            ..Default::default()
+        });
+        assert!(operations.contains(&CapabilityOperation::SqlListSchemasBounded));
+        assert!(operations.contains(&CapabilityOperation::SqlListTablesBounded));
+        assert!(matches!(sqlserver_catalog_limit(0), Err(Error::Config(_))));
+        assert!(matches!(
+            sqlserver_catalog_limit(usize::MAX),
+            Err(Error::Config(_))
+        ));
+        assert_eq!(sqlserver_catalog_limit(2).unwrap().1, 3);
+    }
 
     #[test]
     fn builds_config_from_url_parts() {
