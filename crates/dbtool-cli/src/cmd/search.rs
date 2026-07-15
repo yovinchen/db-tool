@@ -185,8 +185,16 @@ fn effective_search_from(query: &serde_json::Value, option_from: Option<usize>) 
 }
 
 fn search_results_truncated(hits: &SearchHits, from: u64) -> bool {
+    let incomplete_backend_result = hits.total_relation != "eq"
+        || hits.timed_out
+        || hits
+            .extra
+            .get("_shards")
+            .and_then(|shards| shards.get("failed"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|failed| failed > 0);
     let returned = u64::try_from(hits.hits.len()).unwrap_or(u64::MAX);
-    from.saturating_add(returned) < hits.total
+    incomplete_backend_result || from.saturating_add(returned) < hits.total
 }
 
 #[cfg(test)]
@@ -236,5 +244,55 @@ mod tests {
 
         assert!(!search_results_truncated(&hits, 8));
         assert!(search_results_truncated(&hits, 7));
+    }
+
+    #[test]
+    fn truncated_is_true_when_total_is_only_a_lower_bound() {
+        let hits = SearchHits {
+            total: 2,
+            total_relation: "gte".to_owned(),
+            hits: vec![json!({}); 2],
+            took_ms: 1,
+            timed_out: false,
+            aggregations: None,
+            hits_metadata: Default::default(),
+            extra: Default::default(),
+        };
+
+        assert!(search_results_truncated(&hits, 0));
+    }
+
+    #[test]
+    fn truncated_is_true_when_search_timed_out() {
+        let hits = SearchHits {
+            total: 1,
+            total_relation: "eq".to_owned(),
+            hits: vec![json!({})],
+            took_ms: 1,
+            timed_out: true,
+            aggregations: None,
+            hits_metadata: Default::default(),
+            extra: Default::default(),
+        };
+
+        assert!(search_results_truncated(&hits, 0));
+    }
+
+    #[test]
+    fn truncated_is_true_when_any_shard_failed() {
+        let hits = SearchHits {
+            total: 1,
+            total_relation: "eq".to_owned(),
+            hits: vec![json!({})],
+            took_ms: 1,
+            timed_out: false,
+            aggregations: None,
+            hits_metadata: Default::default(),
+            extra: [("_shards".to_owned(), json!({ "failed": 1 }))]
+                .into_iter()
+                .collect(),
+        };
+
+        assert!(search_results_truncated(&hits, 0));
     }
 }

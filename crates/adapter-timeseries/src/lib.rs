@@ -11,10 +11,13 @@ use futures::future::BoxFuture;
 use serde_json::{Map, Value as JsonValue};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 use url::{form_urlencoded, Url};
+
+const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HTTP_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 
 pub struct PrometheusAdapter {
     client: PrometheusHttpClient,
@@ -162,11 +165,8 @@ impl PrometheusHttpClient {
                 .map_err(|e| Error::Connection(e.to_string()))?;
         }
 
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let response =
+            read_bounded_http_response(&mut stream, MAX_HTTP_RESPONSE_BODY_BYTES).await?;
         parse_http_json(&response)
     }
 
@@ -184,11 +184,8 @@ impl PrometheusHttpClient {
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let response =
+            read_bounded_http_response(&mut stream, MAX_HTTP_RESPONSE_BODY_BYTES).await?;
         parse_http_success(&response, "prometheus remote write")
     }
 
@@ -254,6 +251,60 @@ impl PrometheusHttpClient {
             format!("{}{}", self.base_path, path)
         }
     }
+}
+
+async fn read_bounded_http_response<S>(stream: &mut S, max_body_bytes: usize) -> Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut body_start = None;
+
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+
+        let next_len = response
+            .len()
+            .checked_add(read)
+            .ok_or_else(|| Error::Connection("prometheus HTTP response size overflow".into()))?;
+        if let Some(body_start) = body_start {
+            let body_len = next_len.checked_sub(body_start).ok_or_else(|| {
+                Error::Connection("prometheus HTTP response body size underflow".into())
+            })?;
+            ensure_http_body_within_limit(body_len, max_body_bytes, "body")?;
+        }
+        response.extend_from_slice(&buffer[..read]);
+
+        if body_start.is_none() {
+            if let Some(header_end) = find_http_header_end(&response) {
+                ensure_http_headers_within_limit(header_end)?;
+                let start = header_end.checked_add(4).ok_or_else(|| {
+                    Error::Connection("prometheus HTTP response header size overflow".into())
+                })?;
+                let header_text = std::str::from_utf8(&response[..header_end])
+                    .map_err(|e| Error::Connection(format!("invalid HTTP headers: {e}")))?;
+                ensure_content_length_within_limit(header_text, max_body_bytes)?;
+                let body_len = response.len().checked_sub(start).ok_or_else(|| {
+                    Error::Connection("prometheus HTTP response body size underflow".into())
+                })?;
+                ensure_http_body_within_limit(body_len, max_body_bytes, "body")?;
+                body_start = Some(start);
+            } else if response.len() > MAX_HTTP_RESPONSE_HEADER_BYTES + 3 {
+                return Err(Error::Connection(format!(
+                    "prometheus HTTP response headers exceed {MAX_HTTP_RESPONSE_HEADER_BYTES} bytes"
+                )));
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 fn normalize_base_path(path: &str) -> String {
@@ -588,55 +639,152 @@ fn parse_http_success(response: &[u8], operation: &str) -> Result<()> {
 }
 
 fn parse_http_response(response: &[u8]) -> Result<(u16, Vec<u8>)> {
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
+    parse_http_response_with_limit(response, MAX_HTTP_RESPONSE_BODY_BYTES)
+}
+
+fn parse_http_response_with_limit(
+    response: &[u8],
+    max_body_bytes: usize,
+) -> Result<(u16, Vec<u8>)> {
+    let header_end = find_http_header_end(response)
         .ok_or_else(|| Error::Connection("invalid HTTP response from prometheus backend".into()))?;
-    let (headers, body) = response.split_at(header_end);
-    let body = &body[4..];
+    ensure_http_headers_within_limit(header_end)?;
+    let body_start = header_end
+        .checked_add(4)
+        .ok_or_else(|| Error::Connection("prometheus HTTP response header size overflow".into()))?;
+    let headers = &response[..header_end];
+    let body = response
+        .get(body_start..)
+        .ok_or_else(|| Error::Connection("invalid HTTP response from prometheus backend".into()))?;
     let header_text = std::str::from_utf8(headers)
         .map_err(|e| Error::Connection(format!("invalid HTTP headers: {e}")))?;
+    ensure_content_length_within_limit(header_text, max_body_bytes)?;
+    ensure_http_body_within_limit(body.len(), max_body_bytes, "body")?;
     let status = header_text
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse::<u16>().ok())
         .ok_or_else(|| Error::Connection("missing HTTP status".into()))?;
-    let body = if header_text
-        .lines()
-        .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"))
-    {
-        decode_chunked_body(body)?
+    let body = if has_chunked_transfer_encoding(header_text) {
+        decode_chunked_body_with_limit(body, max_body_bytes)?
     } else {
         body.to_vec()
     };
     Ok((status, body))
 }
 
-fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
+fn find_http_header_end(response: &[u8]) -> Option<usize> {
+    response.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn ensure_http_headers_within_limit(header_bytes: usize) -> Result<()> {
+    if header_bytes > MAX_HTTP_RESPONSE_HEADER_BYTES {
+        return Err(Error::Connection(format!(
+            "prometheus HTTP response headers exceed {MAX_HTTP_RESPONSE_HEADER_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_content_length_within_limit(header_text: &str, max_body_bytes: usize) -> Result<()> {
+    let mut content_length = None;
+    for line in header_text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let parsed = value.trim().parse::<usize>().map_err(|e| {
+            Error::Connection(format!("invalid prometheus HTTP Content-Length: {e}"))
+        })?;
+        if let Some(existing) = content_length {
+            if existing != parsed {
+                return Err(Error::Connection(
+                    "conflicting prometheus HTTP Content-Length headers".into(),
+                ));
+            }
+        }
+        content_length = Some(parsed);
+    }
+
+    if let Some(content_length) = content_length {
+        if content_length > max_body_bytes {
+            return Err(Error::Connection(format!(
+                "prometheus HTTP Content-Length {content_length} exceeds limit of {max_body_bytes} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_http_body_within_limit(
+    body_bytes: usize,
+    max_body_bytes: usize,
+    body_kind: &str,
+) -> Result<()> {
+    if body_bytes > max_body_bytes {
+        return Err(Error::Connection(format!(
+            "prometheus HTTP response {body_kind} exceeds limit of {max_body_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn has_chunked_transfer_encoding(header_text: &str) -> bool {
+    header_text.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+        })
+    })
+}
+
+fn decode_chunked_body_with_limit(body: &[u8], max_body_bytes: usize) -> Result<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut position = 0;
 
     loop {
-        let line_end = find_crlf(&body[position..])
-            .map(|offset| position + offset)
+        let remaining = body
+            .get(position..)
+            .ok_or_else(|| Error::Connection("invalid chunked response".into()))?;
+        let line_end = find_crlf(remaining)
+            .and_then(|offset| position.checked_add(offset))
             .ok_or_else(|| Error::Connection("invalid chunked response".into()))?;
         let size_line = std::str::from_utf8(&body[position..line_end])
             .map_err(|e| Error::Connection(format!("invalid chunk header: {e}")))?;
         let size = usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
             .map_err(|e| Error::Connection(format!("invalid chunk size: {e}")))?;
-        position = line_end + 2;
+        position = line_end
+            .checked_add(2)
+            .ok_or_else(|| Error::Connection("prometheus chunk position overflow".into()))?;
 
         if size == 0 {
             break;
         }
 
-        let chunk_end = position + size;
-        if chunk_end + 2 > body.len() {
+        let chunk_end = position
+            .checked_add(size)
+            .ok_or_else(|| Error::Connection("prometheus chunk size overflow".into()))?;
+        let framed_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| Error::Connection("prometheus chunk framing overflow".into()))?;
+        if framed_end > body.len() {
             return Err(Error::Connection("truncated chunked response".into()));
         }
+        if body.get(chunk_end..framed_end) != Some(b"\r\n") {
+            return Err(Error::Connection("invalid chunk terminator".into()));
+        }
+        let decoded_len = decoded
+            .len()
+            .checked_add(size)
+            .ok_or_else(|| Error::Connection("prometheus decoded body size overflow".into()))?;
+        ensure_http_body_within_limit(decoded_len, max_body_bytes, "decoded body")?;
         decoded.extend_from_slice(&body[position..chunk_end]);
-        position = chunk_end + 2;
+        position = framed_end;
     }
 
     Ok(decoded)
@@ -849,6 +997,77 @@ mod tests {
         let value = parse_http_json(response).unwrap();
 
         assert_eq!(value["status"], "success");
+    }
+
+    #[test]
+    fn rejects_content_length_above_http_body_budget() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n";
+
+        let error = parse_http_response_with_limit(response, 8).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Connection(message)
+                if message.contains("Content-Length") && message.contains("8 bytes")
+        ));
+    }
+
+    #[test]
+    fn rejects_raw_http_body_above_budget() {
+        let response = b"HTTP/1.1 200 OK\r\n\r\n123456789";
+
+        let error = parse_http_response_with_limit(response, 8).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Connection(message)
+                if message.contains("body") && message.contains("8 bytes")
+        ));
+    }
+
+    #[test]
+    fn rejects_decoded_chunked_body_above_budget() {
+        let error = decode_chunked_body_with_limit(b"9\r\n123456789\r\n0\r\n\r\n", 8).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Connection(message)
+                if message.contains("decoded body") && message.contains("8 bytes")
+        ));
+    }
+
+    #[test]
+    fn rejects_chunk_size_arithmetic_overflow() {
+        let body = format!("{:X}\r\n", usize::MAX);
+
+        let error = decode_chunked_body_with_limit(body.as_bytes(), usize::MAX).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Connection(message) if message.contains("overflow")
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_streamed_body_above_budget() {
+        let (mut reader, mut writer) = tokio::io::duplex(128);
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n123456789")
+                .await
+                .unwrap();
+        });
+
+        let error = read_bounded_http_response(&mut reader, 8)
+            .await
+            .unwrap_err();
+        writer_task.await.unwrap();
+
+        assert!(matches!(
+            error,
+            Error::Connection(message)
+                if message.contains("body") && message.contains("8 bytes")
+        ));
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
