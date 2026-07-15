@@ -50,7 +50,7 @@ usable.
 | Valkey | `valkey://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Real Valkey compatibility live test |
 | KeyDB | `keydb://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Optional real KeyDB live test with `DBTOOL_IT_COMPAT_EXTRA=1` |
 | Dragonfly | `dragonfly://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Optional real Dragonfly live test with `DBTOOL_IT_COMPAT_EXTRA=1` |
-| MongoDB | `mongodb://` | MongoDB | collections, find, insert, update, delete, aggregate | Base Docker live test |
+| MongoDB | `mongodb://` | MongoDB | collections, find（skip/sort/projection）, insert, update, delete, bounded aggregate, drop collection | Base Docker live test + full document surface lifecycle |
 | Kafka | `kafka://` | Kafka | ping, produce, consume, topics, detail/watermarks; lag explicitly unsupported | Redpanda live test through pure Rust backend |
 | Kafka native | `kafka://` with `full-native` | Kafka | librdkafka-backed ping, produce, consume, topics/detail; machine-readable unsupported lag | Native live test passed against Redpanda |
 | Redpanda | `redpanda://` | Kafka | Full Kafka-compatible lifecycle through product-named scheme | Real Redpanda pure/native live tests |
@@ -111,7 +111,7 @@ usable.
 | CQL | `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema` | `cql exec` requires `--allow-write` |
 | Db2 | `db2 schemas`, `db2 tables`, `db2 schema`, `db2 sequences`, `db2 routines`, `db2 tablespaces`, `db2 foreign-keys`, `db2 ddl` | All read-only; no `--allow-write` required |
 | KV | `kv get`, `kv set`, `kv scan`, `kv del`, `kv raw` | `set`, `del`, and mutating raw commands require `--allow-write` |
-| Document | `doc collections`, `doc find`, `doc insert`, `doc update`, `doc delete`, `doc aggregate` | insert/update/delete require `--allow-write`; delete refuses empty filters adapter-side |
+| Document | `doc collections`, `doc find`, `doc insert`, `doc update`, `doc delete`, `doc aggregate`, `doc drop` | find exposes skip/sort/projection and exact truncation; insert/update/delete require `--allow-write`; update/delete reject empty filters; drop requires target-bound confirmation |
 | Transfer | `export sql`, `export kv`, `export doc`, `import sql`, `import kv`, `import doc` | all import commands require `--allow-write` before DSN resolution, artifact reads, or connecting |
 | Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write` |
 | Search | `search indices`, `search search`, `search index` | `index` requires `--allow-write` |

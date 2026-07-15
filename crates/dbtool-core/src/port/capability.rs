@@ -60,6 +60,29 @@ pub trait DocumentStore: Connector {
         -> Result<UpdateOutcome>;
     async fn delete(&self, collection: &str, filter: Value) -> Result<u64>;
     async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>>;
+
+    /// Run an aggregation while bounding the number of documents retained by
+    /// the adapter. Implementations should stop reading once `max_items` have
+    /// been collected instead of materializing the complete cursor first.
+    async fn aggregate_bounded(
+        &self,
+        collection: &str,
+        pipeline: Vec<Value>,
+        max_items: usize,
+    ) -> Result<Vec<Document>> {
+        let mut documents = self.aggregate(collection, pipeline).await?;
+        documents.truncate(max_items);
+        Ok(documents)
+    }
+
+    /// Drop a document collection. Connectors that cannot manage collection
+    /// lifecycle must reject the operation explicitly.
+    async fn drop_collection(&self, _collection: &str) -> Result<()> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "DocumentStore.drop_collection",
+        })
+    }
 }
 
 #[async_trait]

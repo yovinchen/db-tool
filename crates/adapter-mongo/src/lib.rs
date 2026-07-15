@@ -123,6 +123,7 @@ impl DocumentStore for MongoAdapter {
     ) -> Result<UpdateOutcome> {
         let col = self.db.collection::<mongodb::bson::Document>(collection);
         let filter = value_to_document(filter)?;
+        ensure_nonempty_filter(&filter, "update")?;
         let update = update_document(update)?;
         let result = col
             .update_many(filter, update)
@@ -137,11 +138,7 @@ impl DocumentStore for MongoAdapter {
     async fn delete(&self, collection: &str, filter: Value) -> Result<u64> {
         let col = self.db.collection::<mongodb::bson::Document>(collection);
         let filter = value_to_document(filter)?;
-        if filter.is_empty() {
-            return Err(Error::Query(
-                "refusing to delete documents without a filter".into(),
-            ));
-        }
+        ensure_nonempty_filter(&filter, "delete")?;
         let r = col
             .delete_many(filter)
             .await
@@ -150,7 +147,39 @@ impl DocumentStore for MongoAdapter {
     }
 
     async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>> {
+        self.aggregate_with_limit(collection, pipeline, None).await
+    }
+
+    async fn aggregate_bounded(
+        &self,
+        collection: &str,
+        pipeline: Vec<Value>,
+        max_items: usize,
+    ) -> Result<Vec<Document>> {
+        self.aggregate_with_limit(collection, pipeline, Some(max_items))
+            .await
+    }
+
+    async fn drop_collection(&self, collection: &str) -> Result<()> {
+        self.db
+            .collection::<mongodb::bson::Document>(collection)
+            .drop()
+            .await
+            .map_err(|e| Error::Query(e.to_string()))
+    }
+}
+
+impl MongoAdapter {
+    async fn aggregate_with_limit(
+        &self,
+        collection: &str,
+        pipeline: Vec<Value>,
+        max_items: Option<usize>,
+    ) -> Result<Vec<Document>> {
         use futures::StreamExt;
+        if max_items == Some(0) {
+            return Ok(Vec::new());
+        }
         let col = self.db.collection::<mongodb::bson::Document>(collection);
         let pipeline = pipeline
             .into_iter()
@@ -165,6 +194,9 @@ impl DocumentStore for MongoAdapter {
             docs.push(bson_document_to_core(
                 doc.map_err(|e| Error::Query(e.to_string()))?,
             ));
+            if max_items.is_some_and(|max_items| docs.len() >= max_items) {
+                break;
+            }
         }
         Ok(docs)
     }
@@ -172,6 +204,15 @@ impl DocumentStore for MongoAdapter {
 
 fn optional_document(value: Option<Value>) -> Result<Option<bson::Document>> {
     value.map(value_to_document).transpose()
+}
+
+fn ensure_nonempty_filter(filter: &bson::Document, operation: &str) -> Result<()> {
+    if filter.is_empty() {
+        return Err(Error::Query(format!(
+            "refusing to {operation} documents without a filter"
+        )));
+    }
+    Ok(())
 }
 
 fn value_to_document(value: Value) -> Result<bson::Document> {
@@ -294,6 +335,23 @@ mod tests {
 
         assert!(update.contains_key("$inc"));
         assert!(!update.contains_key("$set"));
+    }
+
+    #[test]
+    fn bulk_update_and_delete_reject_empty_filters() {
+        let filter = bson::Document::new();
+
+        let update_error = ensure_nonempty_filter(&filter, "update").unwrap_err();
+        assert!(matches!(
+            update_error,
+            Error::Query(message) if message.contains("update documents without a filter")
+        ));
+
+        let delete_error = ensure_nonempty_filter(&filter, "delete").unwrap_err();
+        assert!(matches!(
+            delete_error,
+            Error::Query(message) if message.contains("delete documents without a filter")
+        ));
     }
 
     #[test]

@@ -57,6 +57,46 @@ impl SafetyGuard {
             }
         }
     }
+
+    /// Require a target-bound confirmation token for a destructive operation
+    /// that is not represented by SQL (for example, dropping a MongoDB
+    /// collection or an OpenSearch index).
+    pub fn check_destructive_operation(
+        operation: &str,
+        resource: &str,
+        target: &str,
+        allow_write: bool,
+        confirm_token: Option<&str>,
+    ) -> Result<()> {
+        if !allow_write {
+            return Err(Error::WriteNotAllowed);
+        }
+
+        let operation = operation.trim().to_ascii_uppercase();
+        let resource = resource.trim();
+        if operation.is_empty() || resource.is_empty() {
+            return Err(Error::Config(
+                "destructive operation and resource must not be empty".into(),
+            ));
+        }
+
+        let impact = serde_json::json!({
+            "op": operation,
+            "resource": resource,
+            "target": target,
+        });
+        let normalized = format!("{} {}", impact["op"].as_str().unwrap_or_default(), resource);
+        let token = compute_token(&normalized, target, &impact);
+
+        match confirm_token {
+            Some(candidate) if candidate == token => Ok(()),
+            Some(_) => Err(Error::Internal("confirm token mismatch".into())),
+            None => Err(Error::ConfirmRequired {
+                confirm_token: token,
+                impact,
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -261,6 +301,64 @@ mod tests {
             SafetyGuard::check("drop table users", true, Some(&token)).unwrap(),
             StatementKind::Destructive
         );
+    }
+
+    #[test]
+    fn non_sql_destructive_operation_requires_target_bound_confirmation() {
+        let error = SafetyGuard::check_destructive_operation(
+            "drop_collection",
+            "events",
+            "conn:local",
+            true,
+            None,
+        )
+        .unwrap_err();
+        let token = match error {
+            Error::ConfirmRequired {
+                confirm_token,
+                impact,
+            } => {
+                assert_eq!(impact["op"], "DROP_COLLECTION");
+                assert_eq!(impact["resource"], "events");
+                assert_eq!(impact["target"], "conn:local");
+                confirm_token
+            }
+            other => panic!("expected confirmation requirement, got {other:?}"),
+        };
+
+        SafetyGuard::check_destructive_operation(
+            "drop_collection",
+            "events",
+            "conn:local",
+            true,
+            Some(&token),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            SafetyGuard::check_destructive_operation(
+                "drop_collection",
+                "events",
+                "conn:other",
+                true,
+                Some(&token),
+            ),
+            Err(Error::Internal(message)) if message.contains("mismatch")
+        ));
+    }
+
+    #[test]
+    fn non_sql_destructive_operation_still_requires_write_permission() {
+        assert!(matches!(
+            SafetyGuard::check_destructive_operation(
+                "drop_collection",
+                "events",
+                "conn:local",
+                false,
+                None,
+            ),
+            Err(Error::WriteNotAllowed)
+        ));
     }
 
     #[test]
