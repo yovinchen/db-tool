@@ -2,6 +2,27 @@
 
 dbtool exposes one shared `mq` command family, but each broker family has different metadata guarantees. The core adapter layer keeps protocol-native behavior separate from management-plugin behavior so a successful command does not imply a backend can discover metadata it does not actually expose.
 
+## Kafka / Redpanda
+
+The default pure-Rust backend provides bounded stateless reads and exact
+partition/offset cursors. It does not advertise consumer-group or acknowledgement
+operations. The `full-native` librdkafka backend additionally provides dynamic
+group subscription and broker offset commits:
+
+- `--group <name> --ack none` joins the group and reads from its committed
+  positions without committing the returned batch.
+- `--group <name> --ack on-success` converts the complete batch first, then
+  synchronously commits each partition's highest observed offset plus one.
+- A failed poll, unrepresentable tombstone/header, or commit failure is an
+  error, never a successful partial response. Kafka may still accept a commit
+  before a process dies while formatting output, so this is at-least-once
+  progress handling, not exactly-once processing.
+- `--consumer` would mean Kafka static membership. Static members do not leave
+  immediately when this one-shot consumer closes, so the native adapter rejects
+  the option rather than silently treating it as a client label.
+- `mq lag <group>` uses committed offsets and partition high watermarks only in
+  the native backend. Pure Kafka returns `UNSUPPORTED_CAPABILITY`.
+
 ## AMQP / RabbitMQ
 
 AMQP 0.9.1 can publish, consume, acknowledge, and passively inspect a known queue. It does not provide a protocol operation for listing all queues in a virtual host.

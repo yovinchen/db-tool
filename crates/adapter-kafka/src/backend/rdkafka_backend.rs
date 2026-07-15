@@ -4,9 +4,9 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
-        MessageCursor, MessagePlacement, MessageResource, PartitionWatermark, ProduceOutcome,
-        TopicDetail, TopicInfo,
+        AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, DeleteResourceOutcome,
+        LagInfo, Message, MessageCursor, MessagePlacement, MessageResource, PartitionWatermark,
+        ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -18,15 +18,15 @@ use rdkafka::{
     admin::{AdminClient, AdminOptions, NewTopic, TopicReplication},
     client::DefaultClientContext,
     config::ClientConfig,
-    consumer::{BaseConsumer, Consumer},
+    consumer::{BaseConsumer, CommitMode, Consumer},
     error::{KafkaError, RDKafkaErrorCode},
-    message::{Header, Headers, Message as KafkaMessage, OwnedHeaders},
+    message::{BorrowedMessage, Header, Headers, Message as KafkaMessage, OwnedHeaders},
     producer::{FutureProducer, FutureRecord},
     util::Timeout,
     Offset, TopicPartitionList,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     time::{Duration, Instant},
 };
 
@@ -80,14 +80,7 @@ impl Connector for RdkafkaAdapter {
     }
 
     fn operations(&self) -> Vec<CapabilityOperation> {
-        let mut operations = self.capabilities().operations();
-        operations.extend([
-            CapabilityOperation::MessageAdminListTopics,
-            CapabilityOperation::MessageAdminTopicDetail,
-            CapabilityOperation::MessageAdminConsumerLag,
-            CapabilityOperation::MessageAdminDelete,
-        ]);
-        operations
+        native_operations(self.capabilities())
     }
 
     async fn ping(&self) -> Result<()> {
@@ -116,6 +109,19 @@ impl Connector for RdkafkaAdapter {
     fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
         Some(self)
     }
+}
+
+fn native_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::MessageConsumeGroup,
+        CapabilityOperation::MessageConsumeAck,
+        CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminConsumerLag,
+        CapabilityOperation::MessageAdminDelete,
+    ]);
+    operations
 }
 
 #[async_trait::async_trait]
@@ -176,66 +182,12 @@ impl MessageProducer for RdkafkaAdapter {
 impl MessageConsumer for RdkafkaAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_topic(source)?;
-        let (requested_partition, requested_offset) = resolve_consume_position(&options)?;
-        if options.max == 0 {
-            return Ok(vec![]);
-        }
-
+        let group = native_consumer_group(&self.kind.0, &options)?;
         let deadline = consume_deadline(options.timeout)?;
-        let consumer = self.consumer("dbtool")?;
-        let Some(remaining) = remaining_until(deadline) else {
-            return Ok(vec![]);
-        };
-        let topics = self.topic_infos_with(&consumer, remaining)?;
-        let topic = require_topic(topics, source)?;
-        let partitions = if let Some(partition) = requested_partition {
-            vec![partition]
-        } else {
-            (0..topic.partitions).collect()
-        };
-        let mut assignment = TopicPartitionList::new();
-        for partition in partitions {
-            let offset = match requested_offset {
-                Some(offset) => offset,
-                None => {
-                    let Some(remaining) = remaining_until(deadline) else {
-                        return Ok(vec![]);
-                    };
-                    self.low_watermark_with(&consumer, source, partition, remaining)?
-                }
-            };
-            assignment
-                .add_partition_offset(source, partition, Offset::Offset(offset))
-                .map_err(kafka_query_error)?;
+        match group {
+            Some(group) => self.consume_group(source, group, options.ack, options.max, deadline),
+            None => self.consume_stateless(source, &options, deadline),
         }
-        consumer.assign(&assignment).map_err(kafka_query_error)?;
-
-        let mut messages = Vec::new();
-        while messages.len() < options.max && Instant::now() < deadline {
-            let poll_timeout = remaining_poll_timeout(deadline);
-            match consumer.poll(poll_timeout) {
-                Some(Ok(message)) => {
-                    messages.push(Message {
-                        key: message.key().map(Bytes::copy_from_slice),
-                        payload: Bytes::copy_from_slice(message.payload().unwrap_or_default()),
-                        headers: native_headers_to_core(message.headers()),
-                        partition: Some(message.partition()),
-                        offset: Some(message.offset()),
-                        timestamp: message.timestamp().to_millis(),
-                        cursor: Some(MessageCursor::Kafka {
-                            topic: source.to_owned(),
-                            partition: message.partition(),
-                            offset: message.offset(),
-                        }),
-                        metadata: None,
-                    });
-                }
-                Some(Err(KafkaError::PartitionEOF(_))) | None => {}
-                Some(Err(error)) => return Err(kafka_query_error(error)),
-            }
-        }
-
-        Ok(messages)
     }
 }
 
@@ -395,6 +347,68 @@ impl RdkafkaAdapter {
             .map_err(kafka_connection_error)
     }
 
+    fn consume_stateless(
+        &self,
+        source: &str,
+        options: &ConsumeOptions,
+        deadline: Instant,
+    ) -> Result<Vec<Message>> {
+        let (requested_partition, requested_offset) = resolve_consume_position(options)?;
+        let consumer = self.consumer("dbtool")?;
+        let Some(remaining) = remaining_until(deadline) else {
+            return Ok(vec![]);
+        };
+        let topic = require_topic(self.topic_infos_with(&consumer, remaining)?, source)?;
+        let partitions = if let Some(partition) = requested_partition {
+            vec![partition]
+        } else {
+            (0..topic.partitions).collect()
+        };
+        let mut assignment = TopicPartitionList::new();
+        for partition in partitions {
+            let offset = match requested_offset {
+                Some(offset) => offset,
+                None => {
+                    let Some(remaining) = remaining_until(deadline) else {
+                        return Ok(vec![]);
+                    };
+                    self.low_watermark_with(&consumer, source, partition, remaining)?
+                }
+            };
+            assignment
+                .add_partition_offset(source, partition, Offset::Offset(offset))
+                .map_err(kafka_query_error)?;
+        }
+        consumer.assign(&assignment).map_err(kafka_query_error)?;
+        collect_native_messages(&consumer, source, options.max, deadline)
+    }
+
+    fn consume_group(
+        &self,
+        source: &str,
+        group: &str,
+        ack: AckMode,
+        max: usize,
+        deadline: Instant,
+    ) -> Result<Vec<Message>> {
+        let consumer = self.consumer(group)?;
+        let Some(remaining) = remaining_until(deadline) else {
+            return Ok(vec![]);
+        };
+        require_topic(self.topic_infos_with(&consumer, remaining)?, source)?;
+        consumer.subscribe(&[source]).map_err(kafka_query_error)?;
+
+        let messages = collect_native_messages(&consumer, source, max, deadline)?;
+        if ack == AckMode::OnSuccess && !messages.is_empty() {
+            let offsets = next_offsets_for_batch(source, &messages)?;
+            consumer
+                .commit(&offsets, CommitMode::Sync)
+                .map_err(kafka_query_error)?;
+        }
+        consumer.unsubscribe();
+        Ok(messages)
+    }
+
     async fn ensure_topic(&self, name: &str) -> Result<()> {
         if self.topic_infos()?.iter().any(|topic| topic.name == name) {
             return Ok(());
@@ -471,6 +485,122 @@ impl RdkafkaAdapter {
     }
 }
 
+fn native_consumer_group<'a>(kind: &str, options: &'a ConsumeOptions) -> Result<Option<&'a str>> {
+    options
+        .validate()
+        .map_err(|message| Error::Config(format!("Kafka consume: {message}")))?;
+    match &options.identity {
+        ConsumerIdentity::Stateless if options.ack == AckMode::None => Ok(None),
+        ConsumerIdentity::Stateless => Err(Error::Config(
+            "Kafka --ack on-success requires a consumer group".to_owned(),
+        )),
+        ConsumerIdentity::Group {
+            group,
+            member: None,
+        } => normalize_consumer_group(group).map(Some),
+        ConsumerIdentity::Group {
+            member: Some(_), ..
+        } => Err(Error::Config(
+            "Kafka's short-lived consume operation cannot safely retain a static member; omit --consumer"
+                .to_owned(),
+        )),
+        ConsumerIdentity::Durable { .. } => Err(Error::UnsupportedCapability {
+            kind: kind.to_owned(),
+            needed: CapabilityOperation::MessageConsumeDurable.as_str(),
+        }),
+    }
+}
+
+fn collect_native_messages(
+    consumer: &BaseConsumer,
+    source: &str,
+    max: usize,
+    deadline: Instant,
+) -> Result<Vec<Message>> {
+    let mut messages = Vec::new();
+    while messages.len() < max && Instant::now() < deadline {
+        match consumer.poll(remaining_poll_timeout(deadline)) {
+            Some(Ok(message)) => messages.push(native_message_to_core(source, &message)?),
+            Some(Err(KafkaError::PartitionEOF(_))) | None => {}
+            Some(Err(error)) => return Err(kafka_query_error(error)),
+        }
+    }
+    Ok(messages)
+}
+
+fn native_message_to_core(expected_topic: &str, message: &BorrowedMessage<'_>) -> Result<Message> {
+    if message.topic() != expected_topic {
+        return Err(Error::Serialization(format!(
+            "Kafka group returned topic {:?} while consuming {expected_topic:?}",
+            message.topic()
+        )));
+    }
+    let partition = message.partition();
+    let offset = message.offset();
+    if partition < 0 || offset < 0 {
+        return Err(Error::Serialization(format!(
+            "Kafka returned invalid position {partition}:{offset}"
+        )));
+    }
+    let payload = message.payload().ok_or_else(|| {
+        Error::Serialization(
+            "Kafka tombstone payload cannot be represented by the portable Message model".into(),
+        )
+    })?;
+    Ok(Message {
+        key: message.key().map(Bytes::copy_from_slice),
+        payload: Bytes::copy_from_slice(payload),
+        headers: native_headers_to_core(message.headers())?,
+        partition: Some(partition),
+        offset: Some(offset),
+        timestamp: message.timestamp().to_millis(),
+        cursor: Some(MessageCursor::Kafka {
+            topic: message.topic().to_owned(),
+            partition,
+            offset,
+        }),
+        metadata: None,
+    })
+}
+
+fn next_offsets_for_batch(topic: &str, messages: &[Message]) -> Result<TopicPartitionList> {
+    let mut next_by_partition = BTreeMap::<i32, i64>::new();
+    for message in messages {
+        let Some(MessageCursor::Kafka {
+            topic: message_topic,
+            partition,
+            offset,
+        }) = &message.cursor
+        else {
+            return Err(Error::Serialization(
+                "Kafka commit batch contains a message without an exact Kafka cursor".into(),
+            ));
+        };
+        if message_topic != topic || *partition < 0 || *offset < 0 {
+            return Err(Error::Serialization(format!(
+                "Kafka commit cursor does not match topic {topic:?}: {message_topic:?}:{partition}:{offset}"
+            )));
+        }
+        let next = offset.checked_add(1).ok_or_else(|| {
+            Error::Serialization(format!(
+                "Kafka offset overflow while committing {message_topic:?}:{partition}:{offset}"
+            ))
+        })?;
+        next_by_partition
+            .entry(*partition)
+            .and_modify(|current| *current = (*current).max(next))
+            .or_insert(next);
+    }
+
+    let mut offsets = TopicPartitionList::new();
+    for (partition, offset) in next_by_partition {
+        offsets
+            .add_partition_offset(topic, partition, Offset::Offset(offset))
+            .map_err(kafka_query_error)?;
+    }
+    Ok(offsets)
+}
+
 fn kafka_config(dsn: &Dsn, brokers: &str) -> ClientConfig {
     let mut config = ClientConfig::new();
     config
@@ -484,19 +614,21 @@ fn kafka_config(dsn: &Dsn, brokers: &str) -> ClientConfig {
 fn consumer_client_config(base: &ClientConfig, group: &str) -> Result<ClientConfig> {
     let group = normalize_consumer_group(group)?;
     let mut config = base.clone();
+    config.remove("group.instance.id");
     config
         .set("group.id", group)
         .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
         .set("enable.partition.eof", "true")
         .set("auto.offset.reset", "earliest");
     Ok(config)
 }
 
 fn normalize_consumer_group(group: &str) -> Result<&str> {
-    let group = group.trim();
-    if group.is_empty() {
+    if group.trim().is_empty() || group != group.trim() || group.chars().any(char::is_control) {
         return Err(Error::Config(
-            "Kafka consumer group must not be empty".to_owned(),
+            "Kafka consumer group must be non-empty, have no surrounding whitespace, and contain no control characters"
+                .to_owned(),
         ));
     }
     Ok(group)
@@ -653,17 +785,32 @@ fn core_headers_to_native(headers: &HashMap<String, String>) -> OwnedHeaders {
     )
 }
 
-fn native_headers_to_core<H: Headers>(headers: Option<&H>) -> HashMap<String, String> {
-    headers
-        .into_iter()
-        .flat_map(Headers::iter)
-        .map(|header| {
-            (
-                header.key.to_owned(),
-                String::from_utf8_lossy(header.value.unwrap_or_default()).into_owned(),
-            )
-        })
-        .collect()
+fn native_headers_to_core<H: Headers>(headers: Option<&H>) -> Result<HashMap<String, String>> {
+    let mut decoded = HashMap::new();
+    for header in headers.into_iter().flat_map(Headers::iter) {
+        let value = header.value.ok_or_else(|| {
+            Error::Serialization(format!(
+                "Kafka header {:?} has a null value that the portable Message model cannot represent",
+                header.key
+            ))
+        })?;
+        let value = std::str::from_utf8(value).map_err(|_| {
+            Error::Serialization(format!(
+                "Kafka header {:?} contains a non-UTF-8 value",
+                header.key
+            ))
+        })?;
+        if decoded
+            .insert(header.key.to_owned(), value.to_owned())
+            .is_some()
+        {
+            return Err(Error::Serialization(format!(
+                "Kafka message contains duplicate header key {:?}",
+                header.key
+            )));
+        }
+    }
+    Ok(decoded)
 }
 
 fn consume_deadline(timeout: Duration) -> Result<Instant> {
@@ -699,7 +846,7 @@ fn kafka_query_error(error: KafkaError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdkafka::consumer::CommitMode;
+    use dbtool_core::model::MessageResourceKind;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn message(headers: HashMap<String, String>) -> Message {
@@ -723,7 +870,7 @@ mod tests {
         ]);
         let native = core_headers_to_native(&expected);
 
-        assert_eq!(native_headers_to_core(Some(&native)), expected);
+        assert_eq!(native_headers_to_core(Some(&native)).unwrap(), expected);
     }
 
     #[test]
@@ -740,7 +887,44 @@ mod tests {
 
     #[test]
     fn absent_native_headers_decode_to_empty_map() {
-        assert!(native_headers_to_core::<OwnedHeaders>(None).is_empty());
+        assert!(native_headers_to_core::<OwnedHeaders>(None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unrepresentable_native_headers_fail_instead_of_becoming_different_values() {
+        let null_value = OwnedHeaders::new().insert(Header::<&[u8]> {
+            key: "nullable",
+            value: None,
+        });
+        assert!(native_headers_to_core(Some(&null_value))
+            .unwrap_err()
+            .to_string()
+            .contains("null value"));
+
+        let non_utf8 = OwnedHeaders::new().insert(Header {
+            key: "binary",
+            value: Some(&[0xff][..]),
+        });
+        assert!(native_headers_to_core(Some(&non_utf8))
+            .unwrap_err()
+            .to_string()
+            .contains("non-UTF-8"));
+
+        let duplicates = OwnedHeaders::new()
+            .insert(Header {
+                key: "trace",
+                value: Some("one"),
+            })
+            .insert(Header {
+                key: "trace",
+                value: Some("two"),
+            });
+        assert!(native_headers_to_core(Some(&duplicates))
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
     }
 
     #[test]
@@ -748,7 +932,9 @@ mod tests {
         let mut base = ClientConfig::new();
         base.set("bootstrap.servers", "127.0.0.1:9092")
             .set("group.id", "dsn-group")
-            .set("enable.auto.commit", "true");
+            .set("group.instance.id", "dsn-static-member")
+            .set("enable.auto.commit", "true")
+            .set("enable.auto.offset.store", "true");
 
         let first = consumer_client_config(&base, "group-a").unwrap();
         let second = consumer_client_config(&base, "group-b").unwrap();
@@ -758,6 +944,8 @@ mod tests {
         assert_eq!(first.get("group.id"), Some("group-a"));
         assert_eq!(second.get("group.id"), Some("group-b"));
         assert_eq!(first.get("enable.auto.commit"), Some("false"));
+        assert_eq!(first.get("enable.auto.offset.store"), Some("false"));
+        assert_eq!(first.get("group.instance.id"), None);
         assert_eq!(first.get("enable.partition.eof"), Some("true"));
         assert_eq!(first.get("auto.offset.reset"), Some("earliest"));
     }
@@ -767,7 +955,97 @@ mod tests {
         let error = consumer_client_config(&ClientConfig::new(), "  ").unwrap_err();
 
         assert!(matches!(error, Error::Config(_)));
-        assert!(error.to_string().contains("must not be empty"));
+        assert!(error.to_string().contains("non-empty"));
+
+        for invalid in [" group", "group ", "group\nmember"] {
+            assert!(consumer_client_config(&ClientConfig::new(), invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn native_consume_contract_is_group_scoped_and_never_claims_durable_state() {
+        let operations = native_operations(Capabilities {
+            consumer: true,
+            ..Default::default()
+        });
+        assert!(operations.contains(&CapabilityOperation::MessageConsumeGroup));
+        assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
+        assert!(!operations.contains(&CapabilityOperation::MessageConsumeDurable));
+
+        let stateless = ConsumeOptions::default();
+        assert_eq!(native_consumer_group("kafka", &stateless).unwrap(), None);
+
+        let stateless_ack = ConsumeOptions {
+            ack: AckMode::OnSuccess,
+            ..Default::default()
+        };
+        assert!(native_consumer_group("kafka", &stateless_ack)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a consumer group"));
+
+        let mut grouped = ConsumeOptions {
+            identity: ConsumerIdentity::Group {
+                group: "orders".to_owned(),
+                member: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            native_consumer_group("kafka", &grouped).unwrap(),
+            Some("orders")
+        );
+        grouped.identity = ConsumerIdentity::Group {
+            group: "orders".to_owned(),
+            member: Some("worker-1".to_owned()),
+        };
+        assert!(native_consumer_group("kafka", &grouped)
+            .unwrap_err()
+            .to_string()
+            .contains("static member"));
+
+        grouped.identity = ConsumerIdentity::Durable {
+            name: "orders".to_owned(),
+        };
+        assert!(matches!(
+            native_consumer_group("kafka", &grouped),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "message.consume_durable"
+        ));
+    }
+
+    #[test]
+    fn group_commit_offsets_use_each_partitions_highest_observed_offset_plus_one() {
+        let consumed = |partition, offset| Message {
+            key: None,
+            payload: Bytes::from_static(b"payload"),
+            headers: HashMap::new(),
+            partition: Some(partition),
+            offset: Some(offset),
+            timestamp: None,
+            cursor: Some(MessageCursor::Kafka {
+                topic: "orders".to_owned(),
+                partition,
+                offset,
+            }),
+            metadata: None,
+        };
+        let offsets =
+            next_offsets_for_batch("orders", &[consumed(1, 7), consumed(0, 3), consumed(1, 9)])
+                .unwrap();
+        assert_eq!(
+            offsets.find_partition("orders", 0).unwrap().offset(),
+            Offset::Offset(4)
+        );
+        assert_eq!(
+            offsets.find_partition("orders", 1).unwrap().offset(),
+            Offset::Offset(10)
+        );
+
+        let wrong_topic = next_offsets_for_batch("payments", &[consumed(0, 0)]).unwrap_err();
+        assert!(matches!(wrong_topic, Error::Serialization(_)));
+        let overflow = next_offsets_for_batch("orders", &[consumed(0, i64::MAX)]).unwrap_err();
+        assert!(matches!(overflow, Error::Serialization(_)));
     }
 
     #[test]
@@ -901,5 +1179,152 @@ mod tests {
             deleted[0].is_ok(),
             "cleanup topic deletion failed: {deleted:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn live_group_consume_replays_without_ack_and_commits_complete_batches() {
+        if std::env::var("DBTOOL_RUN_KAFKA_NATIVE_LIVE").as_deref() != Ok("1") {
+            return;
+        }
+        let raw_dsn = std::env::var("DBTOOL_IT_KAFKA_DSN")
+            .expect("DBTOOL_IT_KAFKA_DSN is required for the native live test");
+        let dsn = Dsn::parse(&raw_dsn).expect("native live Kafka DSN should parse");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after Unix epoch")
+            .as_millis();
+        let topic = format!("dbtool_it_native_group_{}_{}", std::process::id(), unique);
+        let group = format!("dbtool-it-native-group-{}-{unique}", std::process::id());
+        let brokers = brokers_from_dsn(&dsn);
+        let base = kafka_config(&dsn, &brokers);
+        let admin = base
+            .create::<AdminClient<DefaultClientContext>>()
+            .expect("cleanup admin client should be created");
+        let created = admin
+            .create_topics(
+                &[NewTopic::new(&topic, 2, TopicReplication::Fixed(1))],
+                &AdminOptions::new(),
+            )
+            .await
+            .expect("two-partition topic creation should complete");
+        assert_eq!(created.len(), 1);
+        assert!(created[0].is_ok(), "topic creation failed: {created:?}");
+
+        let connector = connect(dsn).await.expect("Kafka should connect");
+        let produced = connector
+            .as_producer()
+            .expect("native Kafka exposes MessageProducer")
+            .produce(
+                &topic,
+                [(0, "p0-a"), (0, "p0-b"), (1, "p1-a"), (1, "p1-b")]
+                    .into_iter()
+                    .map(|(partition, payload)| Message {
+                        key: None,
+                        payload: Bytes::copy_from_slice(payload.as_bytes()),
+                        headers: HashMap::new(),
+                        partition: Some(partition),
+                        offset: None,
+                        timestamp: None,
+                        cursor: None,
+                        metadata: None,
+                    })
+                    .collect(),
+            )
+            .await
+            .expect("messages should be produced to both partitions");
+        assert_eq!(produced.produced, 4);
+
+        let options = |ack, max, timeout| ConsumeOptions {
+            max,
+            timeout,
+            identity: ConsumerIdentity::Group {
+                group: group.clone(),
+                member: None,
+            },
+            ack,
+            ..Default::default()
+        };
+        let consumer = connector
+            .as_consumer()
+            .expect("native Kafka exposes MessageConsumer");
+        let first = consumer
+            .consume(&topic, options(AckMode::None, 4, Duration::from_secs(10)))
+            .await
+            .expect("ack-none group consume should succeed");
+        assert_eq!(first.len(), 4);
+        let replay = consumer
+            .consume(&topic, options(AckMode::None, 4, Duration::from_secs(10)))
+            .await
+            .expect("ack-none group consume should replay");
+        let mut first_payloads = first
+            .iter()
+            .map(|message| message.payload.to_vec())
+            .collect::<Vec<_>>();
+        let mut replay_payloads = replay
+            .iter()
+            .map(|message| message.payload.to_vec())
+            .collect::<Vec<_>>();
+        first_payloads.sort();
+        replay_payloads.sort();
+        assert_eq!(replay_payloads, first_payloads);
+
+        let admin_inspect = connector
+            .as_admin()
+            .expect("native Kafka exposes AdminInspect");
+        assert!(admin_inspect
+            .consumer_lag(&group)
+            .await
+            .expect("uncommitted group lag inspection should succeed")
+            .iter()
+            .all(|entry| entry.topic != topic));
+
+        let committed = consumer
+            .consume(
+                &topic,
+                options(AckMode::OnSuccess, 4, Duration::from_secs(10)),
+            )
+            .await
+            .expect("successful batch should commit");
+        assert_eq!(committed.len(), 4);
+        let lag = admin_inspect
+            .consumer_lag(&group)
+            .await
+            .expect("committed group lag should be readable")
+            .into_iter()
+            .filter(|entry| entry.topic == topic)
+            .collect::<Vec<_>>();
+        assert_eq!(lag.len(), 2);
+        assert_eq!(lag.iter().map(|entry| entry.latest).sum::<i64>(), 4);
+        assert_eq!(lag.iter().map(|entry| entry.committed).sum::<i64>(), 4);
+        assert_eq!(lag.iter().map(|entry| entry.lag).sum::<i64>(), 0);
+
+        let no_more = consumer
+            .consume(
+                &topic,
+                options(AckMode::OnSuccess, 1, Duration::from_secs(3)),
+            )
+            .await
+            .expect("fully committed group should remain readable");
+        assert!(no_more.is_empty());
+
+        let deleted = connector
+            .as_admin_mutate()
+            .expect("native Kafka exposes AdminMutate")
+            .delete_resource(
+                MessageResource {
+                    kind: MessageResourceKind::KafkaTopic,
+                    name: topic.clone(),
+                },
+                DeleteResourceOptions::default(),
+            )
+            .await
+            .expect("test topic should be deleted");
+        assert!(deleted.acknowledged && deleted.verified_absent);
+        assert!(!admin_inspect
+            .list_topics()
+            .await
+            .expect("topics should remain inspectable")
+            .iter()
+            .any(|entry| entry.name == topic));
     }
 }

@@ -471,9 +471,9 @@ dbtool --dsn "$KAFKA_DSN" mq consume orders \
 状态消费使用显式 typed 参数，不从 DSN 或固定默认 group 猜测：
 
 ```bash
-# consumer group；member 只允许与 group 同时出现
+# native Kafka consumer group
 dbtool --dsn "$BROKER_DSN" --allow-write mq consume orders \
-  --group billing --consumer worker-1 --ack on-success --max 10 --timeout 5
+  --group billing --ack on-success --max 10 --timeout 5
 
 # durable consumer
 dbtool --dsn "$NATS_DSN" --allow-write mq consume ORDERS \
@@ -487,6 +487,13 @@ cursor 混用。CLI 连接后还会检查 `message.consume_group`、
 `message.consume_durable`、`message.consume_ack`；粗粒度 `consumer=true` 不会冒充这些
 扩展能力。不提供跨进程通用 `mq ack <token>`，因为 Kafka commit、Redis XACK、NATS
 reply subject 和 AMQP channel-scoped delivery tag 不是同一种可移植句柄。
+
+native Kafka 只声明 `message.consume_group` 与 `message.consume_ack`。它通过真正的
+group subscription 从 broker committed offset（无提交时为 earliest）开始；
+`--ack none` 不提交，下一次同组调用可重放；`--ack on-success` 等整个返回批次全部转换
+成功后，按每个 partition 观察到的最大 offset + 1 同步提交。pure `rskafka` 不声明这两项
+能力。Kafka 的 static member 需要长生命周期并且关闭时不会主动离组，与一次性 CLI 调用
+不兼容，因此 native Kafka 明确拒绝 `--consumer`，不会把它偷换成 `client.id` 或静默忽略。
 
 ACK/commit 只能保证 broker 接受进度更新；进度提交后、CLI 输出前仍存在进程崩溃窗口，
 不得描述为 exactly-once。
@@ -510,6 +517,11 @@ cursor。native Kafka 的 `mq lag <group>` 使用真实 committed offset 和 hig
 pure Kafka 明确不支持。RabbitMQ queue depth 只属于 `mq detail`，不得伪装成
 consumer-group lag。
 
+外部 Kafka producer 可以写入 tombstone、null header value、重复 header key 或非 UTF-8
+header value，而公共 `Message` 模型不能无损表达这些形态。native consumer 会在提交 group
+offset 之前返回明确的序列化错误；它不会把 tombstone 变成空 payload、把 null 变成空串、
+覆盖重复 header，或做有损 UTF-8 转换。
+
 持久消息资源删除统一使用两段式确认：
 
 ```bash
@@ -528,8 +540,9 @@ dbtool --dsn "$RABBIT_MANAGEMENT_DSN" --allow-write --confirm '<token>' \
 `messages`，或在该字段缺失时以 checked `messages_ready + messages_unacknowledged` 重建；
 快照尚未完整、值非法或溢出时返回错误，不以零代替。
 
-设计中声明的 durable/group 消费与显式 ACK 选择仍由 IF-T48 跟踪；现有无状态 cursor
-读取不能被描述为已经提交 consumer-group 进度。
+Redis Streams、NATS 与 AMQP 的 stateful ACK 兑现仍由 IF-T48 跟踪；只有已经声明并实现
+对应 method-level operation 的 adapter 才能描述为推进了 broker 进度。无状态 cursor 读取
+仍不能被描述为已经提交 consumer-group 进度。
 
 ## Search / OpenSearch / Elasticsearch
 
