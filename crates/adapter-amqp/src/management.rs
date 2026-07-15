@@ -304,9 +304,7 @@ struct QueueDeleteCounts {
 
 impl QueueDeleteCounts {
     fn total_messages(self) -> Result<u64> {
-        self.ready
-            .checked_add(self.unacknowledged)
-            .ok_or_else(|| Error::Serialization("RabbitMQ queue message count overflow".into()))
+        checked_message_total(self.ready, self.unacknowledged)
     }
 }
 
@@ -338,7 +336,7 @@ fn queue_topic_info(queue: &Value) -> Result<TopicInfo> {
 
 fn queue_detail(queue: &Value) -> Result<TopicDetail> {
     let info = queue_topic_info(queue)?;
-    let message_count = json_u64_required(queue, "messages")?;
+    let message_count = queue_message_count(queue)?;
     let consumer_count = json_u64_required(queue, "consumers")?;
     let total = i64::try_from(message_count)
         .map_err(|_| Error::Serialization("RabbitMQ message count exceeds i64".into()))?;
@@ -371,6 +369,26 @@ fn queue_detail(queue: &Value) -> Result<TopicDetail> {
             high: total,
         }],
     })
+}
+
+fn queue_message_count(queue: &Value) -> Result<u64> {
+    match queue.get("messages") {
+        Some(value) => value.as_u64().ok_or_else(|| {
+            Error::Serialization(
+                "RabbitMQ queue response contains invalid non-negative integer messages".into(),
+            )
+        }),
+        None => checked_message_total(
+            json_u64_required(queue, "messages_ready")?,
+            json_u64_required(queue, "messages_unacknowledged")?,
+        ),
+    }
+}
+
+fn checked_message_total(ready: u64, unacknowledged: u64) -> Result<u64> {
+    ready
+        .checked_add(unacknowledged)
+        .ok_or_else(|| Error::Serialization("RabbitMQ queue message count overflow".into()))
 }
 
 fn json_string(value: &Value, key: &str) -> Option<String> {
@@ -554,6 +572,47 @@ fn percent_decode(input: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    // Captured from the RabbitMQ 3.13 management endpoint used by the Docker
+    // integration suite after publishing one message to a classic queue.
+    const RABBITMQ_QUEUE_DETAIL_FIXTURE: &str = r#"{
+        "consumer_details": [],
+        "arguments": {},
+        "auto_delete": false,
+        "consumer_capacity": 0,
+        "consumer_utilisation": 0,
+        "consumers": 0,
+        "durable": false,
+        "exclusive": false,
+        "message_bytes": 7,
+        "message_bytes_ready": 7,
+        "message_bytes_unacknowledged": 0,
+        "messages": 1,
+        "messages_ready": 1,
+        "messages_unacknowledged": 0,
+        "name": "dbtool_fixture_admin_count",
+        "node": "rabbit@ccc0eb90d95e",
+        "state": "running",
+        "type": "classic",
+        "vhost": "dbtool_it"
+    }"#;
+
+    // A newly declared queue can temporarily have no management count fields
+    // at all. This is also a real response shape from the same Docker image.
+    const RABBITMQ_NEW_QUEUE_FIXTURE: &str = r#"{
+        "consumer_details": [],
+        "arguments": {},
+        "auto_delete": false,
+        "deliveries": [],
+        "durable": false,
+        "exclusive": false,
+        "incoming": [],
+        "name": "dbtool_fixture_admin_count",
+        "node": "rabbit@ccc0eb90d95e",
+        "state": "running",
+        "type": "classic",
+        "vhost": "dbtool_it"
+    }"#;
+
     #[test]
     fn management_dsn_extracts_vhost_and_auth() {
         let dsn = Dsn::parse("rabbitmq+http://dbtool:secret@127.0.0.1:15672/%2F").unwrap();
@@ -583,8 +642,8 @@ mod tests {
             "name": "jobs",
             "vhost": "dbtool_it",
             "messages": 3,
-            "messages_ready": 2,
-            "messages_unacknowledged": 1,
+            "messages_ready": 200,
+            "messages_unacknowledged": 100,
             "consumers": 4,
             "state": "running"
         });
@@ -600,6 +659,64 @@ mod tests {
             "consumers": 4
         }))
         .is_err());
+    }
+
+    #[test]
+    fn queue_detail_accepts_real_rabbitmq_management_response() {
+        let value: Value = serde_json::from_str(RABBITMQ_QUEUE_DETAIL_FIXTURE).unwrap();
+
+        let detail = queue_detail(&value).unwrap();
+
+        assert_eq!(detail.info.name, "dbtool_fixture_admin_count");
+        assert_eq!(detail.config["message_count"], "1");
+        assert_eq!(detail.config["consumer_count"], "0");
+        assert_eq!(detail.watermarks[0].high, 1);
+    }
+
+    #[test]
+    fn queue_detail_reconstructs_missing_aggregate_from_exact_component_counts() {
+        let mut value: Value = serde_json::from_str(RABBITMQ_QUEUE_DETAIL_FIXTURE).unwrap();
+        value
+            .as_object_mut()
+            .expect("fixture should be an object")
+            .remove("messages");
+
+        let detail = queue_detail(&value).unwrap();
+
+        assert_eq!(detail.config["message_count"], "1");
+        assert_eq!(detail.watermarks[0].high, 1);
+    }
+
+    #[test]
+    fn queue_detail_refuses_missing_invalid_or_overflowing_message_counts() {
+        let newly_declared: Value = serde_json::from_str(RABBITMQ_NEW_QUEUE_FIXTURE).unwrap();
+        assert!(matches!(
+            queue_detail(&newly_declared),
+            Err(Error::Serialization(message)) if message.contains("messages_ready")
+        ));
+
+        let invalid_aggregate = serde_json::json!({
+            "name": "jobs",
+            "messages": -1,
+            "messages_ready": 2,
+            "messages_unacknowledged": 1,
+            "consumers": 0
+        });
+        assert!(matches!(
+            queue_detail(&invalid_aggregate),
+            Err(Error::Serialization(message)) if message.contains("invalid") && message.contains("messages")
+        ));
+
+        let overflowing_components = serde_json::json!({
+            "name": "jobs",
+            "messages_ready": u64::MAX,
+            "messages_unacknowledged": 1,
+            "consumers": 0
+        });
+        assert!(matches!(
+            queue_detail(&overflowing_components),
+            Err(Error::Serialization(message)) if message.contains("overflow")
+        ));
     }
 
     #[test]

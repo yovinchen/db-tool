@@ -11,13 +11,25 @@ Current core behavior:
 - `mq produce <queue>` declares the named queue when needed and publishes to it.
 - `mq consume <queue>` declares the named queue when needed and performs bounded `basic.get` with ack.
 - `mq detail <queue>` uses passive queue declare and returns `message_count` and `consumer_count`.
+- `mq delete --kind amqp-queue <queue>` can remove a known queue; `--if-empty` and
+  `--if-unused` are part of the target-bound confirmation scope and cannot be
+  changed after a token is issued.
 - `mq topics` and `mq lag` return `UNSUPPORTED_CAPABILITY` for pure AMQP because queue discovery and queue-depth lag require RabbitMQ's HTTP management plugin. An empty success would incorrectly mean that the broker was inspected and contained no queues.
 
 RabbitMQ queue listing is exposed through an explicit management boundary, not hidden inside the pure AMQP protocol path:
 
 - `rabbitmq+http://user:pass@host:15672/vhost` registers an admin-only connector.
 - `mq topics` lists queues through `/api/queues/{vhost}`.
-- `mq detail <queue>` and `mq lag <queue>` use `/api/queues/{vhost}/{queue}`.
+- `mq detail <queue>` uses `/api/queues/{vhost}/{queue}` and reports an exact
+  snapshot only after RabbitMQ publishes count fields. It prefers a valid
+  `messages`; when that aggregate is absent it uses checked
+  `messages_ready + messages_unacknowledged`. Missing, invalid, or overflowing
+  counts are errors, never an invented zero.
+- `mq delete --kind amqp-queue <queue>` uses the management DELETE endpoint and
+  verifies absence after RabbitMQ acknowledges removal.
+- `mq lag` remains `UNSUPPORTED_CAPABILITY`: queue depth is not a portable
+  consumer-group committed-offset lag, so detail metadata is not relabeled as
+  lag.
 
 Do not infer the management API port from the AMQP port in core code; local deployments commonly remap one without the other.
 

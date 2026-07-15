@@ -355,10 +355,44 @@ dbtool --dsn "$KAFKA_DSN" mq consume orders \
 达到 `--max` 时，`meta.truncated=true` 只表示本次预算已用完，不证明 broker 中还有
 下一条消息。
 
-当前 pure `rskafka` 与 native `librdkafka` 均已在 Redpanda 24.3.6 上逐字段验证
-payload/key/headers/partition/offset/timestamp。CLI 参数是公共输入面，不代表每种消息
-协议都有同名语义：Kafka 之外的字段映射或显式拒绝、Redis Streams 精确 cursor、
-consumer group 与资源删除仍由 IF-T47/IF-T48 跟踪，在完成前不能把忽略字段描述为成功。
+当前 pure `rskafka` 与 native `librdkafka` 均已在 Redpanda 上逐字段验证
+payload/key/headers/partition/offset/timestamp。Kafka、Redis Streams 与 NATS JetStream
+还会返回无损 `cursor`，可原样作为 inclusive 起点重放同一条仍被保留的消息：
+
+```bash
+dbtool --dsn "$KAFKA_DSN" mq consume orders --cursor 'kafka:0:42' --max 1
+dbtool --dsn "$REDIS_DSN" mq consume stream:orders \
+  --cursor 'redis-stream:1710000000000-3' --max 1
+dbtool --dsn "$NATS_DSN" mq consume ORDERS \
+  --cursor 'nats-jetstream:42' --max 1
+```
+
+协议不接受的字段会返回 `CONFIG_ERROR`，不会静默丢弃。AMQP 返回 delivery tag、
+redelivered、exchange、routing key 等已 ACK 的诊断 metadata；它不是可跨进程复用的
+cursor。native Kafka 的 `mq lag <group>` 使用真实 committed offset 和 high watermark；
+pure Kafka 明确不支持。RabbitMQ queue depth 只属于 `mq detail`，不得伪装成
+consumer-group lag。
+
+持久消息资源删除统一使用两段式确认：
+
+```bash
+# 第一次返回 CONFIRM_REQUIRED 和 confirm_token
+dbtool --dsn "$RABBIT_MANAGEMENT_DSN" --allow-write \
+  mq delete --kind amqp-queue jobs --if-empty --if-unused
+
+# 第二次的 kind/name/if-empty/if-unused 必须与第一次完全一致
+dbtool --dsn "$RABBIT_MANAGEMENT_DSN" --allow-write --confirm '<token>' \
+  mq delete --kind amqp-queue jobs --if-empty --if-unused
+```
+
+可删除类型为 Kafka topic、AMQP queue、Redis Stream、NATS JetStream；Core NATS subject
+和 Redis Pub/Sub channel 没有持久资源删除语义。确认摘要绑定连接目标、resource kind/name
+以及完整删除选项，任何条件变化都会拒绝旧 token。RabbitMQ 管理 detail 只接受合法
+`messages`，或在该字段缺失时以 checked `messages_ready + messages_unacknowledged` 重建；
+快照尚未完整、值非法或溢出时返回错误，不以零代替。
+
+设计中声明的 durable/group 消费与显式 ACK 选择仍由 IF-T48 跟踪；现有无状态 cursor
+读取不能被描述为已经提交 consumer-group 进度。
 
 ## Search / OpenSearch / Elasticsearch
 

@@ -67,6 +67,26 @@ fn stdout_json_retry_until(args: &[&str], matches: impl Fn(&Value) -> bool) -> V
     panic!("retry condition was not met for args {args:?}; last JSON response: {last_value}");
 }
 
+fn stdout_json_retry_until_complete(args: &[&str], matches: impl Fn(&Value) -> bool) -> Value {
+    let mut last_response = "command was not attempted".to_owned();
+    for _ in 0..20 {
+        let output = dbtool(args);
+        if output.status.success() {
+            let value: Value = serde_json::from_slice(&output.stdout)
+                .expect("successful command stdout should be JSON");
+            if matches(&value) {
+                return value;
+            }
+            last_response = value.to_string();
+        } else {
+            last_response = String::from_utf8_lossy(&output.stderr).into_owned();
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    panic!("complete response was not available for args {args:?}; last response: {last_response}");
+}
+
 fn stderr_json(output: Output) -> Value {
     assert!(
         !output.status.success(),
@@ -728,7 +748,10 @@ fn rabbitmq_management_live_lists_details_and_deletes_queues() {
         .iter()
         .any(|item| item["name"] == queue));
 
-    let detail = stdout_json_retry_until(
+    // RabbitMQ can briefly omit every queue-count field after declaration.
+    // The adapter intentionally fails closed until an exact snapshot exists,
+    // so the live test waits for that complete management response.
+    let detail = stdout_json_retry_until_complete(
         &["--dsn", &management_dsn, "mq", "detail", &queue],
         |value| value["data"]["config"]["message_count"] == "1",
     );

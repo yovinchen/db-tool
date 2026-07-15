@@ -171,6 +171,47 @@ fn resource_delete_rejects_amqp_only_conditions_before_connecting() {
 }
 
 #[test]
+fn resource_delete_confirmation_cannot_be_reused_with_different_conditions() {
+    let first = stderr_json(dbtool(&[
+        "--dsn",
+        UNREACHABLE_AMQP_DSN,
+        "--allow-write",
+        "mq",
+        "delete",
+        "--kind",
+        "amqp-queue",
+        "events",
+        "--if-empty",
+    ]));
+    assert_eq!(first["error"]["code"], "CONFIRM_REQUIRED");
+    let token = first["error"]["confirm_token"]
+        .as_str()
+        .expect("delete confirmation should include a token")
+        .to_owned();
+
+    for changed_conditions in [
+        Vec::<&str>::new(),
+        vec!["--if-unused"],
+        vec!["--if-empty", "--if-unused"],
+    ] {
+        let mut args = vec![
+            "--dsn",
+            UNREACHABLE_AMQP_DSN,
+            "--allow-write",
+            "--confirm",
+            token.as_str(),
+            "mq",
+            "delete",
+            "--kind",
+            "amqp-queue",
+            "events",
+        ];
+        args.extend(changed_conditions);
+        assert_error(&args, "INTERNAL_ERROR", "confirm token mismatch");
+    }
+}
+
+#[test]
 fn consume_bounds_and_positions_fail_as_json_before_connecting() {
     assert_config_error(
         &[

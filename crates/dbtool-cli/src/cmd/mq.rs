@@ -184,10 +184,12 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             request.resource.kind.as_str(),
             request.resource.name
         );
-        SafetyGuard::check_destructive_operation(
+        let confirmation_scope = delete_confirmation_scope(request)?;
+        SafetyGuard::check_destructive_operation_with_scope(
             "delete_message_resource",
             &safety_resource,
             &ctx.safety_target(&dsn),
+            &confirmation_scope,
             ctx.allow_write,
             ctx.confirm.as_deref(),
         )?;
@@ -327,6 +329,10 @@ fn build_delete_request(
             if_unused,
         },
     })
+}
+
+fn delete_confirmation_scope(request: &DeleteRequest) -> Result<String> {
+    SafetyGuard::confirmation_scope_digest(&(&request.resource, request.options))
 }
 
 fn build_message(
