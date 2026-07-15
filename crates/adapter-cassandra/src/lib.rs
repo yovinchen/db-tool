@@ -9,14 +9,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, ResultSet, TableInfo, TableKind,
-        TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ResultSet, TableInfo,
+        TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
     },
     port::{
         capability::{CqlEngine, SqlEngine},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, ResultLimiter},
+    service::limiter::{ListLimiter, MetadataLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, StreamExt};
 use scylla::{
@@ -36,6 +36,8 @@ pub struct CassandraAdapter {
     kind: ConnectorKind,
     keyspace: Option<String>,
 }
+
+const LEGACY_SCHEMA_MAX_ITEMS: usize = 100_000;
 
 pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
@@ -155,6 +157,119 @@ impl CassandraAdapter {
         drop(rows);
         Ok(limiter.finish(items))
     }
+
+    async fn query_metadata_rows(
+        &self,
+        cql: &str,
+        limiter: &MetadataLimiter,
+    ) -> Result<Vec<Vec<Value>>> {
+        let probe_items = limiter.probe_items()?;
+        let page_size = metadata_page_size(probe_items)?;
+        let statement = Statement::new(cql).with_page_size(page_size);
+        let pager = self
+            .session
+            .query_iter(statement, &[])
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let mut stream = pager
+            .rows_stream::<Row>()
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let mut rows = Vec::with_capacity(probe_items.min(256));
+        while rows.len() < probe_items {
+            let Some(row) = stream.next().await else {
+                break;
+            };
+            rows.push(cql_row_values(
+                row.map_err(|error| Error::Query(error.to_string()))?,
+            ));
+        }
+        drop(stream);
+        Ok(rows)
+    }
+
+    async fn describe_table_complete(
+        &self,
+        table: &str,
+        budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        let table_ref = parse_table_ref(table)?;
+        let keyspace = table_ref
+            .schema
+            .as_deref()
+            .or(self.keyspace.as_deref())
+            .ok_or_else(|| {
+                Error::Dsn(
+                    "Cassandra table schema requires keyspace.table or a DSN keyspace".to_owned(),
+                )
+            })?;
+        let keyspace = validate_identifier(keyspace, "keyspace")?;
+        let mut limiter = MetadataLimiter::new(budget, "Cassandra table schema")?;
+        let column_rows = self
+            .query_metadata_rows(
+                &format!(
+                    "SELECT column_name, type, kind, position FROM system_schema.columns \
+                     WHERE keyspace_name = '{}' AND table_name = '{}'",
+                    keyspace, table_ref.name
+                ),
+                &limiter,
+            )
+            .await?;
+        if column_rows.is_empty() {
+            return Err(Error::Query(format!(
+                "Cassandra table does not exist: {keyspace}.{}",
+                table_ref.name
+            )));
+        }
+
+        let mut columns = Vec::with_capacity(column_rows.len());
+        for row in column_rows {
+            let column = parse_described_column(&row)?;
+            limiter.observe(&column.meta)?;
+            columns.push(column);
+        }
+        columns.sort_by(|left, right| {
+            left.kind_rank
+                .cmp(&right.kind_rank)
+                .then_with(|| left.position.cmp(&right.position))
+                .then_with(|| left.meta.name.cmp(&right.meta.name))
+        });
+
+        let mut indexes = Vec::new();
+        if let Some(primary) = primary_index(&columns) {
+            limiter.observe(&("index", &primary.name, primary.unique, primary.primary))?;
+            for column in &primary.columns {
+                limiter.observe(&("index-column", column))?;
+            }
+            indexes.push(primary);
+        }
+
+        let index_rows = self
+            .query_metadata_rows(
+                &format!(
+                    "SELECT index_name, options FROM system_schema.indexes \
+                     WHERE keyspace_name = '{}' AND table_name = '{}'",
+                    keyspace, table_ref.name
+                ),
+                &limiter,
+            )
+            .await?;
+        for row in index_rows {
+            let index = parse_cassandra_index(&row)?;
+            limiter.observe(&("index", &index.name, index.unique, index.primary))?;
+            for column in &index.columns {
+                limiter.observe(&("index-column", column))?;
+            }
+            indexes.push(index);
+        }
+
+        let schema = TableSchema {
+            name: table_ref.name,
+            columns: columns.into_iter().map(|column| column.meta).collect(),
+            indexes,
+        };
+        limiter.ensure_complete(&schema)?;
+        Ok(schema)
+    }
 }
 
 fn cassandra_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
@@ -164,8 +279,15 @@ fn cassandra_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> 
         CapabilityOperation::SqlListTablesBounded,
         CapabilityOperation::CqlListKeyspacesBounded,
         CapabilityOperation::CqlListTablesBounded,
+        CapabilityOperation::SqlDescribeTableBounded,
+        CapabilityOperation::CqlDescribeTableBounded,
     ]);
     operations
+}
+
+fn metadata_page_size(probe_items: usize) -> Result<i32> {
+    i32::try_from(probe_items.min(256))
+        .map_err(|_| Error::Internal("bounded CQL metadata page size overflow".to_owned()))
 }
 
 fn bounded_catalog_plan(max_items: usize) -> Result<(ListLimiter, usize, i32)> {
@@ -386,85 +508,19 @@ impl SqlEngine for CassandraAdapter {
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
-        let table_ref = parse_table_ref(table)?;
-        let keyspace = table_ref
-            .schema
-            .as_deref()
-            .or(self.keyspace.as_deref())
-            .ok_or_else(|| {
-                Error::Dsn(
-                    "Cassandra table schema requires keyspace.table or a DSN keyspace".to_owned(),
-                )
-            })?;
-        let keyspace = validate_identifier(keyspace, "keyspace")?;
-        let result = self
-            .query(
-                &format!(
-                    "SELECT column_name, type, kind, position FROM system_schema.columns \
-                     WHERE keyspace_name = '{}' AND table_name = '{}'",
-                    keyspace, table_ref.name
-                ),
-                &[],
-            )
-            .await?;
+        self.describe_table_complete(
+            table,
+            MetadataBudget::new(LEGACY_SCHEMA_MAX_ITEMS, DEFAULT_METADATA_BYTES)?,
+        )
+        .await
+    }
 
-        let mut columns = result
-            .rows
-            .into_iter()
-            .filter_map(|row| {
-                let name = row.first().and_then(value_text)?.to_owned();
-                let type_name = row.get(1).and_then(value_text)?.to_owned();
-                let kind = row.get(2).and_then(value_text).unwrap_or("regular");
-                let position = row.get(3).and_then(Value::as_i64).unwrap_or(i64::MAX);
-                Some(DescribedColumn {
-                    meta: ColumnMeta {
-                        name,
-                        type_name,
-                        nullable: !matches!(kind, "partition_key" | "clustering"),
-                        primary_key: matches!(kind, "partition_key" | "clustering"),
-                        default_value: None,
-                    },
-                    kind_rank: cql_column_kind_rank(kind),
-                    position,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        columns.sort_by(|left, right| {
-            left.kind_rank
-                .cmp(&right.kind_rank)
-                .then_with(|| left.position.cmp(&right.position))
-                .then_with(|| left.meta.name.cmp(&right.meta.name))
-        });
-
-        let idx_result = self
-            .query(
-                &format!(
-                    "SELECT index_name, options FROM system_schema.indexes \
-                     WHERE keyspace_name = '{}' AND table_name = '{}'",
-                    keyspace, table_ref.name
-                ),
-                &[],
-            )
-            .await?;
-
-        let mut indexes = primary_index(&columns).into_iter().collect::<Vec<_>>();
-        indexes.extend(idx_result.rows.into_iter().filter_map(|row| {
-            let name = row.first().and_then(value_text)?.to_owned();
-            let col = row.get(1).and_then(cassandra_index_column)?;
-            Some(IndexInfo {
-                name,
-                columns: vec![col],
-                unique: false,
-                primary: false,
-            })
-        }));
-
-        Ok(TableSchema {
-            name: table_ref.name,
-            columns: columns.into_iter().map(|column| column.meta).collect(),
-            indexes,
-        })
+    async fn describe_table_bounded(
+        &self,
+        table: &str,
+        budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        self.describe_table_complete(table, budget).await
     }
 }
 
@@ -505,6 +561,14 @@ impl CqlEngine for CassandraAdapter {
     async fn describe_cql_table(&self, table: &str) -> Result<TableSchema> {
         <Self as SqlEngine>::describe_table(self, table).await
     }
+
+    async fn describe_cql_table_bounded(
+        &self,
+        table: &str,
+        budget: MetadataBudget,
+    ) -> Result<TableSchema> {
+        <Self as SqlEngine>::describe_table_bounded(self, table, budget).await
+    }
 }
 
 struct DescribedColumn {
@@ -528,11 +592,22 @@ fn primary_index(columns: &[DescribedColumn]) -> Option<IndexInfo> {
     })
 }
 
-fn cassandra_index_column(options: &Value) -> Option<String> {
+fn cassandra_index_column(options: &Value) -> Result<String> {
     let Value::Map(options) = options else {
-        return None;
+        return Err(Error::Serialization(
+            "Cassandra index options are not a map".to_owned(),
+        ));
     };
-    let target = options.get("target").and_then(value_text)?.trim();
+    let target = options
+        .get("target")
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("Cassandra index target is not text".to_owned()))?
+        .trim();
+    if target.is_empty() {
+        return Err(Error::Serialization(
+            "Cassandra index target is empty".to_owned(),
+        ));
+    }
 
     if let Some(open) = target.find('(') {
         let function = &target[..open];
@@ -542,16 +617,71 @@ fn cassandra_index_column(options: &Value) -> Option<String> {
                 "keys" | "values" | "entries" | "full"
             )
         {
-            return Some(
-                target[open + 1..target.len() - 1]
-                    .trim()
-                    .trim_matches('"')
-                    .to_owned(),
-            );
+            return Ok(target[open + 1..target.len() - 1]
+                .trim()
+                .trim_matches('"')
+                .to_owned());
         }
     }
 
-    Some(target.trim_matches('"').to_owned())
+    let column = target.trim_matches('"').to_owned();
+    if column.is_empty() {
+        Err(Error::Serialization(
+            "Cassandra index target column is empty".to_owned(),
+        ))
+    } else {
+        Ok(column)
+    }
+}
+
+fn parse_described_column(row: &[Value]) -> Result<DescribedColumn> {
+    let name = row
+        .first()
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("Cassandra column name is not text".to_owned()))?;
+    let type_name = row
+        .get(1)
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("Cassandra column type is not text".to_owned()))?;
+    let kind = row
+        .get(2)
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("Cassandra column kind is not text".to_owned()))?;
+    if !matches!(kind, "partition_key" | "clustering" | "regular" | "static") {
+        return Err(Error::Serialization(format!(
+            "unsupported Cassandra column kind: {kind}"
+        )));
+    }
+    let position = row.get(3).and_then(Value::as_i64).ok_or_else(|| {
+        Error::Serialization("Cassandra column position is not an integer".to_owned())
+    })?;
+    Ok(DescribedColumn {
+        meta: ColumnMeta {
+            name: name.to_owned(),
+            type_name: type_name.to_owned(),
+            nullable: !matches!(kind, "partition_key" | "clustering"),
+            primary_key: matches!(kind, "partition_key" | "clustering"),
+            default_value: None,
+        },
+        kind_rank: cql_column_kind_rank(kind),
+        position,
+    })
+}
+
+fn parse_cassandra_index(row: &[Value]) -> Result<IndexInfo> {
+    let name = row
+        .first()
+        .and_then(value_text)
+        .ok_or_else(|| Error::Serialization("Cassandra index name is not text".to_owned()))?;
+    let options = row
+        .get(1)
+        .ok_or_else(|| Error::Serialization("Cassandra index options are missing".to_owned()))?;
+    Ok(IndexInfo {
+        name: name.to_owned(),
+        columns: vec![cassandra_index_column(options)?],
+        unique: false,
+        primary: false,
+    })
 }
 
 struct TableRef {
@@ -882,6 +1012,8 @@ mod tests {
             CapabilityOperation::SqlListTablesBounded,
             CapabilityOperation::CqlListKeyspacesBounded,
             CapabilityOperation::CqlListTablesBounded,
+            CapabilityOperation::SqlDescribeTableBounded,
+            CapabilityOperation::CqlDescribeTableBounded,
         ] {
             assert!(operations.contains(&operation));
         }
@@ -1011,14 +1143,47 @@ mod tests {
             Value::Text("values(\"tags\")".to_owned()),
         )]));
 
-        assert_eq!(cassandra_index_column(&options).as_deref(), Some("tags"));
+        assert_eq!(cassandra_index_column(&options).unwrap(), "tags");
         assert_eq!(
             cassandra_index_column(&Value::Map(BTreeMap::from([(
                 "target".to_owned(),
                 Value::Text("email".to_owned()),
             )])))
-            .as_deref(),
-            Some("email")
+            .unwrap(),
+            "email"
         );
+        assert!(cassandra_index_column(&Value::Map(BTreeMap::new())).is_err());
+    }
+
+    #[test]
+    fn bounded_schema_parsers_fail_closed_on_missing_catalog_fields() {
+        let column = parse_described_column(&[
+            Value::Text("tenant_id".into()),
+            Value::Text("uuid".into()),
+            Value::Text("partition_key".into()),
+            Value::Int(0),
+        ])
+        .unwrap();
+        assert!(column.meta.primary_key);
+        assert!(!column.meta.nullable);
+        assert!(parse_described_column(&[Value::Text("tenant_id".into())]).is_err());
+        assert!(parse_described_column(&[
+            Value::Text("id".into()),
+            Value::Text("uuid".into()),
+            Value::Text("mystery".into()),
+            Value::Int(0),
+        ])
+        .is_err());
+
+        let index = parse_cassandra_index(&[
+            Value::Text("events_tags_idx".into()),
+            Value::Map(BTreeMap::from([(
+                "target".into(),
+                Value::Text("values(\"tags\")".into()),
+            )])),
+        ])
+        .unwrap();
+        assert_eq!(index.columns, ["tags"]);
+        assert!(parse_cassandra_index(&[Value::Text("broken".into())]).is_err());
     }
 }
