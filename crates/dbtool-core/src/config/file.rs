@@ -1,14 +1,10 @@
 use crate::{
-    service::{Rate, ThrottleConfig},
+    service::{write_file_atomically, Rate, ThrottleConfig},
     Error, Result,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-
-static CONFIG_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -76,7 +72,7 @@ impl ConnectionConfig {
     pub fn save_atomic(&self, path: &std::path::Path) -> Result<()> {
         let content =
             toml::to_string_pretty(self).map_err(|e| crate::Error::Serialization(e.to_string()))?;
-        write_atomic_config(path, content.as_bytes(), || Ok(()))
+        write_file_atomically(path, content.as_bytes()).map_err(config_io_error)
     }
 
     pub fn throttle_config_for(&self, connection: Option<&str>) -> Result<ThrottleConfig> {
@@ -103,127 +99,6 @@ impl ConnectionConfig {
 
         Ok(config)
     }
-}
-
-fn write_atomic_config<F>(path: &std::path::Path, content: &[u8], before_rename: F) -> Result<()>
-where
-    F: FnOnce() -> std::io::Result<()>,
-{
-    let parent = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent).map_err(config_io_error)?;
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("connections.toml");
-    let mut temporary = None;
-    let mut file = None;
-    for _ in 0..128 {
-        let sequence = CONFIG_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(
-            ".{file_name}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&candidate) {
-            Ok(opened) => {
-                temporary = Some(candidate);
-                file = Some(opened);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(config_io_error(error)),
-        }
-    }
-
-    let temporary = temporary.ok_or_else(|| {
-        Error::Config("unable to allocate a temporary connection config file".into())
-    })?;
-    let mut file = file.expect("temporary path and file are created together");
-    let mut renamed = false;
-    let result = (|| -> std::io::Result<()> {
-        file.write_all(content)?;
-        file.sync_all()?;
-        drop(file);
-        before_rename()?;
-        replace_config_file(&temporary, path)?;
-        renamed = true;
-        sync_config_parent(parent)?;
-        Ok(())
-    })();
-
-    if !renamed {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.map_err(config_io_error)
-}
-
-#[cfg(not(windows))]
-fn replace_config_file(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(source, target)
-}
-
-#[cfg(windows)]
-fn replace_config_file(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-
-    #[link(name = "Kernel32")]
-    extern "system" {
-        fn MoveFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            flags: u32,
-        ) -> i32;
-    }
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: Both paths are live, NUL-terminated UTF-16 buffers for the
-    // duration of the call. No buffer is mutated by MoveFileExW.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn sync_config_parent(parent: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_config_parent(_parent: &std::path::Path) -> std::io::Result<()> {
-    // The Windows replacement uses MOVEFILE_WRITE_THROUGH. Opening a
-    // directory as a regular File is not portable on Windows.
-    Ok(())
 }
 
 fn config_io_error(error: std::io::Error) -> Error {
@@ -371,6 +246,9 @@ fn default_config_dir() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CONFIG_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn missing_config_loads_as_empty() {
@@ -617,16 +495,19 @@ max_concurrency = 2
     }
 
     #[test]
-    fn failure_before_rename_keeps_the_previous_config_and_removes_temp_file() {
+    fn failure_before_replace_keeps_the_previous_config_and_removes_temp_file() {
         let root = unique_test_dir("atomic-failure");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("connections.toml");
         let original = b"[connections.old]\ndsn = \"sqlite::memory:\"\n";
         std::fs::write(&path, original).unwrap();
 
-        let error = write_atomic_config(&path, b"replacement", || {
-            Err(std::io::Error::other("injected before rename"))
-        })
+        let error = crate::service::atomic_file::write_file_atomically_with(
+            &path,
+            b"replacement",
+            |_, _| Err(std::io::Error::other("injected before replace")),
+        )
+        .map_err(config_io_error)
         .unwrap_err();
 
         assert!(error.to_string().contains("unable to persist"));
@@ -657,7 +538,7 @@ max_concurrency = 2
     }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {
-        let sequence = CONFIG_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let sequence = CONFIG_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
             "dbtool-config-{label}-{}-{sequence}",
             std::process::id()

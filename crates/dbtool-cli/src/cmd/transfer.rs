@@ -7,6 +7,7 @@ use dbtool_core::{
     service::{
         limiter::ResultLimiter,
         safety::{SafetyGuard, StatementKind},
+        write_file_atomically,
     },
     Result,
 };
@@ -16,8 +17,10 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const KV_TRANSFER_VERSION: u32 = 3;
 const DOCUMENT_TRANSFER_VERSION: u32 = 3;
@@ -900,52 +903,9 @@ fn parse_json_value(raw: &str) -> Result<Value> {
 }
 
 fn write_artifact(path: &Path, artifact: TransferArtifact) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| Error::Config(e.to_string()))?;
     let bytes = serialize_artifact_bounded(&artifact, MAX_TRANSFER_ARTIFACT_BYTES)?;
-    let file_name = path.file_name().ok_or_else(|| {
-        Error::Config(format!(
-            "artifact output path has no file name: {}",
-            path.display()
-        ))
-    })?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::Config(format!("system clock is before the Unix epoch: {e}")))?
-        .as_nanos();
-    let temp_path = parent.join(format!(
-        ".{}.dbtool-tmp-{}-{nonce}",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temp_path)
-        .map_err(|e| Error::Config(format!("create artifact temp file: {e}")))?;
-    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(Error::Config(format!(
-            "persist artifact temp file: {error}"
-        )));
-    }
-    drop(file);
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(Error::Config(format!(
-            "publish artifact atomically: {error}"
-        )));
-    }
-    sync_parent_directory(parent)?;
-    Ok(())
+    write_file_atomically(path, &bytes)
+        .map_err(|error| Error::Config(format!("publish transfer artifact atomically: {error}")))
 }
 
 struct BoundedVecWriter {
@@ -986,18 +946,6 @@ fn serialize_artifact_bounded(artifact: &TransferArtifact, max_bytes: usize) -> 
         ))
     })?;
     Ok(writer.bytes)
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> Result<()> {
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| Error::Config(format!("sync artifact parent directory: {error}")))
-}
-
-#[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> Result<()> {
-    Ok(())
 }
 
 fn read_artifact(path: &Path) -> Result<TransferArtifact> {
@@ -1791,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_publish_is_atomic_and_leaves_no_temp_file() {
+    fn artifact_publish_replaces_existing_target_and_leaves_no_temp_file() {
         let root = std::env::temp_dir().join(format!(
             "dbtool-transfer-{}-{}",
             std::process::id(),
@@ -1801,15 +1749,23 @@ mod tests {
                 .as_nanos()
         ));
         let path = root.join("values.json");
-        let artifact = TransferArtifact::KvPairs {
+        let initial = TransferArtifact::KvPairs {
             version: KV_TRANSFER_VERSION,
             source: source("key-pattern", Value::Text("*".to_owned())),
             integrity: complete_integrity(0),
             entries: vec![],
         };
+        let replacement = TransferArtifact::KvPairs {
+            version: KV_TRANSFER_VERSION,
+            source: source("key-pattern", Value::Text("replacement:*".to_owned())),
+            integrity: complete_integrity(0),
+            entries: vec![],
+        };
 
-        write_artifact(&path, artifact.clone()).unwrap();
-        assert_eq!(read_artifact(&path).unwrap(), artifact);
+        write_artifact(&path, initial).unwrap();
+        write_artifact(&path, replacement.clone()).unwrap();
+
+        assert_eq!(read_artifact(&path).unwrap(), replacement);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         #[cfg(unix)]
         {
