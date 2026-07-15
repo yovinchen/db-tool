@@ -954,47 +954,37 @@ read_only = true
 }
 
 #[test]
-fn misspelled_connection_and_flow_control_fields_fail_before_connecting() {
+fn misspelled_connection_fields_fail_closed_without_echoing_config_source() {
     let cases = [
-        (
-            "readonli",
-            r#"
+        r#"
 [connections.typo]
-dsn = "postgres://127.0.0.1:1/app"
+dsn = "postgres://user:config-source-secret@127.0.0.1:1/app"
 readonli = true
 "#,
-        ),
-        (
-            "request_timout",
-            r#"
+        r#"
 [connections.typo]
-dsn = "postgres://127.0.0.1:1/app"
+dsn = "postgres://user:config-source-secret@127.0.0.1:1/app"
 
 [connections.typo.limits]
 request_timout = "1s"
 "#,
-        ),
-        (
-            "max_concurency",
-            r#"
+        r#"
 [defaults.limits]
 max_concurency = 1
 
 [connections.typo]
-dsn = "postgres://127.0.0.1:1/app"
+dsn = "postgres://user:config-source-secret@127.0.0.1:1/app"
 "#,
-        ),
     ];
 
-    for (unknown_field, config) in cases {
+    for config in cases {
         let err = stderr_json(&dbtool_with_config(&["--conn", "typo", "ping"], config));
         assert_eq!(err["error"]["code"], "CONFIG_ERROR");
-        assert!(
-            err["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains(unknown_field)),
-            "expected {unknown_field:?} in config error: {err}"
+        assert_eq!(
+            err["error"]["message"],
+            "config error: connection config is invalid TOML or contains unsupported fields"
         );
+        assert!(!err.to_string().contains("config-source-secret"));
     }
 }
 
