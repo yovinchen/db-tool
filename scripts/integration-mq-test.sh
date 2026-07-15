@@ -12,4 +12,5 @@ fi
 
 export DBTOOL_RUN_MQ_INTEGRATION=1
 
+cargo test -p adapter-amqp --test live_stateful -- --nocapture
 cargo test -p dbtool-cli --features full --test live_messaging -- --nocapture

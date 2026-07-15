@@ -25,6 +25,12 @@ pub enum Error {
     // ── Query / execution ─────────────────────────────────────────────────────
     #[error("query error: {0}")]
     Query(String),
+    /// The client submitted an irreversible protocol operation but could not
+    /// prove whether the remote system applied it. Callers must inspect remote
+    /// state before retrying instead of treating this as a normal transient
+    /// failure.
+    #[error("remote outcome is indeterminate: {0}")]
+    OutcomeIndeterminate(String),
 
     // ── Safety guard ──────────────────────────────────────────────────────────
     #[error("destructive operation blocked; call again with --confirm {confirm_token}")]
@@ -70,6 +76,7 @@ impl Error {
             Error::Connection(_) => "CONNECTION_ERROR",
             Error::Auth(_) => "AUTH_ERROR",
             Error::Query(_) => "QUERY_ERROR",
+            Error::OutcomeIndeterminate(_) => "OUTCOME_INDETERMINATE",
             Error::ConfirmRequired { .. } => "CONFIRM_REQUIRED",
             Error::ReadOnly => "READ_ONLY",
             Error::WriteNotAllowed => "WRITE_NOT_ALLOWED",
@@ -80,5 +87,18 @@ impl Error {
             Error::Serialization(_) => "SERIALIZATION_ERROR",
             Error::Internal(_) => "INTERNAL_ERROR",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn indeterminate_remote_outcomes_are_stable_and_never_retryable() {
+        let error = Error::OutcomeIndeterminate("inspect remote state".into());
+        assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("inspect remote state"));
     }
 }

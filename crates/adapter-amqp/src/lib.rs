@@ -2,9 +2,9 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
-        MessageMetadata, MessageResource, MessageResourceKind, ProduceOutcome, TopicDetail,
-        TopicInfo,
+        AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, DeleteResourceOutcome,
+        LagInfo, Message, MessageMetadata, MessageResource, MessageResourceKind, ProduceOutcome,
+        TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -23,7 +23,7 @@ use lapin::{
     BasicProperties, Connection, ConnectionProperties,
 };
 use std::{collections::HashMap, fs};
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep_until, timeout_at, Instant};
 use url::Url;
 
 mod management;
@@ -164,37 +164,70 @@ impl MessageProducer for AmqpAdapter {
 impl MessageConsumer for AmqpAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_queue(source)?;
-        validate_consume_position(&options)?;
-        if options.max == 0 {
-            return Ok(vec![]);
-        }
+        validate_consume_options(&options)?;
 
         let deadline = checked_deadline(options.timeout)?;
-        let channel = self.channel().await?;
+        let acknowledgement_reserve =
+            std::cmp::min(options.timeout / 5, std::time::Duration::from_millis(250));
+        let receive_deadline = deadline
+            .checked_sub(acknowledgement_reserve)
+            .unwrap_or(deadline);
+        let channel = timeout_at(deadline, self.channel())
+            .await
+            .map_err(|_| Error::Timeout)??;
         // Consuming is not a queue-creation operation. Passive declaration
         // makes a missing queue an explicit broker error instead of mutating
         // broker state as a side effect of a read-shaped command.
-        declare_queue(&channel, source, true).await?;
+        timeout_at(deadline, declare_queue(&channel, source, true))
+            .await
+            .map_err(|_| Error::Timeout)??;
 
         let mut messages = Vec::new();
-        while messages.len() < options.max && Instant::now() < deadline {
-            match channel
-                .basic_get(source, BasicGetOptions::default())
-                .await
-                .map_err(|e| Error::Query(e.to_string()))?
+        let mut last_delivery_tag = None;
+        while messages.len() < options.max && Instant::now() < receive_deadline {
+            let delivery = match timeout_at(
+                receive_deadline,
+                channel.basic_get(source, BasicGetOptions::default()),
+            )
+            .await
             {
+                Ok(Ok(delivery)) => delivery,
+                Ok(Err(error)) => {
+                    let error = Error::Query(error.to_string());
+                    return Err(abort_unacknowledged_batch(&channel, deadline, error).await);
+                }
+                Err(_) => {
+                    return Err(
+                        abort_unacknowledged_batch(&channel, deadline, Error::Timeout).await,
+                    );
+                }
+            };
+
+            match delivery {
                 Some(delivery) => {
-                    let headers = headers_from_properties(&delivery.delivery.properties)?;
+                    let headers = match headers_from_properties(&delivery.delivery.properties) {
+                        Ok(headers) => headers,
+                        Err(error) => {
+                            return Err(abort_unacknowledged_batch(&channel, deadline, error).await);
+                        }
+                    };
                     let payload = delivery.delivery.data.clone();
                     let delivery_tag = delivery.delivery.delivery_tag;
                     let redelivered = delivery.delivery.redelivered;
                     let exchange = delivery.delivery.exchange.as_str().to_owned();
                     let routing_key = delivery.delivery.routing_key.as_str().to_owned();
-                    delivery
-                        .delivery
-                        .ack(BasicAckOptions::default())
-                        .await
-                        .map_err(|e| Error::Query(e.to_string()))?;
+                    if last_delivery_tag.is_some_and(|previous| delivery_tag <= previous) {
+                        return Err(abort_unacknowledged_batch(
+                            &channel,
+                            deadline,
+                            Error::Query(
+                                "AMQP delivery tags were not strictly increasing on the consume channel"
+                                    .into(),
+                            ),
+                        )
+                        .await);
+                    }
+                    last_delivery_tag = Some(delivery_tag);
                     messages.push(Message {
                         key: None,
                         payload: payload.into(),
@@ -213,8 +246,50 @@ impl MessageConsumer for AmqpAdapter {
                             routing_key,
                         }),
                     });
+
+                    // basic.get reports the number of ready messages that
+                    // remained immediately after this delivery. Once it is
+                    // zero, waiting for the full timeout would only hold this
+                    // already-converted batch unacknowledged.
+                    if delivery.message_count == 0 {
+                        break;
+                    }
                 }
-                None => sleep(std::time::Duration::from_millis(50)).await,
+                None => {
+                    let wake_at = std::cmp::min(
+                        receive_deadline,
+                        Instant::now() + std::time::Duration::from_millis(50),
+                    );
+                    sleep_until(wake_at).await;
+                }
+            }
+        }
+
+        if let Some(delivery_tag) = last_delivery_tag {
+            // This channel is created exclusively for this one consume call,
+            // so one multiple ACK cannot include deliveries owned by another
+            // caller. Sending a single protocol frame also avoids a loop that
+            // could acknowledge only an arbitrary prefix after conversion.
+            // Do not poll a one-way AMQP ACK unless it still has caller-owned
+            // budget. Once first-polled, lapin may enqueue the irreversible
+            // frame; cancelling it on a timeout and then closing the channel
+            // could report failure even though RabbitMQ deleted the batch.
+            if Instant::now() >= deadline {
+                return Err(abort_unacknowledged_batch(&channel, deadline, Error::Timeout).await);
+            }
+            if channel
+                .basic_ack(delivery_tag, BasicAckOptions { multiple: true })
+                .await
+                .is_err()
+            {
+                // AMQP 0.9.1 has no ACK-of-ACK. A local I/O error cannot prove
+                // whether the already-submitted frame reached RabbitMQ, and a
+                // follow-up channel close cannot undo it. This error is
+                // intentionally non-retryable.
+                return Err(Error::OutcomeIndeterminate(
+                    "AMQP batch ACK may or may not have reached RabbitMQ; inspect queue state before retrying"
+                        .into(),
+                ));
             }
         }
 
@@ -313,6 +388,7 @@ impl AmqpAdapter {
 fn direct_amqp_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminDelete,
     ]);
@@ -398,7 +474,20 @@ fn validate_produce_message(message: &Message) -> Result<()> {
     Ok(())
 }
 
-fn validate_consume_position(options: &ConsumeOptions) -> Result<()> {
+fn validate_consume_options(options: &ConsumeOptions) -> Result<()> {
+    options
+        .validate()
+        .map_err(|message| Error::Config(format!("AMQP consume: {message}")))?;
+    if options.identity != ConsumerIdentity::Stateless {
+        return Err(Error::Config(
+            "AMQP consume does not support group or durable identities".into(),
+        ));
+    }
+    if options.ack != AckMode::OnSuccess {
+        return Err(Error::Config(
+            "AMQP consume requires ack mode on-success because basic.get is destructive".into(),
+        ));
+    }
     if options.partition.is_some() {
         return Err(Error::Config(
             "AMQP consumer does not support partitions".into(),
@@ -415,6 +504,23 @@ fn validate_consume_position(options: &ConsumeOptions) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+async fn abort_unacknowledged_batch(
+    channel: &lapin::Channel,
+    deadline: Instant,
+    original: Error,
+) -> Error {
+    // channel.close-ok is the only confirmation available here that the
+    // call-owned channel closed and RabbitMQ can requeue its unacknowledged
+    // basic.get deliveries. Never wait beyond the caller's consume deadline.
+    match timeout_at(deadline, channel.close(200, "dbtool consume aborted")).await {
+        Ok(Ok(())) => original,
+        Ok(Err(_)) | Err(_) => Error::OutcomeIndeterminate(format!(
+            "AMQP consume failed with {}, and channel closure could not confirm requeue before the deadline; inspect queue state before retrying",
+            original.code()
+        )),
+    }
 }
 
 fn properties_with_headers(headers: &HashMap<String, String>) -> Result<BasicProperties> {
@@ -608,32 +714,35 @@ mod tests {
     #[test]
     fn amqp_rejects_consumer_positions_and_non_string_headers() {
         assert!(matches!(
-            validate_consume_position(&ConsumeOptions {
+            validate_consume_options(&ConsumeOptions {
                 max: 1,
                 timeout: std::time::Duration::from_secs(1),
                 partition: Some(0),
                 offset: None,
                 cursor: None,
+                ack: AckMode::OnSuccess,
                 ..Default::default()
             }),
             Err(Error::Config(message)) if message.contains("partitions")
         ));
         assert!(matches!(
-            validate_consume_position(&ConsumeOptions {
+            validate_consume_options(&ConsumeOptions {
                 max: 1,
                 timeout: std::time::Duration::from_secs(1),
                 partition: None,
                 offset: Some(0),
                 cursor: None,
+                ack: AckMode::OnSuccess,
                 ..Default::default()
             }),
             Err(Error::Config(message)) if message.contains("offsets")
         ));
         assert!(matches!(
-            validate_consume_position(&ConsumeOptions {
+            validate_consume_options(&ConsumeOptions {
                 cursor: Some(dbtool_core::model::ConsumeCursor::RedisStream {
                     id: "1-0".to_owned(),
                 }),
+                ack: AckMode::OnSuccess,
                 ..Default::default()
             }),
             Err(Error::Config(message)) if message.contains("exact cursors")
@@ -645,6 +754,22 @@ mod tests {
         assert!(matches!(
             headers_from_properties(&properties),
             Err(Error::Serialization(message)) if message.contains("non-string")
+        ));
+
+        assert!(matches!(
+            validate_consume_options(&ConsumeOptions::default()),
+            Err(Error::Config(message)) if message.contains("on-success")
+        ));
+        assert!(matches!(
+            validate_consume_options(&ConsumeOptions {
+                identity: ConsumerIdentity::Group {
+                    group: "workers".to_owned(),
+                    member: None,
+                },
+                ack: AckMode::OnSuccess,
+                ..Default::default()
+            }),
+            Err(Error::Config(message)) if message.contains("group or durable")
         ));
     }
 
@@ -672,6 +797,7 @@ mod tests {
 
         assert!(operations.contains(&CapabilityOperation::MessageProduce));
         assert!(operations.contains(&CapabilityOperation::MessageConsume));
+        assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
         assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetail));
         assert!(operations.contains(&CapabilityOperation::MessageAdminDelete));
         assert!(!operations.contains(&CapabilityOperation::MessageAdminListTopics));

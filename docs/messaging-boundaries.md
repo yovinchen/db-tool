@@ -30,7 +30,29 @@ AMQP 0.9.1 can publish, consume, acknowledge, and passively inspect a known queu
 Current core behavior:
 
 - `mq produce <queue>` declares the named queue when needed and publishes to it.
-- `mq consume <queue>` declares the named queue when needed and performs bounded `basic.get` with ack.
+- `mq consume <queue> --ack on-success` requires `--allow-write`, passively
+  verifies that the queue already exists, and performs bounded `basic.get`.
+  AMQP has no non-destructive `basic.get`: `--ack none`, group identities, and
+  durable identities are rejected instead of being assigned invented semantics.
+- Every delivery in the bounded AMQP batch is converted first. Only after all
+  payloads, string headers, routing metadata, and strictly increasing
+  channel-scoped delivery tags are representable does dbtool send one
+  `basic.ack(multiple=true)` for the final tag. A conversion failure closes the
+  call-owned channel within the consume deadline; a confirmed channel close
+  lets RabbitMQ requeue the complete unacknowledged batch. If that close cannot
+  be confirmed, dbtool returns `OUTCOME_INDETERMINATE` and tells the caller to
+  inspect queue state before retrying.
+  One multiple ACK avoids a client-side ACK loop that could advance an
+  arbitrary prefix.
+- AMQP does not acknowledge an ACK frame back to the client. dbtool checks its
+  deadline before submitting the frame and, once submitted, does not cancel it
+  or pretend a channel close can roll it back. A local send error returns the
+  non-retryable `OUTCOME_INDETERMINATE`. There is still an unavoidable CLI
+  boundary after ACK submission and before formatted stdout is observed (for
+  example, process termination or an outer request timeout), so this is not a
+  transactional, exactly-once, or strict end-to-end at-least-once output
+  guarantee. Callers that need those semantics must process and acknowledge in
+  one long-lived broker-native consumer rather than use this one-shot CLI.
 - `mq detail <queue>` uses passive queue declare and returns `message_count` and `consumer_count`.
 - `mq delete --kind amqp-queue <queue>` can remove a known queue; `--if-empty` and
   `--if-unused` are part of the target-bound confirmation scope and cannot be
@@ -53,6 +75,13 @@ RabbitMQ queue listing is exposed through an explicit management boundary, not h
   lag.
 
 Do not infer the management API port from the AMQP port in core code; local deployments commonly remap one without the other.
+
+Example:
+
+```text
+dbtool --dsn amqp://user:pass@host:5672/vhost --allow-write \
+  mq consume jobs --max 100 --timeout 5 --ack on-success
+```
 
 ## NATS
 

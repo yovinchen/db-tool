@@ -130,7 +130,9 @@ fn confirmed_mq_delete(dsn: &str, resource_kind: &str, name: &str, conditions: &
         name,
     ];
     second_args.extend_from_slice(conditions);
-    stdout_json_retry(&second_args)
+    // A destructive request is never retried by the fixture: a transport
+    // failure can make its remote outcome indeterminate.
+    stdout_json(dbtool(&second_args))
 }
 
 fn dsn(name: &str) -> Option<String> {
@@ -766,7 +768,7 @@ fn amqp_live_queue_produce_detail_and_consume() {
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "mq", "produce", &queue, "blocked"]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
 
-    let produced = stdout_json_retry(&[
+    let produced = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
         "--allow-write",
@@ -776,12 +778,24 @@ fn amqp_live_queue_produce_detail_and_consume() {
         "amqp-payload",
         "--header",
         "trace=amqp",
-    ]);
+    ]));
     assert_eq!(produced["data"]["produced"], 1);
+    let produced_second = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "mq",
+        "produce",
+        &queue,
+        "amqp-payload-2",
+        "--header",
+        "trace=amqp-2",
+    ]));
+    assert_eq!(produced_second["data"]["produced"], 1);
 
     let detail = stdout_json_retry(&["--dsn", &dsn, "mq", "detail", &queue]);
     assert_eq!(detail["data"]["info"]["name"], queue);
-    assert_eq!(detail["data"]["config"]["message_count"], "1");
+    assert_eq!(detail["data"]["config"]["message_count"], "2");
 
     let blocked_consume = stderr_json(dbtool(&[
         "--dsn",
@@ -793,17 +807,19 @@ fn amqp_live_queue_produce_detail_and_consume() {
         "1",
         "--timeout",
         "1",
+        "--ack",
+        "on-success",
     ]));
     assert_eq!(blocked_consume["error"]["code"], "WRITE_NOT_ALLOWED");
     let unchanged = stdout_json_retry(&["--dsn", &dsn, "mq", "detail", &queue]);
-    assert_eq!(unchanged["data"]["config"]["message_count"], "1");
+    assert_eq!(unchanged["data"]["config"]["message_count"], "2");
 
     let topics = stderr_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
     assert_eq!(topics["error"]["code"], "UNSUPPORTED_CAPABILITY");
     let lag = stderr_json(dbtool(&["--dsn", &dsn, "mq", "lag", &queue]));
     assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
 
-    let consumed = stdout_json_retry(&[
+    let consumed = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
         "--allow-write",
@@ -811,19 +827,28 @@ fn amqp_live_queue_produce_detail_and_consume() {
         "consume",
         &queue,
         "--max",
-        "1",
+        "2",
         "--timeout",
         "5",
-    ]);
+        "--ack",
+        "on-success",
+    ]));
     assert_eq!(payload_text(&consumed["data"][0]), "amqp-payload");
     assert_eq!(consumed["data"][0]["headers"]["trace"], "amqp");
-    assert_eq!(consumed["data"][0]["metadata"]["kind"], "amqp");
-    assert!(consumed["data"][0]["metadata"]["delivery_tag"]
-        .as_u64()
-        .is_some_and(|tag| tag > 0));
-    assert_eq!(consumed["data"][0]["metadata"]["redelivered"], false);
-    assert_eq!(consumed["data"][0]["metadata"]["exchange"], "");
-    assert_eq!(consumed["data"][0]["metadata"]["routing_key"], queue);
+    assert_eq!(payload_text(&consumed["data"][1]), "amqp-payload-2");
+    assert_eq!(consumed["data"][1]["headers"]["trace"], "amqp-2");
+    for message in consumed["data"]
+        .as_array()
+        .expect("AMQP consume should return an array")
+    {
+        assert_eq!(message["metadata"]["kind"], "amqp");
+        assert!(message["metadata"]["delivery_tag"]
+            .as_u64()
+            .is_some_and(|tag| tag > 0));
+        assert_eq!(message["metadata"]["redelivered"], false);
+        assert_eq!(message["metadata"]["exchange"], "");
+        assert_eq!(message["metadata"]["routing_key"], queue);
+    }
 
     let drained = stdout_json_retry_until(&["--dsn", &dsn, "mq", "detail", &queue], |value| {
         value["data"]["config"]["message_count"] == "0"
@@ -852,7 +877,7 @@ fn rabbitmq_management_live_lists_details_and_deletes_queues() {
     };
     let queue = unique_name("dbtool_it_rabbitmq_mgmt_queue");
 
-    let produced = stdout_json_retry(&[
+    let produced = stdout_json(dbtool(&[
         "--dsn",
         &amqp_dsn,
         "--allow-write",
@@ -862,7 +887,7 @@ fn rabbitmq_management_live_lists_details_and_deletes_queues() {
         "rabbitmq-management-payload",
         "--header",
         "trace=rabbitmq-management",
-    ]);
+    ]));
     assert_eq!(produced["data"]["produced"], 1);
 
     let ping = stdout_json_retry(&["--dsn", &management_dsn, "ping"]);
@@ -905,7 +930,7 @@ fn rabbitmq_management_live_lists_details_and_deletes_queues() {
     ]));
     assert_eq!(unsupported["error"]["code"], "UNSUPPORTED_CAPABILITY");
 
-    let consumed = stdout_json_retry(&[
+    let consumed = stdout_json(dbtool(&[
         "--dsn",
         &amqp_dsn,
         "--allow-write",
@@ -916,7 +941,9 @@ fn rabbitmq_management_live_lists_details_and_deletes_queues() {
         "1",
         "--timeout",
         "5",
-    ]);
+        "--ack",
+        "on-success",
+    ]));
     assert_eq!(
         payload_text(&consumed["data"][0]),
         "rabbitmq-management-payload"
@@ -973,7 +1000,7 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "mq", "produce", &queue, "blocked"]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
 
-    let produced = stdout_json_retry(&[
+    let produced = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
         "--allow-write",
@@ -983,7 +1010,7 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
         "amqps-payload",
         "--header",
         "trace=amqps",
-    ]);
+    ]));
     assert_eq!(produced["data"]["produced"], 1);
 
     let detail = stdout_json_retry(&["--dsn", &dsn, "mq", "detail", &queue]);
@@ -995,7 +1022,7 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
     let lag = stderr_json(dbtool(&["--dsn", &dsn, "mq", "lag", &queue]));
     assert_eq!(lag["error"]["code"], "UNSUPPORTED_CAPABILITY");
 
-    let consumed = stdout_json_retry(&[
+    let consumed = stdout_json(dbtool(&[
         "--dsn",
         &dsn,
         "--allow-write",
@@ -1006,7 +1033,9 @@ fn amqps_mq_tls_live_queue_produce_detail_and_consume() {
         "1",
         "--timeout",
         "5",
-    ]);
+        "--ack",
+        "on-success",
+    ]));
     assert_eq!(payload_text(&consumed["data"][0]), "amqps-payload");
     assert_eq!(consumed["data"][0]["headers"]["trace"], "amqps");
 
