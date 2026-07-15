@@ -1,6 +1,10 @@
 use crate::{Error, Result};
 use sha2::{Digest, Sha256};
-use sqlparser::{ast::Statement, dialect::GenericDialect, parser::Parser};
+use sqlparser::{
+    ast::{Query, SetExpr, Statement},
+    dialect::GenericDialect,
+    parser::Parser,
+};
 
 /// Statement-level classification produced by the SQL parser.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +43,7 @@ impl SafetyGuard {
             StatementKind::Read => Ok(StatementKind::Read),
             StatementKind::Write if allow_write => Ok(StatementKind::Write),
             StatementKind::Write => Err(Error::WriteNotAllowed),
+            StatementKind::Destructive if !allow_write => Err(Error::WriteNotAllowed),
             StatementKind::Destructive => {
                 let impact = serde_json::json!({
                     "op": analysis.operation,
@@ -140,9 +145,8 @@ fn analyze(sql: &str) -> SafetyAnalysis {
 
 fn classify_statement(statement: &Statement) -> StatementKind {
     match statement {
-        Statement::Query(_)
-        | Statement::Analyze { .. }
-        | Statement::ExplainTable { .. }
+        Statement::Query(query) => classify_query(query),
+        Statement::ExplainTable { .. }
         | Statement::ShowFunctions { .. }
         | Statement::ShowVariable { .. }
         | Statement::ShowStatus { .. }
@@ -163,6 +167,7 @@ fn classify_statement(statement: &Statement) -> StatementKind {
             }
         }
 
+        Statement::Analyze { .. } => StatementKind::Write,
         Statement::Update { selection, .. } => {
             if selection.is_some() {
                 StatementKind::Write
@@ -211,6 +216,39 @@ fn classify_statement(statement: &Statement) -> StatementKind {
     }
 }
 
+fn classify_query(query: &Query) -> StatementKind {
+    let mut kind = if query.locks.is_empty() {
+        StatementKind::Read
+    } else {
+        // SELECT ... FOR UPDATE/SHARE changes transactional lock state and is
+        // not a read-only operation even though it returns rows.
+        StatementKind::Write
+    };
+
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            kind = strongest_kind(kind, classify_query(&cte.query));
+        }
+    }
+
+    strongest_kind(kind, classify_set_expr(&query.body))
+}
+
+fn classify_set_expr(expression: &SetExpr) -> StatementKind {
+    match expression {
+        SetExpr::Select(select) if select.into.is_some() => {
+            // PostgreSQL and SQL Server SELECT ... INTO create a table.
+            StatementKind::Destructive
+        }
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => StatementKind::Read,
+        SetExpr::Query(query) => classify_query(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            strongest_kind(classify_set_expr(left), classify_set_expr(right))
+        }
+        SetExpr::Insert(statement) | SetExpr::Update(statement) => classify_statement(statement),
+    }
+}
+
 fn strongest_kind(acc: StatementKind, next: StatementKind) -> StatementKind {
     match (acc, next) {
         (StatementKind::Destructive, _) | (_, StatementKind::Destructive) => {
@@ -226,7 +264,21 @@ fn classify_by_keyword(sql: &str) -> StatementKind {
     let kw = upper.split_whitespace().next().unwrap_or("");
 
     match kw {
-        "SELECT" | "SHOW" | "DESCRIBE" | "EXPLAIN" | "WITH" => StatementKind::Read,
+        "SELECT" => {
+            if upper
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|token| token == "INTO")
+            {
+                StatementKind::Destructive
+            } else {
+                StatementKind::Read
+            }
+        }
+        "SHOW" | "DESCRIBE" | "EXPLAIN" => StatementKind::Read,
+        // A parser failure means we cannot inspect CTE bodies. PostgreSQL data-
+        // modifying CTEs are valid SQL, so treating every WITH as read would
+        // fail open and permit DELETE/UPDATE through read-only entry points.
+        "WITH" => StatementKind::Write,
         "DROP" | "TRUNCATE" => StatementKind::Destructive,
         "DELETE" | "UPDATE" => {
             // No WHERE clause → destructive.
@@ -300,6 +352,49 @@ mod tests {
         assert_eq!(
             SafetyGuard::check("drop table users", true, Some(&token)).unwrap(),
             StatementKind::Destructive
+        );
+    }
+
+    #[test]
+    fn destructive_sql_requires_write_permission_before_confirmation() {
+        assert!(matches!(
+            SafetyGuard::check("drop table users", false, None),
+            Err(Error::WriteNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn data_modifying_cte_fails_closed_when_the_parser_cannot_inspect_it() {
+        let sql = "with deleted as (delete from users returning *) select * from deleted";
+
+        assert!(matches!(
+            SafetyGuard::check(sql, false, None),
+            Err(Error::WriteNotAllowed)
+        ));
+        assert_eq!(
+            SafetyGuard::check(sql, true, None).unwrap(),
+            StatementKind::Write
+        );
+    }
+
+    #[test]
+    fn select_into_is_destructive_and_select_for_update_is_a_write() {
+        assert!(matches!(
+            SafetyGuard::check("select 1 as id into created_table", false, None),
+            Err(Error::WriteNotAllowed)
+        ));
+        assert!(matches!(
+            SafetyGuard::check("select 1 as id into created_table", true, None),
+            Err(Error::ConfirmRequired { .. })
+        ));
+
+        assert!(matches!(
+            SafetyGuard::check("select * from users for update", false, None),
+            Err(Error::WriteNotAllowed)
+        ));
+        assert_eq!(
+            SafetyGuard::check("select * from users for update", true, None).unwrap(),
+            StatementKind::Write
         );
     }
 
