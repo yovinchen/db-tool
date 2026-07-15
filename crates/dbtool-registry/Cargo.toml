@@ -26,7 +26,7 @@ amqp     = ["dep:adapter-amqp"]
 nats     = ["dep:adapter-nats"]
 mq       = ["nats", "amqp", "redis"]
 
-# Single kafka feature; backend chosen inside adapter-kafka via mutually exclusive features
+# Public Kafka entry features select one mutually exclusive adapter backend.
 kafka         = ["dep:adapter-kafka", "adapter-kafka/backend-pure"]
 kafka-native  = ["dep:adapter-kafka", "adapter-kafka/backend-native"]
 

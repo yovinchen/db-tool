@@ -17,13 +17,42 @@ Examples:
 - `redis`: `valkey`, `keydb`, `dragonfly`
 - `kafka`: `automq`, `redpanda`, `warpstream`, `confluent`
 
+## Capability Negotiation
+
+`Capabilities` booleans are a backward-compatible family summary only.
+Method dispatch uses `Connector::operations()` and the stable
+`CapabilityOperation` names. The required order for CLI, TUI, and embedded
+callers is:
+
+```text
+exact operation -> capability accessor -> method invocation
+```
+
+Missing operations fail with `UNSUPPORTED_CAPABILITY`; callers must not fall
+back to an unbounded or weaker method. Optional groups include SQL atomic
+import, KV expiry preservation, Document cardinality/lifecycle, bounded
+catalogs, stateful messaging, and each partial-admin method. Typed consumers
+reject operation names that their `CapabilityOperation` version does not know;
+they must never grant support from an unknown string. An absent `operations`
+field in a legacy report means an empty method-level set, not implicit support.
+
+`CapabilityReport` keeps legacy booleans flattened and adds a sorted,
+deduplicated `operations` array. See
+[`interface-usage.zh-CN.md`](interface-usage.zh-CN.md) for the embedded calling
+pattern and
+[`test-evidence/capability-negotiation.md`](test-evidence/capability-negotiation.md)
+for verification.
+
 ## Named Connections
 
 Use `ConnectionResolver` instead of duplicating lookup logic. The resolver accepts either a raw DSN or a connection name, then checks environment variables and `ConnectionConfig`.
 
 ## Safety And Limits
 
-`SafetyGuard` classifies SQL before execution. `ResultLimiter` applies output-size constraints after adapter execution when pushdown is unavailable.
+`SafetyGuard` classifies SQL before execution. `ResultLimiter` and `ListLimiter`
+validate caller budgets and N+1 probes; public user-query and top-level name
+catalog paths push the bound into adapters or enforce an explicit protocol
+response-size ceiling. Nested metadata collections remain tracked by IF-T67.
 
 These services are intentionally adapter-agnostic so the CLI, TUI, and embedded library paths can share the same behavior.
 

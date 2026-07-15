@@ -11,16 +11,16 @@ usable.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Core contracts | Implemented | `Connector`, capability traits, shared models, registry, DSN parsing, redaction, and protocol aliases are in place. |
-| Embedded library path | Implemented | `dbtool-registry` has a service-free embedded smoke that builds the registry directly, reuses a connection through `ConnectionManager`, applies `SafetyGuard`, and runs SQL under `FlowControl` without spawning the CLI. |
-| CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `cql`, `db2`, `kv`, `doc`, `mq`, `search`, and `ts` command families exist with default backends for core read paths. Root and command-family help describe safety boundaries, JSON inputs, bounded reads, and examples. |
+| Core contracts | Implemented | `Connector`, capability traits, shared models, registry, DSN parsing, redaction, protocol aliases, backward-compatible `CapabilityReport`, and stable method-level operation names are in place. |
+| Embedded library path | Implemented | `dbtool-registry` has a service-free embedded smoke that builds the registry directly, reuses a connection through `ConnectionManager`, checks exact operations before capability accessors, applies `SafetyGuard`, and runs SQL under `FlowControl` without spawning the CLI. |
+| CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `cql`, `db2`, `kv`, `doc`, `mq`, `search`, `ts`, `export`, and `import` command families exist. Every data method negotiates its exact operation before taking an accessor, and help describes safety boundaries, JSON inputs, bounded reads, and examples. |
 | Output formats | Implemented | JSON is the default. `--format table` and `--format ndjson` are implemented for successful command output; errors always stay JSON so `error.code` and confirmation tokens remain machine-readable. |
 | SQL safety | Implemented | Query ASTs are recursively classified; data-modifying CTEs fail closed, `SELECT INTO` is destructive, locking SELECT is a write, all writes need `--allow-write`, and destructive SQL additionally needs a target-bound confirm token. Database least-privilege roles remain the final boundary for side-effectful vendor functions. |
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`, then apply CLI overrides such as `--rate`, `--request-timeout`, and `--deadline`; CLI execution uses the one-shot path so writes are not replayed by retries. |
 | Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, observability, OpenSearch security-plugin TLS, and product-native Elasticsearch profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; feature-matrix gates prove minimal/default/portable/full/full-native composition and pure/native Kafka exclusivity; live Docker jobs are manual workflow inputs. |
 | Release artifacts | Implemented | Tags must equal the Cargo workspace version. Six-platform `portable` binaries contain every self-contained adapter while excluding host-ODBC Db2 and native Kafka; archive/npm/wheel packaging accepts only target-specific binaries, preflights every selected target before writing output, includes generated completions/manpage, enforces executable permissions, install-smokes the host package, and attaches all artifacts to GitHub Release. |
-| TUI | Implemented | Connection picker, capability-aware command dispatch, read limits, AST-based SQL write classification, readonly/one-shot confirmation, command history, per-capability forms, and RAII terminal restoration are covered by smoke and failure-path tests. |
+| TUI | Implemented | Connection picker, exact-operation command dispatch, read limits, AST-based SQL write classification, readonly/one-shot confirmation, command history, per-capability forms, and RAII terminal restoration are covered by smoke and failure-path tests. |
 
 ## Usable Database And Protocol Matrix
 
@@ -132,12 +132,19 @@ the stated dbtool objective.
 
 ## Active Verification Work
 
-The implementation surface is broad, but real-product completeness is now
-tracked separately in `docs/db-completeness-tasks.md`. A connector or test
-script being present does not by itself mean that a product completed CRUD or
-the equivalent family checklist. External DSN skips, compatible aliases, and
-missing host runtimes remain explicit non-pass states in
-`testdata/db-completeness.manifest`.
+Top-level catalog bounds and exact method negotiation are complete. IF-T67 in
+`docs/interface-completion-tasks.zh-CN.md` now tracks nested collections such as
+table columns/indexes, DDL inputs, topic partition watermarks, and lag details;
+these must not be inferred complete from a bounded top-level name list. IF-T68
+tracks Windows replace-existing semantics for transfer artifact publication.
+IF-T51 remains open until the final all-feature compile, test, and packaging
+pass.
+
+Real-product completeness is tracked separately in
+`docs/db-completeness-tasks.md`. A connector or test script being present does
+not by itself mean that a product completed CRUD or the equivalent family
+checklist. External DSN skips, compatible aliases, and missing host runtimes
+remain explicit non-pass states in `testdata/db-completeness.manifest`.
 
 Design-only candidates such as Oracle, etcd, InfluxDB, VictoriaMetrics, Pulsar,
 MQTT, and RocketMQ do not have registered factories and are not listed as
@@ -148,3 +155,14 @@ implemented backends.
 `docs/final-goal-audit.md` maps the final objective to concrete evidence, and
 `./scripts/validate-final-goal.sh` verifies the repo-level completion evidence
 without starting Docker.
+
+Method-level and bounded-catalog evidence is split by contract so one protocol
+cannot mask another:
+
+- `docs/test-evidence/capability-negotiation.md`
+- `docs/test-evidence/sql-catalog-bounded.md`
+- `docs/test-evidence/sqlserver-catalog-bounded.md`
+- `docs/test-evidence/cassandra-catalog-bounded.md`
+- `docs/test-evidence/db2-catalog-bounded.md`
+- `docs/test-evidence/bounded-document-search-timeseries.md`
+- `docs/test-evidence/messaging-bounded-catalogs.md`

@@ -10,7 +10,7 @@ Environment: Docker on macOS arm64; Rust 1.96.0; single RabbitMQ node and isolat
 
 Product version: `rabbitmq:3.13-management-alpine`
 
-Commands: `./scripts/integration-mq-test.sh`; focused adapter and CLI commands shown below
+Command: `./scripts/integration-mq-test.sh`; focused adapter and CLI commands shown below
 
 Resource operations:
 

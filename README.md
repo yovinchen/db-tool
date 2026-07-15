@@ -2,14 +2,22 @@
 
 dbtool is a Rust workspace for a unified data and message connection tool. The current implementation follows the design in [dbtool-design.md](dbtool-design.md): a small core crate defines DSN parsing, capability traits, safety guards, result limits, format envelopes, and a registry mechanism; adapters and frontends build on top of that core.
 
-## Current Focus
+## Current Status
 
-The project is being completed core-first.
+The core, CLI, independent TUI, registered adapters, Docker integration paths,
+and release packaging are implemented. Method-level capability negotiation and
+top-level bounded catalogs are complete. Current work is limited to nested
+metadata bounds, cross-platform artifact replacement, external-product
+evidence, and final full-feature packaging verification.
 
-- `dbtool-core` is the stable foundation: domain models, ports, DSN parsing, registry, config loading, safety, limiting, and formatting.
-- `dbtool-cli` is the first frontend that exercises the core.
-- `dbtool-tui` is intentionally a lightweight shell for now.
-- Message adapters are staged. Kafka pure/native feature selection is wired, with pure Rust as the default and native librdkafka available through `full-native`.
+- `dbtool-core` owns stable models, ports, exact operation names, DSN/config,
+  safety, limits, formatting, and connection management.
+- `dbtool-cli` exposes SQL, CQL, Db2, KV, Document, Search, TimeSeries,
+  Messaging, transfer, and named-connection command families.
+- `dbtool-tui` is a working independent binary with SQL/KV/Document/Search/TS
+  command dispatch, safety checks, history, forms, and terminal restoration.
+- Kafka pure/native, Redis Streams, AMQP/RabbitMQ, and NATS/JetStream paths are
+  implemented; each connector advertises only the exact methods it supports.
 
 ## Workspace Layout
 
@@ -28,9 +36,12 @@ The project is being completed core-first.
 │   ├── adapter-mongo     # MongoDB document adapter
 │   ├── adapter-search    # OpenSearch/Elasticsearch HTTP search adapter
 │   ├── adapter-timeseries # Prometheus HTTP time-series adapter
-│   ├── adapter-kafka     # Kafka-compatible message adapter shell
+│   ├── adapter-kafka     # Kafka pure/native message adapter
 │   ├── adapter-amqp      # AMQP plus RabbitMQ management adapter
-│   └── adapter-nats      # NATS adapter shell
+│   ├── adapter-nats      # NATS core plus JetStream adapter
+│   ├── adapter-sqlserver # SQL Server/TDS adapter
+│   ├── adapter-cassandra # Cassandra/Scylla CQL adapter
+│   └── adapter-db2       # IBM Db2 ODBC and catalog adapter
 ├── docs
 ├── tests
 └── .github/workflows
@@ -41,7 +52,11 @@ The project is being completed core-first.
 `dbtool-core` owns the stable contracts:
 
 - `model`: shared result, value, document, message, metadata, and time-series structs.
-- `port`: capability traits such as `SqlEngine`, `KeyValueStore`, `DocumentStore`, `SearchEngine`, `MessageProducer`, and `AdminInspect`.
+- `port`: capability traits such as `SqlEngine`, `CqlEngine`, `Db2Engine`,
+  `KeyValueStore`, `DocumentStore`, `SearchEngine`, `TimeSeriesStore`,
+  `MessageProducer`, `MessageConsumer`, `AdminInspect`, and `AdminMutate`.
+- `CapabilityReport`: backward-compatible family booleans plus a sorted,
+  deduplicated `operations` list used for exact method negotiation.
 - `dsn`: DSN parsing, environment expansion, and safe redaction.
 - `registry`: scheme-to-factory lookup plus protocol-family alias handling.
 - `config`: named connection loading from `connections.toml` and `DBTOOL_CONN_*` environment variables.
@@ -65,6 +80,21 @@ All CLI responses are JSON envelopes by default:
 }
 ```
 
+Run `caps` before dispatch. Legacy booleans identify only a capability family;
+`data.operations` is the authoritative method contract. Every CLI/TUI data
+action that takes a capability accessor uses
+`exact operation -> accessor -> invoke`, so partial connectors fail before
+downcast instead of falling back to a weaker method. Connector-level `ping`
+and report-only `caps` do not require a capability operation.
+
+```bash
+dbtool --conn production caps
+```
+
+See [the Chinese interface and safety guide](docs/interface-usage.zh-CN.md) and
+[capability negotiation evidence](docs/test-evidence/capability-negotiation.md)
+for the complete embedded pattern and partial-connector matrix.
+
 Examples:
 
 ```bash
@@ -74,13 +104,17 @@ cargo run -p dbtool-cli -- --allow-write conn add local-sqlite sqlite:local.db
 cargo run -p dbtool-cli -- --dsn sqlite::memory: sql query "select 1"
 cargo run -p dbtool-cli -- --dsn sqlite::memory: --format table sql query "select 1 as id"
 cargo run -p dbtool-cli -- --dsn sqlite::memory: --format ndjson sql query "select 1 as id"
+cargo run -p dbtool-cli --features cassandra -- --dsn cassandra://127.0.0.1:9042/app cql keyspaces
+cargo run -p dbtool-cli --features db2 -- --dsn "$DB2_DSN" db2 sequences
 cargo run -p dbtool-cli -- --conn redis-local kv get my-key
+cargo run -p dbtool-cli -- --conn redis-local --limit 20 mq topics
 cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 search indices
 cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 --limit 10 search search users --q '{"match_all":{}}'
 cargo run -p dbtool-cli -- --dsn opensearch://127.0.0.1:9200 --allow-write search index users '{"name":"alice"}'
 cargo run -p dbtool-cli -- --dsn prometheus://127.0.0.1:9090 ts measurements
 cargo run -p dbtool-cli -- --dsn prometheus://127.0.0.1:9090 ts query up --last-minutes 10
 cargo run -p dbtool-cli -- --dsn prometheus://127.0.0.1:9090 --allow-write ts write dbtool_sample 1 --tag job=dbtool
+cargo run -p dbtool-cli -- --conn local --limit 100 export sql --query "select * from users" --out users.json
 ```
 
 Named connections resolve in this order:
@@ -168,6 +202,9 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ./scripts/smoke-core-flow.sh
+./scripts/validate-db-completeness.sh
+./scripts/validate-tidb-ha-drills.sh
+./scripts/validate-final-goal.sh
 ```
 
 The embedded library path is covered without spawning the CLI:
@@ -429,9 +466,21 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
 - Core contracts and services: implemented as the main foundation.
 - SQL/Redis/Mongo adapters: implemented and covered by service-free plus live-test paths, including real MariaDB, TiDB, TiDB auth/TLS/HA, TiDB TiProxy, Valkey, KeyDB, and Dragonfly compatibility profiles.
 - OpenSearch/Elasticsearch HTTP/HTTPS search adapter: implemented for index listing, document indexing, search, hard result limits, pagination, and truncation; covered by exact real-product HTTP runs, TLS transport fixtures, and OpenSearch security-plugin auth/trust checks.
-- Prometheus HTTP time-series adapter: implemented for metric listing and range queries, with read-only semantics.
+- Prometheus HTTP time-series adapter: implemented for bounded metric listing,
+  range queries, and remote write; Prometheus still has no portable row-style
+  update/delete contract.
 - SQL Server and Cassandra/ScyllaDB adapters: implemented and registered, with service-free adapter coverage plus opt-in Docker integration profiles; Cassandra has passed local live coverage, and SQL Server has passed live coverage on GitHub Actions x86_64 runners.
-- Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
+- Kafka adapter: pure Rust ping/list/detail/produce/consume is included by
+  `portable` and `full`; native librdkafka is selected by `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; AMQPS and NATS TLS live paths, NATS JetStream admin, and RabbitMQ management-backed queue discovery are implemented.
-- TUI: connection picker, capability-aware forms/command dispatch, read limits, AST-based SQL write classification, readonly protection, one-shot write confirmation, history, and failure-safe terminal restoration are implemented.
+- TUI: connection picker, a fixed form palette, operation-gated command dispatch,
+  read limits, AST-based SQL write classification, readonly protection,
+  one-shot write confirmation, history, and failure-safe terminal restoration
+  are implemented.
 - Release packaging: tag/version validation, target-specific preflight for portable six-platform archives, npm and pip/uv install smokes, GitHub Release attachment, and mise/ubi metadata are wired; a host binary cannot be reused as another target, while signing/notarization is still future work.
+
+The detailed current matrix is in
+[docs/implementation-status.md](docs/implementation-status.md). The Chinese
+[interface task table](docs/interface-completion-tasks.zh-CN.md) distinguishes
+completed top-level catalogs from remaining nested-metadata bounds and external
+runtime blockers.

@@ -10,7 +10,7 @@ Environment: Docker on macOS arm64; Rust 1.96.0; NATS with JetStream enabled
 
 Product version: `nats:2.10-alpine` (`2.10.29`, server `/varz`)
 
-Commands:
+Command: focused adapter, CLI, and server-inspection commands below
 
 ```text
 cargo test -p adapter-nats --all-targets

@@ -11,6 +11,13 @@ Use dbtool when you need to inspect SQL databases, key-value stores, document st
    dbtool --dsn sqlite::memory: caps
    ```
 
+   Treat `data.operations` as the authoritative method contract. Legacy fields
+   such as `sql`, `document`, or `admin` only identify a capability family;
+   they do not authorize optional, bounded, stateful, or partial-admin methods.
+   Match the exact stable name before invoking a command, for example
+   `sql.query_bounded`, `document.drop_collection`, or
+   `message.admin.consumer_lag`.
+
 2. Inspect structure before querying data:
 
    ```bash
@@ -34,7 +41,11 @@ Use dbtool when you need to inspect SQL databases, key-value stores, document st
    ```bash
    dbtool --conn redis-local kv raw XLEN mystream
    dbtool --conn redis-local --allow-write kv raw SET key value
+   dbtool --conn redis-local --allow-write --confirm '<token>' kv raw SET key value
    ```
+
+   The first mutation call only returns `CONFIRM_REQUIRED`; replay the exact
+   connection, command, and arguments with its token to execute it.
 
 ## Output Contract
 
@@ -52,7 +63,7 @@ Default CLI output is JSON. The envelope is stable:
 }
 ```
 
-On failure, read `error.code` before interpreting the message. Useful codes include `UNSUPPORTED_CAPABILITY`, `WRITE_NOT_ALLOWED`, and `CONFIRM_REQUIRED`.
+On failure, read `error.code` before interpreting the message. Useful codes include `UNSUPPORTED_CAPABILITY`, `WRITE_NOT_ALLOWED`, and `CONFIRM_REQUIRED`. `error.needed` is diagnostic; use `caps.data.operations`, not message text, for machine negotiation.
 
 For human inspection or pipelines, request an alternate successful-output format:
 

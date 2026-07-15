@@ -40,8 +40,10 @@ Products: SQLite in-memory; PostgreSQL 16.14; MySQL 8.4.9; MariaDB 11.4
 | MySQL | `mysql://`, `mariadb://`, `tidb://` | `information_schema`, `LIMIT ?` | database + table name | LIVE_PASS on MySQL and MariaDB alias |
 
 SQL Server is implemented by the separate `adapter-sqlserver` crate, not
-`adapter-sql`; it does not advertise these new operations in this task and is
-therefore rejected instead of receiving an unbounded compatibility fallback.
+`adapter-sql`. It now advertises and implements the same bounded SQL schema and
+table operations through TDS `TOP (N+1)` queries. Its independent contract and
+live-run boundary are recorded in
+[`sqlserver-catalog-bounded.md`](sqlserver-catalog-bounded.md).
 
 ## Evidence
 

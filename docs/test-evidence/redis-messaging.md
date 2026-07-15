@@ -9,7 +9,9 @@ Run at (UTC): 2026-07-15T21:27:35Z
 Environment: Docker on macOS arm64; Rust 1.96.0; Redis 7 Alpine, Valkey 8.1.8,
 KeyDB 6.3.4, and Dragonfly 1.39.0 compatibility profiles
 
-Commands:
+Product version: Redis 7.4.9, Valkey 8.1.8, KeyDB 6.3.4, Dragonfly 1.39.0
+
+Command: focused adapter/CLI commands below, repeated for each compatible DSN
 
 ```text
 cargo test -p adapter-redis
@@ -26,7 +28,7 @@ env DBTOOL_RUN_MQ_INTEGRATION=1 DBTOOL_IT_REDIS_DSN=redis://127.0.0.1:16379/0 \
 # dragonfly://127.0.0.1:26381/0
 ```
 
-Stateful Stream matrix:
+Resource operations: stateful Stream matrix
 
 | Operation | Live assertion | Result |
 | --- | --- | --- |

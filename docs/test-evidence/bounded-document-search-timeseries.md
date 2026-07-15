@@ -31,7 +31,7 @@ cargo test -p dbtool-tui --bin dbtool-tui
 cargo test -p dbtool-cli --test bounded_document_search_ts invalid_catalog_limits_fail_before_connection_for_all_three_surfaces -- --exact --nocapture
 ```
 
-结果：三个 adapter 的 bounded parser、N/N+1、operation 声明和 HTTP body cap 单测通过；CLI 82/82 通过；三种无效 limit 的公共 CLI 测试通过。TUI 新增的显式能力门禁与连接前校验通过。TUI 全量中另有一个既存断言仍要求错误消息回显未知配置字段 `readonli`，与当前“配置诊断不泄露原文”的核心策略冲突；它不是本分支引入的目录错误，需独立修正测试期望。
+结果：三个 adapter 的 bounded parser、N/N+1、operation 声明和 HTTP body cap 单测通过；CLI 全量命令单测通过；三种无效 limit 的公共 CLI 测试通过。TUI 的显式能力门禁、连接前校验及 32/32 全量测试通过。配置诊断测试已与“不泄露未知字段原文”的核心策略统一，不再保留过期失败说明。
 
 Docker 真实验证：
 
