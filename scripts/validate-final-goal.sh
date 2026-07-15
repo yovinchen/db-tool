@@ -166,7 +166,7 @@ require_pattern "crates/dbtool-registry/tests/embedded_library.rs" "FlowControl"
 require_pattern "crates/dbtool-tui/src/state.rs" "CommandFormState"
 require_pattern "crates/dbtool-tui/src/app.rs" "pending_write"
 
-if grep -Ev '^\| IF-T43–IF-T68 Interface completion campaign ' "$ROOT/docs/tasks.md" \
+if grep -Ev '^\| IF-T43–IF-T75 Interface completion campaign ' "$ROOT/docs/tasks.md" \
   | grep -Eq 'Pending|In progress|Deferred|\[ \]'; then
   fail "docs/tasks.md still contains an unfinished implementation task marker"
 fi
@@ -191,7 +191,7 @@ require_pattern "docs/final-goal-audit.md" "The repo satisfies the original dbto
 require_pattern "docs/final-goal-audit.md" "Product-specific production-readiness exercises remain explicit boundaries"
 require_pattern "docs/final-goal-audit.md" "Active Interface Completion Campaign"
 require_pattern "docs/final-goal-audit.md" "22 tasks are"
-require_pattern "docs/tasks.md" "IF-T43–IF-T68 Interface completion campaign"
+require_pattern "docs/tasks.md" "IF-T43–IF-T75 Interface completion campaign"
 require_pattern "docs/interface-completion-tasks.zh-CN.md" "IF-T43 SQL 参数绑定"
 require_pattern "docs/interface-completion-tasks.zh-CN.md" "IF-T55 CLI/发布严格性"
 require_pattern "docs/implementation-status.md" "export sql"

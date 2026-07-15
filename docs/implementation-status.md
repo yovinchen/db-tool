@@ -132,13 +132,15 @@ the stated dbtool objective.
 
 ## Active Verification Work
 
-Top-level catalog bounds and exact method negotiation are complete. IF-T67 in
-`docs/interface-completion-tasks.zh-CN.md` now tracks nested collections such as
-table columns/indexes, DDL inputs, topic partition watermarks, and lag details;
-these must not be inferred complete from a bounded top-level name list. IF-T68
-tracks Windows replace-existing semantics for transfer artifact publication.
-IF-T51 remains open until the final all-feature compile, test, and packaging
-pass.
+Top-level catalog bounds and exact method negotiation are complete. The current
+read-envelope audit is tracked as IF-T67 through IF-T75 in
+`docs/interface-completion-tasks.zh-CN.md`: nested schema/topic metadata,
+cross-platform artifact replacement, recursive SQL/CQL result bytes, KV reads,
+multi-document accumulation, message batch bytes before ACK, time-series
+structure, catalog scalar bytes, and the legacy unbounded API lifecycle. A
+bounded top-level name or row count is not evidence that these nested values are
+bounded. IF-T51 remains open until the final all-feature compile, test, and
+packaging pass.
 
 Real-product completeness is tracked separately in
 `docs/db-completeness-tasks.md`. A connector or test script being present does
