@@ -39,18 +39,26 @@ capability_operations! {
     SqlExecute => "sql.execute",
     SqlInsertRowsAtomic => "sql.insert_rows_atomic",
     SqlListSchemas => "sql.list_schemas",
+    SqlListSchemasBounded => "sql.list_schemas_bounded",
     SqlListTables => "sql.list_tables",
+    SqlListTablesBounded => "sql.list_tables_bounded",
     SqlDescribeTable => "sql.describe_table",
     CqlQuery => "cql.query",
     CqlQueryBounded => "cql.query_bounded",
     CqlExecute => "cql.execute",
     CqlListKeyspaces => "cql.list_keyspaces",
+    CqlListKeyspacesBounded => "cql.list_keyspaces_bounded",
     CqlListTables => "cql.list_tables",
+    CqlListTablesBounded => "cql.list_tables_bounded",
     CqlDescribeTable => "cql.describe_table",
     Db2ListSequences => "db2.list_sequences",
+    Db2ListSequencesBounded => "db2.list_sequences_bounded",
     Db2ListRoutines => "db2.list_routines",
+    Db2ListRoutinesBounded => "db2.list_routines_bounded",
     Db2ListTablespaces => "db2.list_tablespaces",
+    Db2ListTablespacesBounded => "db2.list_tablespaces_bounded",
     Db2ListForeignKeys => "db2.list_foreign_keys",
+    Db2ListForeignKeysBounded => "db2.list_foreign_keys_bounded",
     Db2GenerateDdl => "db2.generate_ddl",
     KeyValueGet => "kv.get",
     KeyValueGetWithExpiry => "kv.get_with_expiry",
@@ -60,6 +68,7 @@ capability_operations! {
     KeyValueScan => "kv.scan",
     KeyValueRawCommand => "kv.raw_command",
     DocumentListCollections => "document.list_collections",
+    DocumentListCollectionsBounded => "document.list_collections_bounded",
     DocumentFind => "document.find",
     DocumentInsert => "document.insert",
     DocumentUpdate => "document.update",
@@ -72,9 +81,11 @@ capability_operations! {
     DocumentAggregateBounded => "document.aggregate_bounded",
     DocumentDropCollection => "document.drop_collection",
     TimeSeriesListMeasurements => "time_series.list_measurements",
+    TimeSeriesListMeasurementsBounded => "time_series.list_measurements_bounded",
     TimeSeriesWritePoints => "time_series.write_points",
     TimeSeriesQueryRange => "time_series.query_range",
     SearchListIndices => "search.list_indices",
+    SearchListIndicesBounded => "search.list_indices_bounded",
     SearchSearch => "search.search",
     SearchIndexDocument => "search.index_doc",
     SearchPutDocument => "search.put_doc",
@@ -88,6 +99,7 @@ capability_operations! {
     MessageConsumeDurable => "message.consume_durable",
     MessageConsumeAck => "message.consume_ack",
     MessageAdminListTopics => "message.admin.list_topics",
+    MessageAdminListTopicsBounded => "message.admin.list_topics_bounded",
     MessageAdminTopicDetail => "message.admin.topic_detail",
     MessageAdminConsumerLag => "message.admin.consumer_lag",
     MessageAdminDelete => "message.admin.delete",
@@ -170,6 +182,22 @@ impl CapabilityOperation {
         Self::MessageAdminTopicDetail,
         Self::MessageAdminConsumerLag,
         Self::MessageAdminDelete,
+    ];
+    /// Bounded catalog operations require backend-aware N+1 reads and are
+    /// therefore never inferred from any legacy coarse capability flag.
+    pub const BOUNDED_CATALOGS: &'static [Self] = &[
+        Self::SqlListSchemasBounded,
+        Self::SqlListTablesBounded,
+        Self::CqlListKeyspacesBounded,
+        Self::CqlListTablesBounded,
+        Self::Db2ListSequencesBounded,
+        Self::Db2ListRoutinesBounded,
+        Self::Db2ListTablespacesBounded,
+        Self::Db2ListForeignKeysBounded,
+        Self::DocumentListCollectionsBounded,
+        Self::TimeSeriesListMeasurementsBounded,
+        Self::SearchListIndicesBounded,
+        Self::MessageAdminListTopicsBounded,
     ];
 }
 
@@ -496,6 +524,7 @@ mod tests {
                 !CapabilityOperation::MESSAGE_ADMIN.contains(operation)
                     && *operation != CapabilityOperation::SqlInsertRowsAtomic
                     && !CapabilityOperation::KEY_VALUE_LIFETIME.contains(operation)
+                    && !CapabilityOperation::BOUNDED_CATALOGS.contains(operation)
                     && ![
                         CapabilityOperation::DocumentUpdateOne,
                         CapabilityOperation::DocumentUpdateMany,
@@ -518,6 +547,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::MESSAGE_CONSUMER_EXTENSIONS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::BOUNDED_CATALOGS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         for operation in [

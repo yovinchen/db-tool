@@ -1,3 +1,4 @@
+pub mod bounded;
 pub mod document;
 pub mod kv;
 pub mod message;
@@ -7,6 +8,7 @@ pub mod search;
 pub mod series;
 pub mod value;
 
+pub use bounded::BoundedList;
 pub use document::{Document, FindOptions, InsertOutcome, UpdateOutcome};
 pub use kv::{KeyExpiry, KeyValueRestoreOutcome, KeyValueSnapshot};
 pub use message::{

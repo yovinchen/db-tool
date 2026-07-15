@@ -6,7 +6,7 @@ pub mod safety;
 pub mod throttle;
 
 pub use formatter::{Format, Formatter};
-pub use limiter::ResultLimiter;
+pub use limiter::{ListLimiter, ResultLimiter};
 pub use manager::ConnectionManager;
 pub use resolver::ConnectionResolver;
 pub use safety::SafetyGuard;

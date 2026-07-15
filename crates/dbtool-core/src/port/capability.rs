@@ -1,7 +1,7 @@
 use crate::{
     model::{
-        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, Document, ExecOutcome,
-        FindOptions, ForeignKeyInfo, InsertOutcome, KeyExpiry, KeyValueRestoreOutcome,
+        BoundedList, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, Document,
+        ExecOutcome, FindOptions, ForeignKeyInfo, InsertOutcome, KeyExpiry, KeyValueRestoreOutcome,
         KeyValueSnapshot, LagInfo, Message, MessageResource, Point, ProduceOutcome, ResultSet,
         RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema, TablespaceInfo, TimeRange,
         TopicDetail, TopicInfo, UpdateOutcome, Value,
@@ -59,12 +59,37 @@ pub trait SqlEngine: Connector {
     /// Interactive callers must therefore apply their own result budget and
     /// report whether the returned list was truncated.
     async fn list_schemas(&self) -> Result<Vec<String>>;
+    /// Return at most `max_items` schemas while probing one additional item.
+    ///
+    /// This optional method must apply its limit before or during backend
+    /// iteration. The default intentionally does not call [`Self::list_schemas`]
+    /// because truncating a fully materialized catalog is not bounded.
+    async fn list_schemas_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SqlEngine.list_schemas_bounded",
+        })
+    }
     /// Return the complete table/view catalog for `schema`.
     ///
     /// Every returned [`TableInfo`] should carry its effective schema when the
     /// backend supports namespaces so portable unquoted names can be sent back
     /// to [`Self::describe_table`] without ambiguity.
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>>;
+    /// Return at most `max_items` tables while probing one additional item.
+    ///
+    /// Implementations must bound backend work and explicitly advertise
+    /// `sql.list_tables_bounded`; the legacy list method is never a fallback.
+    async fn list_tables_bounded(
+        &self,
+        _schema: Option<&str>,
+        _max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SqlEngine.list_tables_bounded",
+        })
+    }
     async fn describe_table(&self, table: &str) -> Result<TableSchema>;
 }
 
@@ -77,7 +102,23 @@ pub trait CqlEngine: Connector {
     async fn query_cql_bounded(&self, cql: &str, max_rows: usize) -> Result<ResultSet>;
     async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome>;
     async fn list_keyspaces(&self) -> Result<Vec<String>>;
+    async fn list_keyspaces_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "CqlEngine.list_keyspaces_bounded",
+        })
+    }
     async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>>;
+    async fn list_cql_tables_bounded(
+        &self,
+        _keyspace: Option<&str>,
+        _max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "CqlEngine.list_cql_tables_bounded",
+        })
+    }
     async fn describe_cql_table(&self, table: &str) -> Result<TableSchema>;
 }
 
@@ -133,6 +174,12 @@ pub struct SetOptions {
 #[async_trait]
 pub trait DocumentStore: Connector {
     async fn list_collections(&self) -> Result<Vec<String>>;
+    async fn list_collections_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "DocumentStore.list_collections_bounded",
+        })
+    }
     async fn find(
         &self,
         collection: &str,
@@ -234,6 +281,12 @@ pub trait DocumentStore: Connector {
 #[async_trait]
 pub trait TimeSeriesStore: Connector {
     async fn list_measurements(&self) -> Result<Vec<String>>;
+    async fn list_measurements_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "TimeSeriesStore.list_measurements_bounded",
+        })
+    }
     async fn write_points(&self, points: Vec<Point>) -> Result<()>;
     async fn query_range(&self, query: &str, range: TimeRange) -> Result<SeriesSet>;
 }
@@ -241,6 +294,15 @@ pub trait TimeSeriesStore: Connector {
 #[async_trait]
 pub trait SearchEngine: Connector {
     async fn list_indices(&self) -> Result<Vec<crate::model::IndexInfo>>;
+    async fn list_indices_bounded(
+        &self,
+        _max_items: usize,
+    ) -> Result<BoundedList<crate::model::IndexInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SearchEngine.list_indices_bounded",
+        })
+    }
     async fn search(&self, index: &str, query: Value, options: SearchOptions)
         -> Result<SearchHits>;
     /// Create a document using a backend-generated identifier.
@@ -278,6 +340,12 @@ pub trait MessageConsumer: Connector {
 #[async_trait]
 pub trait AdminInspect: Connector {
     async fn list_topics(&self) -> Result<Vec<TopicInfo>>;
+    async fn list_topics_bounded(&self, _max_items: usize) -> Result<BoundedList<TopicInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "AdminInspect.list_topics_bounded",
+        })
+    }
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail>;
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>>;
 }
@@ -304,12 +372,51 @@ pub trait AdminMutate: Connector {
 pub trait Db2Engine: Connector {
     /// List user-defined sequences in a schema (defaults to current schema).
     async fn list_sequences(&self, schema: Option<&str>) -> Result<Vec<SequenceInfo>>;
+    async fn list_sequences_bounded(
+        &self,
+        _schema: Option<&str>,
+        _max_items: usize,
+    ) -> Result<BoundedList<SequenceInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.list_sequences_bounded",
+        })
+    }
     /// List stored procedures and user-defined functions in a schema.
     async fn list_routines(&self, schema: Option<&str>) -> Result<Vec<RoutineInfo>>;
+    async fn list_routines_bounded(
+        &self,
+        _schema: Option<&str>,
+        _max_items: usize,
+    ) -> Result<BoundedList<RoutineInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.list_routines_bounded",
+        })
+    }
     /// List all tablespaces visible in the current database.
     async fn list_tablespaces(&self) -> Result<Vec<TablespaceInfo>>;
+    async fn list_tablespaces_bounded(
+        &self,
+        _max_items: usize,
+    ) -> Result<BoundedList<TablespaceInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.list_tablespaces_bounded",
+        })
+    }
     /// List foreign-key constraints for a table (schema.table or bare table name).
     async fn list_foreign_keys(&self, table: &str) -> Result<Vec<ForeignKeyInfo>>;
+    async fn list_foreign_keys_bounded(
+        &self,
+        _table: &str,
+        _max_items: usize,
+    ) -> Result<BoundedList<ForeignKeyInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.list_foreign_keys_bounded",
+        })
+    }
     /// Generate a CREATE TABLE DDL statement from the Db2 catalog.
     async fn generate_ddl(&self, table: &str) -> Result<String>;
 }
@@ -321,6 +428,343 @@ mod tests {
         port::{Capabilities, CapabilityOperation, ConnectorKind},
         Error,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct LegacyCatalogs {
+        unbounded_calls: AtomicUsize,
+    }
+
+    impl LegacyCatalogs {
+        fn new() -> Self {
+            Self {
+                unbounded_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn record_unbounded<T>(&self, value: T) -> T {
+            self.unbounded_calls.fetch_add(1, Ordering::SeqCst);
+            value
+        }
+    }
+
+    #[async_trait]
+    impl Connector for LegacyCatalogs {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind("legacy-catalogs".into())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                sql: true,
+                cql: true,
+                db2: true,
+                document: true,
+                time_series: true,
+                search: true,
+                admin: true,
+                ..Default::default()
+            }
+        }
+
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SqlEngine for LegacyCatalogs {
+        async fn query(&self, _sql: &str, _params: &[Value]) -> Result<ResultSet> {
+            Ok(ResultSet::empty())
+        }
+
+        async fn query_bounded(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+            _max_rows: usize,
+        ) -> Result<ResultSet> {
+            Ok(ResultSet::empty())
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<ExecOutcome> {
+            Ok(ExecOutcome {
+                rows_affected: 0,
+                last_insert_id: None,
+            })
+        }
+
+        async fn list_schemas(&self) -> Result<Vec<String>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn list_tables(&self, _schema: Option<&str>) -> Result<Vec<TableInfo>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn describe_table(&self, _table: &str) -> Result<TableSchema> {
+            Err(Error::Query("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl CqlEngine for LegacyCatalogs {
+        async fn query_cql(&self, _cql: &str) -> Result<ResultSet> {
+            Ok(ResultSet::empty())
+        }
+
+        async fn query_cql_bounded(&self, _cql: &str, _max_rows: usize) -> Result<ResultSet> {
+            Ok(ResultSet::empty())
+        }
+
+        async fn execute_cql(&self, _cql: &str) -> Result<ExecOutcome> {
+            Ok(ExecOutcome {
+                rows_affected: 0,
+                last_insert_id: None,
+            })
+        }
+
+        async fn list_keyspaces(&self) -> Result<Vec<String>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn list_cql_tables(&self, _keyspace: Option<&str>) -> Result<Vec<TableInfo>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn describe_cql_table(&self, _table: &str) -> Result<TableSchema> {
+            Err(Error::Query("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl DocumentStore for LegacyCatalogs {
+        async fn list_collections(&self) -> Result<Vec<String>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn find(
+            &self,
+            _collection: &str,
+            _filter: Value,
+            _options: FindOptions,
+        ) -> Result<Vec<Document>> {
+            Ok(Vec::new())
+        }
+
+        async fn insert(&self, _collection: &str, _docs: Vec<Document>) -> Result<InsertOutcome> {
+            Ok(InsertOutcome {
+                inserted: 0,
+                ids: Vec::new(),
+            })
+        }
+
+        async fn update(
+            &self,
+            _collection: &str,
+            _filter: Value,
+            _update: Value,
+        ) -> Result<UpdateOutcome> {
+            Ok(UpdateOutcome {
+                matched: 0,
+                modified: 0,
+            })
+        }
+
+        async fn delete(&self, _collection: &str, _filter: Value) -> Result<u64> {
+            Ok(0)
+        }
+
+        async fn aggregate(
+            &self,
+            _collection: &str,
+            _pipeline: Vec<Value>,
+        ) -> Result<Vec<Document>> {
+            Ok(Vec::new())
+        }
+
+        async fn aggregate_bounded(
+            &self,
+            _collection: &str,
+            _pipeline: Vec<Value>,
+            _max_items: usize,
+        ) -> Result<Vec<Document>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl TimeSeriesStore for LegacyCatalogs {
+        async fn list_measurements(&self) -> Result<Vec<String>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn write_points(&self, _points: Vec<Point>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn query_range(&self, _query: &str, _range: TimeRange) -> Result<SeriesSet> {
+            Err(Error::Query("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl SearchEngine for LegacyCatalogs {
+        async fn list_indices(&self) -> Result<Vec<crate::model::IndexInfo>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn search(
+            &self,
+            _index: &str,
+            _query: Value,
+            _options: SearchOptions,
+        ) -> Result<SearchHits> {
+            Err(Error::Query("unused".into()))
+        }
+
+        async fn index_doc(&self, _index: &str, _doc: Value) -> Result<SearchWriteOutcome> {
+            Err(Error::Query("unused".into()))
+        }
+
+        async fn put_doc(
+            &self,
+            _index: &str,
+            _id: &str,
+            _doc: Value,
+        ) -> Result<SearchWriteOutcome> {
+            Err(Error::Query("unused".into()))
+        }
+
+        async fn get_doc(&self, _index: &str, _id: &str) -> Result<Option<SearchDocument>> {
+            Err(Error::Query("unused".into()))
+        }
+
+        async fn update_doc(
+            &self,
+            _index: &str,
+            _id: &str,
+            _patch: Value,
+        ) -> Result<SearchWriteOutcome> {
+            Err(Error::Query("unused".into()))
+        }
+
+        async fn delete_doc(&self, _index: &str, _id: &str) -> Result<SearchWriteOutcome> {
+            Err(Error::Query("unused".into()))
+        }
+
+        async fn delete_index(&self, _index: &str) -> Result<SearchDeleteIndexOutcome> {
+            Err(Error::Query("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl AdminInspect for LegacyCatalogs {
+        async fn list_topics(&self) -> Result<Vec<TopicInfo>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn topic_detail(&self, _name: &str) -> Result<TopicDetail> {
+            Err(Error::Query("unused".into()))
+        }
+
+        async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
+            Err(Error::Query("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl Db2Engine for LegacyCatalogs {
+        async fn list_sequences(&self, _schema: Option<&str>) -> Result<Vec<SequenceInfo>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn list_routines(&self, _schema: Option<&str>) -> Result<Vec<RoutineInfo>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn list_tablespaces(&self) -> Result<Vec<TablespaceInfo>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn list_foreign_keys(&self, _table: &str) -> Result<Vec<ForeignKeyInfo>> {
+            Ok(self.record_unbounded(Vec::new()))
+        }
+
+        async fn generate_ddl(&self, _table: &str) -> Result<String> {
+            Err(Error::Query("unused".into()))
+        }
+    }
+
+    fn assert_unsupported<T>(result: Result<T>, expected: &'static str) {
+        assert!(matches!(
+            result,
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-catalogs" && needed == expected
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_catalog_defaults_never_materialize_legacy_lists() {
+        let connector = LegacyCatalogs::new();
+
+        assert_unsupported(
+            SqlEngine::list_schemas_bounded(&connector, 10).await,
+            "SqlEngine.list_schemas_bounded",
+        );
+        assert_unsupported(
+            SqlEngine::list_tables_bounded(&connector, Some("public"), 10).await,
+            "SqlEngine.list_tables_bounded",
+        );
+        assert_unsupported(
+            CqlEngine::list_keyspaces_bounded(&connector, 10).await,
+            "CqlEngine.list_keyspaces_bounded",
+        );
+        assert_unsupported(
+            CqlEngine::list_cql_tables_bounded(&connector, Some("app"), 10).await,
+            "CqlEngine.list_cql_tables_bounded",
+        );
+        assert_unsupported(
+            DocumentStore::list_collections_bounded(&connector, 10).await,
+            "DocumentStore.list_collections_bounded",
+        );
+        assert_unsupported(
+            SearchEngine::list_indices_bounded(&connector, 10).await,
+            "SearchEngine.list_indices_bounded",
+        );
+        assert_unsupported(
+            TimeSeriesStore::list_measurements_bounded(&connector, 10).await,
+            "TimeSeriesStore.list_measurements_bounded",
+        );
+        assert_unsupported(
+            AdminInspect::list_topics_bounded(&connector, 10).await,
+            "AdminInspect.list_topics_bounded",
+        );
+        assert_unsupported(
+            Db2Engine::list_sequences_bounded(&connector, None, 10).await,
+            "Db2Engine.list_sequences_bounded",
+        );
+        assert_unsupported(
+            Db2Engine::list_routines_bounded(&connector, None, 10).await,
+            "Db2Engine.list_routines_bounded",
+        );
+        assert_unsupported(
+            Db2Engine::list_tablespaces_bounded(&connector, 10).await,
+            "Db2Engine.list_tablespaces_bounded",
+        );
+        assert_unsupported(
+            Db2Engine::list_foreign_keys_bounded(&connector, "app.orders", 10).await,
+            "Db2Engine.list_foreign_keys_bounded",
+        );
+
+        assert_eq!(connector.unbounded_calls.load(Ordering::SeqCst), 0);
+        assert!(CapabilityOperation::BOUNDED_CATALOGS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+    }
 
     struct LegacySql;
 
