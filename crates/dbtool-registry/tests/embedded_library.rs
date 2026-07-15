@@ -72,11 +72,16 @@ async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior()
         ..ThrottleConfig::default()
     });
     let rows = flow
-        .run_single(sql.query("select id, note from embedded_values where id = 1", &[]))
+        .run_single(sql.query_bounded(
+            "select id, note from embedded_values where id = 1",
+            &[],
+            100,
+        ))
         .await
         .unwrap();
 
     assert_eq!(rows.rows.len(), 1);
+    assert!(!rows.truncated);
     assert_eq!(rows.rows[0][0], Value::Int(1));
     assert_eq!(rows.rows[0][1], Value::Text("library path".to_owned()));
 }

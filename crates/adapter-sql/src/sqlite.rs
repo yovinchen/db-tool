@@ -8,8 +8,9 @@ use dbtool_core::{
         capability::SqlEngine,
         connector::{Capabilities, Connector, ConnectorKind},
     },
+    service::limiter::ResultLimiter,
 };
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, TryStreamExt};
 use sqlx::query::Query;
 use sqlx::sqlite::{SqliteArguments, SqlitePoolOptions};
 use sqlx::{types::Json, Column, Row, Sqlite, SqlitePool};
@@ -122,6 +123,55 @@ impl SqlEngine for SqliteAdapter {
             rows: result_rows,
             truncated: false,
         })
+    }
+
+    async fn query_bounded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<ResultSet> {
+        let limiter = ResultLimiter::new(max_rows);
+        let probe_rows = limiter.probe_rows()?;
+        let mut stream = bind_sqlite_params(sql, params)?.fetch(&self.pool);
+        let mut columns = Vec::new();
+        let mut result_rows = Vec::new();
+
+        while result_rows.len() < probe_rows {
+            let Some(row) = stream
+                .try_next()
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?
+            else {
+                break;
+            };
+
+            if columns.is_empty() {
+                columns = row
+                    .columns()
+                    .iter()
+                    .map(|column| ColumnMeta {
+                        name: column.name().to_owned(),
+                        type_name: column_type_name(column),
+                        nullable: true,
+                        primary_key: false,
+                        default_value: None,
+                    })
+                    .collect();
+            }
+            result_rows.push(
+                (0..columns.len())
+                    .map(|index| sqlite_value(&row, index))
+                    .collect(),
+            );
+        }
+        drop(stream);
+
+        Ok(limiter.apply(ResultSet {
+            columns,
+            rows: result_rows,
+            truncated: false,
+        }))
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
@@ -413,5 +463,74 @@ mod tests {
 
         assert_eq!(rows.rows[0][0], Value::Int(1_700_000_000_000));
         assert_eq!(rows.rows[0][1], Value::Int(7));
+    }
+
+    #[tokio::test]
+    async fn sqlite_bounded_query_streams_one_probe_row_and_preserves_params() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+
+        let limited = sql
+            .query_bounded(
+                "with recursive numbers(value) as (
+                    select 1
+                    union all
+                    select value + 1 from numbers where value < 10000
+                 )
+                 select value from numbers",
+                &[],
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            limited.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+        assert!(limited.truncated);
+
+        let exact = sql
+            .query_bounded(
+                "select ? as value union all select ? union all select ?",
+                &[Value::Int(7), Value::Int(8), Value::Int(9)],
+                3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exact.rows,
+            vec![
+                vec![Value::Int(7)],
+                vec![Value::Int(8)],
+                vec![Value::Int(9)]
+            ]
+        );
+        assert!(!exact.truncated);
+
+        let empty = sql
+            .query_bounded("select 1 as value where false", &[], 3)
+            .await
+            .unwrap();
+        assert!(empty.rows.is_empty());
+        assert!(!empty.truncated);
+    }
+
+    #[tokio::test]
+    async fn sqlite_bounded_query_rejects_invalid_limits_before_sql() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+
+        assert!(matches!(
+            sql.query_bounded("not valid sql", &[], 0).await,
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            sql.query_bounded("not valid sql", &[], usize::MAX).await,
+            Err(Error::Config(_))
+        ));
     }
 }

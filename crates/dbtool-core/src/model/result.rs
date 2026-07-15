@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ResultSet {
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<Value>>,
-    /// True when the result was cut off by ResultLimiter.
+    /// True when one or more rows were omitted because of a caller row budget.
     pub truncated: bool,
 }
 

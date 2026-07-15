@@ -8,9 +8,10 @@ use dbtool_core::{
         capability::SqlEngine,
         connector::{Capabilities, Connector, ConnectorKind},
     },
+    service::limiter::ResultLimiter,
 };
-use futures::future::BoxFuture;
-use tiberius::{AuthMethod, Client, Column, ColumnData, Config, EncryptionLevel, Row};
+use futures::{future::BoxFuture, TryStreamExt};
+use tiberius::{AuthMethod, Client, Column, ColumnData, Config, EncryptionLevel, QueryItem, Row};
 use tokio::{net::TcpStream, sync::Mutex};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -18,28 +19,35 @@ type SqlServerClient = Client<Compat<TcpStream>>;
 
 pub struct SqlServerAdapter {
     client: Mutex<Option<SqlServerClient>>,
+    dsn: Dsn,
     kind: ConnectorKind,
 }
 
 pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
-        let config = config_from_dsn(&dsn)?;
-        let addr = config.get_addr();
-        let tcp = TcpStream::connect(&addr)
-            .await
-            .map_err(|e| Error::Connection(format!("{addr}: {e}")))?;
-        tcp.set_nodelay(true)
-            .map_err(|e| Error::Connection(e.to_string()))?;
-
-        let client = Client::connect(config, tcp.compat_write())
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let client = connect_client(&dsn).await?;
+        let kind = ConnectorKind(dsn.scheme.clone());
 
         Ok(Box::new(SqlServerAdapter {
             client: Mutex::new(Some(client)),
-            kind: ConnectorKind(dsn.scheme),
+            dsn,
+            kind,
         }) as Box<dyn Connector>)
     })
+}
+
+async fn connect_client(dsn: &Dsn) -> Result<SqlServerClient> {
+    let config = config_from_dsn(dsn)?;
+    let addr = config.get_addr();
+    let tcp = TcpStream::connect(&addr)
+        .await
+        .map_err(|e| Error::Connection(format!("{addr}: {e}")))?;
+    tcp.set_nodelay(true)
+        .map_err(|e| Error::Connection(e.to_string()))?;
+
+    Client::connect(config, tcp.compat_write())
+        .await
+        .map_err(|e| Error::Connection(e.to_string()))
 }
 
 #[async_trait::async_trait]
@@ -106,6 +114,57 @@ impl SqlEngine for SqlServerAdapter {
             .map_err(|e| Error::Query(e.to_string()))?;
 
         rows_to_result_set(rows)
+    }
+
+    async fn query_bounded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<ResultSet> {
+        let limiter = ResultLimiter::new(max_rows);
+        let probe_rows = limiter.probe_rows()?;
+        reject_dynamic_params(params)?;
+        // A Tiberius QueryStream is flushed before the shared client can run a
+        // later query. Use a disposable connection so truncation closes the
+        // unread response rather than deferring an unbounded drain.
+        let mut client = connect_client(&self.dsn).await?;
+        let mut stream = client
+            .query(sql, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        while rows.len() < probe_rows {
+            let Some(item) = stream
+                .try_next()
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?
+            else {
+                break;
+            };
+
+            match item {
+                QueryItem::Metadata(metadata) if metadata.result_index() == 0 => {
+                    columns = metadata.columns().iter().map(column_meta).collect();
+                }
+                QueryItem::Metadata(_) => break,
+                QueryItem::Row(row) if row.result_index() == 0 => rows.push(row_values(row)),
+                QueryItem::Row(_) => break,
+            }
+        }
+        drop(stream);
+        client
+            .close()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+
+        Ok(limiter.apply(ResultSet {
+            columns,
+            rows,
+            truncated: false,
+        }))
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {

@@ -60,6 +60,9 @@ pub enum SqlAction {
 }
 
 pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
+    if matches!(&cmd.action, SqlAction::Query { .. }) {
+        ResultLimiter::new(ctx.limit).probe_rows()?;
+    }
     let dsn = ctx.resolve_dsn()?;
     let target = ctx.safety_target(&dsn);
 
@@ -71,7 +74,8 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
     };
 
     match &cmd.action {
-        SqlAction::Query { sql, .. } | SqlAction::Exec { sql, .. } => {
+        SqlAction::Query { sql, .. } => ensure_readonly_query(sql)?,
+        SqlAction::Exec { sql, .. } => {
             let kind = SafetyGuard::check_with_target(
                 sql,
                 &target,
@@ -109,9 +113,12 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
     let output = match cmd.action {
         SqlAction::Query { sql, .. } => {
             let rs = sql_engine
-                .query(&sql, parsed_params.as_deref().unwrap_or_default())
+                .query_bounded(
+                    &sql,
+                    parsed_params.as_deref().unwrap_or_default(),
+                    ctx.limit,
+                )
                 .await?;
-            let rs = ResultLimiter::new(ctx.limit).apply(rs);
             let truncated = rs.truncated;
             ctx.render_success(
                 conn.kind().0.as_str(),
@@ -175,6 +182,13 @@ fn parse_sql_params(raw: &str) -> Result<Vec<Value>> {
         .enumerate()
         .map(|(index, value)| parse_sql_param(index, value))
         .collect()
+}
+
+fn ensure_readonly_query(sql: &str) -> Result<()> {
+    match SafetyGuard::check(sql, false, None) {
+        Ok(StatementKind::Read) => Ok(()),
+        _ => Err(Error::WriteNotAllowed),
+    }
 }
 
 fn parse_sql_param(index: usize, value: &serde_json::Value) -> Result<Value> {

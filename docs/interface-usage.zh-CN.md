@@ -173,6 +173,39 @@ MySQL 与 SQLite 使用 `?`，PostgreSQL 使用 `$1`、`$2`。参数不会插入
 `SqlQuerySchema` 的 `UNSUPPORTED_CAPABILITY`。表列表仍通过
 `sql tables --schema <name>` 使用已实现的 schema 过滤。
 
+## SQL / CQL 有界读取范式
+
+CLI、TUI、SQL export 和嵌入式交互路径不再调用全量查询后截断，而是把全局
+`--limit` 传入 adapter：
+
+```bash
+dbtool --dsn "$POSTGRES_DSN" --limit 100 \
+  sql query 'select * from events order by id'
+
+dbtool --dsn "$CASSANDRA_DSN" --limit 100 \
+  cql query 'select * from app.events'
+```
+
+`SqlEngine::query_bounded` 与 `CqlEngine::query_cql_bounded` 是 required method，新的
+adapter 不能通过默认实现退回“全量读取再 truncate”。实现合同固定为：
+
+1. `max_rows` 必须大于零，且 `max_rows + 1` 不能溢出；
+2. adapter 最多观察一条探测行；发现该行时只返回 `max_rows` 条并标记
+   `ResultSet.truncated=true`；
+3. 结果恰好等于上限但没有探测行时必须为 false；
+4. SQLx 使用 row stream，Cassandra 使用分页 row stream，Tiberius 只读取第一结果集，
+   Db2 ODBC 的有界路径使用单行 rowset，避免预取整批；
+5. CLI 会把相同值同步到响应 `meta.truncated`。
+
+公共 `query/query_cql` 保留为显式无界兼容接口，供已知规模的内部 metadata 查询和
+受控嵌入式调用使用；任何用户输入、导出或交互式调用必须优先选择 bounded 方法。
+
+`export sql` 只接受只读语句。新生成的 `sql-rows` v2 artifact 必须包含
+`truncated` 完整性字段；部分 artifact 默认拒绝导入，调用方必须提高 `--limit`
+重新导出，不能把不完整数据静默恢复成完整表。历史 v1 artifact 没有该字段，无法区分
+完整导出与旧版客户端截断，因此默认同样拒绝；人工核验后只能通过显式
+`import sql --accept-legacy-unmarked` 覆盖这一保护。
+
 ## TimeSeries / Prometheus 查询范围
 
 `ts query` 有两种互斥的时间范围：

@@ -13,7 +13,24 @@ pub use crate::port::connector::Connector;
 
 #[async_trait]
 pub trait SqlEngine: Connector {
+    /// Execute a query without a client-side row budget.
+    ///
+    /// Interactive, export, and other user-controlled paths should use
+    /// [`Self::query_bounded`] instead.
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet>;
+    /// Execute a query while returning at most `max_rows` rows.
+    ///
+    /// Implementations must reject zero and overflowed limits, observe at most
+    /// one additional row, and set `ResultSet::truncated` only when that probe
+    /// row exists. This method is intentionally required: a default that calls
+    /// `query` and truncates afterwards would silently reintroduce unbounded
+    /// materialization in new adapters.
+    async fn query_bounded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<ResultSet>;
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome>;
     async fn list_schemas(&self) -> Result<Vec<String>>;
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>>;
@@ -22,7 +39,11 @@ pub trait SqlEngine: Connector {
 
 #[async_trait]
 pub trait CqlEngine: Connector {
+    /// Execute CQL without a client-side row budget.
     async fn query_cql(&self, cql: &str) -> Result<ResultSet>;
+    /// Execute CQL while returning at most `max_rows` rows and probing one
+    /// additional row to report truncation accurately.
+    async fn query_cql_bounded(&self, cql: &str, max_rows: usize) -> Result<ResultSet>;
     async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome>;
     async fn list_keyspaces(&self) -> Result<Vec<String>>;
     async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>>;

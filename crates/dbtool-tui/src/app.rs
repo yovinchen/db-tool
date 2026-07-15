@@ -317,11 +317,7 @@ async fn run_sql_query(
     let sql = connector
         .as_sql()
         .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
-    let mut result = sql.query(sql_text, &[]).await?;
-    if result.rows.len() > limit {
-        result.rows.truncate(limit);
-        result.truncated = true;
-    }
+    let result = sql.query_bounded(sql_text, &[], limit).await?;
     render_json(result)
 }
 

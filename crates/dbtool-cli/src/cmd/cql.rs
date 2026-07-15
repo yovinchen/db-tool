@@ -50,6 +50,9 @@ pub enum CqlAction {
 }
 
 pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
+    if matches!(&cmd.action, CqlAction::Query { .. }) {
+        ResultLimiter::new(ctx.limit).probe_rows()?;
+    }
     let dsn = ctx.resolve_dsn()?;
     let target = ctx.safety_target(&dsn);
 
@@ -70,8 +73,7 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
 
     Ok(match cmd.action {
         CqlAction::Query { cql: query } => {
-            let result = cql.query_cql(&query).await?;
-            let result = ResultLimiter::new(ctx.limit).apply(result);
+            let result = cql.query_cql_bounded(&query, ctx.limit).await?;
             let truncated = result.truncated;
             ctx.render_success(&kind, result, elapsed(), truncated)
         }

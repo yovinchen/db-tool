@@ -9,6 +9,7 @@ use dbtool_core::{
         capability::{Db2Engine, SqlEngine},
         connector::{Capabilities, Connector, ConnectorKind},
     },
+    service::limiter::ResultLimiter,
 };
 use futures::future::BoxFuture;
 use odbc_api::{
@@ -115,6 +116,26 @@ impl SqlEngine for Db2Adapter {
             let env = get_env()?;
             let conn = open(env, &conn_str)?;
             query_result_set(&conn, &sql)
+        })
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?
+    }
+
+    async fn query_bounded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<ResultSet> {
+        let limiter = ResultLimiter::new(max_rows);
+        let probe_rows = limiter.probe_rows()?;
+        reject_params(params)?;
+        let conn_str = self.conn_str.clone();
+        let sql = sql.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let env = get_env()?;
+            let conn = open(env, &conn_str)?;
+            query_result_set_bounded(&conn, &sql, max_rows, probe_rows)
         })
         .await
         .map_err(|e| Error::Query(e.to_string()))?
@@ -555,6 +576,23 @@ const BATCH: usize = 256;
 const MAX_STR: usize = 4096;
 
 fn query_result_set(conn: &Connection<'_>, sql: &str) -> Result<ResultSet> {
+    query_result_set_with_bound(conn, sql, None)
+}
+
+fn query_result_set_bounded(
+    conn: &Connection<'_>,
+    sql: &str,
+    max_rows: usize,
+    probe_rows: usize,
+) -> Result<ResultSet> {
+    query_result_set_with_bound(conn, sql, Some((max_rows, probe_rows)))
+}
+
+fn query_result_set_with_bound(
+    conn: &Connection<'_>,
+    sql: &str,
+    bound: Option<(usize, usize)>,
+) -> Result<ResultSet> {
     let mut cursor = match conn
         .execute(sql, ())
         .map_err(|e| Error::Query(e.to_string()))?
@@ -587,14 +625,17 @@ fn query_result_set(conn: &Connection<'_>, sql: &str) -> Result<ResultSet> {
         })
         .collect();
 
-    let buf = TextRowSet::for_cursor(BATCH, &mut cursor, Some(MAX_STR))
+    // A one-row ODBC rowset prevents the driver from filling a full 256-row
+    // batch after only one truncation probe row remains.
+    let batch_size = if bound.is_some() { 1 } else { BATCH };
+    let buf = TextRowSet::for_cursor(batch_size, &mut cursor, Some(MAX_STR))
         .map_err(|e| Error::Query(e.to_string()))?;
     let mut row_set_cursor = cursor
         .bind_buffer(buf)
         .map_err(|e| Error::Query(e.to_string()))?;
 
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    while let Some(batch) = row_set_cursor
+    'fetch: while let Some(batch) = row_set_cursor
         .fetch()
         .map_err(|e| Error::Query(e.to_string()))?
     {
@@ -608,13 +649,20 @@ fn query_result_set(conn: &Connection<'_>, sql: &str) -> Result<ResultSet> {
                 row_vals.push(val);
             }
             rows.push(row_vals);
+            if bound.is_some_and(|(_, probe_rows)| rows.len() >= probe_rows) {
+                break 'fetch;
+            }
         }
     }
 
-    Ok(ResultSet {
+    let result = ResultSet {
         columns,
         rows,
         truncated: false,
+    };
+    Ok(match bound {
+        Some((max_rows, _)) => ResultLimiter::new(max_rows).apply(result),
+        None => result,
     })
 }
 

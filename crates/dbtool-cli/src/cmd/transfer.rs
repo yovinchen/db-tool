@@ -4,7 +4,10 @@ use dbtool_core::{
     error::Error,
     model::{Document, FindOptions, ResultSet, Value},
     port::capability::SetOptions,
-    service::limiter::ResultLimiter,
+    service::{
+        limiter::ResultLimiter,
+        safety::{SafetyGuard, StatementKind},
+    },
     Result,
 };
 use serde::{Deserialize, Serialize};
@@ -14,6 +17,7 @@ use std::{
 };
 
 const TRANSFER_VERSION: u32 = 1;
+const SQL_TRANSFER_VERSION: u32 = 2;
 
 #[derive(Args)]
 #[command(
@@ -78,6 +82,10 @@ pub enum ImportAction {
         /// Input JSON artifact path.
         #[arg(long)]
         input: PathBuf,
+        /// Accept a legacy v1 SQL artifact without an integrity marker. Such
+        /// artifacts may contain a silently truncated export.
+        #[arg(long)]
+        accept_legacy_unmarked: bool,
     },
     /// Import kv-pairs into a key-value backend.
     Kv {
@@ -114,6 +122,8 @@ enum TransferArtifact {
         version: u32,
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
+        #[serde(default)]
+        truncated: Option<bool>,
     },
     KvPairs {
         version: u32,
@@ -133,6 +143,10 @@ struct KvEntry {
 }
 
 pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
+    if let ExportAction::Sql { query, .. } = &cmd.action {
+        ensure_readonly_export_query(query)?;
+        ResultLimiter::new(ctx.limit).probe_rows()?;
+    }
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
     let start = std::time::Instant::now();
@@ -145,9 +159,9 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 kind: kind.clone(),
                 needed: "SqlEngine",
             })?;
-            let result = sql.query(&query, &[]).await?;
-            let result = ResultLimiter::new(ctx.limit).apply(result);
+            let result = sql.query_bounded(&query, &[], ctx.limit).await?;
             let count = result.rows.len();
+            let truncated = result.truncated;
             write_artifact(&out, sql_rows_artifact(result))?;
             ctx.render_success(
                 &kind,
@@ -157,7 +171,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                     "rows": count,
                 }),
                 elapsed(),
-                false,
+                truncated,
             )
         }
         ExportAction::Kv { pattern, out } => {
@@ -244,19 +258,24 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
     let elapsed = || start.elapsed().as_millis() as u64;
 
     Ok(match cmd.action {
-        ImportAction::Sql { table, input } => {
+        ImportAction::Sql {
+            table,
+            input,
+            accept_legacy_unmarked,
+        } => {
             let artifact = read_artifact(&input)?;
             let TransferArtifact::SqlRows {
                 version,
                 columns,
                 rows,
+                truncated,
             } = artifact
             else {
                 return Err(Error::Serialization(
                     "expected sql-rows transfer artifact".to_owned(),
                 ));
             };
-            require_version(version)?;
+            require_complete_sql_artifact(version, truncated, accept_legacy_unmarked)?;
             let sql = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "SqlEngine",
@@ -383,14 +402,23 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
 }
 
 fn sql_rows_artifact(result: ResultSet) -> TransferArtifact {
+    let ResultSet {
+        columns,
+        rows,
+        truncated,
+    } = result;
     TransferArtifact::SqlRows {
-        version: TRANSFER_VERSION,
-        columns: result
-            .columns
-            .into_iter()
-            .map(|column| column.name)
-            .collect(),
-        rows: result.rows,
+        version: SQL_TRANSFER_VERSION,
+        columns: columns.into_iter().map(|column| column.name).collect(),
+        rows,
+        truncated: Some(truncated),
+    }
+}
+
+fn ensure_readonly_export_query(query: &str) -> Result<()> {
+    match SafetyGuard::check(query, false, None) {
+        Ok(StatementKind::Read) => Ok(()),
+        _ => Err(Error::WriteNotAllowed),
     }
 }
 
@@ -424,6 +452,46 @@ fn require_version(version: u32) -> Result<()> {
         Err(Error::Serialization(format!(
             "unsupported transfer artifact version: {version}"
         )))
+    }
+}
+
+fn require_complete_sql_artifact(
+    version: u32,
+    truncated: Option<bool>,
+    accept_legacy_unmarked: bool,
+) -> Result<()> {
+    match version {
+        SQL_TRANSFER_VERSION => {
+            let truncated = truncated.ok_or_else(|| {
+                Error::Serialization(
+                    "sql-rows v2 artifact is missing the required truncated integrity marker"
+                        .to_owned(),
+                )
+            })?;
+            reject_truncated_sql_artifact(truncated)
+        }
+        TRANSFER_VERSION => match truncated {
+            Some(truncated) => reject_truncated_sql_artifact(truncated),
+            None if accept_legacy_unmarked => Ok(()),
+            None => Err(Error::Serialization(
+                "refusing to import an unmarked legacy sql-rows v1 artifact because it may be incomplete; inspect it and pass --accept-legacy-unmarked to override"
+                    .to_owned(),
+            )),
+        },
+        version => Err(Error::Serialization(format!(
+            "unsupported sql-rows transfer artifact version: {version}"
+        ))),
+    }
+}
+
+fn reject_truncated_sql_artifact(truncated: bool) -> Result<()> {
+    if truncated {
+        Err(Error::Serialization(
+            "refusing to import a truncated sql-rows artifact; rerun the export with a sufficient --limit"
+                .to_owned(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -553,5 +621,52 @@ mod tests {
             "main.people"
         );
         assert!(validate_identifier_path("bad-name", "table").is_err());
+    }
+
+    #[test]
+    fn legacy_sql_artifacts_are_unknown_and_require_an_explicit_override() {
+        let artifact: TransferArtifact = serde_json::from_value(serde_json::json!({
+            "kind": "sql-rows",
+            "version": 1,
+            "columns": ["id"],
+            "rows": [[1]]
+        }))
+        .unwrap();
+
+        let TransferArtifact::SqlRows { truncated, .. } = artifact else {
+            panic!("expected sql-rows artifact");
+        };
+        assert_eq!(truncated, None);
+        assert!(matches!(
+            require_complete_sql_artifact(1, truncated, false),
+            Err(Error::Serialization(message)) if message.contains("--accept-legacy-unmarked")
+        ));
+        require_complete_sql_artifact(1, truncated, true).unwrap();
+    }
+
+    #[test]
+    fn sql_artifact_integrity_marker_is_required_and_truncation_is_rejected() {
+        assert!(matches!(
+            require_complete_sql_artifact(SQL_TRANSFER_VERSION, None, false),
+            Err(Error::Serialization(message)) if message.contains("required truncated")
+        ));
+        require_complete_sql_artifact(SQL_TRANSFER_VERSION, Some(false), false).unwrap();
+        assert!(matches!(
+            require_complete_sql_artifact(SQL_TRANSFER_VERSION, Some(true), true),
+            Err(Error::Serialization(message)) if message.contains("truncated sql-rows")
+        ));
+    }
+
+    #[test]
+    fn export_query_contract_is_strictly_readonly() {
+        assert!(ensure_readonly_export_query("select 1").is_ok());
+        assert!(matches!(
+            ensure_readonly_export_query("delete from users where id = 1"),
+            Err(Error::WriteNotAllowed)
+        ));
+        assert!(matches!(
+            ensure_readonly_export_query("drop table users"),
+            Err(Error::WriteNotAllowed)
+        ));
     }
 }

@@ -15,8 +15,9 @@ use dbtool_core::{
         capability::{CqlEngine, SqlEngine},
         connector::{Capabilities, Connector, ConnectorKind},
     },
+    service::limiter::ResultLimiter,
 };
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, StreamExt};
 use scylla::{
     client::{
         execution_profile::ExecutionProfile, session::Session, session_builder::SessionBuilder,
@@ -25,6 +26,7 @@ use scylla::{
     frame::response::result::{CollectionType, ColumnType, NativeType},
     policies::address_translator::{AddressTranslator, UntranslatedPeer},
     response::query_result::QueryRowsResult,
+    statement::unprepared::Statement,
     value::{CqlValue, Row},
 };
 
@@ -122,6 +124,62 @@ impl SqlEngine for CassandraAdapter {
             .into_rows_result()
             .map_err(|e| Error::Query(e.to_string()))?;
         rows_to_result_set(rows)
+    }
+
+    async fn query_bounded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<ResultSet> {
+        let limiter = ResultLimiter::new(max_rows);
+        let probe_rows = limiter.probe_rows()?;
+        reject_dynamic_params(params)?;
+
+        // Keep every driver's raw page bounded as well as the collected core
+        // rows. A smaller page remains accurate because the stream stops after
+        // the single truncation probe row is observed.
+        let page_size = i32::try_from(probe_rows.min(256))
+            .map_err(|_| Error::Internal("bounded CQL page size overflow".to_owned()))?;
+        let statement = Statement::new(sql).with_page_size(page_size);
+        let pager = self
+            .session
+            .query_iter(statement, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut rows_stream = pager
+            .rows_stream::<Row>()
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        let columns = {
+            let specs = rows_stream.column_specs();
+            specs
+                .iter()
+                .map(|spec| ColumnMeta {
+                    name: spec.name().to_owned(),
+                    type_name: cql_type_name(spec.typ()),
+                    nullable: true,
+                    primary_key: false,
+                    default_value: None,
+                })
+                .collect()
+        };
+
+        let mut output_rows = Vec::new();
+        while output_rows.len() < probe_rows {
+            let Some(row) = rows_stream.next().await else {
+                break;
+            };
+            let row = row.map_err(|e| Error::Query(e.to_string()))?;
+            output_rows.push(cql_row_values(row));
+        }
+        drop(rows_stream);
+
+        Ok(limiter.apply(ResultSet {
+            columns,
+            rows: output_rows,
+            truncated: false,
+        }))
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
@@ -294,6 +352,10 @@ impl CqlEngine for CassandraAdapter {
         <Self as SqlEngine>::query(self, cql, &[]).await
     }
 
+    async fn query_cql_bounded(&self, cql: &str, max_rows: usize) -> Result<ResultSet> {
+        <Self as SqlEngine>::query_bounded(self, cql, &[], max_rows).await
+    }
+
     async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome> {
         <Self as SqlEngine>::execute(self, cql, &[]).await
     }
@@ -451,12 +513,7 @@ fn rows_to_result_set(rows: QueryRowsResult) -> Result<ResultSet> {
         .map_err(|e| Error::Query(e.to_string()))?
     {
         let row = row.map_err(|e| Error::Query(e.to_string()))?;
-        output_rows.push(
-            row.columns
-                .into_iter()
-                .map(|value| value.map_or(Value::Null, cql_value_to_value))
-                .collect(),
-        );
+        output_rows.push(cql_row_values(row));
     }
 
     Ok(ResultSet {
@@ -464,6 +521,13 @@ fn rows_to_result_set(rows: QueryRowsResult) -> Result<ResultSet> {
         rows: output_rows,
         truncated: false,
     })
+}
+
+fn cql_row_values(row: Row) -> Vec<Value> {
+    row.columns
+        .into_iter()
+        .map(|value| value.map_or(Value::Null, cql_value_to_value))
+        .collect()
 }
 
 fn cql_type_name(typ: &ColumnType<'_>) -> String {

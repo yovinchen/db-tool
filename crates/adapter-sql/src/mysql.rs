@@ -6,8 +6,9 @@ use dbtool_core::{
         capability::SqlEngine,
         connector::{Capabilities, Connector, ConnectorKind},
     },
+    service::limiter::ResultLimiter,
 };
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, TryStreamExt};
 use sqlx::mysql::{MySqlArguments, MySqlRow};
 use sqlx::query::Query;
 use sqlx::{types::Json, Column, MySql, MySqlPool, Row};
@@ -126,6 +127,72 @@ impl SqlEngine for MySqlAdapter {
             rows: result_rows,
             truncated: false,
         })
+    }
+
+    async fn query_bounded(
+        &self,
+        sql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<ResultSet> {
+        let limiter = ResultLimiter::new(max_rows);
+        let probe_rows = limiter.probe_rows()?;
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        let mut stream = bind_mysql_params(sql, params)?.fetch(&mut *connection);
+        let mut columns = Vec::new();
+        let mut result_rows = Vec::new();
+
+        while result_rows.len() < probe_rows {
+            let row = match stream.try_next().await {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(error) => {
+                    drop(stream);
+                    connection.close_on_drop();
+                    return Err(Error::Query(error.to_string()));
+                }
+            };
+
+            if columns.is_empty() {
+                columns = row
+                    .columns()
+                    .iter()
+                    .map(|column| ColumnMeta {
+                        name: column.name().to_owned(),
+                        type_name: column_type_name(column),
+                        nullable: true,
+                        primary_key: false,
+                        default_value: None,
+                    })
+                    .collect();
+            }
+            result_rows.push(
+                (0..columns.len())
+                    .map(|index| mysql_value(&row, index))
+                    .collect(),
+            );
+        }
+        let retire_connection = result_rows.len() == probe_rows;
+        drop(stream);
+        if retire_connection {
+            // MySQL pool checkout pings wait for unread protocol frames. Close
+            // a truncated result socket so a later query never drains the
+            // discarded tail before it can start.
+            connection
+                .close()
+                .await
+                .map_err(|e| Error::Connection(e.to_string()))?;
+        }
+
+        Ok(limiter.apply(ResultSet {
+            columns,
+            rows: result_rows,
+            truncated: false,
+        }))
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {

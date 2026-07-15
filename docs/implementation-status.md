@@ -15,7 +15,7 @@ usable.
 | Embedded library path | Implemented | `dbtool-registry` has a service-free embedded smoke that builds the registry directly, reuses a connection through `ConnectionManager`, applies `SafetyGuard`, and runs SQL under `FlowControl` without spawning the CLI. |
 | CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `cql`, `db2`, `kv`, `doc`, `mq`, `search`, and `ts` command families exist with default backends for core read paths. Root and command-family help describe safety boundaries, JSON inputs, bounded reads, and examples. |
 | Output formats | Implemented | JSON is the default. `--format table` and `--format ndjson` are implemented for successful command output; errors always stay JSON so `error.code` and confirmation tokens remain machine-readable. |
-| SQL safety | Implemented | Read statements are allowed, writes need `--allow-write`, destructive SQL needs a confirm token bound to the target. |
+| SQL safety | Implemented | Query ASTs are recursively classified; data-modifying CTEs fail closed, `SELECT INTO` is destructive, locking SELECT is a write, all writes need `--allow-write`, and destructive SQL additionally needs a target-bound confirm token. Database least-privilege roles remain the final boundary for side-effectful vendor functions. |
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`, then apply CLI overrides such as `--rate`, `--request-timeout`, and `--deadline`; CLI execution uses the one-shot path so writes are not replayed by retries. |
 | Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, observability, OpenSearch security-plugin TLS, and product-native Elasticsearch profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; feature-matrix gates prove minimal/default/portable/full/full-native composition and pure/native Kafka exclusivity; live Docker jobs are manual workflow inputs. |
@@ -26,8 +26,8 @@ usable.
 
 | Backend | DSN schemes | Adapter | Usable operations | Verification |
 | --- | --- | --- | --- | --- |
-| SQLite | `sqlite:` | SQL | `ping`, parameterized query/exec, tables/schema; scalar/bytes/timestamp/JSON binding | In-memory unit and CLI injection-safety tests |
-| PostgreSQL | `postgres://` | SQL | parameterized query/exec/tables/schema with write safety; scalar/bytes/timestamptz/jsonb binding | Base Docker live test + full parameter lifecycle |
+| SQLite | `sqlite:` | SQL | `ping`, adapter-bounded parameterized query, exec, tables/schema; scalar/bytes/timestamp/JSON binding | In-memory 10,000-row bounded stream, exact-limit, and CLI injection-safety tests |
+| PostgreSQL | `postgres://` | SQL | adapter-bounded parameterized query, exec/tables/schema with write safety; scalar/bytes/timestamptz/jsonb binding | PostgreSQL 16.14 Docker 10,000-row bounded stream + full parameter lifecycle |
 | PostgreSQL alias | `postgresql://` | SQL | Same as Postgres adapter | Registry alias test only |
 | CockroachDB | `cockroach://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real CockroachDB compatibility live test |
 | TimescaleDB | `timescale://` | SQL | Postgres-family SQL lifecycle, typed values, result limiting, table listing, schema inspection | Real TimescaleDB compatibility live test |
@@ -35,8 +35,8 @@ usable.
 | IBM Db2 | `db2://` | Db2 ODBC | `ping`, `sql query`, `sql exec`, `sql tables`, `sql schema`, `db2 schemas`, `db2 tables`, `db2 schema`, `db2 sequences`, `db2 routines`, `db2 tablespaces`, `db2 foreign-keys`, `db2 ddl` | Service-free adapter tests; live integration guarded by `DBTOOL_RUN_DB2_INTEGRATION=1` |
 | IBM Db2 alias | `ibmdb2://`, `as400://` | Db2 ODBC | Same as Db2 adapter | Registry alias test only |
 | SQL Server | `sqlserver://`, `mssql://` | SQL Server/TDS | SQL query/exec/tables/schema, typed scalar values, result limiting | Service-free adapter tests plus real SQL Server Docker live test on GitHub Actions x86_64 runner |
-| Cassandra/ScyllaDB | `cassandra://`, `scylla://` | CQL | `ping`, `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema`, SQL-compatible CQL path, primitive/collection typed values | Adapter tests plus real Cassandra Docker live test |
-| MySQL | `mysql://` | SQL | parameterized query/exec/tables/schema; scalar/bytes/datetime/json binding; typed values and result limiting | Base Docker live test + full parameter lifecycle |
+| Cassandra/ScyllaDB | `cassandra://`, `scylla://` | CQL | `ping`, page-bounded `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema`, SQL-compatible CQL path, primitive/collection typed values | Cassandra 5.0.8 Docker paged limit+1/exact-limit tests plus lifecycle |
+| MySQL | `mysql://` | SQL | adapter-bounded parameterized query, exec/tables/schema; scalar/bytes/datetime/json binding | MySQL 8.4.9 Docker recursive large-result bound + full parameter lifecycle |
 | MariaDB | `mariadb://` | SQL | MySQL-family SQL lifecycle, typed values, result limiting | Real MariaDB compatibility live test |
 | TiDB | `tidb://` | SQL | MySQL-family SQL lifecycle, typed values, table listing, schema-qualified tables | Real PD/TiKV/TiDB live test |
 | TiDB secure HA | `tidb://` with TLS params | SQL | SQL TLS, component TLS, `REQUIRE SSL`, `REQUIRE X509`, insecure-login rejection, two SQL-node lifecycle | Real 3 PD + 2 TiKV + 2 TiDB live test |
@@ -69,7 +69,7 @@ usable.
 | Script | Services | Main coverage | Resource note |
 | --- | --- | --- | --- |
 | `./scripts/integration-db-suite.sh` | Selectable local DB suite | Orchestrates Compose config validation, service-free checks, base DB workflows, flow-control, database-side SQL timeout checks, live connection config, custom environment smoke, fixture data/images, logical roundtrip, compatibility profiles, TiDB, and opt-in heavy DB/protocol phases | Default excludes heavy phases; `DBTOOL_IT_DB_SUITE_PHASES=all` includes every declared DB, messaging, observability, search, and external-endpoint phase |
-| `./scripts/integration-test.sh` | Postgres, MySQL, Redis, MongoDB | Canonical SQL, KV, and document workflows | Roughly 2 GiB container memory |
+| `./scripts/integration-test.sh` | Postgres, MySQL, Redis, MongoDB | Canonical SQL, KV, and document workflows plus PostgreSQL/MySQL adapter-level large-result bounds | Roughly 2 GiB container memory |
 | `./scripts/integration-flow-control-test.sh` | Postgres, MySQL, Redis, MongoDB | Live request timeout, rate/admission flags, SQL/KV/document result limiting, and disposable fixture cleanup | Roughly 2 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-server-timeout-test.sh` | Postgres, MySQL | Database-side SQL timeout checks for PostgreSQL `statement_timeout`, PostgreSQL `idle_in_transaction_session_timeout`, PostgreSQL `lock_timeout`, and MySQL `innodb_lock_wait_timeout` | Roughly 1.25 GiB container memory; local-only while CI budget is frozen |
 | `./scripts/integration-connection-config-test.sh` | Postgres, MySQL, Redis, MongoDB | Temporary `connections.toml` named connections for SQL/KV/document workflows plus connection-level request timeout | Roughly 2 GiB container memory; local-only while CI budget is frozen |
@@ -81,7 +81,7 @@ usable.
 | `./scripts/integration-pg-compat-test.sh` | CockroachDB, TimescaleDB | PostgreSQL-family compatible databases | Roughly 1 GiB container memory |
 | `./scripts/integration-redshift-test.sh` | Externally supplied Redshift endpoint | Env-gated SQL lifecycle, typed values, result limiting, table listing, and schema inspection; no secrets are committed | Skips when `DBTOOL_IT_REDSHIFT_DSN` is not supplied |
 | `./scripts/integration-sqlserver-test.sh` | SQL Server | TDS SQL lifecycle, typed values, limiting, tables, and schema | Passed on GitHub Actions x86_64 runner; requires amd64-capable Docker locally; roughly 2 GiB container memory |
-| `./scripts/integration-cassandra-test.sh` | Cassandra | CQL lifecycle, keyspace-qualified tables, schema inspection, typed scalar and collection values | Roughly 2 GiB container memory; startup can be slow |
+| `./scripts/integration-cassandra-test.sh` | Cassandra | CQL lifecycle, keyspace-qualified tables, schema inspection, typed values, paged limit+1 and exact-limit reads | Roughly 2 GiB container memory; startup can be slow |
 | `./scripts/integration-cassandra-fixture-data-test.sh` | Cassandra | File-backed reusable CQL fixture loading, seeded row readback, table listing, and schema inspection | Roughly 2 GiB container memory; heavy/local-only while CI budget is frozen |
 | `./scripts/integration-tidb-test.sh` | PD, TiKV, TiDB | Real TiDB compatibility | Roughly 1.75 GiB container memory |
 | `./scripts/integration-tidb-secure-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB auth/TLS/local HA | Roughly 3.75 GiB container memory |
@@ -107,12 +107,12 @@ usable.
 | --- | --- | --- |
 | Connection | `conn list` | Read-only |
 | General | `ping`, `caps` | Read-only |
-| SQL | `sql query`, `sql exec`, `sql tables`, `sql schema`, `sql schemas` | query/exec accept `--params JSON_ARRAY`; `sql exec` and unsafe SQL require `--allow-write` and sometimes `--confirm`; query `--schema` explicitly reports unsupported instead of being ignored |
-| CQL | `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema` | `cql exec` requires `--allow-write` |
+| SQL | `sql query`, `sql exec`, `sql tables`, `sql schema`, `sql schemas` | query/exec accept `--params JSON_ARRAY`; query is adapter-bounded by positive `--limit` and strictly read-only; writes use `sql exec` with `--allow-write` and sometimes `--confirm`; query `--schema` explicitly reports unsupported instead of being ignored |
+| CQL | `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema` | query is adapter-page-bounded by positive `--limit`; `cql exec` requires `--allow-write` |
 | Db2 | `db2 schemas`, `db2 tables`, `db2 schema`, `db2 sequences`, `db2 routines`, `db2 tablespaces`, `db2 foreign-keys`, `db2 ddl` | All read-only; no `--allow-write` required |
 | KV | `kv get`, `kv set`, `kv scan`, `kv del`, `kv raw` | `set`, `del`, and mutating raw commands require `--allow-write` |
 | Document | `doc collections`, `doc find`, `doc insert`, `doc update`, `doc delete`, `doc aggregate`, `doc drop` | find exposes skip/sort/projection and exact truncation; insert/update/delete require `--allow-write`; update/delete reject empty filters; drop requires target-bound confirmation |
-| Transfer | `export sql`, `export kv`, `export doc`, `import sql`, `import kv`, `import doc` | all import commands require `--allow-write` before DSN resolution, artifact reads, or connecting |
+| Transfer | `export sql`, `export kv`, `export doc`, `import sql`, `import kv`, `import doc` | SQL export is read-only and adapter-bounded, records `truncated`, and partial SQL artifacts are not importable; all imports require `--allow-write` before DSN resolution, artifact reads, or connecting |
 | Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write`; produce exposes key/repeated headers/partition/epoch-ms timestamp; consume requires positive max/timeout and exposes non-negative partition/offset; reaching max is reported as a limit signal, not proof of another message |
 | Search | `search indices`, `search search`, `search index`, `search put`, `search get`, `search update`, `search delete`, `search delete-index` | all mutations require `--allow-write`; `delete-index` additionally requires a target-bound `--confirm` token |
 | Time series | `ts measurements`, `ts query [--last-minutes N | --start-ms MS --end-ms MS]`, `ts write` | query validates range pairing/order and a 1..=1,000,000 sample budget before connecting; Prometheus remote write requires `--allow-write` |
