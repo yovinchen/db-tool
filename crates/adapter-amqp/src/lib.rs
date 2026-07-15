@@ -3,7 +3,8 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
-        MessageResource, MessageResourceKind, ProduceOutcome, TopicDetail, TopicInfo,
+        MessageMetadata, MessageResource, MessageResourceKind, ProduceOutcome, TopicDetail,
+        TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -185,6 +186,10 @@ impl MessageConsumer for AmqpAdapter {
                 Some(delivery) => {
                     let headers = headers_from_properties(&delivery.delivery.properties)?;
                     let payload = delivery.delivery.data.clone();
+                    let delivery_tag = delivery.delivery.delivery_tag;
+                    let redelivered = delivery.delivery.redelivered;
+                    let exchange = delivery.delivery.exchange.as_str().to_owned();
+                    let routing_key = delivery.delivery.routing_key.as_str().to_owned();
                     delivery
                         .delivery
                         .ack(BasicAckOptions::default())
@@ -195,10 +200,18 @@ impl MessageConsumer for AmqpAdapter {
                         payload: payload.into(),
                         headers,
                         partition: None,
-                        // AMQP delivery tags are channel-scoped ACK handles,
-                        // not stable consumer offsets.
+                        // Record the channel-scoped delivery tag observed
+                        // before the ACK above; it is diagnostic only and is
+                        // not a stable consumer offset or reusable ACK handle.
                         offset: None,
                         timestamp: None,
+                        cursor: None,
+                        metadata: Some(MessageMetadata::Amqp {
+                            delivery_tag,
+                            redelivered,
+                            exchange,
+                            routing_key,
+                        }),
                     });
                 }
                 None => sleep(std::time::Duration::from_millis(50)).await,
@@ -363,6 +376,11 @@ fn validate_produce_message(message: &Message) -> Result<()> {
             "AMQP producer does not support an exact millisecond timestamp mapping".into(),
         ));
     }
+    if message.cursor.is_some() || message.metadata.is_some() {
+        return Err(Error::Config(
+            "AMQP producer messages cannot set consumer cursor or delivery metadata".into(),
+        ));
+    }
 
     for (key, value) in &message.headers {
         if key.len() > u8::MAX as usize {
@@ -389,6 +407,11 @@ fn validate_consume_position(options: &ConsumeOptions) -> Result<()> {
     if options.offset.is_some() {
         return Err(Error::Config(
             "AMQP consumer does not support offsets".into(),
+        ));
+    }
+    if options.cursor.is_some() {
+        return Err(Error::Config(
+            "AMQP consumer does not support exact cursors".into(),
         ));
     }
     Ok(())
@@ -521,6 +544,8 @@ mod tests {
             partition: None,
             offset: None,
             timestamp: None,
+            cursor: None,
+            metadata: None,
         }
     }
 
@@ -588,6 +613,7 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
                 partition: Some(0),
                 offset: None,
+                cursor: None,
             }),
             Err(Error::Config(message)) if message.contains("partitions")
         ));
@@ -597,8 +623,18 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
                 partition: None,
                 offset: Some(0),
+                cursor: None,
             }),
             Err(Error::Config(message)) if message.contains("offsets")
+        ));
+        assert!(matches!(
+            validate_consume_position(&ConsumeOptions {
+                cursor: Some(dbtool_core::model::ConsumeCursor::RedisStream {
+                    id: "1-0".to_owned(),
+                }),
+                ..Default::default()
+            }),
+            Err(Error::Config(message)) if message.contains("exact cursors")
         ));
 
         let mut table = FieldTable::default();

@@ -66,6 +66,8 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
     assert!(consume_help.contains("--timeout <TIMEOUT>"));
     assert!(consume_help.contains("--partition <PARTITION>"));
     assert!(consume_help.contains("--offset <OFFSET>"));
+    assert!(consume_help.contains("--cursor <CURSOR>"));
+    assert!(consume_help.contains("redis-stream:M-S"));
 
     let delete_help = stdout_text(dbtool(&["mq", "delete", "--help"]));
     assert!(delete_help.contains("--kind <KIND>"));
@@ -215,6 +217,32 @@ fn consume_bounds_and_positions_fail_as_json_before_connecting() {
             "--offset=-1",
         ],
         "--offset must be greater than or equal to zero",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--cursor",
+            "redis-stream:1710000000000",
+        ],
+        "full <milliseconds>-<sequence>",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "consume",
+            "events",
+            "--partition",
+            "0",
+            "--cursor",
+            "kafka:0:1",
+        ],
+        "cannot be combined",
     );
 }
 

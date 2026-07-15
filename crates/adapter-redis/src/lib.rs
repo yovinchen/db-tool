@@ -2,9 +2,9 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
-        MessagePlacement, MessageResource, MessageResourceKind, PartitionWatermark, ProduceOutcome,
-        TopicDetail, TopicInfo, Value,
+        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo,
+        Message, MessageCursor, MessagePlacement, MessageResource, MessageResourceKind,
+        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo, Value,
     },
     port::{
         capability::{
@@ -389,6 +389,10 @@ impl RedisAdapter {
             placements.push(MessagePlacement {
                 partition: 0,
                 offset: redis_stream_offset(&id),
+                cursor: Some(MessageCursor::RedisStream {
+                    stream: stream.to_owned(),
+                    id,
+                }),
             });
         }
 
@@ -424,10 +428,7 @@ impl RedisAdapter {
             return Ok(vec![]);
         }
 
-        let offset = options
-            .offset
-            .map(|offset| format!("{offset}-0"))
-            .unwrap_or_else(|| "0-0".to_owned());
+        let offset = redis_stream_start(&options)?;
         let block_ms = duration_millis_usize(options.timeout)?;
         let mut c = self.conn.lock().await;
         let reply: StreamReadReply = redis::cmd("XREAD")
@@ -447,7 +448,7 @@ impl RedisAdapter {
             .into_iter()
             .flat_map(|key| key.ids.into_iter())
             .take(options.max)
-            .map(stream_id_to_message)
+            .map(|entry| stream_id_to_message(stream, entry))
             .collect())
     }
 
@@ -491,6 +492,8 @@ impl RedisAdapter {
                         partition: None,
                         offset: None,
                         timestamp: None,
+                        cursor: None,
+                        metadata: None,
                     });
                 }
                 Ok(None) | Err(_) => break,
@@ -671,6 +674,11 @@ fn validate_stream_produce_message(message: &Message) -> Result<()> {
             "Redis Stream producer does not support caller-supplied timestamps".into(),
         ));
     }
+    if message.cursor.is_some() || message.metadata.is_some() {
+        return Err(Error::Config(
+            "Redis Stream producer does not accept consumer cursor or delivery metadata".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -701,6 +709,11 @@ fn validate_pubsub_produce_message(message: &Message) -> Result<()> {
             "Redis PubSub producer supports payload only; timestamps are not supported".into(),
         ));
     }
+    if message.cursor.is_some() || message.metadata.is_some() {
+        return Err(Error::Config(
+            "Redis PubSub producer does not accept consumer cursor or delivery metadata".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -711,7 +724,58 @@ fn validate_stream_consume_options(options: &ConsumeOptions) -> Result<()> {
             "Redis Stream consumer offset must be greater than or equal to zero".into(),
         ));
     }
+    match &options.cursor {
+        None => {}
+        Some(cursor @ ConsumeCursor::RedisStream { .. }) => {
+            cursor.validate().map_err(Error::Config)?;
+            if options.partition.is_some() || options.offset.is_some() {
+                return Err(Error::Config(
+                    "Redis Stream exact cursor cannot be combined with legacy partition or offset fields"
+                        .into(),
+                ));
+            }
+        }
+        Some(cursor) => {
+            return Err(Error::Config(format!(
+                "Redis Stream consumer cannot use {cursor:?} cursor"
+            )))
+        }
+    }
     Ok(())
+}
+
+fn redis_stream_start(options: &ConsumeOptions) -> Result<String> {
+    validate_stream_consume_options(options)?;
+    Ok(match &options.cursor {
+        Some(ConsumeCursor::RedisStream { id }) => redis_stream_predecessor(id)?,
+        Some(_) => unreachable!("cursor kind was validated"),
+        None => options
+            .offset
+            .map(|offset| format!("{offset}-0"))
+            .unwrap_or_else(|| "0-0".to_owned()),
+    })
+}
+
+/// XREAD treats its ID as the last-seen (exclusive) position. Convert dbtool's
+/// inclusive native cursor into the immediately preceding Redis Stream ID.
+fn redis_stream_predecessor(id: &str) -> Result<String> {
+    ConsumeCursor::RedisStream { id: id.to_owned() }
+        .validate()
+        .map_err(Error::Config)?;
+    let (millis, sequence) = id
+        .split_once('-')
+        .expect("validated Redis Stream IDs contain a separator");
+    let millis = millis
+        .parse::<u64>()
+        .expect("validated Redis Stream milliseconds are numeric");
+    let sequence = sequence
+        .parse::<u64>()
+        .expect("validated Redis Stream sequences are numeric");
+    if sequence > 0 {
+        Ok(format!("{millis}-{}", sequence - 1))
+    } else {
+        Ok(format!("{}-{}", millis - 1, u64::MAX))
+    }
 }
 
 fn validate_pubsub_consume_options(options: &ConsumeOptions) -> Result<()> {
@@ -723,6 +787,11 @@ fn validate_pubsub_consume_options(options: &ConsumeOptions) -> Result<()> {
     if options.offset.is_some() {
         return Err(Error::Config(
             "Redis PubSub consumer does not support offsets".into(),
+        ));
+    }
+    if options.cursor.is_some() {
+        return Err(Error::Config(
+            "Redis PubSub consumer does not support exact cursors".into(),
         ));
     }
     Ok(())
@@ -737,7 +806,7 @@ fn validate_stream_partition(partition: Option<i32>, operation: &str) -> Result<
     Ok(())
 }
 
-fn stream_id_to_message(entry: StreamId) -> Message {
+fn stream_id_to_message(stream: &str, entry: StreamId) -> Message {
     let payload = entry.get::<Vec<u8>>("payload").unwrap_or_default();
     let key = entry.get::<Vec<u8>>("key").map(bytes::Bytes::from);
     let mut headers = HashMap::from([("redis_stream_id".to_owned(), entry.id.clone())]);
@@ -755,6 +824,11 @@ fn stream_id_to_message(entry: StreamId) -> Message {
         partition: Some(0),
         offset: Some(redis_stream_offset(&entry.id)),
         timestamp: redis_stream_timestamp(&entry.id),
+        cursor: Some(MessageCursor::RedisStream {
+            stream: stream.to_owned(),
+            id: entry.id,
+        }),
+        metadata: None,
     }
 }
 
@@ -874,6 +948,8 @@ mod tests {
             partition: None,
             offset: None,
             timestamp: None,
+            cursor: None,
+            metadata: None,
         }
     }
 
@@ -951,6 +1027,56 @@ mod tests {
     }
 
     #[test]
+    fn redis_stream_messages_keep_the_full_native_id() {
+        let message = stream_id_to_message(
+            "orders",
+            StreamId {
+                id: "1710000000000-42".to_owned(),
+                map: HashMap::from([(
+                    "payload".to_owned(),
+                    redis::Value::BulkString(b"payload".to_vec()),
+                )]),
+            },
+        );
+
+        assert_eq!(message.offset, Some(1_710_000_000_000));
+        assert_eq!(
+            message.cursor,
+            Some(MessageCursor::RedisStream {
+                stream: "orders".to_owned(),
+                id: "1710000000000-42".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn redis_exact_cursor_is_not_compressed_to_millisecond_offset() {
+        let options = ConsumeOptions {
+            cursor: Some(ConsumeCursor::RedisStream {
+                id: "1710000000000-42".to_owned(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(redis_stream_start(&options).unwrap(), "1710000000000-41");
+        assert_eq!(
+            redis_stream_predecessor("1710000000000-0").unwrap(),
+            format!("1709999999999-{}", u64::MAX)
+        );
+        assert_eq!(redis_stream_predecessor("0-1").unwrap(), "0-0");
+        assert!(redis_stream_predecessor("0-0").is_err());
+
+        let conflict = ConsumeOptions {
+            offset: Some(1_710_000_000_000),
+            cursor: options.cursor,
+            ..Default::default()
+        };
+        assert!(matches!(
+            redis_stream_start(&conflict),
+            Err(Error::Config(message)) if message.contains("cannot be combined")
+        ));
+    }
+
+    #[test]
     fn redis_stream_preserves_supported_metadata_and_rejects_the_rest() {
         let mut supported = message();
         supported.key = Some(bytes::Bytes::from_static(b"key"));
@@ -1020,6 +1146,7 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
                 partition: Some(0),
                 offset: None,
+                cursor: None,
             }),
             Err(Error::Config(message)) if message.contains("partitions")
         ));
@@ -1029,6 +1156,7 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
                 partition: None,
                 offset: Some(0),
+                cursor: None,
             }),
             Err(Error::Config(message)) if message.contains("offsets")
         ));
@@ -1041,6 +1169,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(1),
             partition,
             offset: Some(42),
+            cursor: None,
         };
 
         assert!(validate_stream_consume_options(&options(None)).is_ok());

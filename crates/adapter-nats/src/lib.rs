@@ -2,9 +2,9 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
-        MessageResource, MessageResourceKind, PartitionWatermark, ProduceOutcome, TopicDetail,
-        TopicInfo,
+        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo,
+        Message, MessageCursor, MessageMetadata, MessageResource, MessageResourceKind,
+        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -130,6 +130,12 @@ impl MessageConsumer for NatsAdapter {
             return Ok(vec![]);
         }
 
+        if let Some(ConsumeCursor::NatsJetstream { stream_sequence }) = options.cursor {
+            return self
+                .consume_jetstream(source, options.max, options.timeout, stream_sequence)
+                .await;
+        }
+
         let deadline = checked_deadline(options.timeout)?;
         let mut subscriber = self
             .client
@@ -158,6 +164,8 @@ impl MessageConsumer for NatsAdapter {
                         partition: None,
                         offset: None,
                         timestamp: None,
+                        cursor: None,
+                        metadata: None,
                     });
                 }
                 Ok(None) => break,
@@ -298,6 +306,131 @@ impl NatsAdapter {
     fn jetstream(&self) -> async_nats::jetstream::Context {
         async_nats::jetstream::new(self.client.clone())
     }
+
+    async fn consume_jetstream(
+        &self,
+        subject: &str,
+        max: usize,
+        wait: std::time::Duration,
+        start_sequence: u64,
+    ) -> Result<Vec<Message>> {
+        use async_nats::jetstream::consumer::{pull, AckPolicy, DeliverPolicy};
+
+        let deadline = checked_deadline(wait)?;
+        let jetstream = self.jetstream();
+        let stream_name = jetstream
+            .stream_by_subject(subject)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let stream = jetstream
+            .get_stream(&stream_name)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let consumer = stream
+            .create_consumer(pull::Config {
+                deliver_policy: DeliverPolicy::ByStartSequence { start_sequence },
+                ack_policy: AckPolicy::None,
+                filter_subject: subject.to_owned(),
+                inactive_threshold: wait
+                    .checked_add(std::time::Duration::from_secs(5))
+                    .ok_or_else(|| {
+                        Error::Config(
+                            "NATS JetStream consume timeout is too large for cleanup".into(),
+                        )
+                    })?,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let consumer_name = consumer.cached_info().name.clone();
+
+        let consume_result = async {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| Error::Query("NATS JetStream consume deadline elapsed".into()))?;
+            let mut batch = consumer
+                .fetch()
+                .max_messages(max)
+                .expires(remaining)
+                .messages()
+                .await
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let mut messages = Vec::new();
+            while messages.len() < max {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                let item = match timeout(remaining, batch.next()).await {
+                    Ok(Some(item)) => item.map_err(|error| Error::Query(error.to_string()))?,
+                    Ok(None) | Err(_) => break,
+                };
+                messages.push(jetstream_message_to_core(item)?);
+            }
+            Ok(messages)
+        }
+        .await;
+
+        let cleanup_result = jetstream
+            .delete_consumer_from_stream(&consumer_name, &stream_name)
+            .await
+            .map(|status| status.success)
+            .map_err(|error| Error::Query(error.to_string()));
+        finish_temporary_consumer(consume_result, cleanup_result)
+    }
+}
+
+fn finish_temporary_consumer<T>(consume: Result<T>, cleanup: Result<bool>) -> Result<T> {
+    let cleanup = cleanup.and_then(|success| {
+        if success {
+            Ok(())
+        } else {
+            Err(Error::Query(
+                "NATS JetStream reported unsuccessful temporary consumer cleanup".into(),
+            ))
+        }
+    });
+    match (consume, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(consume_error), Ok(())) => Err(consume_error),
+        (Err(consume_error), Err(cleanup_error)) => Err(Error::Query(format!(
+            "NATS JetStream consume failed: {consume_error}; temporary consumer cleanup also failed: {cleanup_error}"
+        ))),
+    }
+}
+
+fn jetstream_message_to_core(message: async_nats::jetstream::Message) -> Result<Message> {
+    let info = message
+        .info()
+        .map_err(|error| Error::Serialization(error.to_string()))?;
+    let stream = info.stream.to_owned();
+    let consumer = info.consumer.to_owned();
+    let stream_sequence = info.stream_sequence;
+    let consumer_sequence = info.consumer_sequence;
+    let delivery_attempt = info.delivered;
+    let pending = info.pending;
+    let timestamp = i64::try_from(info.published.unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| Error::Serialization("NATS publish timestamp exceeds i64 millis".into()))?;
+    let headers = nats_headers_to_core(message.headers.as_ref())?;
+
+    Ok(Message {
+        key: None,
+        payload: message.payload.clone(),
+        headers,
+        partition: None,
+        offset: None,
+        timestamp: Some(timestamp),
+        cursor: Some(MessageCursor::NatsJetstream {
+            stream,
+            stream_sequence,
+        }),
+        metadata: Some(MessageMetadata::NatsJetstream {
+            consumer,
+            consumer_sequence,
+            delivery_attempt,
+            pending,
+        }),
+    })
 }
 
 fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
@@ -373,6 +506,11 @@ fn validate_produce_message(message: &Message) -> Result<()> {
             "Core NATS producer does not support producer timestamps".into(),
         ));
     }
+    if message.cursor.is_some() || message.metadata.is_some() {
+        return Err(Error::Config(
+            "Core NATS producer messages cannot set consumer cursor or delivery metadata".into(),
+        ));
+    }
 
     // Validate header syntax before any message is published so a batch cannot
     // partially succeed due to a later invalid header.
@@ -390,6 +528,17 @@ fn validate_consume_position(options: &ConsumeOptions) -> Result<()> {
         return Err(Error::Config(
             "Core NATS consumer does not support offsets".into(),
         ));
+    }
+    match &options.cursor {
+        None => {}
+        Some(cursor @ ConsumeCursor::NatsJetstream { .. }) => {
+            cursor.validate().map_err(Error::Config)?;
+        }
+        Some(cursor) => {
+            return Err(Error::Config(format!(
+                "NATS consumer cannot use {cursor:?} cursor"
+            )))
+        }
     }
     Ok(())
 }
@@ -531,6 +680,8 @@ mod tests {
             partition: None,
             offset: None,
             timestamp: None,
+            cursor: None,
+            metadata: None,
         }
     }
 
@@ -600,6 +751,7 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
                 partition: Some(0),
                 offset: None,
+                cursor: None,
             }),
             Err(Error::Config(message)) if message.contains("partitions")
         ));
@@ -609,8 +761,50 @@ mod tests {
                 timeout: std::time::Duration::from_secs(1),
                 partition: None,
                 offset: Some(0),
+                cursor: None,
             }),
             Err(Error::Config(message)) if message.contains("offsets")
+        ));
+
+        assert!(validate_consume_position(&ConsumeOptions {
+            cursor: Some(ConsumeCursor::NatsJetstream {
+                stream_sequence: 42
+            }),
+            ..Default::default()
+        })
+        .is_ok());
+        assert!(matches!(
+            validate_consume_position(&ConsumeOptions {
+                cursor: Some(ConsumeCursor::NatsJetstream { stream_sequence: 0 }),
+                ..Default::default()
+            }),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        assert!(matches!(
+            validate_consume_position(&ConsumeOptions {
+                cursor: Some(ConsumeCursor::RedisStream {
+                    id: "1-0".to_owned(),
+                }),
+                ..Default::default()
+            }),
+            Err(Error::Config(message)) if message.contains("cannot use")
+        ));
+    }
+
+    #[test]
+    fn temporary_consumer_cleanup_must_succeed_and_preserves_dual_failures() {
+        assert_eq!(finish_temporary_consumer(Ok(7), Ok(true)).unwrap(), 7);
+        assert!(matches!(
+            finish_temporary_consumer::<()>(Ok(()), Ok(false)),
+            Err(Error::Query(message)) if message.contains("unsuccessful")
+        ));
+        assert!(matches!(
+            finish_temporary_consumer::<()>(
+                Err(Error::Query("consume broke".into())),
+                Err(Error::Query("cleanup broke".into())),
+            ),
+            Err(Error::Query(message))
+                if message.contains("consume broke") && message.contains("cleanup broke")
         ));
     }
 

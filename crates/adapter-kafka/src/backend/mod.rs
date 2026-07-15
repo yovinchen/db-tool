@@ -2,7 +2,8 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        DeleteResourceOptions, Message, MessageResource, MessageResourceKind, PartitionWatermark,
+        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, Message, MessageResource,
+        MessageResourceKind, PartitionWatermark,
     },
     port::connector::Connector,
 };
@@ -41,10 +42,34 @@ fn validate_produce_message(message: &Message) -> Result<()> {
         ));
     }
 
+    if message.cursor.is_some() || message.metadata.is_some() {
+        return Err(Error::Config(
+            "Kafka producer messages cannot set consumer cursor or delivery metadata".to_owned(),
+        ));
+    }
+
     Ok(())
 }
 
-fn validate_consume_position(partition: Option<i32>, offset: Option<i64>) -> Result<()> {
+fn resolve_consume_position(options: &ConsumeOptions) -> Result<(Option<i32>, Option<i64>)> {
+    let (partition, offset) = match &options.cursor {
+        None => (options.partition, options.offset),
+        Some(ConsumeCursor::Kafka { partition, offset }) => {
+            if options.partition.is_some() || options.offset.is_some() {
+                return Err(Error::Config(
+                    "Kafka exact cursor cannot be combined with legacy partition or offset fields"
+                        .to_owned(),
+                ));
+            }
+            (Some(*partition), Some(*offset))
+        }
+        Some(cursor) => {
+            return Err(Error::Config(format!(
+                "Kafka consumer cannot use {cursor:?} cursor"
+            )))
+        }
+    };
+
     if offset.is_some() && partition.is_none() {
         return Err(Error::Config(
             "Kafka consume offset requires an explicit partition".to_owned(),
@@ -61,7 +86,17 @@ fn validate_consume_position(partition: Option<i32>, offset: Option<i64>) -> Res
         ));
     }
 
-    Ok(())
+    Ok((partition, offset))
+}
+
+#[cfg(test)]
+fn validate_consume_position(partition: Option<i32>, offset: Option<i64>) -> Result<()> {
+    resolve_consume_position(&ConsumeOptions {
+        partition,
+        offset,
+        ..Default::default()
+    })
+    .map(|_| ())
 }
 
 fn validate_kafka_delete_request(
@@ -105,6 +140,8 @@ mod tests {
             partition,
             offset,
             timestamp: None,
+            cursor: None,
+            metadata: None,
         }
     }
 
@@ -143,6 +180,41 @@ mod tests {
 
         assert!(matches!(error, Error::Config(_)));
         assert!(error.to_string().contains("explicit partition"));
+    }
+
+    #[test]
+    fn exact_kafka_cursor_resolves_without_legacy_position_loss() {
+        assert_eq!(
+            resolve_consume_position(&ConsumeOptions {
+                cursor: Some(ConsumeCursor::Kafka {
+                    partition: 7,
+                    offset: 99,
+                }),
+                ..Default::default()
+            })
+            .unwrap(),
+            (Some(7), Some(99))
+        );
+
+        let conflict = resolve_consume_position(&ConsumeOptions {
+            partition: Some(7),
+            cursor: Some(ConsumeCursor::Kafka {
+                partition: 7,
+                offset: 99,
+            }),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(conflict.to_string().contains("cannot be combined"));
+
+        let wrong_protocol = resolve_consume_position(&ConsumeOptions {
+            cursor: Some(ConsumeCursor::RedisStream {
+                id: "1-0".to_owned(),
+            }),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(wrong_protocol.to_string().contains("cannot use"));
     }
 
     #[test]

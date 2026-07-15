@@ -203,6 +203,15 @@ fn redis_live_stream_produce_detail_and_consume() {
         "0",
     ]));
     assert_eq!(produced["data"]["produced"], 1);
+    let redis_id = produced["data"]["placements"][0]["cursor"]["id"]
+        .as_str()
+        .expect("Redis XADD should return the full stream ID")
+        .to_owned();
+    assert_eq!(
+        produced["data"]["placements"][0]["cursor"]["kind"],
+        "redis-stream"
+    );
+    assert!(redis_id.contains('-'));
 
     let topics = stdout_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
     assert!(topics["data"]
@@ -231,10 +240,29 @@ fn redis_live_stream_produce_detail_and_consume() {
     assert_eq!(bytes_text(&consumed["data"][0]["key"]), "redis-stream-key");
     assert_eq!(consumed["data"][0]["headers"]["trace"], "redis-stream");
     assert_eq!(consumed["data"][0]["partition"], 0);
+    assert_eq!(consumed["data"][0]["cursor"]["kind"], "redis-stream");
+    assert_eq!(consumed["data"][0]["cursor"]["stream"], stream);
+    assert_eq!(consumed["data"][0]["cursor"]["id"], redis_id);
     assert!(consumed["data"][0]["headers"]["redis_stream_id"]
         .as_str()
         .expect("stream id header should be present")
         .contains('-'));
+    let redis_cursor = format!("redis-stream:{redis_id}");
+    let replayed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "mq",
+        "consume",
+        &stream,
+        "--max",
+        "1",
+        "--timeout",
+        "5",
+        "--cursor",
+        &redis_cursor,
+    ]));
+    assert_eq!(replayed["data"][0]["cursor"]["id"], redis_id);
+    assert_eq!(payload_text(&replayed["data"][0]), "redis-stream-payload");
 
     // Create a consumer group at offset 0 so it sees the already-produced message as undelivered.
     let group = unique_name("dbtool_it_redis_group");
@@ -468,6 +496,10 @@ fn run_kafka_smoke(
     let produced_offset = placement["offset"]
         .as_i64()
         .expect("Kafka produce should return an offset");
+    assert_eq!(placement["cursor"]["kind"], "kafka");
+    assert_eq!(placement["cursor"]["topic"], topic);
+    assert_eq!(placement["cursor"]["partition"], 0);
+    assert_eq!(placement["cursor"]["offset"], produced_offset);
 
     let topics = stdout_json(dbtool(&["--dsn", dsn, "mq", "topics"]));
     assert!(topics["data"]
@@ -503,12 +535,39 @@ fn run_kafka_smoke(
         consumed["data"][0]["offset"],
         produced_offset.parse::<i64>().unwrap()
     );
+    assert_eq!(consumed["data"][0]["cursor"]["kind"], "kafka");
+    assert_eq!(consumed["data"][0]["cursor"]["topic"], topic);
+    assert_eq!(consumed["data"][0]["cursor"]["partition"], 0);
+    assert_eq!(
+        consumed["data"][0]["cursor"]["offset"],
+        produced_offset.parse::<i64>().unwrap()
+    );
     if verify_metadata {
         assert_eq!(bytes_text(&consumed["data"][0]["key"]), "order-42");
         assert_eq!(consumed["data"][0]["headers"]["trace"], "abc");
         assert_eq!(consumed["data"][0]["headers"]["content-type"], "text/plain");
         assert_eq!(consumed["data"][0]["timestamp"], 1_710_000_000_123_i64);
     }
+
+    let kafka_cursor = format!("kafka:0:{produced_offset}");
+    let replayed = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "mq",
+        "consume",
+        &topic,
+        "--max",
+        "1",
+        "--timeout",
+        "5",
+        "--cursor",
+        &kafka_cursor,
+    ]));
+    assert_eq!(payload_text(&replayed["data"][0]), payload);
+    assert_eq!(
+        replayed["data"][0]["cursor"]["offset"],
+        produced_offset.parse::<i64>().unwrap()
+    );
 
     if cfg!(feature = "full-native") {
         let lag = stdout_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
@@ -606,6 +665,13 @@ fn amqp_live_queue_produce_detail_and_consume() {
     ]);
     assert_eq!(payload_text(&consumed["data"][0]), "amqp-payload");
     assert_eq!(consumed["data"][0]["headers"]["trace"], "amqp");
+    assert_eq!(consumed["data"][0]["metadata"]["kind"], "amqp");
+    assert!(consumed["data"][0]["metadata"]["delivery_tag"]
+        .as_u64()
+        .is_some_and(|tag| tag > 0));
+    assert_eq!(consumed["data"][0]["metadata"]["redelivered"], false);
+    assert_eq!(consumed["data"][0]["metadata"]["exchange"], "");
+    assert_eq!(consumed["data"][0]["metadata"]["routing_key"], queue);
 
     let drained = stdout_json_retry_until(&["--dsn", &dsn, "mq", "detail", &queue], |value| {
         value["data"]["config"]["message_count"] == "0"
@@ -895,6 +961,42 @@ fn nats_live_jetstream_admin_lists_detail_and_lag() {
             .await
             .expect("JetStream consumer should be created");
     });
+
+    let exact = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "mq",
+        "consume",
+        &subject,
+        "--max",
+        "1",
+        "--timeout",
+        "5",
+        "--cursor",
+        "nats-jetstream:1",
+    ]));
+    assert_eq!(payload_text(&exact["data"][0]), "nats-jetstream-payload");
+    assert_eq!(exact["data"][0]["cursor"]["kind"], "nats-jetstream");
+    assert_eq!(exact["data"][0]["cursor"]["stream"], stream);
+    assert_eq!(exact["data"][0]["cursor"]["stream_sequence"], 1);
+    assert_eq!(exact["data"][0]["metadata"]["kind"], "nats-jetstream");
+    assert_eq!(exact["data"][0]["metadata"]["consumer_sequence"], 1);
+    assert_eq!(exact["data"][0]["metadata"]["delivery_attempt"], 1);
+    let replayed = stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "mq",
+        "consume",
+        &subject,
+        "--max",
+        "1",
+        "--timeout",
+        "5",
+        "--cursor",
+        "nats-jetstream:1",
+    ]));
+    assert_eq!(payload_text(&replayed["data"][0]), "nats-jetstream-payload");
+    assert_eq!(replayed["data"][0]["cursor"]["stream_sequence"], 1);
 
     let topics = stdout_json(dbtool(&["--dsn", &dsn, "mq", "topics"]));
     assert!(topics["data"]

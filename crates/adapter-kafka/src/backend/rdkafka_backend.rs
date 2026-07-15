@@ -5,8 +5,8 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
-        MessagePlacement, MessageResource, PartitionWatermark, ProduceOutcome, TopicDetail,
-        TopicInfo,
+        MessageCursor, MessagePlacement, MessageResource, PartitionWatermark, ProduceOutcome,
+        TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -31,7 +31,7 @@ use std::{
 };
 
 use super::{
-    kafka_messages_before, validate_consume_position, validate_kafka_delete_request,
+    kafka_messages_before, resolve_consume_position, validate_kafka_delete_request,
     validate_produce_message,
 };
 
@@ -154,7 +154,15 @@ impl MessageProducer for RdkafkaAdapter {
                 .send(record, Timeout::After(Duration::from_secs(5)))
                 .await
                 .map_err(|(error, _)| Error::Query(error.to_string()))?;
-            placements.push(MessagePlacement { partition, offset });
+            placements.push(MessagePlacement {
+                partition,
+                offset,
+                cursor: Some(MessageCursor::Kafka {
+                    topic: target.to_owned(),
+                    partition,
+                    offset,
+                }),
+            });
         }
 
         Ok(ProduceOutcome {
@@ -168,7 +176,7 @@ impl MessageProducer for RdkafkaAdapter {
 impl MessageConsumer for RdkafkaAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_topic(source)?;
-        validate_consume_position(options.partition, options.offset)?;
+        let (requested_partition, requested_offset) = resolve_consume_position(&options)?;
         if options.max == 0 {
             return Ok(vec![]);
         }
@@ -180,14 +188,14 @@ impl MessageConsumer for RdkafkaAdapter {
         };
         let topics = self.topic_infos_with(&consumer, remaining)?;
         let topic = require_topic(topics, source)?;
-        let partitions = if let Some(partition) = options.partition {
+        let partitions = if let Some(partition) = requested_partition {
             vec![partition]
         } else {
             (0..topic.partitions).collect()
         };
         let mut assignment = TopicPartitionList::new();
         for partition in partitions {
-            let offset = match options.offset {
+            let offset = match requested_offset {
                 Some(offset) => offset,
                 None => {
                     let Some(remaining) = remaining_until(deadline) else {
@@ -214,6 +222,12 @@ impl MessageConsumer for RdkafkaAdapter {
                         partition: Some(message.partition()),
                         offset: Some(message.offset()),
                         timestamp: message.timestamp().to_millis(),
+                        cursor: Some(MessageCursor::Kafka {
+                            topic: source.to_owned(),
+                            partition: message.partition(),
+                            offset: message.offset(),
+                        }),
+                        metadata: None,
                     });
                 }
                 Some(Err(KafkaError::PartitionEOF(_))) | None => {}
@@ -696,6 +710,8 @@ mod tests {
             partition: Some(2),
             offset: None,
             timestamp: Some(1_710_000_000_123),
+            cursor: None,
+            metadata: None,
         }
     }
 
@@ -833,6 +849,8 @@ mod tests {
                 partition: Some(0),
                 offset: None,
                 timestamp: None,
+                cursor: None,
+                metadata: None,
             })
             .collect();
         connector

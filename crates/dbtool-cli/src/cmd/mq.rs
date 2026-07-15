@@ -3,7 +3,10 @@ use clap::{Args, Subcommand, ValueEnum};
 use dbtool_core::{
     dsn::Dsn,
     error::Error,
-    model::{ConsumeOptions, DeleteResourceOptions, Message, MessageResource, MessageResourceKind},
+    model::{
+        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, Message, MessageResource,
+        MessageResourceKind,
+    },
     service::safety::SafetyGuard,
     Result,
 };
@@ -45,7 +48,7 @@ pub enum MqAction {
     },
     /// Consume messages (always bounded)
     #[command(
-        long_about = "Consume a bounded batch of messages. Both --max and --timeout must be greater than zero. AMQP/AMQPS consume requires the global --allow-write flag because each successful delivery is ACKed and removed from the queue. A JSON meta.truncated value of true means the returned count reached --max; it does not prove that another message exists in the backend. Optional --partition and --offset values must be non-negative."
+        long_about = "Consume a bounded batch of messages. Both --max and --timeout must be greater than zero. AMQP/AMQPS consume requires the global --allow-write flag because each successful delivery is ACKed and removed from the queue. A JSON meta.truncated value of true means the returned count reached --max; it does not prove that another message exists in the backend. Optional --partition and --offset values must be non-negative. --cursor is an inclusive backend-native starting position: replaying a returned Kafka, Redis Stream, or NATS JetStream cursor returns that retained message again without compressing its native identity into the legacy offset field."
     )]
     Consume {
         /// Topic, stream, subject, or queue name.
@@ -62,6 +65,9 @@ pub enum MqAction {
         /// Non-negative starting offset for backends that support offsets.
         #[arg(long)]
         offset: Option<i64>,
+        /// Exact native cursor: kafka:P:O, redis-stream:M-S, or nats-jetstream:S.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
     },
     /// List topics
     Topics,
@@ -146,8 +152,15 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             timeout,
             partition,
             offset,
+            cursor,
             ..
-        } => Some(build_consume_options(*max, *timeout, *partition, *offset)?),
+        } => Some(build_consume_options(
+            *max,
+            *timeout,
+            *partition,
+            *offset,
+            cursor.as_deref(),
+        )?),
         _ => None,
     };
     let delete_request = match &cmd.action {
@@ -211,6 +224,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             timeout: _,
             partition: _,
             offset: _,
+            cursor: _,
         } => {
             let consumer = conn
                 .as_consumer()
@@ -330,6 +344,8 @@ fn build_message(
         partition,
         offset: None,
         timestamp: timestamp_ms,
+        cursor: None,
+        metadata: None,
     })
 }
 
@@ -338,6 +354,7 @@ fn build_consume_options(
     timeout_secs: u64,
     partition: Option<i32>,
     offset: Option<i64>,
+    cursor: Option<&str>,
 ) -> Result<ConsumeOptions> {
     if max == 0 {
         return Err(Error::Config(
@@ -355,6 +372,15 @@ fn build_consume_options(
             "mq consume --offset must be greater than or equal to zero".into(),
         ));
     }
+    let cursor = cursor
+        .map(str::parse::<ConsumeCursor>)
+        .transpose()
+        .map_err(|message| Error::Config(format!("mq consume --cursor: {message}")))?;
+    if cursor.is_some() && (partition.is_some() || offset.is_some()) {
+        return Err(Error::Config(
+            "mq consume --cursor cannot be combined with --partition or --offset".into(),
+        ));
+    }
     let timeout = Duration::from_secs(timeout_secs);
     Instant::now().checked_add(timeout).ok_or_else(|| {
         Error::Config("mq consume --timeout is too large for this platform".into())
@@ -364,6 +390,7 @@ fn build_consume_options(
         timeout,
         partition,
         offset,
+        cursor,
     })
 }
 
@@ -451,31 +478,44 @@ mod tests {
     #[test]
     fn consume_options_require_positive_bounds_and_non_negative_position() {
         assert!(matches!(
-            build_consume_options(0, 1, None, None),
+            build_consume_options(0, 1, None, None, None),
             Err(Error::Config(message)) if message.contains("--max")
         ));
         assert!(matches!(
-            build_consume_options(1, 0, None, None),
+            build_consume_options(1, 0, None, None, None),
             Err(Error::Config(message)) if message.contains("--timeout")
         ));
         assert!(matches!(
-            build_consume_options(1, 1, Some(-1), None),
+            build_consume_options(1, 1, Some(-1), None, None),
             Err(Error::Config(message)) if message.contains("--partition")
         ));
         assert!(matches!(
-            build_consume_options(1, 1, None, Some(-1)),
+            build_consume_options(1, 1, None, Some(-1), None),
             Err(Error::Config(message)) if message.contains("--offset")
         ));
         assert!(matches!(
-            build_consume_options(1, u64::MAX, None, None),
+            build_consume_options(1, u64::MAX, None, None, None),
             Err(Error::Config(message)) if message.contains("too large")
         ));
 
-        let options = build_consume_options(25, 3, Some(4), Some(99)).unwrap();
+        let options = build_consume_options(25, 3, Some(4), Some(99), None).unwrap();
         assert_eq!(options.max, 25);
         assert_eq!(options.timeout, Duration::from_secs(3));
         assert_eq!(options.partition, Some(4));
         assert_eq!(options.offset, Some(99));
+
+        let exact =
+            build_consume_options(1, 1, None, None, Some("redis-stream:1710000000000-42")).unwrap();
+        assert_eq!(
+            exact.cursor,
+            Some(ConsumeCursor::RedisStream {
+                id: "1710000000000-42".to_owned(),
+            })
+        );
+        assert!(matches!(
+            build_consume_options(1, 1, Some(0), None, Some("kafka:0:1")),
+            Err(Error::Config(message)) if message.contains("cannot be combined")
+        ));
     }
 
     #[test]
