@@ -84,19 +84,18 @@ pub trait DocumentStore: Connector {
     async fn delete(&self, collection: &str, filter: Value) -> Result<u64>;
     async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>>;
 
-    /// Run an aggregation while bounding the number of documents retained by
-    /// the adapter. Implementations should stop reading once `max_items` have
-    /// been collected instead of materializing the complete cursor first.
+    /// Run an aggregation while bounding the number of documents read and
+    /// retained by the adapter.
+    ///
+    /// This method is deliberately required: a default implementation that
+    /// calls [`Self::aggregate`] and truncates afterwards would claim bounded
+    /// behavior while still materializing an unbounded remote cursor.
     async fn aggregate_bounded(
         &self,
         collection: &str,
         pipeline: Vec<Value>,
         max_items: usize,
-    ) -> Result<Vec<Document>> {
-        let mut documents = self.aggregate(collection, pipeline).await?;
-        documents.truncate(max_items);
-        Ok(documents)
-    }
+    ) -> Result<Vec<Document>>;
 
     /// Drop a document collection. Connectors that cannot manage collection
     /// lifecycle must reject the operation explicitly.
