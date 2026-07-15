@@ -115,8 +115,12 @@ impl SqlEngine for SqliteAdapter {
 
         let result_rows = rows
             .iter()
-            .map(|row| (0..columns.len()).map(|i| sqlite_value(row, i)).collect())
-            .collect();
+            .map(|row| {
+                (0..columns.len())
+                    .map(|index| sqlite_value(row, index))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(ResultSet {
             columns,
@@ -162,7 +166,7 @@ impl SqlEngine for SqliteAdapter {
             result_rows.push(
                 (0..columns.len())
                     .map(|index| sqlite_value(&row, index))
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
             );
         }
         drop(stream);

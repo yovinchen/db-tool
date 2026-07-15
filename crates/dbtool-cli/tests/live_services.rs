@@ -601,6 +601,59 @@ fn postgres_family_typed_probe(dsn: &str, expected_kind: &str) {
     assert_eq!(limited["meta"]["truncated"], true);
 }
 
+fn postgres_lossless_non_null_probe(dsn: &str) {
+    let typed = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        "select '550e8400-e29b-41d4-a716-446655440000'::uuid as uuid_value, \
+                date '2026-07-16' as date_value, \
+                time '12:34:56.123456' as time_value, \
+                12345678901234567890.123456789::numeric as numeric_value, \
+                array[1,2,3]::int[] as int_array, \
+                array['alpha','beta']::text[] as text_array",
+    ]));
+    let row = &typed["data"]["rows"][0];
+    assert_eq!(row[0], "550e8400-e29b-41d4-a716-446655440000");
+    assert_eq!(row[1], "2026-07-16");
+    assert_eq!(row[2], "12:34:56.123456");
+    assert_eq!(row[3], "12345678901234567890.123456789");
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[4].clone()).unwrap(),
+        CoreValue::Array(vec![
+            CoreValue::Int(1),
+            CoreValue::Int(2),
+            CoreValue::Int(3)
+        ])
+    );
+    assert_eq!(
+        serde_json::from_value::<CoreValue>(row[5].clone()).unwrap(),
+        CoreValue::Array(vec![
+            CoreValue::Text("alpha".into()),
+            CoreValue::Text("beta".into())
+        ])
+    );
+}
+
+fn mysql_lossless_non_null_probe(dsn: &str) {
+    let typed = stdout_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "sql",
+        "query",
+        "select cast(18446744073709551615 as unsigned) as unsigned_value, \
+                cast(12345678901234567890.123456789 as decimal(40,9)) as decimal_value, \
+                cast('2026-07-16' as date) as date_value, \
+                cast('12:34:56.123456' as time(6)) as time_value",
+    ]));
+    let row = &typed["data"]["rows"][0];
+    assert_eq!(row[0], "18446744073709551615");
+    assert_eq!(row[1], "12345678901234567890.123456789");
+    assert_eq!(row[2], "2026-07-16");
+    assert_eq!(row[3], "12:34:56.123456");
+}
+
 fn sqlserver_typed_probe(dsn: &str, expected_kind: &str) {
     let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
     assert_eq!(ping["kind"], expected_kind);
@@ -900,6 +953,7 @@ fn postgres_live_sql_lifecycle() {
     let table = unique_name("dbtool_it_postgres_users");
 
     postgres_family_typed_probe(&dsn, "postgres");
+    postgres_lossless_non_null_probe(&dsn);
     sql_lifecycle(
         &dsn,
         &table,
@@ -919,6 +973,7 @@ fn mysql_live_sql_lifecycle() {
     let table = unique_name("dbtool_it_mysql_users");
 
     mysql_family_typed_probe(&dsn, "mysql");
+    mysql_lossless_non_null_probe(&dsn);
     sql_lifecycle(
         &dsn,
         &table,

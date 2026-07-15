@@ -119,8 +119,12 @@ impl SqlEngine for MySqlAdapter {
 
         let result_rows: Vec<Vec<Value>> = rows
             .iter()
-            .map(|row| (0..columns.len()).map(|i| mysql_value(row, i)).collect())
-            .collect();
+            .map(|row| {
+                (0..columns.len())
+                    .map(|index| mysql_value(row, index))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(ResultSet {
             columns,
@@ -170,11 +174,17 @@ impl SqlEngine for MySqlAdapter {
                     })
                     .collect();
             }
-            result_rows.push(
-                (0..columns.len())
-                    .map(|index| mysql_value(&row, index))
-                    .collect(),
-            );
+            let decoded = (0..columns.len())
+                .map(|index| mysql_value(&row, index))
+                .collect::<Result<Vec<_>>>();
+            match decoded {
+                Ok(decoded) => result_rows.push(decoded),
+                Err(error) => {
+                    drop(stream);
+                    connection.close_on_drop();
+                    return Err(error);
+                }
+            }
         }
         let retire_connection = result_rows.len() == probe_rows;
         drop(stream);
