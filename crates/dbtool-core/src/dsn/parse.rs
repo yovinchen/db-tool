@@ -1,9 +1,9 @@
 use crate::{Error, Result};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 use url::Url;
 
 /// Parsed DSN with ownership — passed by value into Factory to satisfy 'static.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Dsn {
     /// Original (raw) string, with password intact (never log this).
     pub raw: String,
@@ -16,9 +16,25 @@ pub struct Dsn {
     pub params: HashMap<String, String>,
 }
 
+/// Never expose the raw DSN, password, or secret query parameters through
+/// diagnostic formatting. Connector errors commonly include `Debug` values,
+/// so this boundary must be safe by construction rather than relying on every
+/// caller to remember to redact first.
+impl fmt::Debug for Dsn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Dsn")
+            .field("redacted", &self.redacted())
+            .field("scheme", &self.scheme)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Dsn {
     pub fn parse(s: &str) -> Result<Self> {
-        let expanded = expand_env(s);
+        let expanded = expand_env(s)?;
         let url = Url::parse(&expanded).map_err(|e| Error::Dsn(format!("invalid URL: {e}")))?;
 
         let scheme = url.scheme().to_lowercase();
@@ -27,10 +43,10 @@ impl Dsn {
         let username = if url.username().is_empty() {
             None
         } else {
-            Some(url.username().to_owned())
+            Some(percent_decode(url.username())?)
         };
-        let password = url.password().map(str::to_owned);
-        let database = url.path().trim_start_matches('/').to_owned();
+        let password = url.password().map(percent_decode).transpose()?;
+        let database = percent_decode(url.path().trim_start_matches('/'))?;
         let database = if database.is_empty() {
             None
         } else {
@@ -70,22 +86,88 @@ impl Dsn {
     }
 }
 
-fn expand_env(s: &str) -> String {
-    // Replace ${VAR} with environment variable value, leaving unknown vars as-is.
-    let mut result = s.to_owned();
-    while let Some(start) = result.find("${") {
-        let end = match result[start..].find('}') {
-            Some(i) => start + i,
-            None => break,
+fn expand_env(s: &str) -> Result<String> {
+    const MAX_EXPANSION_PASSES: usize = 32;
+
+    // Multiple passes support variables whose values reference other
+    // variables. Unknown variables remain literal, but do not prevent known
+    // variables later in the DSN from being expanded.
+    let mut current = s.to_owned();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..MAX_EXPANSION_PASSES {
+        if !seen.insert(current.clone()) {
+            return Err(Error::Dsn(
+                "cyclic environment-variable expansion in DSN".into(),
+            ));
+        }
+
+        let (next, replaced_known) = expand_env_once(&current);
+        if !replaced_known {
+            return Ok(current);
+        }
+        if next == current {
+            return Err(Error::Dsn(
+                "cyclic environment-variable expansion in DSN".into(),
+            ));
+        }
+        current = next;
+    }
+
+    Err(Error::Dsn(format!(
+        "environment-variable expansion exceeds {MAX_EXPANSION_PASSES} passes"
+    )))
+}
+
+fn expand_env_once(input: &str) -> (String, bool) {
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut replaced_known = false;
+
+    while let Some(relative_start) = input[cursor..].find("${") {
+        let start = cursor + relative_start;
+        output.push_str(&input[cursor..start]);
+        let Some(relative_end) = input[start + 2..].find('}') else {
+            output.push_str(&input[start..]);
+            return (output, replaced_known);
         };
-        let var_name = &result[start + 2..end];
-        if let Ok(val) = std::env::var(var_name) {
-            result.replace_range(start..=end, &val);
+        let end = start + 2 + relative_end;
+        let variable = &input[start + 2..end];
+        match std::env::var(variable) {
+            Ok(value) => {
+                output.push_str(&value);
+                replaced_known = true;
+            }
+            Err(_) => output.push_str(&input[start..=end]),
+        }
+        cursor = end + 1;
+    }
+    output.push_str(&input[cursor..]);
+    (output, replaced_known)
+}
+
+fn percent_decode(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let encoded = bytes
+                .get(index + 1..index + 3)
+                .ok_or_else(|| Error::Dsn("invalid percent escape in DSN component".into()))?;
+            let encoded = std::str::from_utf8(encoded)
+                .map_err(|_| Error::Dsn("invalid percent escape in DSN component".into()))?;
+            let byte = u8::from_str_radix(encoded, 16)
+                .map_err(|_| Error::Dsn("invalid percent escape in DSN component".into()))?;
+            decoded.push(byte);
+            index += 3;
         } else {
-            break;
+            decoded.push(bytes[index]);
+            index += 1;
         }
     }
-    result
+
+    String::from_utf8(decoded)
+        .map_err(|_| Error::Dsn("invalid UTF-8 in percent-encoded DSN component".into()))
 }
 
 #[cfg(test)]
@@ -109,6 +191,16 @@ mod tests {
     }
 
     #[test]
+    fn percent_decodes_credentials_and_database() {
+        let dsn =
+            Dsn::parse("postgres://user%40tenant:p%40ss%3Aword@localhost/team%20database").unwrap();
+
+        assert_eq!(dsn.username.as_deref(), Some("user@tenant"));
+        assert_eq!(dsn.password.as_deref(), Some("p@ss:word"));
+        assert_eq!(dsn.database.as_deref(), Some("team database"));
+    }
+
+    #[test]
     fn stores_expanded_raw_url_for_connectors() {
         std::env::set_var("DBTOOL_PARSE_TEST_PASSWORD", "secret-pass");
         let dsn = Dsn::parse("mysql://root:${DBTOOL_PARSE_TEST_PASSWORD}@localhost/app").unwrap();
@@ -127,5 +219,49 @@ mod tests {
             dsn.raw_with_scheme("mysql").unwrap(),
             "mysql://user:pass@localhost:3306/app?ssl-mode=disabled"
         );
+    }
+
+    #[test]
+    fn unknown_environment_variable_does_not_block_later_known_variable() {
+        std::env::set_var("DBTOOL_PARSE_LATER_KNOWN", "expanded");
+        let dsn = Dsn::parse(
+            "postgres://localhost/db?unknown=${DBTOOL_PARSE_MISSING}&known=${DBTOOL_PARSE_LATER_KNOWN}",
+        )
+        .unwrap();
+
+        assert_eq!(
+            dsn.params.get("unknown").map(String::as_str),
+            Some("${DBTOOL_PARSE_MISSING}")
+        );
+        assert_eq!(
+            dsn.params.get("known").map(String::as_str),
+            Some("expanded")
+        );
+    }
+
+    #[test]
+    fn cyclic_environment_variable_fails_instead_of_looping() {
+        std::env::set_var(
+            "DBTOOL_PARSE_SELF_REFERENCE",
+            "${DBTOOL_PARSE_SELF_REFERENCE}",
+        );
+        let error =
+            Dsn::parse("postgres://localhost/db?token=${DBTOOL_PARSE_SELF_REFERENCE}").unwrap_err();
+
+        assert_eq!(error.code(), "INVALID_DSN");
+        assert!(error.to_string().contains("cyclic"));
+    }
+
+    #[test]
+    fn debug_output_never_contains_password_or_secret_query_value() {
+        let dsn = Dsn::parse(
+            "postgres://user:plain-secret@localhost/db?token=query-secret&sslmode=require",
+        )
+        .unwrap();
+        let debug = format!("{dsn:?}");
+
+        assert!(!debug.contains("plain-secret"));
+        assert!(!debug.contains("query-secret"));
+        assert!(debug.contains("***"));
     }
 }
