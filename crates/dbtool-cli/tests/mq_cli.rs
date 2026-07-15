@@ -283,6 +283,27 @@ fn produce_still_requires_write_permission_before_connecting() {
 }
 
 #[test]
+fn topic_catalog_limit_is_rejected_before_connecting() {
+    assert_config_error(
+        &["--limit", "0", "--dsn", UNREACHABLE_DSN, "mq", "topics"],
+        "global --limit must be greater than zero",
+    );
+
+    let overflow = usize::MAX.to_string();
+    assert_config_error(
+        &[
+            "--limit",
+            &overflow,
+            "--dsn",
+            UNREACHABLE_DSN,
+            "mq",
+            "topics",
+        ],
+        "too large to reserve a truncation probe item",
+    );
+}
+
+#[test]
 fn resource_delete_requires_write_and_target_bound_confirmation_before_connecting() {
     assert_error(
         &[

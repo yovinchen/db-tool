@@ -5,14 +5,15 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message,
-        MessageCursor, MessagePlacement, MessageResource, PartitionWatermark, ProduceOutcome,
-        TopicDetail, TopicInfo,
+        BoundedList, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo,
+        Message, MessageCursor, MessagePlacement, MessageResource, PartitionWatermark,
+        ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::limiter::ListLimiter,
 };
 use futures::future::BoxFuture;
 use rskafka::{
@@ -32,8 +33,14 @@ use super::{
     validate_produce_message,
 };
 
+// Kafka's Metadata API does not paginate. Keep the unavoidable protocol frame
+// bounded before rskafka allocates or decodes it, then retain only the N+1
+// catalog probe at the portable boundary.
+const KAFKA_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 pub struct RskafkaAdapter {
     client: Client,
+    catalog_brokers: Vec<String>,
     kind: ConnectorKind,
 }
 
@@ -42,13 +49,14 @@ pub fn connect(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
         let host = dsn.host.unwrap_or_else(|| "localhost".into());
         let port = dsn.port.unwrap_or(9092);
         let brokers = vec![format!("{host}:{port}")];
-        let client = ClientBuilder::new(brokers)
+        let client = ClientBuilder::new(brokers.clone())
             .client_id("dbtool")
             .build()
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
         Ok(Box::new(RskafkaAdapter {
             client,
+            catalog_brokers: brokers,
             kind: ConnectorKind(dsn.scheme),
         }) as Box<dyn Connector>)
     })
@@ -70,13 +78,7 @@ impl Connector for RskafkaAdapter {
     }
 
     fn operations(&self) -> Vec<CapabilityOperation> {
-        let mut operations = self.capabilities().operations();
-        operations.extend([
-            CapabilityOperation::MessageAdminListTopics,
-            CapabilityOperation::MessageAdminTopicDetail,
-            CapabilityOperation::MessageAdminDelete,
-        ]);
-        operations
+        pure_operations(self.capabilities())
     }
 
     async fn ping(&self) -> Result<()> {
@@ -106,6 +108,17 @@ impl Connector for RskafkaAdapter {
     fn as_admin_mutate(&self) -> Option<&dyn AdminMutate> {
         Some(self)
     }
+}
+
+fn pure_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+    let mut operations = capabilities.operations();
+    operations.extend([
+        CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminListTopicsBounded,
+        CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminDelete,
+    ]);
+    operations
 }
 
 #[async_trait::async_trait]
@@ -265,6 +278,33 @@ impl MessageConsumer for RskafkaAdapter {
 impl AdminInspect for RskafkaAdapter {
     async fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         self.topic_infos().await
+    }
+
+    async fn list_topics_bounded(&self, max_items: usize) -> Result<BoundedList<TopicInfo>> {
+        let limiter = ListLimiter::new(max_items);
+        let probe_items = limiter.probe_items()?;
+        // Use a dedicated client so the metadata frame ceiling cannot lower
+        // the established producer/consumer receive budget.
+        let catalog_client = ClientBuilder::new(self.catalog_brokers.clone())
+            .client_id("dbtool-catalog")
+            .max_message_size(KAFKA_MAX_RESPONSE_BYTES)
+            .build()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        let mut topics = catalog_client
+            .list_topics()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?
+            .into_iter()
+            .take(probe_items)
+            .map(|topic| TopicInfo {
+                name: topic.name,
+                partitions: topic.partitions.len() as i32,
+                replicas: 1,
+            })
+            .collect::<Vec<_>>();
+        topics.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(limiter.finish(topics))
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -570,5 +610,19 @@ mod tests {
         assert!(matches!(error, Error::Query(_)));
         assert!(error.to_string().contains("not verified"));
         assert!(error.to_string().contains("events"));
+    }
+
+    #[test]
+    fn pure_kafka_declares_bounded_catalog_without_stateful_consume_claims() {
+        let operations = pure_operations(Capabilities {
+            producer: true,
+            consumer: true,
+            admin: true,
+            ..Default::default()
+        });
+
+        assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
+        assert!(!operations.contains(&CapabilityOperation::MessageConsumeGroup));
+        assert!(!operations.contains(&CapabilityOperation::MessageConsumeAck));
     }
 }

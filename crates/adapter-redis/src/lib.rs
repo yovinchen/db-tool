@@ -2,10 +2,10 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
-        DeleteResourceOutcome, KeyExpiry, KeyValueRestoreOutcome, KeyValueSnapshot, LagInfo,
-        Message, MessageCursor, MessagePlacement, MessageResource, MessageResourceKind,
-        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo, Value,
+        AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
+        DeleteResourceOptions, DeleteResourceOutcome, KeyExpiry, KeyValueRestoreOutcome,
+        KeyValueSnapshot, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
+        MessageResourceKind, PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo, Value,
     },
     port::{
         capability::{
@@ -13,6 +13,7 @@ use dbtool_core::{
         },
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::limiter::ListLimiter,
 };
 use futures::{future::BoxFuture, StreamExt};
 use redis::{
@@ -24,6 +25,26 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::time::{timeout, Instant};
 
 const REDIS_SCAN_COUNT: usize = 10;
+const REDIS_STREAM_SCAN_COUNT: usize = 100;
+const REDIS_STREAM_SCAN_PAGE_MAX: usize = 4096;
+const REDIS_STREAM_SCAN_KEY_BYTES_MAX: usize = 896 * 1024;
+const REDIS_STREAM_SCAN_PAGE_SCRIPT: &str = r#"
+local page = redis.call('SCAN', ARGV[1], 'TYPE', 'stream', 'COUNT', ARGV[2])
+local keys = page[2]
+local max_items = tonumber(ARGV[3])
+local max_key_bytes = tonumber(ARGV[4])
+if #keys > max_items then
+  return redis.error_reply('dbtool stream catalog page exceeds item budget')
+end
+local key_bytes = 0
+for index = 1, #keys do
+  key_bytes = key_bytes + string.len(keys[index])
+  if key_bytes > max_key_bytes then
+    return redis.error_reply('dbtool stream catalog page exceeds byte budget')
+  end
+end
+return {page[1], keys}
+"#;
 const REDIS_LUA_SAFE_INTEGER_MAX_MS: i64 = 9_007_199_254_740_991;
 
 // TIME intentionally precedes PTTL. Computing the absolute deadline from an
@@ -498,35 +519,14 @@ impl MessageConsumer for RedisAdapter {
 #[async_trait::async_trait]
 impl AdminInspect for RedisAdapter {
     async fn list_topics(&self) -> Result<Vec<TopicInfo>> {
-        let mut cursor = 0_u64;
-        let mut topics = Vec::new();
-        let mut c = self.conn.lock().await;
+        self.scan_stream_topics(None).await
+    }
 
-        loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("TYPE")
-                .arg("stream")
-                .arg("COUNT")
-                .arg(100)
-                .query_async(&mut *c)
-                .await
-                .map_err(|e| Error::Query(e.to_string()))?;
-
-            topics.extend(keys.into_iter().map(|name| TopicInfo {
-                name,
-                partitions: 1,
-                replicas: 1,
-            }));
-
-            if next_cursor == 0 {
-                break;
-            }
-            cursor = next_cursor;
-        }
-
-        topics.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(topics)
+    async fn list_topics_bounded(&self, max_items: usize) -> Result<BoundedList<TopicInfo>> {
+        let limiter = ListLimiter::new(max_items);
+        let probe_items = limiter.probe_items()?;
+        let topics = self.scan_stream_topics(Some(probe_items)).await?;
+        Ok(limiter.finish(topics))
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -574,6 +574,73 @@ impl AdminInspect for RedisAdapter {
         }
 
         Ok(results)
+    }
+}
+
+impl RedisAdapter {
+    async fn scan_stream_topics(&self, probe_items: Option<usize>) -> Result<Vec<TopicInfo>> {
+        let mut cursor = 0_u64;
+        let mut topics = Vec::new();
+        let mut names = HashSet::new();
+        let mut cursors = HashSet::new();
+        let mut c = self.conn.lock().await;
+
+        loop {
+            let requested_count = probe_items
+                .map(|limit| limit.saturating_sub(topics.len()))
+                .unwrap_or(REDIS_STREAM_SCAN_COUNT)
+                .clamp(1, REDIS_STREAM_SCAN_COUNT);
+            // Wrap one SCAN page in a read-only Lua call so the server returns
+            // either a capped response or a short error. A plain SCAN command
+            // would let a COUNT-hint overshoot allocate an arbitrary RESP
+            // frame before the client could inspect it.
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("EVAL")
+                .arg(REDIS_STREAM_SCAN_PAGE_SCRIPT)
+                .arg(0)
+                .arg(cursor)
+                .arg(requested_count)
+                .arg(REDIS_STREAM_SCAN_PAGE_MAX)
+                .arg(REDIS_STREAM_SCAN_KEY_BYTES_MAX)
+                .query_async(&mut *c)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+
+            // Retain a defensive client-side shape check even though the Lua
+            // wrapper already enforces the response limit before transport.
+            if keys.len() > REDIS_STREAM_SCAN_PAGE_MAX {
+                return Err(Error::Serialization(format!(
+                    "Redis SCAN returned {} stream keys in one page, exceeding the accepted page budget {REDIS_STREAM_SCAN_PAGE_MAX}",
+                    keys.len()
+                )));
+            }
+
+            for name in keys {
+                if names.insert(name.clone()) {
+                    topics.push(TopicInfo {
+                        name,
+                        partitions: 1,
+                        replicas: 1,
+                    });
+                    if probe_items.is_some_and(|limit| topics.len() >= limit) {
+                        break;
+                    }
+                }
+            }
+
+            if next_cursor == 0 || probe_items.is_some_and(|limit| topics.len() >= limit) {
+                break;
+            }
+            if !cursors.insert(next_cursor) {
+                return Err(Error::Serialization(
+                    "Redis SCAN repeated a non-zero cursor before completing the stream catalog"
+                        .into(),
+                ));
+            }
+            cursor = next_cursor;
+        }
+
+        topics.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(topics)
     }
 }
 
@@ -1637,6 +1704,7 @@ fn redis_operations(
         CapabilityOperation::MessageConsumeGroup,
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminDelete,
     ]);
@@ -3411,6 +3479,7 @@ mod tests {
             CapabilityOperation::MessageConsumeGroup,
             CapabilityOperation::MessageConsumeAck,
             CapabilityOperation::MessageAdminListTopics,
+            CapabilityOperation::MessageAdminListTopicsBounded,
             CapabilityOperation::MessageAdminTopicDetail,
             CapabilityOperation::MessageAdminConsumerLag,
             CapabilityOperation::MessageAdminDelete,

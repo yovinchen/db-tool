@@ -8,7 +8,7 @@ use dbtool_core::{
         MessageResource, MessageResourceKind,
     },
     port::CapabilityOperation,
-    service::safety::SafetyGuard,
+    service::{limiter::ListLimiter, safety::SafetyGuard},
     Result,
 };
 use std::{
@@ -19,7 +19,7 @@ use std::{
 #[derive(Args)]
 #[command(
     about = "Produce, consume, and inspect bounded message queue workflows.",
-    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write. Stateful group/durable consumption and successful-delivery acknowledgement also require --allow-write. AMQP/AMQPS consume requires explicit --ack on-success because successful delivery is ACKed and removed from the queue. Persistent resource deletion requires both --allow-write and a target-bound --confirm token. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
+    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write. Stateful group/durable consumption and successful-delivery acknowledgement also require --allow-write. AMQP/AMQPS consume requires explicit --ack on-success because successful delivery is ACKed and removed from the queue. Persistent resource deletion requires both --allow-write and a target-bound --confirm token. Topic/stream/queue catalogs honor the positive global --limit and require a backend-bounded operation; no unbounded fallback is attempted. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
 )]
 pub struct MqCmd {
     #[command(subcommand)]
@@ -82,7 +82,7 @@ pub enum MqAction {
         #[arg(long, value_enum, value_name = "MODE")]
         ack: Option<MqAckMode>,
     },
-    /// List topics
+    /// List topics/streams/queues within the global --limit
     Topics,
     /// Show topic/queue detail when the backend exposes admin metadata
     Detail {
@@ -158,6 +158,9 @@ struct ConsumeRequest {
 }
 
 pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
+    if matches!(cmd.action, MqAction::Topics) {
+        ListLimiter::new(ctx.limit).probe_items()?;
+    }
     if matches!(cmd.action, MqAction::Produce { .. }) {
         ensure_write_allowed(ctx)?;
     }
@@ -301,8 +304,14 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                     kind: kind.clone(),
                     needed: "AdminInspect",
                 })?;
-            let topics = admin.list_topics().await?;
-            ctx.render_success(&kind, topics, elapsed(), false)
+            require_message_operation(
+                &conn.operations(),
+                CapabilityOperation::MessageAdminListTopicsBounded,
+                &kind,
+            )?;
+            let topics = admin.list_topics_bounded(ctx.limit).await?;
+            let truncated = topics.truncated;
+            ctx.render_success(&kind, topics.items, elapsed(), truncated)
         }
         MqAction::Detail { topic } => {
             let admin = conn
@@ -531,6 +540,14 @@ fn require_consume_operation(
     operation: CapabilityOperation,
     kind: &str,
 ) -> Result<()> {
+    require_message_operation(operations, operation, kind)
+}
+
+fn require_message_operation(
+    operations: &[CapabilityOperation],
+    operation: CapabilityOperation,
+    kind: &str,
+) -> Result<()> {
     if operations.contains(&operation) {
         Ok(())
     } else {
@@ -597,6 +614,21 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn legacy_topic_listing_never_satisfies_bounded_catalog_negotiation() {
+        let operations = [CapabilityOperation::MessageAdminListTopics];
+        assert!(matches!(
+            require_message_operation(
+                &operations,
+                CapabilityOperation::MessageAdminListTopicsBounded,
+                "legacy-mq"
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-mq"
+                    && needed == CapabilityOperation::MessageAdminListTopicsBounded.as_str()
+        ));
     }
 
     #[test]

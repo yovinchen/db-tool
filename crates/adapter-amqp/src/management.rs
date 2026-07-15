@@ -3,17 +3,18 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        DeleteResourceOptions, DeleteResourceOutcome, LagInfo, MessageResource,
+        BoundedList, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, MessageResource,
         MessageResourceKind, PartitionWatermark, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::limiter::ListLimiter,
 };
 use futures::future::BoxFuture;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -23,6 +24,7 @@ use url::Url;
 
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_HTTP_RESPONSE_BYTES: usize = 1024 * 1024;
+const RABBIT_QUEUE_PAGE_SIZE: usize = 100;
 
 pub struct RabbitManagementAdapter {
     client: RabbitManagementClient,
@@ -86,6 +88,13 @@ impl AdminInspect for RabbitManagementAdapter {
             .collect::<Result<Vec<_>>>()?;
         topics.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(topics)
+    }
+
+    async fn list_topics_bounded(&self, max_items: usize) -> Result<BoundedList<TopicInfo>> {
+        let limiter = ListLimiter::new(max_items);
+        let probe_items = limiter.probe_items()?;
+        let topics = self.client.list_queues_bounded(probe_items).await?;
+        Ok(limiter.finish(topics))
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -188,6 +197,13 @@ impl RabbitManagementClient {
         format!("{}/{}", self.queues_path(), percent_encode(queue))
     }
 
+    fn queues_page_path(&self, page: usize, page_size: usize) -> String {
+        format!(
+            "{}?page={page}&page_size={page_size}&pagination=true&sort=name&sort_reverse=false",
+            self.queues_path()
+        )
+    }
+
     fn queue_delete_path(&self, queue: &str, options: DeleteResourceOptions) -> String {
         format!(
             "{}?if-empty={}&if-unused={}",
@@ -210,6 +226,50 @@ impl RabbitManagementClient {
             return Ok(None);
         }
         success_json(&response, false)
+    }
+
+    async fn list_queues_bounded(&self, probe_items: usize) -> Result<Vec<TopicInfo>> {
+        let mut page = 1_usize;
+        let mut topics = Vec::new();
+        let mut names = HashSet::new();
+        // Page numbers are offsets in units of page_size. Keep the requested
+        // size fixed across the traversal; shrinking the final request would
+        // move page 2 backwards and could duplicate or skip queues.
+        let page_size = rabbit_queue_page_size(probe_items);
+
+        while topics.len() < probe_items {
+            let path = self.queues_page_path(page, page_size);
+            let response = self.get_json(&path).await?;
+            let parsed = parse_queue_page(&response, page, page_size)?;
+
+            for topic in parsed.items {
+                if !names.insert(topic.name.clone()) {
+                    return Err(Error::Serialization(format!(
+                        "RabbitMQ paginated queue catalog repeated queue {:?}",
+                        topic.name
+                    )));
+                }
+                topics.push(topic);
+                if topics.len() == probe_items {
+                    break;
+                }
+            }
+
+            if topics.len() == probe_items || page >= parsed.page_count {
+                break;
+            }
+            if parsed.returned == 0 {
+                return Err(Error::Serialization(
+                    "RabbitMQ queue pagination returned an empty page before page_count".into(),
+                ));
+            }
+            page = page.checked_add(1).ok_or_else(|| {
+                Error::Serialization("RabbitMQ queue page number overflow".into())
+            })?;
+        }
+
+        topics.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(topics)
     }
 
     async fn delete_queue(&self, queue: &str, options: DeleteResourceOptions) -> Result<()> {
@@ -279,10 +339,81 @@ fn rabbit_management_operations(capabilities: Capabilities) -> Vec<CapabilityOpe
     let mut operations = capabilities.operations();
     operations.extend([
         CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
+}
+
+struct QueuePage {
+    items: Vec<TopicInfo>,
+    returned: usize,
+    page_count: usize,
+}
+
+fn rabbit_queue_page_size(probe_items: usize) -> usize {
+    probe_items.min(RABBIT_QUEUE_PAGE_SIZE)
+}
+
+fn parse_queue_page(
+    value: &Value,
+    expected_page: usize,
+    requested_page_size: usize,
+) -> Result<QueuePage> {
+    let page = json_usize_required(value, "page")?;
+    let page_size = json_usize_required(value, "page_size")?;
+    let page_count = json_usize_required(value, "page_count")?;
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::Serialization("RabbitMQ paginated queues response is missing items".into())
+        })?;
+
+    if page != expected_page {
+        return Err(Error::Serialization(format!(
+            "RabbitMQ queue pagination returned page {page} while page {expected_page} was requested"
+        )));
+    }
+    if page_size == 0 || page_size > requested_page_size || items.len() > page_size {
+        return Err(Error::Serialization(format!(
+            "RabbitMQ queue pagination returned invalid page_size {page_size} for {} items (requested {requested_page_size})",
+            items.len()
+        )));
+    }
+    if page_count == 0 && !items.is_empty() {
+        return Err(Error::Serialization(
+            "RabbitMQ queue pagination reported zero pages with non-empty items".into(),
+        ));
+    }
+    if page_count != 0 && page > page_count {
+        return Err(Error::Serialization(format!(
+            "RabbitMQ queue pagination returned page {page} beyond page_count {page_count}"
+        )));
+    }
+    if page < page_count && items.len() != page_size {
+        return Err(Error::Serialization(format!(
+            "RabbitMQ queue pagination returned a short non-final page {page}: {} items for page_size {page_size}",
+            items.len()
+        )));
+    }
+
+    let topics = items
+        .iter()
+        .map(queue_topic_info)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(QueuePage {
+        returned: topics.len(),
+        items: topics,
+        page_count,
+    })
+}
+
+fn json_usize_required(value: &Value, key: &str) -> Result<usize> {
+    let value = json_u64_required(value, key)?;
+    usize::try_from(value)
+        .map_err(|_| Error::Serialization(format!("RabbitMQ queue pagination {key} exceeds usize")))
 }
 
 fn validate_management_delete_request(resource: &MessageResource) -> Result<()> {
@@ -730,11 +861,64 @@ mod tests {
             operations,
             vec![
                 CapabilityOperation::MessageAdminListTopics,
+                CapabilityOperation::MessageAdminListTopicsBounded,
                 CapabilityOperation::MessageAdminTopicDetail,
                 CapabilityOperation::MessageAdminDelete,
             ]
         );
         assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
+    }
+
+    #[test]
+    fn paginated_queue_catalog_requires_exact_page_metadata() {
+        let page = serde_json::json!({
+            "page": 1,
+            "page_size": 2,
+            "page_count": 2,
+            "items": [
+                {"name": "jobs-a"},
+                {"name": "jobs-b"}
+            ]
+        });
+        let parsed = parse_queue_page(&page, 1, 2).unwrap();
+        assert_eq!(parsed.page_count, 2);
+        assert_eq!(parsed.returned, 2);
+        assert_eq!(parsed.items[0].name, "jobs-a");
+        assert_eq!(parsed.items[1].name, "jobs-b");
+
+        assert!(matches!(
+            parse_queue_page(&page, 2, 2),
+            Err(Error::Serialization(message)) if message.contains("page 1") && message.contains("page 2")
+        ));
+        assert!(matches!(
+            parse_queue_page(&page, 1, 1),
+            Err(Error::Serialization(message)) if message.contains("page_size")
+        ));
+
+        let short_non_final = serde_json::json!({
+            "page": 1,
+            "page_size": 2,
+            "page_count": 2,
+            "items": [{"name": "jobs-a"}]
+        });
+        assert!(matches!(
+            parse_queue_page(&short_non_final, 1, 2),
+            Err(Error::Serialization(message)) if message.contains("short non-final page")
+        ));
+    }
+
+    #[test]
+    fn queue_page_path_requests_stable_server_side_pagination() {
+        let dsn = Dsn::parse("rabbitmq+http://dbtool:secret@localhost/vhost/a").unwrap();
+        let client = RabbitManagementClient::from_dsn(&dsn).unwrap();
+
+        assert_eq!(
+            client.queues_page_path(3, 100),
+            "/api/queues/vhost%2Fa?page=3&page_size=100&pagination=true&sort=name&sort_reverse=false"
+        );
+        assert_eq!(rabbit_queue_page_size(1), 1);
+        assert_eq!(rabbit_queue_page_size(100), 100);
+        assert_eq!(rabbit_queue_page_size(150), 100);
     }
 
     #[test]

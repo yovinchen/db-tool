@@ -2,18 +2,24 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
-        DeleteResourceOutcome, LagInfo, Message, MessageCursor, MessageMetadata, MessageResource,
-        MessageResourceKind, PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
+        AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
+        DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message, MessageCursor,
+        MessageMetadata, MessageResource, MessageResourceKind, PartitionWatermark, ProduceOutcome,
+        TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::limiter::ListLimiter,
 };
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    str::FromStr,
+};
 use tokio::time::{timeout, Instant};
 
 pub struct NatsAdapter {
@@ -171,6 +177,35 @@ impl AdminInspect for NatsAdapter {
 
         topics.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(topics)
+    }
+
+    async fn list_topics_bounded(&self, max_items: usize) -> Result<BoundedList<TopicInfo>> {
+        let limiter = ListLimiter::new(max_items);
+        let probe_items = limiter.probe_items()?;
+        let mut streams = self.jetstream().streams();
+        let mut topics = Vec::new();
+        let mut names = HashSet::new();
+
+        while topics.len() < probe_items {
+            let Some(info) = streams
+                .try_next()
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?
+            else {
+                break;
+            };
+            let topic = nats_topic_info(&info);
+            if !names.insert(topic.name.clone()) {
+                return Err(Error::Serialization(format!(
+                    "NATS JetStream paginated catalog repeated stream {:?}",
+                    topic.name
+                )));
+            }
+            topics.push(topic);
+        }
+
+        topics.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(limiter.finish(topics))
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -656,6 +691,7 @@ fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageConsumeDurable,
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminConsumerLag,
         CapabilityOperation::MessageAdminDelete,
@@ -1257,6 +1293,7 @@ mod tests {
             CapabilityOperation::MessageConsumeDurable,
             CapabilityOperation::MessageConsumeAck,
             CapabilityOperation::MessageAdminListTopics,
+            CapabilityOperation::MessageAdminListTopicsBounded,
             CapabilityOperation::MessageAdminTopicDetail,
             CapabilityOperation::MessageAdminConsumerLag,
             CapabilityOperation::MessageAdminDelete,

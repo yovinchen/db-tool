@@ -4,14 +4,15 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, DeleteResourceOutcome,
-        LagInfo, Message, MessageCursor, MessagePlacement, MessageResource, PartitionWatermark,
-        ProduceOutcome, TopicDetail, TopicInfo,
+        AckMode, BoundedList, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
+        DeleteResourceOutcome, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
+        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::limiter::ListLimiter,
 };
 use futures::future::BoxFuture;
 use rdkafka::{
@@ -34,6 +35,12 @@ use super::{
     kafka_messages_before, resolve_consume_position, validate_kafka_delete_request,
     validate_produce_message,
 };
+
+// Kafka metadata has no pagination. librdkafka enforces this receive-frame
+// ceiling before exposing a decoded metadata object to the adapter.
+const KAFKA_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const KAFKA_RESPONSE_OVERHEAD_BYTES: usize = 512;
+const KAFKA_MAX_FETCH_BYTES: usize = KAFKA_MAX_RESPONSE_BYTES - KAFKA_RESPONSE_OVERHEAD_BYTES;
 
 pub struct RdkafkaAdapter {
     producer: FutureProducer,
@@ -117,6 +124,7 @@ fn native_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageConsumeGroup,
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
+        CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminConsumerLag,
         CapabilityOperation::MessageAdminDelete,
@@ -195,6 +203,25 @@ impl MessageConsumer for RdkafkaAdapter {
 impl AdminInspect for RdkafkaAdapter {
     async fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         self.topic_infos()
+    }
+
+    async fn list_topics_bounded(&self, max_items: usize) -> Result<BoundedList<TopicInfo>> {
+        let limiter = ListLimiter::new(max_items);
+        let probe_items = limiter.probe_items()?;
+        // Metadata uses a separately capped consumer so ordinary production
+        // and consumption retain the caller's established frame limits.
+        let consumer = bounded_catalog_consumer(&self.consumer_config)?;
+        let metadata = consumer
+            .fetch_metadata(None, Timeout::After(Duration::from_secs(5)))
+            .map_err(kafka_connection_error)?;
+        let mut topics = metadata
+            .topics()
+            .iter()
+            .take(probe_items)
+            .map(topic_info)
+            .collect::<Vec<_>>();
+        topics.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(limiter.finish(topics))
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -611,6 +638,26 @@ fn kafka_config(dsn: &Dsn, brokers: &str) -> ClientConfig {
     config
 }
 
+fn bounded_catalog_consumer(base: &ClientConfig) -> Result<BaseConsumer> {
+    bounded_catalog_config(base)?
+        .create::<BaseConsumer>()
+        .map_err(kafka_connection_error)
+}
+
+fn bounded_catalog_config(base: &ClientConfig) -> Result<ClientConfig> {
+    let mut config = consumer_client_config(base, "dbtool-catalog")?;
+    // Apply after DSN parameters so callers cannot raise the receive budget
+    // and silently turn this admin catalog request back into an unbounded read.
+    config.set(
+        "receive.message.max.bytes",
+        KAFKA_MAX_RESPONSE_BYTES.to_string(),
+    );
+    // librdkafka requires the receive ceiling to exceed the aggregate fetch
+    // ceiling by at least 512 bytes. Bound both values after DSN overrides.
+    config.set("fetch.max.bytes", KAFKA_MAX_FETCH_BYTES.to_string());
+    Ok(config)
+}
+
 fn consumer_client_config(base: &ClientConfig, group: &str) -> Result<ClientConfig> {
     let group = normalize_consumer_group(group)?;
     let mut config = base.clone();
@@ -970,6 +1017,7 @@ mod tests {
         });
         assert!(operations.contains(&CapabilityOperation::MessageConsumeGroup));
         assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
         assert!(!operations.contains(&CapabilityOperation::MessageConsumeDurable));
 
         let stateless = ConsumeOptions::default();
@@ -1012,6 +1060,28 @@ mod tests {
             Err(Error::UnsupportedCapability { needed, .. })
                 if needed == "message.consume_durable"
         ));
+    }
+
+    #[test]
+    fn kafka_catalog_budget_is_isolated_from_normal_client_parameters() {
+        let dsn = Dsn::parse(
+            "kafka://127.0.0.1:9092?kafka.receive.message.max.bytes=999999999&kafka.fetch.max.bytes=999999999",
+        )
+        .unwrap();
+        let config = kafka_config(&dsn, "127.0.0.1:9092");
+
+        assert_eq!(config.get("receive.message.max.bytes"), Some("999999999"));
+        assert_eq!(config.get("fetch.max.bytes"), Some("999999999"));
+
+        let catalog = bounded_catalog_config(&config).unwrap();
+        assert_eq!(
+            catalog.get("receive.message.max.bytes"),
+            Some(KAFKA_MAX_RESPONSE_BYTES.to_string().as_str())
+        );
+        assert_eq!(
+            catalog.get("fetch.max.bytes"),
+            Some(KAFKA_MAX_FETCH_BYTES.to_string().as_str())
+        );
     }
 
     #[test]
