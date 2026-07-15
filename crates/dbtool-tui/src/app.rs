@@ -1,23 +1,57 @@
 use crate::{
     state::{AppState, ConnectionItem, StateAction},
+    terminal::{CrosstermLifecycle, TerminalLifecycle, TerminalSession},
     ui,
 };
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{self, Event, KeyCode};
 use dbtool_core::{
     config::{env::discover_env_connections, ConnectionConfig},
     dsn::Dsn,
     error::Error,
     model::{FindOptions, Point, TimeRange, Value},
     registry::Registry,
-    service::{safety::SafetyGuard, ConnectionManager},
+    service::{
+        safety::{SafetyGuard, StatementKind},
+        ConnectionManager,
+    },
     Result,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
+
+trait TuiRuntime {
+    fn draw(&mut self, state: &AppState) -> io::Result<()>;
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+struct CrosstermRuntime {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl CrosstermRuntime {
+    fn new() -> io::Result<Self> {
+        let backend = CrosstermBackend::new(io::stdout());
+        Ok(Self {
+            terminal: Terminal::new(backend)?,
+        })
+    }
+}
+
+impl TuiRuntime for CrosstermRuntime {
+    fn draw(&mut self, state: &AppState) -> io::Result<()> {
+        self.terminal.draw(|frame| ui::render(frame, state))?;
+        Ok(())
+    }
+
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
 
 pub struct App {
     _manager: Arc<ConnectionManager>,
@@ -47,17 +81,38 @@ impl App {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        enable_raw_mode()?;
-        let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut term = Terminal::new(backend)?;
+        self.run_with_terminal(CrosstermLifecycle, CrosstermRuntime::new)
+            .await
+    }
 
+    async fn run_with_terminal<L, R, F>(
+        &mut self,
+        lifecycle: L,
+        make_runtime: F,
+    ) -> anyhow::Result<()>
+    where
+        L: TerminalLifecycle,
+        R: TuiRuntime,
+        F: FnOnce() -> io::Result<R>,
+    {
+        let mut session = TerminalSession::enter(lifecycle)?;
+        let run_result = match make_runtime() {
+            Ok(mut runtime) => self.run_event_loop(&mut runtime).await,
+            Err(error) => Err(error.into()),
+        };
+        let restore_result = session.restore();
+
+        run_result?;
+        restore_result?;
+        Ok(())
+    }
+
+    async fn run_event_loop<R: TuiRuntime>(&mut self, runtime: &mut R) -> anyhow::Result<()> {
         loop {
-            term.draw(|f| ui::render(f, &self.state))?;
+            runtime.draw(&self.state)?;
 
-            if event::poll(std::time::Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
+            if runtime.poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = runtime.read()? {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         other => match self.state.handle_key(other) {
@@ -69,9 +124,6 @@ impl App {
                 }
             }
         }
-
-        disable_raw_mode()?;
-        execute!(term.backend_mut(), LeaveAlternateScreen)?;
         Ok(())
     }
 
@@ -89,26 +141,41 @@ impl App {
             return;
         }
 
-        if !confirmed_write && command_requires_write(&command) {
+        let Some(connection) = self.state.selected_connection().cloned() else {
+            self.state.result_text = "No configured connections found".to_owned();
+            return;
+        };
+
+        let requires_write = match command_requires_write(&command) {
+            Ok(requires_write) => requires_write,
+            Err(error) => {
+                self.state.pending_write = None;
+                self.state.result_text = format_error(&error);
+                return;
+            }
+        };
+
+        if requires_write && connection.readonly {
+            self.state.pending_write = None;
+            self.state.result_text = "Selected connection is readonly".to_owned();
+            return;
+        }
+
+        if requires_write && !confirmed_write {
             self.state.pending_write = Some(command);
             self.state.result_text =
                 "Write command pending. Press y to execute once, or n to cancel.".to_owned();
             return;
         }
 
-        let Some(connection) = self.state.selected_connection().cloned() else {
-            self.state.result_text = "No configured connections found".to_owned();
-            return;
-        };
-
-        if confirmed_write && connection.readonly {
-            self.state.pending_write = None;
-            self.state.result_text = "Selected connection is readonly".to_owned();
-            return;
-        }
-
-        let output =
-            execute_tui_command(&self._manager, &connection, &command, self.state.limit).await;
+        let output = execute_tui_command(
+            &self._manager,
+            &connection,
+            &command,
+            self.state.limit,
+            confirmed_write,
+        )
+        .await;
         self.state.pending_write = None;
         self.state.record_command(&command);
         self.state.result_text = match output {
@@ -157,7 +224,9 @@ async fn execute_tui_command(
     connection: &ConnectionItem,
     command: &str,
     limit: usize,
+    confirmed_write: bool,
 ) -> Result<String> {
+    authorize_tui_command(connection, command, confirmed_write)?;
     let conn = manager.get_or_connect(&connection.dsn).await?;
     let connector = conn.as_ref().as_ref();
     let mut parts = command.split_whitespace();
@@ -195,14 +264,14 @@ async fn execute_tui_command(
                 .strip_prefix("sql")
                 .map(str::trim)
                 .unwrap_or_default();
-            run_sql_command(connector, connection, rest, limit).await
+            run_sql_command(connector, connection, rest, limit, confirmed_write).await
         }
         "exec" => {
             let sql = command
                 .strip_prefix("exec")
                 .map(str::trim)
                 .unwrap_or_default();
-            run_sql_exec(connector, connection, sql).await
+            run_sql_exec(connector, connection, sql, confirmed_write).await
         }
         "kv" => run_kv_command(connector, command.strip_prefix("kv").unwrap_or("").trim(), limit).await,
         "doc" => run_doc_command(connector, command.strip_prefix("doc").unwrap_or("").trim(), limit).await,
@@ -226,21 +295,25 @@ async fn run_sql_command(
     connection: &ConnectionItem,
     command: &str,
     limit: usize,
+    confirmed_write: bool,
 ) -> Result<String> {
     if let Some(sql) = command.strip_prefix("query ").map(str::trim) {
-        return run_sql_query(connector, sql, limit).await;
+        return run_sql_query(connector, connection, sql, limit, confirmed_write).await;
     }
     if let Some(sql) = command.strip_prefix("exec ").map(str::trim) {
-        return run_sql_exec(connector, connection, sql).await;
+        return run_sql_exec(connector, connection, sql, confirmed_write).await;
     }
-    run_sql_query(connector, command, limit).await
+    run_sql_query(connector, connection, command, limit, confirmed_write).await
 }
 
 async fn run_sql_query(
     connector: &dyn dbtool_core::port::Connector,
+    connection: &ConnectionItem,
     sql_text: &str,
     limit: usize,
+    confirmed_write: bool,
 ) -> Result<String> {
+    authorize_sql_statement(connection, sql_text, confirmed_write)?;
     let sql = connector
         .as_sql()
         .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
@@ -256,11 +329,12 @@ async fn run_sql_exec(
     connector: &dyn dbtool_core::port::Connector,
     connection: &ConnectionItem,
     sql_text: &str,
+    confirmed_write: bool,
 ) -> Result<String> {
+    authorize_sql_statement(connection, sql_text, confirmed_write)?;
     let sql = connector
         .as_sql()
         .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
-    SafetyGuard::check_with_target(sql_text, &safety_target(&connection.dsn), true, None)?;
     render_json(sql.execute(sql_text, &[]).await?)
 }
 
@@ -446,17 +520,106 @@ fn parse_tui_ts_point(raw: &str) -> Result<Point> {
     })
 }
 
-fn command_requires_write(command: &str) -> bool {
+fn command_requires_write(command: &str) -> Result<bool> {
+    if let Some(sql) = sql_statement_from_command(command) {
+        return sql_requires_write(sql);
+    }
+
     let command = command.trim().to_ascii_lowercase();
-    command.starts_with("exec ")
-        || command.starts_with("sql exec ")
-        || command.starts_with("kv set ")
+    Ok(command.starts_with("kv set ")
         || command.starts_with("kv del ")
         || command.starts_with("doc insert ")
         || command.starts_with("doc update ")
         || command.starts_with("doc delete ")
         || command.starts_with("search index ")
-        || command.starts_with("ts write ")
+        || command.starts_with("ts write "))
+}
+
+fn sql_statement_from_command(command: &str) -> Option<&str> {
+    let command = command.trim();
+    if command == "sql" || command == "exec" {
+        return Some("");
+    }
+    if let Some(rest) = command.strip_prefix("sql ").map(str::trim_start) {
+        if rest == "query" || rest == "exec" {
+            return Some("");
+        }
+        if let Some(sql) = rest.strip_prefix("query ").map(str::trim) {
+            return Some(sql);
+        }
+        if let Some(sql) = rest.strip_prefix("exec ").map(str::trim) {
+            return Some(sql);
+        }
+        return Some(rest);
+    }
+    command.strip_prefix("exec ").map(str::trim)
+}
+
+fn sql_requires_write(sql: &str) -> Result<bool> {
+    if sql.trim().is_empty() {
+        return Err(Error::Config("SQL command requires a statement".to_owned()));
+    }
+
+    match SafetyGuard::check(sql, true, None) {
+        Ok(StatementKind::Read) => Ok(false),
+        Ok(StatementKind::Write | StatementKind::Destructive)
+        | Err(Error::ConfirmRequired { .. }) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn authorize_tui_command(
+    connection: &ConnectionItem,
+    command: &str,
+    confirmed_write: bool,
+) -> Result<()> {
+    if command_requires_write(command)? {
+        if connection.readonly {
+            return Err(Error::ReadOnly);
+        }
+        if !confirmed_write {
+            return Err(Error::WriteNotAllowed);
+        }
+    }
+    Ok(())
+}
+
+fn authorize_sql_statement(
+    connection: &ConnectionItem,
+    sql: &str,
+    confirmed_write: bool,
+) -> Result<StatementKind> {
+    if sql.trim().is_empty() {
+        return Err(Error::Config("SQL command requires a statement".to_owned()));
+    }
+
+    let target = safety_target(&connection.dsn);
+    match SafetyGuard::check_with_target(sql, &target, true, None) {
+        Ok(StatementKind::Read) => Ok(StatementKind::Read),
+        Ok(StatementKind::Write) => {
+            if connection.readonly {
+                Err(Error::ReadOnly)
+            } else if confirmed_write {
+                Ok(StatementKind::Write)
+            } else {
+                Err(Error::WriteNotAllowed)
+            }
+        }
+        Ok(StatementKind::Destructive) => unreachable!("destructive SQL requires a token"),
+        Err(Error::ConfirmRequired {
+            confirm_token,
+            impact: _,
+        }) => {
+            if connection.readonly {
+                return Err(Error::ReadOnly);
+            }
+            if !confirmed_write {
+                return Err(Error::WriteNotAllowed);
+            }
+            SafetyGuard::check_with_target(sql, &target, true, Some(&confirm_token))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn parse_json_value(raw: &str) -> Result<Value> {
@@ -495,19 +658,34 @@ fn format_error(err: &Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
     use dbtool_registry::build_registry;
+    use std::sync::Mutex;
 
     #[test]
     fn detects_write_commands() {
-        assert!(command_requires_write("exec insert into t values (1)"));
-        assert!(command_requires_write(
-            "sql exec update users set name = 'a'"
-        ));
-        assert!(command_requires_write("kv set key value"));
-        assert!(command_requires_write("search index users {}"));
-        assert!(command_requires_write("ts write requests_total 1"));
-        assert!(!command_requires_write("sql select 1"));
-        assert!(!command_requires_write("kv get key"));
+        assert!(command_requires_write("exec insert into t values (1)").unwrap());
+        assert!(command_requires_write("sql exec update users set name = 'a'").unwrap());
+        assert!(command_requires_write("kv set key value").unwrap());
+        assert!(command_requires_write("search index users {}").unwrap());
+        assert!(command_requires_write("ts write requests_total 1").unwrap());
+        assert!(!command_requires_write("sql select 1").unwrap());
+        assert!(!command_requires_write("sql query select 1").unwrap());
+        assert!(!command_requires_write("sql exec select 1").unwrap());
+        assert!(!command_requires_write("kv get key").unwrap());
+    }
+
+    #[test]
+    fn sql_query_and_fallback_routes_classify_mutations_with_safety_guard() {
+        for statement in [
+            "delete from users where id = 1",
+            "drop table users",
+            "insert into users values (1)",
+            "update users set name = 'alice' where id = 1",
+        ] {
+            assert!(command_requires_write(&format!("sql query {statement}")).unwrap());
+            assert!(command_requires_write(&format!("sql {statement}")).unwrap());
+        }
     }
 
     #[test]
@@ -542,16 +720,150 @@ mod tests {
             readonly: false,
         };
 
-        let ping = execute_tui_command(&manager, &connection, "ping", 100)
+        let ping = execute_tui_command(&manager, &connection, "ping", 100, false)
             .await
             .unwrap();
         assert!(ping.contains("\"status\": \"ok\""));
 
-        let query = execute_tui_command(&manager, &connection, "sql select 1 as id", 100)
+        let query = execute_tui_command(&manager, &connection, "sql select 1 as id", 100, false)
             .await
             .unwrap();
         assert!(query.contains("\"id\""));
         assert!(query.contains("1"));
+    }
+
+    #[tokio::test]
+    async fn query_style_sql_mutations_require_confirmation_before_execution() {
+        let registry = Arc::new(build_registry());
+        let manager = ConnectionManager::new(registry);
+        let connection = ConnectionItem {
+            name: "sqlite".to_owned(),
+            dsn: "sqlite::memory:".to_owned(),
+            readonly: false,
+        };
+
+        execute_tui_command(
+            &manager,
+            &connection,
+            "sql query create table tui_safety (id integer primary key, name text)",
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+
+        for statement in [
+            "insert into tui_safety values (1, 'alice')",
+            "update tui_safety set name = 'bob' where id = 1",
+            "delete from tui_safety where id = 1",
+            "drop table tui_safety",
+        ] {
+            for command in [format!("sql query {statement}"), format!("sql {statement}")] {
+                assert!(matches!(
+                    execute_tui_command(&manager, &connection, &command, 100, false).await,
+                    Err(Error::WriteNotAllowed)
+                ));
+            }
+        }
+
+        execute_tui_command(
+            &manager,
+            &connection,
+            "sql query insert into tui_safety values (1, 'alice')",
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+        execute_tui_command(
+            &manager,
+            &connection,
+            "sql query update tui_safety set name = 'bob' where id = 1",
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let selected = execute_tui_command(
+            &manager,
+            &connection,
+            "sql query select name from tui_safety where id = 1",
+            100,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(selected.contains("bob"));
+
+        execute_tui_command(
+            &manager,
+            &connection,
+            "sql query delete from tui_safety where id = 1",
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+        execute_tui_command(
+            &manager,
+            &connection,
+            "sql query drop table tui_safety",
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn readonly_rejects_query_style_writes_but_allows_select() {
+        let registry = Arc::new(build_registry());
+        let manager = ConnectionManager::new(registry);
+        let writable = ConnectionItem {
+            name: "writable".to_owned(),
+            dsn: "sqlite::memory:".to_owned(),
+            readonly: false,
+        };
+        let readonly = ConnectionItem {
+            name: "readonly".to_owned(),
+            dsn: writable.dsn.clone(),
+            readonly: true,
+        };
+
+        execute_tui_command(
+            &manager,
+            &writable,
+            "sql query create table tui_readonly (id integer primary key)",
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            execute_tui_command(
+                &manager,
+                &readonly,
+                "sql query insert into tui_readonly values (1)",
+                100,
+                true,
+            )
+            .await,
+            Err(Error::ReadOnly)
+        ));
+
+        let selected = execute_tui_command(
+            &manager,
+            &readonly,
+            "sql query select count(*) as count from tui_readonly",
+            100,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(selected.contains("\"count\""));
+        assert!(selected.contains('0'));
     }
 
     #[tokio::test]
@@ -623,5 +935,149 @@ mod tests {
             vec!["exec create table tui_history (id integer primary key)"]
         );
         assert!(app.state.pending_write.is_none());
+    }
+
+    #[derive(Clone, Copy)]
+    enum RuntimeFailure {
+        None,
+        Draw,
+        Poll,
+        Read,
+    }
+
+    struct FakeRuntime {
+        failure: RuntimeFailure,
+    }
+
+    impl TuiRuntime for FakeRuntime {
+        fn draw(&mut self, _state: &AppState) -> io::Result<()> {
+            if matches!(self.failure, RuntimeFailure::Draw) {
+                Err(io::Error::other("draw failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+            if matches!(self.failure, RuntimeFailure::Poll) {
+                Err(io::Error::other("poll failed"))
+            } else {
+                Ok(true)
+            }
+        }
+
+        fn read(&mut self) -> io::Result<Event> {
+            if matches!(self.failure, RuntimeFailure::Read) {
+                Err(io::Error::other("read failed"))
+            } else {
+                Ok(Event::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::NONE,
+                )))
+            }
+        }
+    }
+
+    struct RecordingLifecycle {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl RecordingLifecycle {
+        fn record(&self, event: &'static str) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl TerminalLifecycle for RecordingLifecycle {
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.record("enable_raw");
+            Ok(())
+        }
+
+        fn enter_alternate_screen(&mut self) -> io::Result<()> {
+            self.record("enter_alternate");
+            Ok(())
+        }
+
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.record("leave_alternate");
+            Ok(())
+        }
+
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.record("disable_raw");
+            Ok(())
+        }
+    }
+
+    fn lifecycle_events() -> Arc<Mutex<Vec<&'static str>>> {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn assert_restored(events: &Arc<Mutex<Vec<&'static str>>>) {
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "enable_raw",
+                "enter_alternate",
+                "leave_alternate",
+                "disable_raw"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn draw_poll_and_read_errors_restore_terminal() {
+        for failure in [
+            RuntimeFailure::Draw,
+            RuntimeFailure::Poll,
+            RuntimeFailure::Read,
+        ] {
+            let events = lifecycle_events();
+            let mut app = App::new(Arc::new(build_registry()));
+            let result = app
+                .run_with_terminal(
+                    RecordingLifecycle {
+                        events: Arc::clone(&events),
+                    },
+                    || Ok(FakeRuntime { failure }),
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert_restored(&events);
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_error_and_normal_early_exit_restore_terminal() {
+        let creation_events = lifecycle_events();
+        let mut app = App::new(Arc::new(build_registry()));
+        let creation_result = app
+            .run_with_terminal(
+                RecordingLifecycle {
+                    events: Arc::clone(&creation_events),
+                },
+                || -> io::Result<FakeRuntime> { Err(io::Error::other("terminal init failed")) },
+            )
+            .await;
+        assert!(creation_result.is_err());
+        assert_restored(&creation_events);
+
+        let exit_events = lifecycle_events();
+        let exit_result = app
+            .run_with_terminal(
+                RecordingLifecycle {
+                    events: Arc::clone(&exit_events),
+                },
+                || {
+                    Ok(FakeRuntime {
+                        failure: RuntimeFailure::None,
+                    })
+                },
+            )
+            .await;
+        assert!(exit_result.is_ok());
+        assert_restored(&exit_events);
     }
 }

@@ -83,3 +83,33 @@ dbtool --dsn "$MONGO_DSN" --allow-write \
 嵌入式调用方可使用 `DocumentStore::drop_collection`。不支持集合生命周期的
 connector 使用 trait 默认实现，返回 `DocumentStore.drop_collection` 对应的
 `UNSUPPORTED_CAPABILITY`。
+
+## TUI 写操作与终端恢复
+
+启动：
+
+```bash
+cargo run -p dbtool-tui
+```
+
+TUI 对 SQL 命令采用语句内容分类，而不是依赖命令前缀。以下四种输入都会先交给
+同一个 `SafetyGuard`：
+
+```text
+sql query DELETE FROM users WHERE id = 42
+sql DELETE FROM users WHERE id = 42
+sql exec UPDATE users SET active = false WHERE id = 42
+exec DROP TABLE archived_users
+```
+
+处理顺序固定为：
+
+1. 解析 SQL 并区分只读、写入、破坏性语句；
+2. 如果连接配置为 `readonly = true`，在建连前拒绝所有写入；
+3. 可写连接把写命令放入一次性 pending 状态，只有当前命令按 `y` 才执行；
+4. query/fallback 和最终 adapter 调用点会再次执行安全校验，不能通过命令别名绕过；
+5. `SELECT` 即使写成 `sql exec SELECT ...` 仍按只读语句处理。
+
+终端 raw mode 与 alternate screen 由 `TerminalSession` 管理。正常退出、运行时创建
+失败、draw/poll/read 错误、提前返回和 panic unwind 都会尝试先离开 alternate
+screen、再关闭 raw mode；即使第一步恢复失败，也仍继续执行第二步。

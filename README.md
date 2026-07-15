@@ -22,7 +22,7 @@ The project is being completed core-first.
 │   ├── dbtool-core       # Domain model, ports, DSN/config, registry, services
 │   ├── dbtool-registry   # Composition root, feature-gated adapter registration
 │   ├── dbtool-cli        # Machine-friendly CLI for direct use and Claude Code skills
-│   ├── dbtool-tui        # Future interactive terminal UI
+│   ├── dbtool-tui        # Interactive terminal UI
 │   ├── adapter-sql       # MySQL/Postgres/SQLite protocol-family adapter
 │   ├── adapter-redis     # Redis-compatible key-value adapter
 │   ├── adapter-mongo     # MongoDB document adapter
@@ -427,5 +427,5 @@ Release builds compile each target once, upload raw binary artifacts, and reuse 
 - SQL Server and Cassandra/ScyllaDB adapters: implemented and registered, with service-free adapter coverage plus opt-in Docker integration profiles; Cassandra has passed local live coverage, and SQL Server has passed live coverage on GitHub Actions x86_64 runners.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume implemented behind `full`; native librdkafka backend implemented behind `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; AMQPS and NATS TLS live paths, NATS JetStream admin, and RabbitMQ management-backed queue discovery are implemented.
-- TUI: basic connection picker, capability-aware command dispatch, read limits, and write confirmation are implemented; richer forms remain future work.
+- TUI: connection picker, capability-aware forms/command dispatch, read limits, AST-based SQL write classification, readonly protection, one-shot write confirmation, history, and failure-safe terminal restoration are implemented.
 - Release packaging: GitHub Release archive, npm, pip/uv, and mise/ubi metadata are wired; signing/notarization is still future work.

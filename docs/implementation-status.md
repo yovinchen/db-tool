@@ -20,7 +20,7 @@ usable.
 | Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, observability, OpenSearch security-plugin TLS, and product-native Elasticsearch profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; live Docker jobs are manual workflow inputs. |
 | Release artifacts | Implemented | Release archives and npm/Python wrapper packages include generated bash, zsh, and fish completions plus `dbtool.1` manpage artifacts derived from the clap command metadata. |
-| TUI | Implemented | Connection picker, capability-aware command dispatch, read limits, write confirmation, command history, full-screen status, per-capability forms, and smoke tests are in place. |
+| TUI | Implemented | Connection picker, capability-aware command dispatch, read limits, AST-based SQL write classification, readonly/one-shot confirmation, command history, per-capability forms, and RAII terminal restoration are covered by smoke and failure-path tests. |
 
 ## Usable Database And Protocol Matrix
 

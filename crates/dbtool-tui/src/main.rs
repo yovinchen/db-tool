@@ -1,5 +1,6 @@
 mod app;
 mod state;
+mod terminal;
 mod ui;
 
 use app::App;
