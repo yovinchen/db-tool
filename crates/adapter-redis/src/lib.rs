@@ -2,10 +2,10 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, KeyExpiry,
-        KeyValueRestoreOutcome, KeyValueSnapshot, LagInfo, Message, MessageCursor,
-        MessagePlacement, MessageResource, MessageResourceKind, PartitionWatermark, ProduceOutcome,
-        TopicDetail, TopicInfo, Value,
+        AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
+        DeleteResourceOutcome, KeyExpiry, KeyValueRestoreOutcome, KeyValueSnapshot, LagInfo,
+        Message, MessageCursor, MessagePlacement, MessageResource, MessageResourceKind,
+        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo, Value,
     },
     port::{
         capability::{
@@ -17,7 +17,7 @@ use dbtool_core::{
 use futures::{future::BoxFuture, StreamExt};
 use redis::{
     aio::MultiplexedConnection,
-    streams::{StreamId, StreamInfoGroupsReply, StreamInfoStreamReply, StreamReadReply},
+    streams::{StreamInfoGroupsReply, StreamInfoStreamReply},
     AsyncCommands, Client,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -105,6 +105,7 @@ pub struct RedisAdapter {
     client: Client,
     conn: tokio::sync::Mutex<MultiplexedConnection>,
     kind: ConnectorKind,
+    consumer_lag_supported: bool,
 }
 
 pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
@@ -112,14 +113,17 @@ pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
         let driver_url = dsn.raw_with_scheme("redis")?;
         let client =
             Client::open(driver_url.as_str()).map_err(|e| Error::Connection(e.to_string()))?;
-        let conn = client
+        let mut conn = client
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
+        let kind = ConnectorKind(dsn.scheme);
+        let consumer_lag_supported = detect_consumer_lag_support(&kind, &mut conn).await;
         Ok(Box::new(RedisAdapter {
             client,
             conn: tokio::sync::Mutex::new(conn),
-            kind: ConnectorKind(dsn.scheme),
+            kind,
+            consumer_lag_supported,
         }) as Box<dyn Connector>)
     })
 }
@@ -141,7 +145,7 @@ impl Connector for RedisAdapter {
     }
 
     fn operations(&self) -> Vec<CapabilityOperation> {
-        redis_operations(self.capabilities())
+        redis_operations(self.capabilities(), self.consumer_lag_supported)
     }
 
     async fn ping(&self) -> Result<()> {
@@ -480,7 +484,7 @@ impl MessageConsumer for RedisAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         match parse_message_target(source)? {
             RedisMessageTarget::Stream(stream) => {
-                validate_stream_consume_options(&options)?;
+                validate_stream_consume_options(&self.kind, &options)?;
                 self.consume_stream(stream, options).await
             }
             RedisMessageTarget::PubSub(channel) => {
@@ -533,6 +537,12 @@ impl AdminInspect for RedisAdapter {
     }
 
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>> {
+        if !self.consumer_lag_supported {
+            return Err(Error::UnsupportedCapability {
+                kind: self.kind.0.clone(),
+                needed: CapabilityOperation::MessageAdminConsumerLag.as_str(),
+            });
+        }
         let streams = self.list_topics().await?;
         let mut results = Vec::new();
 
@@ -544,18 +554,14 @@ impl AdminInspect for RedisAdapter {
                 .query_async(&mut *c)
                 .await
                 .map_err(|e| Error::Query(e.to_string()))?;
-            let latest: u64 = redis::cmd("XLEN")
-                .arg(&stream.name)
-                .query_async(&mut *c)
-                .await
-                .map_err(|e| Error::Query(e.to_string()))?;
             drop(c);
 
             for g in groups.groups {
                 if g.name != group {
                     continue;
                 }
-                let (latest, committed, lag) = redis_lag_dimensions(latest, g.lag)?;
+                let (latest, committed, lag) =
+                    redis_lag_dimensions(&g.last_delivered_id, g.entries_read, g.pending, g.lag)?;
                 results.push(LagInfo {
                     topic: stream.name.clone(),
                     partition: 0,
@@ -670,7 +676,7 @@ impl RedisAdapter {
                 .map_err(|e| Error::Query(e.to_string()))?;
             placements.push(MessagePlacement {
                 partition: 0,
-                offset: redis_stream_offset(&id),
+                offset: redis_stream_offset(&id)?,
                 cursor: Some(MessageCursor::RedisStream {
                     stream: stream.to_owned(),
                     id,
@@ -706,14 +712,34 @@ impl RedisAdapter {
     }
 
     async fn consume_stream(&self, stream: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
-        if options.max == 0 {
-            return Ok(vec![]);
+        match options.identity.clone() {
+            ConsumerIdentity::Stateless => self.consume_stream_stateless(stream, options).await,
+            ConsumerIdentity::Group {
+                group,
+                member: Some(member),
+            } => {
+                self.consume_stream_group(stream, &group, &member, options)
+                    .await
+            }
+            ConsumerIdentity::Group { member: None, .. } => Err(Error::Config(
+                "Redis Stream consumer groups require an explicit consumer member".into(),
+            )),
+            ConsumerIdentity::Durable { .. } => Err(Error::UnsupportedCapability {
+                kind: self.kind.0.clone(),
+                needed: CapabilityOperation::MessageConsumeDurable.as_str(),
+            }),
         }
+    }
 
-        let offset = redis_stream_start(&options)?;
+    async fn consume_stream_stateless(
+        &self,
+        stream: &str,
+        options: ConsumeOptions,
+    ) -> Result<Vec<Message>> {
+        let offset = redis_stream_start(&self.kind, &options)?;
         let block_ms = duration_millis_usize(options.timeout)?;
         let mut c = self.conn.lock().await;
-        let reply: StreamReadReply = redis::cmd("XREAD")
+        let reply: redis::Value = redis::cmd("XREAD")
             .arg("COUNT")
             .arg(options.max)
             .arg("BLOCK")
@@ -725,13 +751,90 @@ impl RedisAdapter {
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
 
-        Ok(reply
-            .keys
+        let reply = parse_stream_read_reply(reply, stream)?;
+        let mut entries = Vec::new();
+        extend_unique_stream_entries(&mut entries, &mut HashSet::new(), reply, options.max)?;
+        entries
             .into_iter()
-            .flat_map(|key| key.ids.into_iter())
-            .take(options.max)
             .map(|entry| stream_id_to_message(stream, entry))
-            .collect())
+            .collect()
+    }
+
+    async fn consume_stream_group(
+        &self,
+        stream: &str,
+        group: &str,
+        member: &str,
+        options: ConsumeOptions,
+    ) -> Result<Vec<Message>> {
+        // The adapter deadline bounds lock wait plus Redis BLOCK time. CLI
+        // FlowControl owns the full-request deadline (including conversion and
+        // XACK); embedded callers that need the same envelope must wrap the
+        // returned future with their own request deadline.
+        let deadline = checked_deadline(options.timeout)?;
+        let mut c = self.conn.lock().await;
+        if Instant::now() >= deadline {
+            return Ok(vec![]);
+        }
+        // Do not reserve from an untrusted embedded max value before Redis has
+        // actually returned any bounded data.
+        let mut entries = Vec::new();
+        let mut seen_ids = HashSet::new();
+
+        // Redis retains unacknowledged deliveries in the PEL. Read this
+        // member's own pending entries first so `--ack none` deterministically
+        // replays them on the next bounded invocation instead of continuously
+        // claiming new work.
+        let pending = xreadgroup(&mut c, stream, group, member, options.max, "0", None).await?;
+        extend_unique_stream_entries(&mut entries, &mut seen_ids, pending, options.max)?;
+
+        if entries.len() < options.max {
+            let now = Instant::now();
+            if now < deadline {
+                let remaining = options.max - entries.len();
+                let block_ms = duration_millis_usize(deadline - now)?;
+                let fresh = xreadgroup(
+                    &mut c,
+                    stream,
+                    group,
+                    member,
+                    remaining,
+                    ">",
+                    Some(block_ms),
+                )
+                .await?;
+                extend_unique_stream_entries(&mut entries, &mut seen_ids, fresh, options.max)?;
+            }
+        }
+
+        // Convert every entry before advancing broker-owned state. Missing or
+        // unrepresentable payload/header data leaves the complete batch in the
+        // PEL for explicit recovery.
+        let messages = entries
+            .iter()
+            .cloned()
+            .map(|entry| stream_id_to_message(stream, entry))
+            .collect::<Result<Vec<_>>>()?;
+
+        if options.ack == AckMode::OnSuccess && !entries.is_empty() {
+            let mut command = redis::cmd("XACK");
+            command.arg(stream).arg(group);
+            for entry in &entries {
+                command.arg(&entry.id);
+            }
+            let acknowledged: usize = command
+                .query_async(&mut *c)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+            if acknowledged != entries.len() {
+                return Err(Error::Query(format!(
+                    "Redis acknowledged {acknowledged} of {} Stream entries for group {group:?}",
+                    entries.len()
+                )));
+            }
+        }
+
+        Ok(messages)
     }
 
     async fn consume_pubsub(&self, channel: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
@@ -812,8 +915,8 @@ impl RedisAdapter {
             config,
             watermarks: vec![PartitionWatermark {
                 partition: 0,
-                low: redis_stream_offset(&info.first_entry.id),
-                high: redis_stream_offset(&info.last_generated_id),
+                low: redis_stream_offset(&info.first_entry.id)?,
+                high: redis_stream_offset(&info.last_generated_id)?,
             }],
         })
     }
@@ -1239,16 +1342,307 @@ fn validate_raw_simple_zadd(args: &[String], command: &str) -> Result<()> {
     check_raw_item_budget(command, (args.len() - 2) / 2)
 }
 
-fn redis_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
+async fn xreadgroup(
+    connection: &mut MultiplexedConnection,
+    stream: &str,
+    group: &str,
+    member: &str,
+    count: usize,
+    start: &str,
+    block_ms: Option<usize>,
+) -> Result<Vec<RedisStreamEntry>> {
+    let mut command = redis::cmd("XREADGROUP");
+    command
+        .arg("GROUP")
+        .arg(group)
+        .arg(member)
+        .arg("COUNT")
+        .arg(count);
+    if let Some(block_ms) = block_ms {
+        command.arg("BLOCK").arg(block_ms);
+    }
+    let reply: redis::Value = command
+        .arg("STREAMS")
+        .arg(stream)
+        .arg(start)
+        .query_async(connection)
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?;
+    parse_stream_read_reply(reply, stream)
+}
+
+fn extend_unique_stream_entries(
+    entries: &mut Vec<RedisStreamEntry>,
+    seen_ids: &mut HashSet<String>,
+    reply: Vec<RedisStreamEntry>,
+    max: usize,
+) -> Result<()> {
+    for entry in reply {
+        if entries.len() == max {
+            return Err(Error::Serialization(format!(
+                "Redis Stream read exceeded the requested {max}-entry batch"
+            )));
+        }
+        if !seen_ids.insert(entry.id.clone()) {
+            return Err(Error::Serialization(
+                "Redis Stream read returned a duplicate entry ID".into(),
+            ));
+        }
+        entries.push(entry);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedisStreamEntry {
+    id: String,
+    fields: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+fn parse_stream_read_reply(
+    value: redis::Value,
+    expected_stream: &str,
+) -> Result<Vec<RedisStreamEntry>> {
+    let rows = match value {
+        redis::Value::Nil => return Ok(vec![]),
+        redis::Value::Array(rows) => rows
+            .into_iter()
+            .map(parse_stream_row_array)
+            .collect::<Result<Vec<_>>>()?,
+        redis::Value::Map(rows) => rows,
+        other => {
+            return Err(Error::Serialization(format!(
+                "Redis Stream read returned unexpected top-level {}",
+                redis_value_shape(&other)
+            )))
+        }
+    };
+
+    let mut matched = false;
+    let mut entries = Vec::new();
+    for (raw_stream, raw_entries) in rows {
+        let stream = redis_stream_raw_bytes(raw_stream, "stream name")?;
+        if stream.as_slice() != expected_stream.as_bytes() {
+            return Err(Error::Serialization(format!(
+                "Redis Stream read returned a different stream name ({} bytes returned, {} expected)",
+                stream.len(),
+                expected_stream.len()
+            )));
+        }
+        if matched {
+            return Err(Error::Serialization(
+                "Redis Stream read returned a duplicate stream row".into(),
+            ));
+        }
+        matched = true;
+        entries.extend(parse_stream_entries(raw_entries)?);
+    }
+    Ok(entries)
+}
+
+fn parse_stream_row_array(value: redis::Value) -> Result<(redis::Value, redis::Value)> {
+    match value {
+        redis::Value::Array(mut values) if values.len() == 2 => {
+            let entries = values.pop().expect("length was checked");
+            let stream = values.pop().expect("length was checked");
+            Ok((stream, entries))
+        }
+        redis::Value::Array(values) => Err(Error::Serialization(format!(
+            "Redis Stream read row must contain exactly stream and entries, got {} elements",
+            values.len()
+        ))),
+        other => Err(Error::Serialization(format!(
+            "Redis Stream read row must be an array, got {}",
+            redis_value_shape(&other)
+        ))),
+    }
+}
+
+fn parse_stream_entries(value: redis::Value) -> Result<Vec<RedisStreamEntry>> {
+    let values = match value {
+        redis::Value::Nil => return Ok(vec![]),
+        redis::Value::Array(values) => values,
+        redis::Value::Map(pairs) => pairs
+            .into_iter()
+            .map(|(id, fields)| redis::Value::Map(vec![(id, fields)]))
+            .collect(),
+        other => {
+            return Err(Error::Serialization(format!(
+                "Redis Stream entries must be an array or map, got {}",
+                redis_value_shape(&other)
+            )))
+        }
+    };
+    values.into_iter().map(parse_stream_entry).collect()
+}
+
+fn parse_stream_entry(value: redis::Value) -> Result<RedisStreamEntry> {
+    let (raw_id, raw_fields) = match value {
+        redis::Value::Array(mut values) if values.len() == 2 => {
+            let fields = values.pop().expect("length was checked");
+            let id = values.pop().expect("length was checked");
+            (id, fields)
+        }
+        redis::Value::Map(mut pairs) if pairs.len() == 1 => {
+            pairs.pop().expect("length was checked")
+        }
+        redis::Value::Array(values) => {
+            return Err(Error::Serialization(format!(
+                "Redis Stream entry must contain exactly ID and fields, got {} elements",
+                values.len()
+            )))
+        }
+        redis::Value::Map(pairs) => {
+            return Err(Error::Serialization(format!(
+                "Redis Stream entry map must contain exactly one ID, got {} entries",
+                pairs.len()
+            )))
+        }
+        other => {
+            return Err(Error::Serialization(format!(
+                "Redis Stream entry must be an ID/fields array or map, got {}",
+                redis_value_shape(&other)
+            )))
+        }
+    };
+    let id = String::from_utf8(redis_stream_raw_bytes(raw_id, "entry ID")?)
+        .map_err(|_| Error::Serialization("Redis Stream entry ID is not valid UTF-8".into()))?;
+    let fields = parse_stream_field_pairs(raw_fields)?;
+    Ok(RedisStreamEntry { id, fields })
+}
+
+fn parse_stream_field_pairs(value: redis::Value) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let pairs = match value {
+        redis::Value::Array(values) => {
+            if !values.len().is_multiple_of(2) {
+                return Err(Error::Serialization(
+                    "Redis Stream entry contains an odd number of field/value elements".into(),
+                ));
+            }
+            let mut values = values.into_iter();
+            let mut pairs = Vec::new();
+            while let Some(field) = values.next() {
+                let value = values.next().expect("even length was checked");
+                pairs.push((field, value));
+            }
+            pairs
+        }
+        redis::Value::Map(pairs) => pairs,
+        other => {
+            return Err(Error::Serialization(format!(
+                "Redis Stream entry fields must be an ordered array or map, got {}",
+                redis_value_shape(&other)
+            )))
+        }
+    };
+
+    pairs
+        .into_iter()
+        .map(|(field, value)| {
+            Ok((
+                redis_stream_raw_bytes(field, "field name")?,
+                redis_stream_raw_bytes(value, "field value")?,
+            ))
+        })
+        .collect()
+}
+
+fn redis_stream_raw_bytes(value: redis::Value, label: &str) -> Result<Vec<u8>> {
+    match value {
+        redis::Value::BulkString(bytes) => Ok(bytes),
+        redis::Value::SimpleString(value) => Ok(value.into_bytes()),
+        other => Err(Error::Serialization(format!(
+            "Redis Stream {label} must be a byte string, got {}",
+            redis_value_shape(&other)
+        ))),
+    }
+}
+
+fn redis_value_shape(value: &redis::Value) -> String {
+    match value {
+        redis::Value::Nil => "nil".to_owned(),
+        redis::Value::Int(_) => "integer".to_owned(),
+        redis::Value::BulkString(bytes) => format!("bulk string ({} bytes)", bytes.len()),
+        redis::Value::Array(values) => format!("array ({} elements)", values.len()),
+        redis::Value::SimpleString(value) => {
+            format!("simple string ({} bytes)", value.len())
+        }
+        redis::Value::Okay => "OK status".to_owned(),
+        redis::Value::Map(values) => format!("map ({} entries)", values.len()),
+        redis::Value::Attribute { attributes, .. } => {
+            format!("attribute ({} attributes)", attributes.len())
+        }
+        redis::Value::Set(values) => format!("set ({} elements)", values.len()),
+        redis::Value::Double(_) => "double".to_owned(),
+        redis::Value::Boolean(_) => "boolean".to_owned(),
+        redis::Value::VerbatimString { text, .. } => {
+            format!("verbatim string ({} bytes)", text.len())
+        }
+        redis::Value::BigNumber(_) => "big number".to_owned(),
+        redis::Value::Push { data, .. } => format!("push ({} elements)", data.len()),
+        redis::Value::ServerError(_) => "server error".to_owned(),
+    }
+}
+
+async fn detect_consumer_lag_support(
+    kind: &ConnectorKind,
+    connection: &mut MultiplexedConnection,
+) -> bool {
+    if kind.0 == "keydb" {
+        return false;
+    }
+    let Ok(info) = redis::cmd("INFO")
+        .arg("server")
+        .query_async::<String>(connection)
+        .await
+    else {
+        return false;
+    };
+    redis_info_supports_consumer_lag(kind, &info)
+}
+
+fn redis_info_supports_consumer_lag(kind: &ConnectorKind, info: &str) -> bool {
+    kind.0 != "keydb" && redis_protocol_major(info).is_some_and(|major| major >= 7)
+}
+
+fn redis_protocol_major(info: &str) -> Option<u64> {
+    let mut versions = info.lines().filter_map(|line| {
+        line.strip_suffix('\r')
+            .unwrap_or(line)
+            .strip_prefix("redis_version:")
+    });
+    let version = versions.next()?;
+    if versions.next().is_some() || version.trim() != version {
+        return None;
+    }
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(major)
+}
+
+fn redis_operations(
+    capabilities: Capabilities,
+    consumer_lag_supported: bool,
+) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
         CapabilityOperation::KeyValueGetWithExpiry,
         CapabilityOperation::KeyValueRestoreWithExpiry,
+        CapabilityOperation::MessageConsumeGroup,
+        CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminTopicDetail,
-        CapabilityOperation::MessageAdminConsumerLag,
         CapabilityOperation::MessageAdminDelete,
     ]);
+    if consumer_lag_supported {
+        operations.push(CapabilityOperation::MessageAdminConsumerLag);
+    }
     operations
 }
 
@@ -1270,28 +1664,45 @@ fn validate_redis_delete_request(
     validate_redis_name("stream", &resource.name)
 }
 
-fn redis_lag_dimensions(latest: u64, lag: Option<usize>) -> Result<(i64, i64, i64)> {
-    let lag = lag.ok_or_else(|| {
-        Error::Query(
-            "Redis server did not report consumer-group lag; pending is not a lag substitute"
-                .into(),
-        )
-    })?;
-    let lag = u64::try_from(lag)
-        .map_err(|_| Error::Serialization("Redis consumer-group lag exceeds u64".into()))?;
-    let committed = latest.checked_sub(lag).ok_or_else(|| {
+fn redis_lag_dimensions(
+    last_delivered_id: &str,
+    entries_read: Option<usize>,
+    pending: usize,
+    server_lag: Option<usize>,
+) -> Result<(i64, i64, i64)> {
+    let entries_read = match entries_read {
+        Some(entries_read) => entries_read,
+        None if last_delivered_id == "0-0" => 0,
+        None => {
+            return Err(Error::Query(
+                "Redis server did not report consumer-group entries-read after delivery began"
+                    .into(),
+            ))
+        }
+    };
+    let server_lag = server_lag
+        .ok_or_else(|| Error::Query("Redis server did not report consumer-group lag".into()))?;
+    let committed = entries_read.checked_sub(pending).ok_or_else(|| {
         Error::Serialization(format!(
-            "Redis consumer-group lag {lag} exceeds stream length {latest}"
+            "Redis consumer-group pending count {pending} exceeds entries-read {entries_read}"
         ))
+    })?;
+    let latest = entries_read.checked_add(server_lag).ok_or_else(|| {
+        Error::Serialization("Redis consumer-group logical latest count overflow".into())
+    })?;
+    let lag = pending.checked_add(server_lag).ok_or_else(|| {
+        Error::Serialization("Redis consumer-group outstanding lag overflow".into())
     })?;
 
     Ok((
-        i64::try_from(latest)
-            .map_err(|_| Error::Serialization("Redis stream length exceeds i64".into()))?,
+        i64::try_from(latest).map_err(|_| {
+            Error::Serialization("Redis consumer-group logical latest count exceeds i64".into())
+        })?,
         i64::try_from(committed)
             .map_err(|_| Error::Serialization("Redis committed count exceeds i64".into()))?,
-        i64::try_from(lag)
-            .map_err(|_| Error::Serialization("Redis consumer-group lag exceeds i64".into()))?,
+        i64::try_from(lag).map_err(|_| {
+            Error::Serialization("Redis consumer-group outstanding lag exceeds i64".into())
+        })?,
     ))
 }
 
@@ -1342,6 +1753,11 @@ fn validate_stream_produce_message(message: &Message) -> Result<()> {
             "Redis Stream producer does not accept consumer cursor or delivery metadata".into(),
         ));
     }
+    if message.headers.contains_key("redis_stream_id") {
+        return Err(Error::Config(
+            "Redis Stream producer reserves the redis_stream_id header for native identity".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1380,13 +1796,11 @@ fn validate_pubsub_produce_message(message: &Message) -> Result<()> {
     Ok(())
 }
 
-fn validate_stream_consume_options(options: &ConsumeOptions) -> Result<()> {
+fn validate_stream_consume_options(kind: &ConnectorKind, options: &ConsumeOptions) -> Result<()> {
+    options
+        .validate()
+        .map_err(|message| Error::Config(format!("Redis Stream consume: {message}")))?;
     validate_stream_partition(options.partition, "consumer")?;
-    if options.offset.is_some_and(|offset| offset < 0) {
-        return Err(Error::Config(
-            "Redis Stream consumer offset must be greater than or equal to zero".into(),
-        ));
-    }
     match &options.cursor {
         None => {}
         Some(cursor @ ConsumeCursor::RedisStream { .. }) => {
@@ -1404,11 +1818,31 @@ fn validate_stream_consume_options(options: &ConsumeOptions) -> Result<()> {
             )))
         }
     }
+    match (&options.identity, options.ack) {
+        (ConsumerIdentity::Stateless, AckMode::None) => {}
+        (ConsumerIdentity::Stateless, AckMode::OnSuccess) => {
+            return Err(Error::Config(
+                "Redis Stream --ack on-success requires a consumer group".into(),
+            ))
+        }
+        (ConsumerIdentity::Group { member: None, .. }, _) => {
+            return Err(Error::Config(
+                "Redis Stream consumer groups require an explicit consumer member".into(),
+            ))
+        }
+        (ConsumerIdentity::Group { .. }, _) => {}
+        (ConsumerIdentity::Durable { .. }, _) => {
+            return Err(Error::UnsupportedCapability {
+                kind: kind.0.clone(),
+                needed: CapabilityOperation::MessageConsumeDurable.as_str(),
+            })
+        }
+    }
     Ok(())
 }
 
-fn redis_stream_start(options: &ConsumeOptions) -> Result<String> {
-    validate_stream_consume_options(options)?;
+fn redis_stream_start(kind: &ConnectorKind, options: &ConsumeOptions) -> Result<String> {
+    validate_stream_consume_options(kind, options)?;
     Ok(match &options.cursor {
         Some(ConsumeCursor::RedisStream { id }) => redis_stream_predecessor(id)?,
         Some(_) => unreachable!("cursor kind was validated"),
@@ -1442,6 +1876,19 @@ fn redis_stream_predecessor(id: &str) -> Result<String> {
 }
 
 fn validate_pubsub_consume_options(options: &ConsumeOptions) -> Result<()> {
+    options
+        .validate()
+        .map_err(|message| Error::Config(format!("Redis PubSub consume: {message}")))?;
+    if options.identity.is_stateful() {
+        return Err(Error::Config(
+            "Redis PubSub consumer does not support group or durable identities".into(),
+        ));
+    }
+    if options.ack == AckMode::OnSuccess {
+        return Err(Error::Config(
+            "Redis PubSub consumer does not support acknowledgement".into(),
+        ));
+    }
     if options.partition.is_some() {
         return Err(Error::Config(
             "Redis PubSub consumer does not support partitions".into(),
@@ -1469,51 +1916,104 @@ fn validate_stream_partition(partition: Option<i32>, operation: &str) -> Result<
     Ok(())
 }
 
-fn stream_id_to_message(stream: &str, entry: StreamId) -> Message {
-    let payload = entry.get::<Vec<u8>>("payload").unwrap_or_default();
-    let key = entry.get::<Vec<u8>>("key").map(bytes::Bytes::from);
-    let mut headers = HashMap::from([("redis_stream_id".to_owned(), entry.id.clone())]);
+fn stream_id_to_message(stream: &str, entry: RedisStreamEntry) -> Result<Message> {
+    let RedisStreamEntry { id, fields } = entry;
+    ConsumeCursor::RedisStream { id: id.clone() }
+        .validate()
+        .map_err(|message| {
+            Error::Serialization(format!("invalid Redis Stream entry ID: {message}"))
+        })?;
+    let mut payload = None;
+    let mut key = None;
+    let mut headers = HashMap::from([("redis_stream_id".to_owned(), id.clone())]);
 
-    for (field, value) in entry.map {
-        if let Some(header) = field.strip_prefix("h:") {
-            headers.insert(header.to_owned(), redis_field_to_string(&value));
+    for (field, value) in fields {
+        if field == b"payload" {
+            if payload.replace(value).is_some() {
+                return Err(Error::Serialization(
+                    "Redis Stream entry contains duplicate payload fields".into(),
+                ));
+            }
+            continue;
+        }
+        if field == b"key" {
+            if key.replace(bytes::Bytes::from(value)).is_some() {
+                return Err(Error::Serialization(
+                    "Redis Stream entry contains duplicate key fields".into(),
+                ));
+            }
+            continue;
+        }
+        let Some(raw_header) = field.strip_prefix(b"h:") else {
+            return Err(Error::Serialization(format!(
+                "Redis Stream entry contains an unsupported field name ({} bytes)",
+                field.len()
+            )));
+        };
+        let header = String::from_utf8(raw_header.to_vec()).map_err(|_| {
+            Error::Serialization("Redis Stream entry contains a non-UTF-8 header name".into())
+        })?;
+        if header == "redis_stream_id" {
+            return Err(Error::Serialization(
+                "Redis Stream entry contains reserved header redis_stream_id".into(),
+            ));
+        }
+        let header_value = String::from_utf8(value).map_err(|_| {
+            Error::Serialization(format!(
+                "Redis Stream entry header value is not valid UTF-8 (header name {} bytes)",
+                header.len()
+            ))
+        })?;
+        if headers.insert(header.clone(), header_value).is_some() {
+            return Err(Error::Serialization(format!(
+                "Redis Stream entry contains a duplicate header ({}-byte name)",
+                header.len()
+            )));
         }
     }
+    let payload = payload.ok_or_else(|| {
+        Error::Serialization("Redis Stream entry is missing the payload field".into())
+    })?;
 
-    Message {
+    let offset = redis_stream_legacy_offset(&id)?;
+    Ok(Message {
         key,
         payload: payload.into(),
         headers,
         partition: Some(0),
-        offset: Some(redis_stream_offset(&entry.id)),
-        timestamp: redis_stream_timestamp(&entry.id),
+        offset,
+        timestamp: offset.filter(|value| *value > 0),
         cursor: Some(MessageCursor::RedisStream {
             stream: stream.to_owned(),
-            id: entry.id,
+            id,
         }),
         metadata: None,
-    }
+    })
 }
 
-fn redis_field_to_string(value: &redis::Value) -> String {
-    match value {
-        redis::Value::BulkString(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        redis::Value::SimpleString(value) => value.clone(),
-        redis::Value::Int(value) => value.to_string(),
-        other => format!("{other:?}"),
-    }
+fn redis_stream_id_millis(id: &str) -> Result<u64> {
+    let (millis, sequence) = id.split_once('-').ok_or_else(|| {
+        Error::Serialization("Redis Stream ID must contain milliseconds and sequence".into())
+    })?;
+    let millis = millis.parse::<u64>().map_err(|_| {
+        Error::Serialization("Redis Stream ID contains invalid milliseconds".into())
+    })?;
+    sequence
+        .parse::<u64>()
+        .map_err(|_| Error::Serialization("Redis Stream ID contains an invalid sequence".into()))?;
+    Ok(millis)
 }
 
-fn redis_stream_offset(id: &str) -> i64 {
-    id.split_once('-')
-        .map(|(millis, _)| millis)
-        .unwrap_or(id)
-        .parse()
-        .unwrap_or_default()
+fn redis_stream_legacy_offset(id: &str) -> Result<Option<i64>> {
+    redis_stream_id_millis(id).map(|millis| i64::try_from(millis).ok())
 }
 
-fn redis_stream_timestamp(id: &str) -> Option<i64> {
-    Some(redis_stream_offset(id)).filter(|value| *value > 0)
+fn redis_stream_offset(id: &str) -> Result<i64> {
+    redis_stream_legacy_offset(id)?.ok_or_else(|| {
+        Error::Serialization(
+            "Redis Stream ID milliseconds exceed the required i64 metadata range".into(),
+        )
+    })
 }
 
 fn duration_millis_usize(duration: std::time::Duration) -> Result<usize> {
@@ -1647,6 +2147,30 @@ mod tests {
             cursor: None,
             metadata: None,
         }
+    }
+
+    fn redis_kind() -> ConnectorKind {
+        ConnectorKind("redis".to_owned())
+    }
+
+    fn stream_entry(id: &str, fields: &[(&[u8], &[u8])]) -> RedisStreamEntry {
+        RedisStreamEntry {
+            id: id.to_owned(),
+            fields: fields
+                .iter()
+                .map(|(field, value)| (field.to_vec(), value.to_vec()))
+                .collect(),
+        }
+    }
+
+    fn resp2_stream_reply(stream: &str, id: &str, fields: Vec<redis::Value>) -> redis::Value {
+        redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(stream.as_bytes().to_vec()),
+            redis::Value::Array(vec![redis::Value::Array(vec![
+                redis::Value::BulkString(id.as_bytes().to_vec()),
+                redis::Value::Array(fields),
+            ])]),
+        ])])
     }
 
     #[test]
@@ -1910,6 +2434,282 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn redis_live_stream_groups_replay_ack_and_report_complete_lag() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("dbtool_it_stream_group_{suffix}");
+        let group = format!("dbtool_it_group_{suffix}");
+        let member = format!("worker-{suffix}");
+
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let driver_url = dsn.raw_with_scheme("redis").unwrap();
+        let client = Client::open(driver_url.as_str()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&stream)
+            .query_async::<u64>(&mut direct)
+            .await
+            .unwrap();
+
+        let connector = factory(dsn).await.unwrap();
+        let operations = connector.operations();
+        assert!(operations.contains(&CapabilityOperation::MessageConsumeGroup));
+        assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
+        assert!(!operations.contains(&CapabilityOperation::MessageConsumeDurable));
+        let lag_supported = operations.contains(&CapabilityOperation::MessageAdminConsumerLag);
+
+        let producer = connector.as_producer().unwrap();
+        let fixtures = [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]
+            .into_iter()
+            .map(|payload| Message {
+                payload: bytes::Bytes::copy_from_slice(payload),
+                ..message()
+            })
+            .collect();
+        assert_eq!(
+            producer.produce(&stream, fixtures).await.unwrap().produced,
+            3
+        );
+        redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&stream)
+            .arg(&group)
+            .arg("0")
+            .query_async::<()>(&mut direct)
+            .await
+            .unwrap();
+
+        let consume_options = |group: &str, member: Option<&str>, ack, max| ConsumeOptions {
+            max,
+            timeout: std::time::Duration::from_secs(2),
+            partition: None,
+            offset: None,
+            cursor: None,
+            identity: ConsumerIdentity::Group {
+                group: group.to_owned(),
+                member: member.map(str::to_owned),
+            },
+            ack,
+        };
+        let message_ids = |messages: &[Message]| {
+            messages
+                .iter()
+                .map(|message| match message.cursor.as_ref().unwrap() {
+                    MessageCursor::RedisStream { stream: owner, id } => {
+                        assert_eq!(owner, &stream);
+                        id.clone()
+                    }
+                    cursor => panic!("unexpected Redis cursor {cursor:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let consumer = connector.as_consumer().unwrap();
+        let admin = connector.as_admin().unwrap();
+        if lag_supported {
+            let initial_lag = admin.consumer_lag(&group).await.unwrap();
+            assert_eq!(initial_lag.len(), 1);
+            assert_eq!(
+                (
+                    initial_lag[0].latest,
+                    initial_lag[0].committed,
+                    initial_lag[0].lag,
+                ),
+                (3, 0, 3)
+            );
+        } else {
+            assert!(matches!(
+                admin.consumer_lag(&group).await,
+                Err(Error::UnsupportedCapability { needed, .. })
+                    if needed == CapabilityOperation::MessageAdminConsumerLag.as_str()
+            ));
+        }
+
+        let missing_group = format!("{group}_missing");
+        let error = consumer
+            .consume(
+                &stream,
+                consume_options(&missing_group, Some(&member), AckMode::None, 1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Query(message) if message.contains("NOGROUP")));
+        let groups: StreamInfoGroupsReply = redis::cmd("XINFO")
+            .arg("GROUPS")
+            .arg(&stream)
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(
+            groups.groups.len(),
+            1,
+            "consume must not create missing groups"
+        );
+
+        assert!(matches!(
+            consumer
+                .consume(
+                    &stream,
+                    consume_options(&group, None, AckMode::None, 1),
+                )
+                .await,
+            Err(Error::Config(message)) if message.contains("explicit consumer member")
+        ));
+
+        let first = consumer
+            .consume(
+                &stream,
+                consume_options(&group, Some(&member), AckMode::None, 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            first
+                .iter()
+                .map(|message| message.payload.as_ref())
+                .collect::<Vec<_>>(),
+            [b"one".as_slice(), b"two".as_slice()]
+        );
+        let first_ids = message_ids(&first);
+
+        let replayed = consumer
+            .consume(
+                &stream,
+                consume_options(&group, Some(&member), AckMode::None, 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(message_ids(&replayed), first_ids);
+
+        if lag_supported {
+            let lag = admin.consumer_lag(&group).await.unwrap();
+            assert_eq!(lag.len(), 1);
+            assert_eq!((lag[0].latest, lag[0].committed, lag[0].lag), (3, 0, 3));
+        }
+
+        let acknowledged = consumer
+            .consume(
+                &stream,
+                consume_options(&group, Some(&member), AckMode::OnSuccess, 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(message_ids(&acknowledged), first_ids);
+        if lag_supported {
+            let lag = admin.consumer_lag(&group).await.unwrap();
+            assert_eq!((lag[0].latest, lag[0].committed, lag[0].lag), (3, 2, 1));
+        }
+
+        let final_message = consumer
+            .consume(
+                &stream,
+                consume_options(&group, Some(&member), AckMode::OnSuccess, 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(final_message.len(), 1);
+        assert_eq!(final_message[0].payload.as_ref(), b"three");
+        if lag_supported {
+            let lag = admin.consumer_lag(&group).await.unwrap();
+            assert_eq!((lag[0].latest, lag[0].committed, lag[0].lag), (3, 3, 0));
+        }
+
+        let boundary_id = format!("{}-0", i64::MAX as u64 + 1);
+        let stored_boundary_id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg(&boundary_id)
+            .arg("payload")
+            .arg("boundary")
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(stored_boundary_id, boundary_id);
+        let boundary_message = consumer
+            .consume(
+                &stream,
+                consume_options(&group, Some(&member), AckMode::OnSuccess, 1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(boundary_message.len(), 1);
+        assert_eq!(boundary_message[0].payload.as_ref(), b"boundary");
+        assert_eq!(boundary_message[0].offset, None);
+        assert_eq!(boundary_message[0].timestamp, None);
+        assert_eq!(
+            boundary_message[0].cursor,
+            Some(MessageCursor::RedisStream {
+                stream: stream.clone(),
+                id: boundary_id,
+            })
+        );
+
+        let malformed_id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("payload")
+            .arg("first")
+            .arg("payload")
+            .arg("second")
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        let result = consumer
+            .consume(
+                &stream,
+                consume_options(&group, Some(&member), AckMode::OnSuccess, 1),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::Serialization(message)) if message.contains("duplicate payload")
+        ));
+        let pending: redis::streams::StreamPendingCountReply = redis::cmd("XPENDING")
+            .arg(&stream)
+            .arg(&group)
+            .arg(&malformed_id)
+            .arg(&malformed_id)
+            .arg(1)
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.ids.len(),
+            1,
+            "failed conversion must not XACK the entry"
+        );
+        if lag_supported {
+            let lag = admin.consumer_lag(&group).await.unwrap();
+            assert_eq!((lag[0].latest, lag[0].committed, lag[0].lag), (5, 4, 1));
+        }
+
+        let outcome = connector
+            .as_admin_mutate()
+            .unwrap()
+            .delete_resource(
+                MessageResource {
+                    kind: MessageResourceKind::RedisStream,
+                    name: stream.clone(),
+                },
+                DeleteResourceOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.acknowledged && outcome.verified_absent);
+        assert_eq!(outcome.messages_before, Some(5));
+        let resource_type: String = redis::cmd("TYPE")
+            .arg(&stream)
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(resource_type, "none");
+    }
+
     #[test]
     fn scan_collector_deduplicates_across_pages_and_stops_at_zero() {
         let mut collector = ScanCollector::new(4).unwrap();
@@ -2127,27 +2927,25 @@ mod tests {
 
     #[test]
     fn redis_stream_ids_map_to_offsets_and_timestamps() {
-        assert_eq!(redis_stream_offset("1710000000000-3"), 1_710_000_000_000);
         assert_eq!(
-            redis_stream_timestamp("1710000000000-3"),
-            Some(1_710_000_000_000)
+            redis_stream_offset("1710000000000-3").unwrap(),
+            1_710_000_000_000
         );
-        assert_eq!(redis_stream_offset("bad-id"), 0);
-        assert_eq!(redis_stream_timestamp("bad-id"), None);
+        assert_eq!(
+            redis_stream_legacy_offset("9223372036854775808-0").unwrap(),
+            None
+        );
+        assert!(redis_stream_offset("9223372036854775808-0").is_err());
+        assert!(redis_stream_offset("bad-id").is_err());
     }
 
     #[test]
     fn redis_stream_messages_keep_the_full_native_id() {
         let message = stream_id_to_message(
             "orders",
-            StreamId {
-                id: "1710000000000-42".to_owned(),
-                map: HashMap::from([(
-                    "payload".to_owned(),
-                    redis::Value::BulkString(b"payload".to_vec()),
-                )]),
-            },
-        );
+            stream_entry("1710000000000-42", &[(b"payload", b"payload")]),
+        )
+        .unwrap();
 
         assert_eq!(message.offset, Some(1_710_000_000_000));
         assert_eq!(
@@ -2157,6 +2955,222 @@ mod tests {
                 id: "1710000000000-42".to_owned(),
             })
         );
+
+        let boundary = stream_id_to_message(
+            "orders",
+            stream_entry("9223372036854775808-7", &[(b"payload", b"boundary")]),
+        )
+        .unwrap();
+        assert_eq!(boundary.offset, None);
+        assert_eq!(boundary.timestamp, None);
+        assert_eq!(
+            boundary.cursor,
+            Some(MessageCursor::RedisStream {
+                stream: "orders".to_owned(),
+                id: "9223372036854775808-7".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn redis_stream_conversion_is_lossless_or_fails_closed() {
+        let valid = stream_id_to_message(
+            "orders",
+            RedisStreamEntry {
+                id: "1710000000000-1".to_owned(),
+                fields: vec![
+                    (b"payload".to_vec(), vec![0, 0xff]),
+                    (b"key".to_vec(), vec![0xfe, 1]),
+                    (b"h:trace".to_vec(), b"abc".to_vec()),
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(valid.payload.as_ref(), &[0, 0xff]);
+        assert_eq!(valid.key.as_deref(), Some(&[0xfe, 1][..]));
+        assert_eq!(valid.headers.get("trace").map(String::as_str), Some("abc"));
+
+        let invalid = |fields| {
+            stream_id_to_message(
+                "orders",
+                RedisStreamEntry {
+                    id: "1710000000000-2".to_owned(),
+                    fields,
+                },
+            )
+        };
+        assert!(matches!(
+            invalid(vec![]),
+            Err(Error::Serialization(message)) if message.contains("missing the payload")
+        ));
+        assert!(matches!(
+            invalid(vec![
+                (b"payload".to_vec(), b"ok".to_vec()),
+                (b"h:trace".to_vec(), vec![0xff]),
+            ]),
+            Err(Error::Serialization(message)) if message.contains("not valid UTF-8")
+        ));
+        assert!(matches!(
+            invalid(vec![
+                (b"payload".to_vec(), b"ok".to_vec()),
+                (b"unknown".to_vec(), b"lost".to_vec()),
+            ]),
+            Err(Error::Serialization(message)) if message.contains("unsupported field")
+        ));
+        assert!(matches!(
+            invalid(vec![
+                (b"payload".to_vec(), b"ok".to_vec()),
+                (b"h:redis_stream_id".to_vec(), b"spoofed".to_vec()),
+            ]),
+            Err(Error::Serialization(message)) if message.contains("reserved header")
+        ));
+    }
+
+    #[test]
+    fn raw_stream_reply_retains_and_rejects_duplicate_fields() {
+        let duplicate_payload = parse_stream_read_reply(
+            resp2_stream_reply(
+                "orders",
+                "1710000000000-3",
+                vec![
+                    redis::Value::BulkString(b"payload".to_vec()),
+                    redis::Value::BulkString(b"one".to_vec()),
+                    redis::Value::BulkString(b"payload".to_vec()),
+                    redis::Value::BulkString(b"two".to_vec()),
+                ],
+            ),
+            "orders",
+        )
+        .unwrap();
+        assert_eq!(duplicate_payload[0].fields.len(), 2);
+        assert!(matches!(
+            stream_id_to_message("orders", duplicate_payload.into_iter().next().unwrap()),
+            Err(Error::Serialization(message)) if message.contains("duplicate payload")
+        ));
+
+        let duplicate_header = parse_stream_read_reply(
+            resp2_stream_reply(
+                "orders",
+                "1710000000000-4",
+                vec![
+                    redis::Value::BulkString(b"payload".to_vec()),
+                    redis::Value::BulkString(b"ok".to_vec()),
+                    redis::Value::BulkString(b"h:trace".to_vec()),
+                    redis::Value::BulkString(b"one".to_vec()),
+                    redis::Value::BulkString(b"h:trace".to_vec()),
+                    redis::Value::BulkString(b"two".to_vec()),
+                ],
+            ),
+            "orders",
+        )
+        .unwrap();
+        assert!(matches!(
+            stream_id_to_message("orders", duplicate_header.into_iter().next().unwrap()),
+            Err(Error::Serialization(message)) if message.contains("duplicate header")
+        ));
+
+        let duplicate_key = stream_entry(
+            "1710000000000-5",
+            &[(b"payload", b"ok"), (b"key", b"one"), (b"key", b"two")],
+        );
+        assert!(matches!(
+            stream_id_to_message("orders", duplicate_key),
+            Err(Error::Serialization(message)) if message.contains("duplicate key")
+        ));
+
+        let resp3 = redis::Value::Map(vec![(
+            redis::Value::BulkString(b"orders".to_vec()),
+            redis::Value::Array(vec![redis::Value::Map(vec![(
+                redis::Value::BulkString(b"1710000000000-6".to_vec()),
+                redis::Value::Map(vec![(
+                    redis::Value::BulkString(b"payload".to_vec()),
+                    redis::Value::BulkString(b"resp3".to_vec()),
+                )]),
+            )])]),
+        )]);
+        let parsed = parse_stream_read_reply(resp3, "orders").unwrap();
+        assert_eq!(
+            stream_id_to_message("orders", parsed.into_iter().next().unwrap())
+                .unwrap()
+                .payload
+                .as_ref(),
+            b"resp3"
+        );
+    }
+
+    #[test]
+    fn raw_stream_parser_errors_redact_values_and_duplicate_ids_fail_closed() {
+        const MARKER: &[u8] = b"DBTOOL_STREAM_SECRET_MARKER";
+        let top_level =
+            parse_stream_read_reply(redis::Value::BulkString(MARKER.to_vec()), "orders")
+                .unwrap_err()
+                .to_string();
+        assert!(!top_level.contains("DBTOOL_STREAM_SECRET_MARKER"));
+
+        let wrong_stream = parse_stream_read_reply(
+            resp2_stream_reply(
+                std::str::from_utf8(MARKER).unwrap(),
+                "1710000000000-6",
+                vec![
+                    redis::Value::BulkString(b"payload".to_vec()),
+                    redis::Value::BulkString(b"ok".to_vec()),
+                ],
+            ),
+            "orders",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!wrong_stream.contains("DBTOOL_STREAM_SECRET_MARKER"));
+
+        let unknown = stream_id_to_message(
+            "orders",
+            RedisStreamEntry {
+                id: "1710000000000-7".to_owned(),
+                fields: vec![
+                    (b"payload".to_vec(), b"ok".to_vec()),
+                    (MARKER.to_vec(), MARKER.to_vec()),
+                ],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!unknown.contains("DBTOOL_STREAM_SECRET_MARKER"));
+
+        let duplicate = stream_entry("1710000000000-8", &[(b"payload", b"ok")]);
+        let mut entries = Vec::new();
+        let mut ids = HashSet::new();
+        extend_unique_stream_entries(&mut entries, &mut ids, vec![duplicate.clone()], 2).unwrap();
+        assert!(matches!(
+            extend_unique_stream_entries(&mut entries, &mut ids, vec![duplicate], 2),
+            Err(Error::Serialization(message)) if message.contains("duplicate entry ID")
+        ));
+    }
+
+    #[test]
+    fn redis_server_version_gates_group_lag_capability() {
+        assert_eq!(
+            redis_protocol_major("# Server\r\nredis_version:7.4.9\r\n"),
+            Some(7)
+        );
+        assert_eq!(redis_protocol_major("redis_version:7.0.0-rc1\n"), Some(7));
+        assert_eq!(redis_protocol_major("redis_version:6.3.4\n"), Some(6));
+        assert_eq!(redis_protocol_major("redis_version:invalid\n"), None);
+        assert_eq!(
+            redis_protocol_major("redis_version:7.4.9\nredis_version:7.4.9\n"),
+            None
+        );
+        assert!(redis_info_supports_consumer_lag(
+            &ConnectorKind("redis".into()),
+            "redis_version:7.4.9\n"
+        ));
+        assert!(!redis_info_supports_consumer_lag(
+            &ConnectorKind("redis".into()),
+            "redis_version:6.2.14\n"
+        ));
+        assert!(!redis_info_supports_consumer_lag(
+            &ConnectorKind("keydb".into()),
+            "redis_version:7.4.9\n"
+        ));
     }
 
     #[test]
@@ -2167,7 +3181,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(redis_stream_start(&options).unwrap(), "1710000000000-41");
+        assert_eq!(
+            redis_stream_start(&redis_kind(), &options).unwrap(),
+            "1710000000000-41"
+        );
         assert_eq!(
             redis_stream_predecessor("1710000000000-0").unwrap(),
             format!("1709999999999-{}", u64::MAX)
@@ -2181,7 +3198,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            redis_stream_start(&conflict),
+            redis_stream_start(&redis_kind(), &conflict),
             Err(Error::Config(message)) if message.contains("cannot be combined")
         ));
     }
@@ -2285,18 +3302,78 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(validate_stream_consume_options(&options(None)).is_ok());
-        assert!(validate_stream_consume_options(&options(Some(0))).is_ok());
+        assert!(validate_stream_consume_options(&redis_kind(), &options(None)).is_ok());
+        assert!(validate_stream_consume_options(&redis_kind(), &options(Some(0))).is_ok());
         assert!(matches!(
-            validate_stream_consume_options(&options(Some(1))),
+            validate_stream_consume_options(&redis_kind(), &options(Some(1))),
             Err(Error::Config(message)) if message.contains("partition 0")
         ));
 
         let mut negative_offset = options(Some(0));
         negative_offset.offset = Some(-1);
         assert!(matches!(
-            validate_stream_consume_options(&negative_offset),
-            Err(Error::Config(message)) if message.contains("greater than or equal to zero")
+            validate_stream_consume_options(&redis_kind(), &negative_offset),
+            Err(Error::Config(message)) if message.contains("non-negative")
+        ));
+    }
+
+    #[test]
+    fn redis_stream_groups_require_members_and_ack_requires_a_group() {
+        let mut options = ConsumeOptions {
+            identity: ConsumerIdentity::Group {
+                group: "workers".to_owned(),
+                member: None,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_stream_consume_options(&redis_kind(), &options),
+            Err(Error::Config(message)) if message.contains("explicit consumer member")
+        ));
+
+        options.identity = ConsumerIdentity::Group {
+            group: "workers".to_owned(),
+            member: Some("worker-1".to_owned()),
+        };
+        assert!(validate_stream_consume_options(&redis_kind(), &options).is_ok());
+        options.ack = AckMode::OnSuccess;
+        assert!(validate_stream_consume_options(&redis_kind(), &options).is_ok());
+
+        options.identity = ConsumerIdentity::Stateless;
+        assert!(matches!(
+            validate_stream_consume_options(&redis_kind(), &options),
+            Err(Error::Config(message)) if message.contains("requires a consumer group")
+        ));
+
+        options.identity = ConsumerIdentity::Durable {
+            name: "durable".to_owned(),
+        };
+        assert!(matches!(
+            validate_stream_consume_options(&ConnectorKind("valkey".into()), &options),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == CapabilityOperation::MessageConsumeDurable.as_str()
+        ));
+    }
+
+    #[test]
+    fn redis_pubsub_rejects_stateful_identity_and_acknowledgement() {
+        let mut options = ConsumeOptions {
+            identity: ConsumerIdentity::Group {
+                group: "workers".to_owned(),
+                member: Some("worker-1".to_owned()),
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_pubsub_consume_options(&options),
+            Err(Error::Config(message)) if message.contains("group or durable")
+        ));
+
+        options.identity = ConsumerIdentity::Stateless;
+        options.ack = AckMode::OnSuccess;
+        assert!(matches!(
+            validate_pubsub_consume_options(&options),
+            Err(Error::Config(message)) if message.contains("acknowledgement")
         ));
     }
 
@@ -2319,17 +3396,20 @@ mod tests {
 
     #[test]
     fn redis_declares_complete_real_admin_profile() {
-        let operations = redis_operations(Capabilities {
+        let capabilities = Capabilities {
             key_value: true,
             producer: true,
             consumer: true,
             admin: true,
             ..Default::default()
-        });
+        };
+        let operations = redis_operations(capabilities, true);
 
         for operation in [
             CapabilityOperation::KeyValueGetWithExpiry,
             CapabilityOperation::KeyValueRestoreWithExpiry,
+            CapabilityOperation::MessageConsumeGroup,
+            CapabilityOperation::MessageConsumeAck,
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminTopicDetail,
             CapabilityOperation::MessageAdminConsumerLag,
@@ -2340,6 +3420,11 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::KeyValueGet));
         assert!(operations.contains(&CapabilityOperation::MessageProduce));
         assert!(operations.contains(&CapabilityOperation::MessageConsume));
+
+        let keydb_operations = redis_operations(capabilities, false);
+        assert!(keydb_operations.contains(&CapabilityOperation::MessageConsumeGroup));
+        assert!(keydb_operations.contains(&CapabilityOperation::MessageConsumeAck));
+        assert!(!keydb_operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
     }
 
     #[test]
@@ -2371,15 +3456,26 @@ mod tests {
     }
 
     #[test]
-    fn redis_lag_uses_server_lag_and_count_dimensions_only() {
-        assert_eq!(redis_lag_dimensions(10, Some(3)).unwrap(), (10, 7, 3));
+    fn redis_lag_includes_pending_and_undelivered_work() {
+        assert_eq!(
+            redis_lag_dimensions("7-0", Some(7), 2, Some(3)).unwrap(),
+            (10, 5, 5)
+        );
+        assert_eq!(
+            redis_lag_dimensions("0-0", None, 0, Some(3)).unwrap(),
+            (3, 0, 3)
+        );
         assert!(matches!(
-            redis_lag_dimensions(10, None),
-            Err(Error::Query(message)) if message.contains("pending is not a lag substitute")
+            redis_lag_dimensions("7-0", None, 0, Some(3)),
+            Err(Error::Query(message)) if message.contains("entries-read")
         ));
         assert!(matches!(
-            redis_lag_dimensions(2, Some(3)),
-            Err(Error::Serialization(message)) if message.contains("exceeds stream length")
+            redis_lag_dimensions("7-0", Some(7), 0, None),
+            Err(Error::Query(message)) if message.contains("consumer-group lag")
+        ));
+        assert!(matches!(
+            redis_lag_dimensions("2-0", Some(2), 3, Some(0)),
+            Err(Error::Serialization(message)) if message.contains("exceeds entries-read")
         ));
     }
 }

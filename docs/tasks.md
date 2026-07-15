@@ -114,6 +114,7 @@ Goal: bounded message operations with no external runtime dependencies.
 - [x] AMQP real producer/consumer and queue detail.
 - [x] NATS core real producer/consumer.
 - [x] Redis Streams/PubSub support in Redis adapter.
+- [x] Redis Streams explicit group/member, PEL replay, full-batch XACK, runtime lag negotiation, and public CLI lifecycle matrix.
 - [x] RabbitMQ HTTP management queue listing/detail/lag through explicit `rabbitmq+http` boundary.
 - [x] NATS JetStream admin/list/detail support.
 
@@ -190,6 +191,7 @@ Goal: replace safe shells with real bounded functionality.
 - [x] NATS core producer/consumer with subject validation.
 - [x] NATS JetStream admin topics/detail/lag support.
 - [x] Redis Streams/PubSub support behind explicit capabilities.
+- [x] Redis Streams stateful group/ACK semantics with ordered RESP fail-closed conversion and Redis-compatible product coverage.
 - [x] Live messaging tests with self-starting Redis/Redpanda/RabbitMQ/NATS and resource limits.
 - [x] RabbitMQ HTTP management queue listing/detail/lag through explicit `rabbitmq+http` boundary.
 

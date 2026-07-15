@@ -74,3 +74,42 @@ Current core behavior:
 - `pubsub:<channel>` targets Redis Pub/Sub.
 - Unprefixed Redis `mq` targets default to Streams.
 - `mq topics` lists Streams only; Pub/Sub channels can be inspected with `mq detail pubsub:<channel>` while subscribers are active.
+- Stateless Stream consumption uses bounded `XREAD` and supports exact native
+  Redis Stream cursors. Stateless consumption accepts only `--ack none`.
+- Stateful Stream consumption requires both `--group <group>` and
+  `--consumer <member>`. dbtool never creates the group: operators must create
+  it with the intended start position before consuming. Omitting the member or
+  naming a missing group is an error.
+- A group invocation first replays that member's own pending entries, then uses
+  any remaining batch budget for new `>` entries. Therefore `--ack none`
+  leaves deliveries in the PEL and the same member deterministically sees them
+  again on its next invocation.
+- `--ack on-success` converts the complete bounded batch before issuing one
+  `XACK` for its unique Stream IDs. Missing payloads, unsupported fields,
+  non-UTF-8 headers, duplicate payload/key/header/native IDs, oversized server
+  batches, malformed RESP shapes, malformed IDs, and partial acknowledgements
+  are errors; conversion failures leave all deliveries pending. XREAD replies
+  are parsed from ordered RESP2/RESP3 pairs rather than a map that could fold
+  duplicate fields. Parser errors report only type/count/length shapes and do
+  not echo message bytes. This is explicit
+  at-least-once progress handling, not exactly-once processing.
+- A legal Stream ID whose millisecond component exceeds `i64::MAX` remains
+  available through the exact Redis cursor; the compatibility `offset` and
+  `timestamp` fields are `null` rather than forged as zero or used to reject
+  the message.
+- `mq lag <group>` uses Redis `entries-read`, `pending`, and server-reported
+  `lag`. Its portable dimensions are `committed = entries-read - pending`,
+  `latest = entries-read + server-lag`, and
+  `lag = pending + server-lag`, so both delivered-unacknowledged and
+  not-yet-delivered work remain visible. Missing or inconsistent server fields
+  fail closed instead of falling back to `XLEN`. The adapter probes
+  `INFO server` while connecting and advertises this method only when the
+  Redis protocol version is at least 7; missing/malformed versions and KeyDB
+  6.3 do not advertise lag, while group delivery and ACK remain available.
+- The adapter timeout covers waiting for its shared connection and Redis
+  `BLOCK`; the CLI `FlowControl` deadline bounds the complete request,
+  including non-blocking pending reads and `XACK`. Embedded callers invoking
+  the adapter directly must provide their own outer request deadline when
+  they need the same end-to-end guarantee.
+- Redis Pub/Sub rejects group/durable identities and acknowledgements because
+  the protocol has neither replayable state nor an ACK operation.

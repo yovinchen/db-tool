@@ -1,5 +1,7 @@
 use std::{
     env,
+    io::{BufRead, BufReader, Write},
+    net::TcpStream,
     path::PathBuf,
     process::{Command, Output, Stdio},
     thread,
@@ -147,6 +149,76 @@ fn unique_subject(prefix: &str) -> String {
     unique_name(prefix).replace('_', ".")
 }
 
+fn redis_fixture_command(raw_dsn: &str, arguments: &[&str]) -> String {
+    let dsn = Dsn::parse(raw_dsn).expect("Redis fixture DSN should parse");
+    assert!(
+        matches!(
+            dsn.scheme.as_str(),
+            "redis" | "valkey" | "keydb" | "dragonfly"
+        ),
+        "Redis fixture setup supports only plaintext Redis-compatible DSNs"
+    );
+    let host = dsn
+        .host
+        .as_deref()
+        .expect("Redis fixture DSN should have a host");
+    let port = dsn.port.unwrap_or(6379);
+    let stream =
+        TcpStream::connect((host, port)).expect("Redis fixture TCP connection should open");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("Redis fixture read timeout should configure");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("Redis fixture write timeout should configure");
+    let mut connection = BufReader::new(stream);
+
+    if let Some(password) = dsn.password.as_deref() {
+        let mut auth = vec!["AUTH"];
+        if let Some(username) = dsn.username.as_deref() {
+            auth.push(username);
+        }
+        auth.push(password);
+        assert_eq!(redis_fixture_resp_line(&mut connection, &auth), "+OK");
+    }
+    if let Some(database) = dsn.database.as_deref() {
+        if database != "0" {
+            assert_eq!(
+                redis_fixture_resp_line(&mut connection, &["SELECT", database]),
+                "+OK"
+            );
+        }
+    }
+    redis_fixture_resp_line(&mut connection, arguments)
+}
+
+fn redis_fixture_resp_line(connection: &mut BufReader<TcpStream>, arguments: &[&str]) -> String {
+    let mut request = format!("*{}\r\n", arguments.len()).into_bytes();
+    for argument in arguments {
+        request.extend_from_slice(format!("${}\r\n", argument.len()).as_bytes());
+        request.extend_from_slice(argument.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    connection
+        .get_mut()
+        .write_all(&request)
+        .expect("Redis fixture request should write");
+    connection
+        .get_mut()
+        .flush()
+        .expect("Redis fixture request should flush");
+    let mut response = String::new();
+    connection
+        .read_line(&mut response)
+        .expect("Redis fixture response should read");
+    let response = response.trim_end_matches(['\r', '\n']).to_owned();
+    assert!(
+        !response.starts_with('-'),
+        "Redis fixture command failed: {response}"
+    );
+    response
+}
+
 fn bytes_text(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
@@ -286,18 +358,11 @@ fn redis_live_stream_produce_detail_and_consume() {
 
     // Create a consumer group at offset 0 so it sees the already-produced message as undelivered.
     let group = unique_name("dbtool_it_redis_group");
-    stdout_json(dbtool(&[
-        "--dsn",
-        &dsn,
-        "--allow-write",
-        "kv",
-        "raw",
-        "XGROUP",
-        "CREATE",
-        &stream,
-        &group,
-        "0",
-    ]));
+    let member = unique_name("dbtool_it_redis_member");
+    assert_eq!(
+        redis_fixture_command(&dsn, &["XGROUP", "CREATE", &stream, &group, "0"]),
+        "+OK"
+    );
 
     let lag = stdout_json(dbtool(&["--dsn", &dsn, "mq", "lag", &group]));
     let lag_items = lag["data"]
@@ -310,18 +375,85 @@ fn redis_live_stream_produce_detail_and_consume() {
         "expected lag >= 1 for group {group} on stream {stream}; output: {lag}"
     );
 
-    let group_destroyed = stdout_json(dbtool(&[
+    let stateful_blocked = stderr_json(dbtool(&[
         "--dsn",
         &dsn,
-        "--allow-write",
-        "kv",
-        "raw",
-        "XGROUP",
-        "DESTROY",
+        "mq",
+        "consume",
         &stream,
+        "--max",
+        "1",
+        "--timeout",
+        "5",
+        "--group",
         &group,
+        "--consumer",
+        &member,
+        "--ack",
+        "none",
     ]));
-    assert_eq!(group_destroyed["data"], 1);
+    assert_eq!(stateful_blocked["error"]["code"], "WRITE_NOT_ALLOWED");
+
+    let group_consume = |ack: &str| {
+        stdout_json(dbtool(&[
+            "--dsn",
+            &dsn,
+            "--allow-write",
+            "mq",
+            "consume",
+            &stream,
+            "--max",
+            "1",
+            "--timeout",
+            "5",
+            "--group",
+            &group,
+            "--consumer",
+            &member,
+            "--ack",
+            ack,
+        ]))
+    };
+    let pending = group_consume("none");
+    assert_eq!(pending["data"][0]["cursor"]["id"], redis_id);
+    assert_eq!(payload_text(&pending["data"][0]), "redis-stream-payload");
+    let replayed_pending = group_consume("none");
+    assert_eq!(replayed_pending["data"][0]["cursor"]["id"], redis_id);
+
+    let pending_lag = stdout_json(dbtool(&["--dsn", &dsn, "mq", "lag", &group]));
+    let group_lag = pending_lag["data"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["topic"] == stream))
+        .expect("Redis group lag should include the test stream");
+    assert_eq!(
+        (
+            group_lag["latest"].as_i64(),
+            group_lag["committed"].as_i64(),
+            group_lag["lag"].as_i64(),
+        ),
+        (Some(1), Some(0), Some(1))
+    );
+
+    let acknowledged = group_consume("on-success");
+    assert_eq!(acknowledged["data"][0]["cursor"]["id"], redis_id);
+    let acknowledged_lag = stdout_json(dbtool(&["--dsn", &dsn, "mq", "lag", &group]));
+    let group_lag = acknowledged_lag["data"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["topic"] == stream))
+        .expect("Redis group lag should include the acknowledged test stream");
+    assert_eq!(
+        (
+            group_lag["latest"].as_i64(),
+            group_lag["committed"].as_i64(),
+            group_lag["lag"].as_i64(),
+        ),
+        (Some(1), Some(1), Some(0))
+    );
+
+    assert_eq!(
+        redis_fixture_command(&dsn, &["XGROUP", "DESTROY", &stream, &group]),
+        ":1"
+    );
 
     let deleted = confirmed_mq_delete(&dsn, "redis-stream", &stream, &[]);
     assert_eq!(deleted["data"]["resource"]["kind"], "redis-stream");
