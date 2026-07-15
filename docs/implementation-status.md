@@ -51,9 +51,9 @@ usable.
 | KeyDB | `keydb://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Optional real KeyDB live test with `DBTOOL_IT_COMPAT_EXTRA=1` |
 | Dragonfly | `dragonfly://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Optional real Dragonfly live test with `DBTOOL_IT_COMPAT_EXTRA=1` |
 | MongoDB | `mongodb://` | MongoDB | collections, find（skip/sort/projection）, insert, update, delete, bounded aggregate, drop collection | Base Docker live test + full document surface lifecycle |
-| Kafka | `kafka://` | Kafka | ping, produce, consume, topics, detail/watermarks; lag explicitly unsupported | Redpanda live test through pure Rust backend |
-| Kafka native | `kafka://` with `full-native` | Kafka | librdkafka-backed ping, produce, consume, topics/detail; machine-readable unsupported lag | Native live test passed against Redpanda |
-| Redpanda | `redpanda://` | Kafka | Full Kafka-compatible lifecycle through product-named scheme | Real Redpanda pure/native live tests |
+| Kafka | `kafka://` | Kafka | ping, produce/consume with key, headers, partition, exact offset and timestamp, topics, detail/watermarks; lag explicitly unsupported | Redpanda field-fidelity live test through pure Rust backend |
+| Kafka native | `kafka://` with `full-native` | Kafka | librdkafka-backed field-fidelity produce/consume, topics/detail; machine-readable unsupported lag | Native field-fidelity live test passed against Redpanda |
+| Redpanda | `redpanda://` | Kafka | Kafka-compatible field-fidelity lifecycle through product-named scheme | Real Redpanda pure/native live tests |
 | AutoMQ | `automq://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_AUTOMQ_DSN` is supplied |
 | WarpStream | `warpstream://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_WARPSTREAM_DSN` is supplied |
 | Confluent | `confluent://` | Kafka | Routed to Kafka adapter; native backend accepts DSN-supplied SASL/TLS params | Env-gated external vendor smoke through `./scripts/integration-kafka-vendor-test.sh` when `DBTOOL_IT_CONFLUENT_DSN` is supplied |
@@ -113,7 +113,7 @@ usable.
 | KV | `kv get`, `kv set`, `kv scan`, `kv del`, `kv raw` | `set`, `del`, and mutating raw commands require `--allow-write` |
 | Document | `doc collections`, `doc find`, `doc insert`, `doc update`, `doc delete`, `doc aggregate`, `doc drop` | find exposes skip/sort/projection and exact truncation; insert/update/delete require `--allow-write`; update/delete reject empty filters; drop requires target-bound confirmation |
 | Transfer | `export sql`, `export kv`, `export doc`, `import sql`, `import kv`, `import doc` | all import commands require `--allow-write` before DSN resolution, artifact reads, or connecting |
-| Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write` |
+| Messaging | `mq produce`, `mq consume`, `mq topics`, `mq detail`, `mq lag` | produce requires `--allow-write`; produce exposes key/repeated headers/partition/epoch-ms timestamp; consume requires positive max/timeout and exposes non-negative partition/offset; reaching max is reported as a limit signal, not proof of another message |
 | Search | `search indices`, `search search`, `search index`, `search put`, `search get`, `search update`, `search delete`, `search delete-index` | all mutations require `--allow-write`; `delete-index` additionally requires a target-bound `--confirm` token |
 | Time series | `ts measurements`, `ts query [--last-minutes N | --start-ms MS --end-ms MS]`, `ts write` | query validates range pairing/order and a 1..=1,000,000 sample budget before connecting; Prometheus remote write requires `--allow-write` |
 

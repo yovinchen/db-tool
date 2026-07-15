@@ -200,6 +200,42 @@ dbtool --dsn "$PROMETHEUS_DSN" ts query 'up' \
 CLI mock 服务测试会核对发给 Prometheus 的秒级 `start/end`；Prometheus 2.55.1 Docker
 实测会写入两个带标签和精确时间戳的样本，再用相对窗口和显式 epoch-ms 窗口逐值读回。
 
+## Messaging / Kafka 字段范式
+
+Kafka-compatible producer 可显式给出已有公共 `Message` 模型中的字段：
+
+```bash
+dbtool --dsn "$KAFKA_DSN" --allow-write \
+  mq produce orders 'created' \
+  --key order-42 \
+  --header trace=abc \
+  --header content-type=text/plain \
+  --partition 0 \
+  --timestamp-ms 1710000000123
+```
+
+`payload` 与 `--key` 都按原始 UTF-8 bytes 编码，不会把 JSON 文本解析或重写；
+`--header` 可重复，每项必须是 `KEY=VALUE`，key 不能为空、不能带首尾空白且不能重复。
+partition 必须非负，offset 由 broker 分配，成功响应的 `placements` 会返回真实
+partition/offset。
+
+可从已知 Kafka placement 精确开始有界读取：
+
+```bash
+dbtool --dsn "$KAFKA_DSN" mq consume orders \
+  --partition 0 --offset 42 --max 100 --timeout 5
+```
+
+`--max` 和秒级 `--timeout` 必须大于零，partition/offset 必须非负；无效值和当前平台
+无法表示的超大 timeout 会在解析 DSN 或连接 broker 前返回 `CONFIG_ERROR`。当响应恰好
+达到 `--max` 时，`meta.truncated=true` 只表示本次预算已用完，不证明 broker 中还有
+下一条消息。
+
+当前 pure `rskafka` 与 native `librdkafka` 均已在 Redpanda 24.3.6 上逐字段验证
+payload/key/headers/partition/offset/timestamp。CLI 参数是公共输入面，不代表每种消息
+协议都有同名语义：Kafka 之外的字段映射或显式拒绝、Redis Streams 精确 cursor、
+consumer group 与资源删除仍由 IF-T47/IF-T48 跟踪，在完成前不能把忽略字段描述为成功。
+
 ## Search / OpenSearch / Elasticsearch
 
 完整文档生命周期使用稳定 ID；自动 ID 写入也会返回后端生成的 ID：

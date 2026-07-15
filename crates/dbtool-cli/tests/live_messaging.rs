@@ -93,8 +93,8 @@ fn unique_subject(prefix: &str) -> String {
     unique_name(prefix).replace('_', ".")
 }
 
-fn payload_text(message: &Value) -> String {
-    match &message["payload"] {
+fn bytes_text(value: &Value) -> String {
+    match value {
         Value::String(value) => value.clone(),
         Value::Array(bytes) => {
             let bytes = bytes
@@ -103,8 +103,12 @@ fn payload_text(message: &Value) -> String {
                 .collect::<Vec<_>>();
             String::from_utf8(bytes).expect("payload should be UTF-8")
         }
-        other => panic!("unexpected payload JSON: {other:?}"),
+        other => panic!("unexpected bytes JSON: {other:?}"),
     }
+}
+
+fn payload_text(message: &Value) -> String {
+    bytes_text(&message["payload"])
 }
 
 async fn nats_client_for_test(raw_dsn: &str) -> async_nats::Client {
@@ -316,7 +320,13 @@ fn kafka_live_topic_produce_detail_and_consume() {
     let Some(dsn) = dsn("DBTOOL_IT_KAFKA_DSN") else {
         return;
     };
-    run_kafka_smoke(&dsn, "kafka", "dbtool_it_kafka_topic", "kafka-payload");
+    run_kafka_smoke(
+        &dsn,
+        "kafka",
+        "dbtool_it_kafka_topic",
+        "kafka-payload",
+        true,
+    );
 }
 
 #[test]
@@ -332,6 +342,7 @@ fn redpanda_alias_live_topic_produce_detail_and_consume() {
         "redpanda",
         "dbtool_it_redpanda_topic",
         "redpanda-payload",
+        true,
     );
 }
 
@@ -365,7 +376,7 @@ fn vendor_kafka_compatible_smoke_profiles() {
     let mut tested = 0;
     for (env_name, expected_kind, prefix, payload) in vendors {
         if let Some(dsn) = dsn(env_name) {
-            run_kafka_smoke(&dsn, expected_kind, prefix, payload);
+            run_kafka_smoke(&dsn, expected_kind, prefix, payload, false);
             tested += 1;
         }
     }
@@ -373,7 +384,13 @@ fn vendor_kafka_compatible_smoke_profiles() {
     assert!(tested > 0, "set at least one vendor Kafka DSN env var");
 }
 
-fn run_kafka_smoke(dsn: &str, expected_kind: &str, prefix: &str, payload: &str) {
+fn run_kafka_smoke(
+    dsn: &str,
+    expected_kind: &str,
+    prefix: &str,
+    payload: &str,
+    verify_metadata: bool,
+) {
     let ping = stdout_json_retry(&["--dsn", dsn, "ping"]);
     assert_eq!(ping["kind"], expected_kind);
 
@@ -381,7 +398,7 @@ fn run_kafka_smoke(dsn: &str, expected_kind: &str, prefix: &str, payload: &str) 
     let blocked = stderr_json(dbtool(&["--dsn", dsn, "mq", "produce", &topic, "blocked"]));
     assert_eq!(blocked["error"]["code"], "WRITE_NOT_ALLOWED");
 
-    let produced = stdout_json_retry(&[
+    let mut produce_args = vec![
         "--dsn",
         dsn,
         "--allow-write",
@@ -389,8 +406,28 @@ fn run_kafka_smoke(dsn: &str, expected_kind: &str, prefix: &str, payload: &str) 
         "produce",
         &topic,
         payload,
-    ]);
+    ];
+    if verify_metadata {
+        produce_args.extend([
+            "--key",
+            "order-42",
+            "--header",
+            "trace=abc",
+            "--header",
+            "content-type=text/plain",
+            "--partition",
+            "0",
+            "--timestamp-ms",
+            "1710000000123",
+        ]);
+    }
+    let produced = stdout_json_retry(&produce_args);
     assert_eq!(produced["data"]["produced"], 1);
+    let placement = &produced["data"]["placements"][0];
+    assert_eq!(placement["partition"], 0);
+    let produced_offset = placement["offset"]
+        .as_i64()
+        .expect("Kafka produce should return an offset");
 
     let topics = stdout_json(dbtool(&["--dsn", dsn, "mq", "topics"]));
     assert!(topics["data"]
@@ -404,7 +441,8 @@ fn run_kafka_smoke(dsn: &str, expected_kind: &str, prefix: &str, payload: &str) 
     assert_eq!(detail["data"]["watermarks"][0]["low"], 0);
     assert!(detail["data"]["watermarks"][0]["high"].as_i64().unwrap() >= 1);
 
-    let consumed = stdout_json(dbtool(&[
+    let produced_offset = produced_offset.to_string();
+    let mut consume_args = vec![
         "--dsn",
         dsn,
         "mq",
@@ -414,8 +452,23 @@ fn run_kafka_smoke(dsn: &str, expected_kind: &str, prefix: &str, payload: &str) 
         "1",
         "--timeout",
         "5",
-    ]));
+    ];
+    if verify_metadata {
+        consume_args.extend(["--partition", "0", "--offset", &produced_offset]);
+    }
+    let consumed = stdout_json(dbtool(&consume_args));
     assert_eq!(payload_text(&consumed["data"][0]), payload);
+    assert_eq!(consumed["data"][0]["partition"], 0);
+    assert_eq!(
+        consumed["data"][0]["offset"],
+        produced_offset.parse::<i64>().unwrap()
+    );
+    if verify_metadata {
+        assert_eq!(bytes_text(&consumed["data"][0]["key"]), "order-42");
+        assert_eq!(consumed["data"][0]["headers"]["trace"], "abc");
+        assert_eq!(consumed["data"][0]["headers"]["content-type"], "text/plain");
+        assert_eq!(consumed["data"][0]["timestamp"], 1_710_000_000_123_i64);
+    }
 
     // The public MQ API has no topic-delete operation. Keep that boundary explicit instead of
     // claiming cleanup; local integration environments remove the broker volume on teardown.

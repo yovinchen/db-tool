@@ -19,7 +19,7 @@ use rdkafka::{
     config::ClientConfig,
     consumer::{BaseConsumer, Consumer},
     error::{KafkaError, RDKafkaErrorCode},
-    message::Message as KafkaMessage,
+    message::{Header, Headers, Message as KafkaMessage, OwnedHeaders},
     producer::{FutureProducer, FutureRecord},
     util::Timeout,
     Offset, TopicPartitionList,
@@ -28,6 +28,8 @@ use std::{
     collections::HashMap,
     time::{Duration, Instant},
 };
+
+use super::{validate_consume_position, validate_produce_message};
 
 pub struct RdkafkaAdapter {
     producer: FutureProducer,
@@ -113,6 +115,9 @@ impl MessageProducer for RdkafkaAdapter {
             });
         }
 
+        for message in &messages {
+            validate_native_produce_message(message)?;
+        }
         self.ensure_topic(target).await?;
         let mut placements = Vec::with_capacity(messages.len());
         for message in messages {
@@ -120,6 +125,15 @@ impl MessageProducer for RdkafkaAdapter {
             let mut record = FutureRecord::to(target).payload(message.payload.as_ref());
             if let Some(key) = key.as_ref() {
                 record = record.key(key);
+            }
+            if !message.headers.is_empty() {
+                record = record.headers(core_headers_to_native(&message.headers));
+            }
+            if let Some(partition) = message.partition {
+                record = record.partition(partition);
+            }
+            if let Some(timestamp) = message.timestamp {
+                record = record.timestamp(timestamp);
             }
             let (partition, offset) = self
                 .producer
@@ -140,6 +154,7 @@ impl MessageProducer for RdkafkaAdapter {
 impl MessageConsumer for RdkafkaAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_topic(source)?;
+        validate_consume_position(options.partition, options.offset)?;
         if options.max == 0 {
             return Ok(vec![]);
         }
@@ -155,9 +170,10 @@ impl MessageConsumer for RdkafkaAdapter {
         };
         let mut assignment = TopicPartitionList::new();
         for partition in partitions {
-            let offset = options
-                .offset
-                .unwrap_or_else(|| self.low_watermark(source, partition).unwrap_or_default());
+            let offset = match options.offset {
+                Some(offset) => offset,
+                None => self.low_watermark(source, partition)?,
+            };
             assignment
                 .add_partition_offset(source, partition, Offset::Offset(offset))
                 .map_err(kafka_query_error)?;
@@ -166,7 +182,9 @@ impl MessageConsumer for RdkafkaAdapter {
             .assign(&assignment)
             .map_err(kafka_query_error)?;
 
-        let deadline = Instant::now() + options.timeout;
+        let deadline = Instant::now().checked_add(options.timeout).ok_or_else(|| {
+            Error::Config("Kafka consume timeout is too large for this platform".to_owned())
+        })?;
         let mut messages = Vec::new();
         while messages.len() < options.max && Instant::now() < deadline {
             let poll_timeout = remaining_poll_timeout(deadline);
@@ -175,7 +193,7 @@ impl MessageConsumer for RdkafkaAdapter {
                     messages.push(Message {
                         key: message.key().map(Bytes::copy_from_slice),
                         payload: Bytes::copy_from_slice(message.payload().unwrap_or_default()),
-                        headers: HashMap::new(),
+                        headers: native_headers_to_core(message.headers()),
                         partition: Some(message.partition()),
                         offset: Some(message.offset()),
                         timestamp: message.timestamp().to_millis(),
@@ -353,6 +371,41 @@ fn validate_topic(topic: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_native_produce_message(message: &Message) -> Result<()> {
+    validate_produce_message(message)?;
+    if let Some(key) = message.headers.keys().find(|key| key.contains('\0')) {
+        return Err(Error::Config(format!(
+            "Kafka header name must not contain a NUL byte: {key:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn core_headers_to_native(headers: &HashMap<String, String>) -> OwnedHeaders {
+    headers.iter().fold(
+        OwnedHeaders::new_with_capacity(headers.len()),
+        |headers, (key, value)| {
+            headers.insert(Header {
+                key,
+                value: Some(value.as_bytes()),
+            })
+        },
+    )
+}
+
+fn native_headers_to_core<H: Headers>(headers: Option<&H>) -> HashMap<String, String> {
+    headers
+        .into_iter()
+        .flat_map(Headers::iter)
+        .map(|header| {
+            (
+                header.key.to_owned(),
+                String::from_utf8_lossy(header.value.unwrap_or_default()).into_owned(),
+            )
+        })
+        .collect()
+}
+
 fn remaining_poll_timeout(deadline: Instant) -> Duration {
     deadline
         .checked_duration_since(Instant::now())
@@ -366,4 +419,48 @@ fn kafka_connection_error(error: KafkaError) -> Error {
 
 fn kafka_query_error(error: KafkaError) -> Error {
     Error::Query(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(headers: HashMap<String, String>) -> Message {
+        Message {
+            key: Some(Bytes::from_static(b"key")),
+            payload: Bytes::from_static(b"payload"),
+            headers,
+            partition: Some(2),
+            offset: None,
+            timestamp: Some(1_710_000_000_123),
+        }
+    }
+
+    #[test]
+    fn native_headers_round_trip_without_loss() {
+        let expected = HashMap::from([
+            ("traceparent".to_owned(), "00-abc".to_owned()),
+            ("content-type".to_owned(), "application/json".to_owned()),
+        ]);
+        let native = core_headers_to_native(&expected);
+
+        assert_eq!(native_headers_to_core(Some(&native)), expected);
+    }
+
+    #[test]
+    fn native_produce_validation_rejects_nul_header_names() {
+        let error = validate_native_produce_message(&message(HashMap::from([(
+            "bad\0header".to_owned(),
+            "value".to_owned(),
+        )])))
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Config(_)));
+        assert!(error.to_string().contains("NUL"));
+    }
+
+    #[test]
+    fn absent_native_headers_decode_to_empty_map() {
+        assert!(native_headers_to_core::<OwnedHeaders>(None).is_empty());
+    }
 }
