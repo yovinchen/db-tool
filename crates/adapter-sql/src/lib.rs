@@ -101,6 +101,22 @@ pub(crate) fn bounded_catalog_limit(max_items: usize, backend: &str) -> Result<(
     Ok((limiter, sql_limit))
 }
 
+/// Validate one item-and-byte catalog envelope and convert its N+1 probe to a
+/// signed SQL LIMIT value before any backend request is issued.
+pub(crate) fn budgeted_catalog_limit(
+    budget: ReadBudget,
+    backend: &str,
+) -> Result<(ReadLimiter, i64)> {
+    let limiter = ReadLimiter::new(budget, format!("{backend} catalog response"))?;
+    let probe_items = limiter.probe_items()?;
+    let sql_limit = i64::try_from(probe_items).map_err(|_| {
+        Error::Config(format!(
+            "{backend} catalog item budget is too large for a SQL LIMIT parameter"
+        ))
+    })?;
+    Ok((limiter, sql_limit))
+}
+
 /// Convert the remaining complete-metadata N+1 probe to a SQL LIMIT value.
 ///
 /// Unlike [`bounded_catalog_limit`], the limiter is shared across columns,

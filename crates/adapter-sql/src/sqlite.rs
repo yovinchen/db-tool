@@ -17,7 +17,7 @@ use sqlx::sqlite::{SqliteArguments, SqlitePoolOptions};
 use sqlx::{types::Json, Column, Row, Sqlite, SqlitePool};
 
 use crate::{
-    bounded_catalog_limit, bounded_metadata_limit,
+    bounded_catalog_limit, bounded_metadata_limit, budgeted_catalog_limit,
     identifier::{parse_table_ref, validate_optional_schema},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, sqlite_value},
@@ -81,7 +81,9 @@ impl Connector for SqliteAdapter {
             CapabilityOperation::SqlQueryBudgeted,
             CapabilityOperation::SqlInsertRowsAtomic,
             CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListSchemasBudgeted,
             CapabilityOperation::SqlListTablesBounded,
+            CapabilityOperation::SqlListTablesBudgeted,
             CapabilityOperation::SqlDescribeTableBounded,
         ]);
         operations
@@ -355,6 +357,23 @@ impl SqlEngine for SqliteAdapter {
         Ok(limiter.finish(schemas))
     }
 
+    async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        let (mut limiter, sql_limit) = budgeted_catalog_limit(budget, "SQLite")?;
+        let rows = sqlx::query("SELECT name FROM pragma_database_list ORDER BY seq LIMIT ?")
+            .bind(sql_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let mut schemas = Vec::with_capacity(rows.len().min(budget.max_items));
+        for row in rows {
+            let schema = row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            limiter.retain_item(schema, &mut schemas)?;
+        }
+        limiter.finish(schemas)
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let schema = validate_optional_schema(schema)?.unwrap_or("main");
         let catalog = sqlite_catalog(schema);
@@ -416,6 +435,46 @@ impl SqlEngine for SqliteAdapter {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(limiter.finish(tables))
+    }
+
+    async fn list_tables_budgeted(
+        &self,
+        schema: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (mut limiter, sql_limit) = budgeted_catalog_limit(budget, "SQLite")?;
+        let schema = validate_optional_schema(schema)?.unwrap_or("main");
+        let catalog = sqlite_catalog(schema);
+        let rows = sqlx::query(&format!(
+            "SELECT name, type FROM {catalog} \
+             WHERE type IN ('table','view') ORDER BY name LIMIT ?"
+        ))
+        .bind(sql_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+        let mut tables = Vec::with_capacity(rows.len().min(budget.max_items));
+        for row in rows {
+            let name = row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            let relation_type = row
+                .try_get::<String, _>(1)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            limiter.retain_item(
+                TableInfo {
+                    schema: Some(schema.to_owned()),
+                    name,
+                    kind: if relation_type == "view" {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                },
+                &mut tables,
+            )?;
+        }
+        limiter.finish(tables)
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -1459,6 +1518,12 @@ mod tests {
         assert!(connector
             .operations()
             .contains(&CapabilityOperation::SqlListTablesBounded));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListSchemasBudgeted));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListTablesBudgeted));
         let sql = connector.as_sql().unwrap();
 
         sql.execute("attach database ':memory:' as aux", &[])
@@ -1474,6 +1539,28 @@ mod tests {
         let limited_schemas = sql.list_schemas_bounded(2).await.unwrap();
         assert_eq!(limited_schemas.items, ["main", "aux"]);
         assert!(limited_schemas.truncated);
+
+        let expected_schemas = BoundedList {
+            items: vec!["main".to_owned(), "aux".to_owned()],
+            truncated: true,
+        };
+        let schema_bytes = serde_json::to_vec(&expected_schemas).unwrap().len()
+            + serde_json::to_vec("extra").unwrap().len();
+        assert_eq!(
+            sql.list_schemas_budgeted(ReadBudget::new(2, schema_bytes).unwrap())
+                .await
+                .unwrap(),
+            expected_schemas
+        );
+        assert!(matches!(
+            sql.list_schemas_budgeted(ReadBudget::new(2, schema_bytes - 1).unwrap())
+                .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == schema_bytes - 1
+        ));
 
         sql.execute("create table alpha (id integer)", &[])
             .await
@@ -1506,6 +1593,34 @@ mod tests {
             ["main.alpha", "main.beta"]
         );
         assert!(limited_tables.truncated);
+
+        let probe = TableInfo {
+            schema: Some("main".to_owned()),
+            name: "gamma".to_owned(),
+            kind: TableKind::Table,
+        };
+        let table_bytes = serde_json::to_vec(&limited_tables).unwrap().len()
+            + serde_json::to_vec(&probe).unwrap().len();
+        let budgeted_tables = sql
+            .list_tables_budgeted(Some("main"), ReadBudget::new(2, table_bytes).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&budgeted_tables).unwrap(),
+            serde_json::to_value(&limited_tables).unwrap()
+        );
+        assert!(matches!(
+            sql.list_tables_budgeted(
+                Some("main"),
+                ReadBudget::new(2, table_bytes - 1).unwrap()
+            )
+            .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == table_bytes - 1
+        ));
     }
 
     #[tokio::test]
@@ -1520,6 +1635,25 @@ mod tests {
             ));
             assert!(matches!(
                 sql.list_tables_bounded(Some("invalid-schema"), limit).await,
+                Err(Error::Config(_))
+            ));
+            assert!(matches!(
+                sql.list_schemas_budgeted(ReadBudget {
+                    max_items: limit,
+                    max_bytes: DEFAULT_READ_BYTES,
+                })
+                .await,
+                Err(Error::Config(_))
+            ));
+            assert!(matches!(
+                sql.list_tables_budgeted(
+                    Some("invalid-schema"),
+                    ReadBudget {
+                        max_items: limit,
+                        max_bytes: DEFAULT_READ_BYTES,
+                    }
+                )
+                .await,
                 Err(Error::Config(_))
             ));
         }
