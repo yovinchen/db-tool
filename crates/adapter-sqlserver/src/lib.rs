@@ -2,14 +2,15 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ReadBudget, ResultSet,
-        TableInfo, TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, InputBudget, MetadataBudget, ReadBudget,
+        ResultSet, TableInfo, TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
+        MAX_INPUT_BYTES,
     },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
+    service::limiter::{InputLimiter, ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, TryStreamExt};
 use tiberius::{AuthMethod, Client, Column, ColumnData, Config, EncryptionLevel, QueryItem, Row};
@@ -18,6 +19,8 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 type SqlServerClient = Client<Compat<TcpStream>>;
 const LEGACY_SCHEMA_MAX_ITEMS: usize = 100_000;
+const SQLSERVER_MAX_STATEMENT_BYTES: usize = MAX_INPUT_BYTES;
+const SQLSERVER_MAX_PARAMETERS: usize = 2_100;
 
 pub struct SqlServerAdapter {
     client: Mutex<Option<SqlServerClient>>,
@@ -294,7 +297,17 @@ impl SqlEngine for SqlServerAdapter {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
-        reject_dynamic_params(params)?;
+        self.execute_budgeted(sql, params, InputBudget::default())
+            .await
+    }
+
+    async fn execute_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: InputBudget,
+    ) -> Result<ExecOutcome> {
+        preflight_sqlserver_execute(sql, params, budget)?;
         let mut guard = self.client.lock().await;
         let client = guard
             .as_mut()
@@ -303,7 +316,11 @@ impl SqlEngine for SqlServerAdapter {
         let result = client
             .execute(sql, &[])
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
+            .map_err(|error| {
+                Error::OutcomeIndeterminate(format!(
+                    "SQL Server execute may have reached the backend: {error}; inspect database state before retrying"
+                ))
+            })?;
 
         Ok(ExecOutcome {
             rows_affected: result.total(),
@@ -622,6 +639,7 @@ fn sqlserver_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> 
     let mut operations = capabilities.operations();
     operations.extend([
         CapabilityOperation::SqlQueryBudgeted,
+        CapabilityOperation::SqlExecuteBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
@@ -851,6 +869,32 @@ fn reject_dynamic_params(params: &[Value]) -> Result<()> {
     }
 }
 
+fn preflight_sqlserver_execute(sql: &str, params: &[Value], budget: InputBudget) -> Result<()> {
+    let request = ("sql", sql, "params", params);
+    let limiter = InputLimiter::new(budget, "SQL Server execute input")?;
+    if params.is_empty() {
+        limiter.validate_request(&request)?;
+    } else {
+        limiter.validate_items_with_request(params, &request)?;
+    }
+    if sql.as_bytes().contains(&0) {
+        return Err(Error::Query(
+            "SQL Server statement contains a NUL byte".to_owned(),
+        ));
+    }
+    if sql.len() > SQLSERVER_MAX_STATEMENT_BYTES {
+        return Err(Error::Query(format!(
+            "SQL Server statement exceeds the fixed {SQLSERVER_MAX_STATEMENT_BYTES}-byte ceiling"
+        )));
+    }
+    if params.len() > SQLSERVER_MAX_PARAMETERS {
+        return Err(Error::Query(format!(
+            "SQL Server request exceeds the fixed {SQLSERVER_MAX_PARAMETERS}-parameter ceiling"
+        )));
+    }
+    reject_dynamic_params(params)
+}
+
 fn dsn_param<'a>(dsn: &'a Dsn, names: &[&str]) -> Option<&'a str> {
     names
         .iter()
@@ -884,6 +928,7 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::SqlListTablesBudgeted));
         assert!(operations.contains(&CapabilityOperation::SqlDescribeTableBounded));
         assert!(operations.contains(&CapabilityOperation::SqlQueryBudgeted));
+        assert!(operations.contains(&CapabilityOperation::SqlExecuteBudgeted));
         assert!(matches!(sqlserver_catalog_limit(0), Err(Error::Config(_))));
         assert!(matches!(
             sqlserver_catalog_limit(usize::MAX),
@@ -910,6 +955,59 @@ mod tests {
                 .1,
             3
         );
+    }
+
+    #[test]
+    fn execute_budget_preflight_is_exact_and_counts_unsupported_params_before_access() {
+        let scalar_bytes = (1..=1024)
+            .find(|bytes| {
+                preflight_sqlserver_execute(
+                    "delete from jobs",
+                    &[],
+                    InputBudget::new(1, *bytes, *bytes).unwrap(),
+                )
+                .is_ok()
+            })
+            .expect("small SQL Server scalar request must fit");
+        preflight_sqlserver_execute(
+            "delete from jobs",
+            &[],
+            InputBudget::new(1, scalar_bytes, scalar_bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            preflight_sqlserver_execute(
+                "delete from jobs",
+                &[],
+                InputBudget::new(1, scalar_bytes, scalar_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded { .. })
+        ));
+
+        let params = [Value::Int(1), Value::Int(2)];
+        assert!(matches!(
+            preflight_sqlserver_execute(
+                "update jobs set id = @P1",
+                &params,
+                InputBudget {
+                    max_items: 1,
+                    ..InputBudget::default()
+                },
+            ),
+            Err(Error::InputBudgetExceeded { unit: "items", .. })
+        ));
+        assert!(matches!(
+            preflight_sqlserver_execute(
+                "update jobs set id = @P1",
+                &params,
+                InputBudget::default(),
+            ),
+            Err(Error::Query(_))
+        ));
+        assert!(matches!(
+            preflight_sqlserver_execute("x\0y", &[], InputBudget::default()),
+            Err(Error::Query(_))
+        ));
     }
 
     #[test]
