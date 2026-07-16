@@ -2,20 +2,20 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, ForeignKeyInfo, IndexInfo, MetadataBudget, ResultSet,
-        RoutineInfo, RoutineKind, SequenceInfo, TableInfo, TableKind, TableSchema, TablespaceInfo,
-        Value, DEFAULT_METADATA_BYTES,
+        BoundedList, ColumnMeta, ExecOutcome, ForeignKeyInfo, IndexInfo, MetadataBudget,
+        ReadBudget, ResultSet, RoutineInfo, RoutineKind, SequenceInfo, TableInfo, TableKind,
+        TableSchema, TablespaceInfo, Value, DEFAULT_METADATA_BYTES,
     },
     port::{
         capability::{Db2Engine, SqlEngine},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter, ResultLimiter},
+    service::limiter::{ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
 };
 use futures::future::BoxFuture;
 use odbc_api::{
-    buffers::TextRowSet, ColumnDescription, Connection, ConnectionOptions, Cursor, Environment,
-    ResultSetMetadata,
+    buffers::{Indicator, TextRowSet},
+    ColumnDescription, Connection, ConnectionOptions, Cursor, Environment, ResultSetMetadata,
 };
 use once_cell::sync::Lazy;
 use std::sync::Arc;
@@ -265,6 +265,26 @@ impl SqlEngine for Db2Adapter {
             let env = get_env()?;
             let conn = open(env, &conn_str)?;
             query_result_set_bounded(&conn, &sql, max_rows, probe_rows)
+        })
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?
+    }
+
+    async fn query_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: ReadBudget,
+    ) -> Result<ResultSet> {
+        let limiter = ReadLimiter::new(budget, "Db2 query result")?;
+        let probe_rows = limiter.probe_items()?;
+        reject_params(params)?;
+        let conn_str = self.conn_str.clone();
+        let sql = sql.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let env = get_env()?;
+            let conn = open(env, &conn_str)?;
+            query_result_set_budgeted(&conn, &sql, limiter, probe_rows)
         })
         .await
         .map_err(|e| Error::Query(e.to_string()))?
@@ -1613,6 +1633,8 @@ fn run_void(conn: &Connection<'_>, sql: &str) -> Result<()> {
 
 const BATCH: usize = 256;
 const MAX_STR: usize = 4096;
+const BUDGETED_ODBC_BATCH: usize = 1;
+const BUDGETED_ODBC_MAX_CELL_BYTES: usize = MAX_STR;
 
 fn query_result_set(conn: &Connection<'_>, sql: &str) -> Result<ResultSet> {
     query_result_set_with_bound(conn, sql, None)
@@ -1625,6 +1647,125 @@ fn query_result_set_bounded(
     probe_rows: usize,
 ) -> Result<ResultSet> {
     query_result_set_with_bound(conn, sql, Some((max_rows, probe_rows)))
+}
+
+fn query_result_set_budgeted(
+    conn: &Connection<'_>,
+    sql: &str,
+    mut limiter: ReadLimiter,
+    probe_rows: usize,
+) -> Result<ResultSet> {
+    let Some(mut cursor) = conn
+        .execute(sql, ())
+        .map_err(|e| Error::Query(e.to_string()))?
+    else {
+        let columns: Vec<ColumnMeta> = Vec::new();
+        limiter.observe_header(&columns)?;
+        return finish_budgeted_result(limiter, columns, Vec::new());
+    };
+
+    let columns = db2_result_columns(&mut cursor)?;
+    limiter.observe_header(&columns)?;
+
+    // One row per ODBC fetch prevents a driver from filling the legacy 256-row
+    // rowset after only the N+1 probe remains. Every cell is capped at the same
+    // fixed 4096-byte process envelope used by the legacy path, but unlike that
+    // path the indicator is checked and any right truncation fails closed.
+    let buffer = TextRowSet::for_cursor(
+        BUDGETED_ODBC_BATCH,
+        &mut cursor,
+        Some(BUDGETED_ODBC_MAX_CELL_BYTES),
+    )
+    .map_err(|e| Error::Query(e.to_string()))?;
+    let mut row_set_cursor = cursor
+        .bind_buffer(buffer)
+        .map_err(|e| Error::Query(e.to_string()))?;
+    let mut rows = Vec::with_capacity(probe_rows.saturating_sub(1).min(BATCH));
+
+    while limiter.observed_items() < probe_rows {
+        let Some(batch) = row_set_cursor
+            .fetch()
+            .map_err(|e| Error::Query(e.to_string()))?
+        else {
+            break;
+        };
+        for row_index in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(columns.len());
+            for column_index in 0..columns.len() {
+                row.push(decode_budgeted_odbc_cell(
+                    batch.at(column_index, row_index),
+                    batch.indicator_at(column_index, row_index),
+                )?);
+            }
+            limiter.retain_item(row, &mut rows)?;
+            if limiter.observed_items() >= probe_rows {
+                break;
+            }
+        }
+    }
+
+    finish_budgeted_result(limiter, columns, rows)
+}
+
+fn db2_result_columns(cursor: &mut impl ResultSetMetadata) -> Result<Vec<ColumnMeta>> {
+    let num_columns = cursor
+        .num_result_cols()
+        .map_err(|e| Error::Query(e.to_string()))? as usize;
+    let mut description = ColumnDescription::default();
+    let mut columns = Vec::with_capacity(num_columns);
+    for index in 1..=num_columns as u16 {
+        cursor
+            .describe_col(index, &mut description)
+            .map_err(|e| Error::Query(e.to_string()))?;
+        columns.push(ColumnMeta {
+            name: String::from_utf16_lossy(&description.name).to_string(),
+            type_name: "text".to_owned(),
+            nullable: true,
+            primary_key: false,
+            default_value: None,
+        });
+    }
+    Ok(columns)
+}
+
+fn decode_budgeted_odbc_cell(bytes: Option<&[u8]>, indicator: Indicator) -> Result<Value> {
+    let buffered_length = bytes.map_or(0, <[u8]>::len);
+    let exceeds_cell_ceiling = buffered_length > BUDGETED_ODBC_MAX_CELL_BYTES
+        || indicator
+            .value_len()
+            .is_some_and(|length| length > BUDGETED_ODBC_MAX_CELL_BYTES);
+    if exceeds_cell_ceiling || indicator.is_truncated(buffered_length) {
+        return Err(Error::ReadBudgetExceeded {
+            subject: "Db2 query cell".to_owned(),
+            unit: "bytes",
+            limit: BUDGETED_ODBC_MAX_CELL_BYTES,
+        });
+    }
+
+    match (bytes, indicator) {
+        (None, Indicator::Null) => Ok(Value::Null),
+        (Some(bytes), Indicator::Length(_)) => {
+            let value = std::str::from_utf8(bytes).map_err(|error| {
+                Error::Serialization(format!("Db2 ODBC query cell is not valid UTF-8: {error}"))
+            })?;
+            Ok(Value::Text(value.to_owned()))
+        }
+        _ => Err(Error::Serialization(
+            "Db2 ODBC query cell value and length indicator are inconsistent".to_owned(),
+        )),
+    }
+}
+
+fn finish_budgeted_result(
+    limiter: ReadLimiter,
+    columns: Vec<ColumnMeta>,
+    rows: Vec<Vec<Value>>,
+) -> Result<ResultSet> {
+    limiter.finish_with(rows, |rows, truncated| ResultSet {
+        columns,
+        rows,
+        truncated,
+    })
 }
 
 fn query_result_set_with_bound(
@@ -1708,6 +1849,7 @@ fn query_result_set_with_bound(
 fn db2_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListTablesBounded,
         CapabilityOperation::SqlDescribeTableBounded,
@@ -2012,6 +2154,7 @@ mod tests {
             ..Default::default()
         });
         for operation in [
+            CapabilityOperation::SqlQueryBudgeted,
             CapabilityOperation::SqlListSchemasBounded,
             CapabilityOperation::SqlListTablesBounded,
             CapabilityOperation::SqlDescribeTableBounded,
@@ -2023,6 +2166,81 @@ mod tests {
         ] {
             assert!(operations.contains(&operation), "missing {operation:?}");
         }
+    }
+
+    #[test]
+    fn budgeted_result_retains_n_probes_n_plus_one_and_accounts_complete_envelope() {
+        let columns = vec![ColumnMeta {
+            name: "payload".to_owned(),
+            type_name: "text".to_owned(),
+            nullable: true,
+            primary_key: false,
+            default_value: None,
+        }];
+
+        let build = |max_items: usize, max_bytes: usize, values: &[&str]| -> Result<ResultSet> {
+            let mut limiter =
+                ReadLimiter::new(ReadBudget::new(max_items, max_bytes)?, "Db2 query result")?;
+            limiter.observe_header(&columns)?;
+            let mut rows = Vec::new();
+            for value in values {
+                limiter.retain_item(vec![Value::Text((*value).to_owned())], &mut rows)?;
+            }
+            finish_budgeted_result(limiter, columns.clone(), rows)
+        };
+
+        let exact = build(2, 4096, &["one", "two"]).unwrap();
+        assert_eq!(exact.rows.len(), 2);
+        assert!(!exact.truncated);
+
+        let probed = build(2, 4096, &["one", "two", "probe"]).unwrap();
+        assert_eq!(probed.rows.len(), 2);
+        assert!(probed.truncated);
+
+        let minimum_complete_bytes = (1..=4096)
+            .find(|max_bytes| build(1, *max_bytes, &["payload"]).is_ok())
+            .expect("a small result must fit the test search envelope");
+        assert!(minimum_complete_bytes > 1);
+        assert!(build(1, minimum_complete_bytes, &["payload"]).is_ok());
+        let short = build(1, minimum_complete_bytes - 1, &["payload"]).unwrap_err();
+        assert_eq!(short.code(), "READ_BUDGET_EXCEEDED");
+    }
+
+    #[test]
+    fn budgeted_odbc_cells_accept_exact_limit_and_fail_closed_on_truncation() {
+        assert_eq!(BUDGETED_ODBC_BATCH, 1);
+        let exact = vec![b'x'; BUDGETED_ODBC_MAX_CELL_BYTES];
+        let value = decode_budgeted_odbc_cell(
+            Some(&exact),
+            Indicator::Length(BUDGETED_ODBC_MAX_CELL_BYTES),
+        )
+        .unwrap();
+        assert!(matches!(
+            value,
+            Value::Text(text) if text.len() == BUDGETED_ODBC_MAX_CELL_BYTES
+        ));
+
+        for indicator in [
+            Indicator::Length(BUDGETED_ODBC_MAX_CELL_BYTES + 1),
+            Indicator::NoTotal,
+        ] {
+            let error = decode_budgeted_odbc_cell(Some(&exact), indicator).unwrap_err();
+            assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+        }
+
+        let oversized = vec![b'x'; BUDGETED_ODBC_MAX_CELL_BYTES + 1];
+        let error = decode_budgeted_odbc_cell(Some(&oversized), Indicator::Length(oversized.len()))
+            .unwrap_err();
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+
+        assert_eq!(
+            decode_budgeted_odbc_cell(None, Indicator::Null).unwrap(),
+            Value::Null
+        );
+        assert!(matches!(
+            decode_budgeted_odbc_cell(Some(&[0xff]), Indicator::Length(1)),
+            Err(Error::Serialization(_))
+        ));
     }
 
     #[test]
