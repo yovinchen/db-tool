@@ -3,8 +3,9 @@
 /// configured DSNs are never echoed verbatim in `conn list` or errors.
 pub fn redact_dsn(raw: &str) -> String {
     if let Ok(mut url) = url::Url::parse(raw) {
-        if url.password().is_some() {
-            let _ = url.set_password(Some("***"));
+        if !url.username().is_empty() || url.password().is_some() {
+            let _ = url.set_username("***");
+            let _ = url.set_password(None);
         }
         let pairs: Vec<(String, String)> = url
             .query_pairs()
@@ -65,14 +66,8 @@ fn redact_userinfo(raw: &str) -> String {
     let Some(at) = authority.rfind('@') else {
         return raw.to_owned();
     };
-    let userinfo = &authority[..at];
-    let Some(colon) = userinfo.find(':') else {
-        return raw.to_owned();
-    };
-
-    let secret_start = authority_start + colon + 1;
-    let secret_end = authority_start + at;
-    format!("{}***{}", &raw[..secret_start], &raw[secret_end..])
+    let userinfo_end = authority_start + at;
+    format!("{}***{}", &raw[..authority_start], &raw[userinfo_end..])
 }
 
 fn redact_assignments(raw: &str) -> String {
@@ -116,7 +111,17 @@ mod tests {
         let raw = "mysql://user:s3cr3t@host:3306/db";
         let redacted = redact_dsn(raw);
         assert!(redacted.contains("***"));
+        assert!(!redacted.contains("user"));
         assert!(!redacted.contains("s3cr3t"));
+    }
+
+    #[test]
+    fn masks_username_only_credentials() {
+        let raw = "nats://NATS_USERNAME_TOKEN_MARKER@localhost:4222";
+        let redacted = redact_dsn(raw);
+
+        assert_eq!(redacted, "nats://***@localhost:4222");
+        assert!(!redacted.contains("NATS_USERNAME_TOKEN_MARKER"));
     }
 
     #[test]
@@ -149,6 +154,15 @@ mod tests {
         assert!(!redacted.contains("plain-secret"));
         assert!(!redacted.contains("query-secret"));
         assert!(redacted.contains("mode=safe"));
+    }
+
+    #[test]
+    fn malformed_username_only_credentials_are_redacted() {
+        let raw = "not a url://NATS_USERNAME_TOKEN_MARKER@bad host/path";
+        let redacted = redact_dsn(raw);
+
+        assert_eq!(redacted, "not a url://***@bad host/path");
+        assert!(!redacted.contains("NATS_USERNAME_TOKEN_MARKER"));
     }
 
     #[test]
