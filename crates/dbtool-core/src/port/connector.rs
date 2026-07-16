@@ -66,12 +66,17 @@ capability_operations! {
     Db2GenerateDdl => "db2.generate_ddl",
     Db2GenerateDdlBounded => "db2.generate_ddl_bounded",
     KeyValueGet => "kv.get",
+    KeyValueExists => "kv.exists",
+    KeyValueGetBounded => "kv.get_bounded",
     KeyValueGetWithExpiry => "kv.get_with_expiry",
+    KeyValueGetWithExpiryBounded => "kv.get_with_expiry_bounded",
     KeyValueSet => "kv.set",
     KeyValueRestoreWithExpiry => "kv.restore_with_expiry",
     KeyValueDelete => "kv.delete",
     KeyValueScan => "kv.scan",
+    KeyValueScanBounded => "kv.scan_bounded",
     KeyValueRawCommand => "kv.raw_command",
+    KeyValueRawCommandBounded => "kv.raw_command_bounded",
     DocumentListCollections => "document.list_collections",
     DocumentListCollectionsBounded => "document.list_collections_bounded",
     DocumentFind => "document.find",
@@ -137,6 +142,10 @@ impl CapabilityOperation {
     pub const BUDGETED_READS: &'static [Self] = &[
         Self::SqlQueryBudgeted,
         Self::CqlQueryBudgeted,
+        Self::KeyValueGetBounded,
+        Self::KeyValueGetWithExpiryBounded,
+        Self::KeyValueScanBounded,
+        Self::KeyValueRawCommandBounded,
         Self::DocumentFindBudgeted,
         Self::DocumentAggregateBudgeted,
     ];
@@ -153,6 +162,18 @@ impl CapabilityOperation {
         Self::KeyValueDelete,
         Self::KeyValueScan,
         Self::KeyValueRawCommand,
+    ];
+    /// Native key-existence checks are optional. The legacy `kv.get`
+    /// operation is not a safe substitute because it materializes the value.
+    pub const KEY_VALUE_EXISTENCE: &'static [Self] = &[Self::KeyValueExists];
+    /// Complete key-value read envelopes are optional backend-aware contracts.
+    /// Neither the legacy family boolean nor the similarly named unbounded or
+    /// row-only operation authorizes these methods.
+    pub const KEY_VALUE_BUDGETED_READS: &'static [Self] = &[
+        Self::KeyValueGetBounded,
+        Self::KeyValueGetWithExpiryBounded,
+        Self::KeyValueScanBounded,
+        Self::KeyValueRawCommandBounded,
     ];
     /// Atomic lifetime operations are optional and must be declared by each
     /// connector. The legacy `key_value=true` flag never implies that a
@@ -500,6 +521,9 @@ mod tests {
         assert_eq!(connector.kind().0, "mock-kv");
         assert!(connector.capabilities().key_value);
         assert_eq!(connector.operations(), CapabilityOperation::KEY_VALUE);
+        assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
         assert!(connector.as_kv().is_some());
         assert!(connector.as_sql().is_none());
         assert!(connector.as_cql().is_none());
@@ -510,8 +534,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_kv_connectors_neither_claim_nor_inherit_atomic_lifetime_operations() {
+    async fn legacy_kv_connectors_neither_claim_nor_inherit_optional_read_operations() {
         let connector = MockKvConnector::default();
+        assert!(CapabilityOperation::KEY_VALUE_EXISTENCE
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::KEY_VALUE_LIFETIME
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
@@ -532,6 +559,34 @@ mod tests {
                 .await,
             Err(crate::Error::UnsupportedCapability { kind, needed })
                 if kind == "mock-kv" && needed == "KeyValueStore.restore_with_expiry"
+        ));
+        assert!(matches!(
+            connector.exists("key").await,
+            Err(crate::Error::UnsupportedCapability { kind, needed })
+                if kind == "mock-kv" && needed == "KeyValueStore.exists"
+        ));
+        let budget = crate::model::ReadBudget::with_default_bytes(2).unwrap();
+        assert!(matches!(
+            connector.get_bounded("key", budget).await,
+            Err(crate::Error::UnsupportedCapability { kind, needed })
+                if kind == "mock-kv" && needed == "KeyValueStore.get_bounded"
+        ));
+        assert!(matches!(
+            connector.get_with_expiry_bounded("key", budget).await,
+            Err(crate::Error::UnsupportedCapability { kind, needed })
+                if kind == "mock-kv" && needed == "KeyValueStore.get_with_expiry_bounded"
+        ));
+        assert!(matches!(
+            connector.scan_bounded("*", budget).await,
+            Err(crate::Error::UnsupportedCapability { kind, needed })
+                if kind == "mock-kv" && needed == "KeyValueStore.scan_bounded"
+        ));
+        assert!(matches!(
+            connector
+                .raw_command_bounded(&["GET".to_owned(), "key".to_owned()], budget)
+                .await,
+            Err(crate::Error::UnsupportedCapability { kind, needed })
+                if kind == "mock-kv" && needed == "KeyValueStore.raw_command_bounded"
         ));
     }
 
@@ -570,6 +625,83 @@ mod tests {
             serde_json::to_value(CapabilityOperation::DocumentAggregateBudgeted).unwrap(),
             serde_json::json!("document.aggregate_budgeted")
         );
+        for (operation, stable_name) in [
+            (CapabilityOperation::KeyValueExists, "kv.exists"),
+            (CapabilityOperation::KeyValueGetBounded, "kv.get_bounded"),
+            (
+                CapabilityOperation::KeyValueGetWithExpiryBounded,
+                "kv.get_with_expiry_bounded",
+            ),
+            (CapabilityOperation::KeyValueScanBounded, "kv.scan_bounded"),
+            (
+                CapabilityOperation::KeyValueRawCommandBounded,
+                "kv.raw_command_bounded",
+            ),
+        ] {
+            assert_eq!(operation.as_str(), stable_name);
+            assert_eq!(
+                serde_json::to_value(operation).unwrap(),
+                serde_json::Value::String(stable_name.to_owned())
+            );
+            assert_eq!(
+                serde_json::from_value::<CapabilityOperation>(serde_json::Value::String(
+                    stable_name.to_owned()
+                ))
+                .unwrap(),
+                operation
+            );
+        }
+        assert_eq!(
+            CapabilityOperation::KEY_VALUE_BUDGETED_READS,
+            [
+                CapabilityOperation::KeyValueGetBounded,
+                CapabilityOperation::KeyValueGetWithExpiryBounded,
+                CapabilityOperation::KeyValueScanBounded,
+                CapabilityOperation::KeyValueRawCommandBounded,
+            ]
+        );
+        assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
+            .iter()
+            .all(|operation| CapabilityOperation::BUDGETED_READS.contains(operation)));
+        assert_eq!(
+            CapabilityOperation::KEY_VALUE_EXISTENCE,
+            [CapabilityOperation::KeyValueExists]
+        );
+    }
+
+    #[test]
+    fn legacy_kv_operation_reports_do_not_authorize_exact_bounded_reads() {
+        let report = CapabilityReport::new(
+            Capabilities {
+                key_value: true,
+                ..Default::default()
+            },
+            vec![
+                CapabilityOperation::KeyValueGet,
+                CapabilityOperation::KeyValueGetWithExpiry,
+                CapabilityOperation::KeyValueScan,
+                CapabilityOperation::KeyValueRawCommand,
+            ],
+        );
+
+        assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
+            .iter()
+            .all(|operation| !report.operations.contains(operation)));
+        assert!(!report
+            .operations
+            .contains(&CapabilityOperation::KeyValueExists));
+        assert!(report
+            .operations
+            .contains(&CapabilityOperation::KeyValueGet));
+        assert!(report
+            .operations
+            .contains(&CapabilityOperation::KeyValueGetWithExpiry));
+        assert!(report
+            .operations
+            .contains(&CapabilityOperation::KeyValueScan));
+        assert!(report
+            .operations
+            .contains(&CapabilityOperation::KeyValueRawCommand));
     }
 
     #[test]
@@ -634,6 +766,7 @@ mod tests {
             .filter(|operation| {
                 !CapabilityOperation::MESSAGE_ADMIN.contains(operation)
                     && *operation != CapabilityOperation::SqlInsertRowsAtomic
+                    && !CapabilityOperation::KEY_VALUE_EXISTENCE.contains(operation)
                     && !CapabilityOperation::KEY_VALUE_LIFETIME.contains(operation)
                     && !CapabilityOperation::DOCUMENT_LIFECYCLE.contains(operation)
                     && !CapabilityOperation::BOUNDED_CATALOGS.contains(operation)
@@ -660,6 +793,9 @@ mod tests {
         assert!(CapabilityOperation::KEY_VALUE_LIFETIME
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::KEY_VALUE_EXISTENCE
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::DOCUMENT_LIFECYCLE
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
@@ -673,6 +809,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BUDGETED_READS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         for operation in [

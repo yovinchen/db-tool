@@ -170,6 +170,40 @@ impl ReadLimiter {
         self.finish_with(items, |items, truncated| BoundedList { items, truncated })
     }
 
+    /// Validate and return one optional scalar response.
+    ///
+    /// A present value consumes one item slot; an absent value consumes none,
+    /// but its complete serialized `None` response is still byte-accounted.
+    /// This is intended for endpoints such as bounded key-value GET. It must
+    /// not be used to hide a collection-shaped raw response inside one scalar
+    /// item; those collection members must be observed separately.
+    pub fn finish_optional<T: Serialize>(mut self, value: Option<T>) -> Result<Option<T>> {
+        let mut retained = Vec::with_capacity(usize::from(value.is_some()));
+        if let Some(value) = value {
+            self.retain_item(value, &mut retained)?;
+        }
+        self.finish_with(retained, |mut values, truncated| {
+            debug_assert!(!truncated, "an optional scalar cannot produce a probe item");
+            values.pop()
+        })
+    }
+
+    /// Validate and return one semantically atomic scalar response.
+    ///
+    /// The value consumes one item slot and the final pass verifies its whole
+    /// serialized form. Collection-shaped responses must instead account each
+    /// caller-visible member before finalization.
+    pub fn finish_single<T: Serialize>(mut self, value: T) -> Result<T> {
+        let mut retained = Vec::with_capacity(1);
+        self.retain_item(value, &mut retained)?;
+        self.finish_with(retained, |mut values, truncated| {
+            debug_assert!(!truncated, "a single scalar cannot produce a probe item");
+            values
+                .pop()
+                .expect("one scalar is retained after successful accounting")
+        })
+    }
+
     /// Finalize a caller-visible response and charge its complete serialized
     /// envelope plus the N+1 probe item, when present.
     ///
@@ -687,6 +721,123 @@ mod tests {
                 rows,
                 truncated,
             }),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == required - 1
+        ));
+    }
+
+    #[test]
+    fn read_limiter_finishes_optional_and_single_kv_values_at_exact_bytes() {
+        let bytes = Bytes::from_static(&[0, 0xff, b'Z']);
+        let present_bytes = serde_json::to_vec(&Some(bytes.clone())).unwrap().len();
+        let present =
+            ReadLimiter::new(ReadBudget::new(1, present_bytes).unwrap(), "bounded KV get")
+                .unwrap()
+                .finish_optional(Some(bytes.clone()))
+                .unwrap();
+        assert_eq!(present, Some(bytes.clone()));
+
+        let error = ReadLimiter::new(
+            ReadBudget::new(1, present_bytes - 1).unwrap(),
+            "bounded KV get",
+        )
+        .unwrap()
+        .finish_optional(Some(bytes))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == present_bytes - 1
+        ));
+
+        let absent_bytes = serde_json::to_vec(&Option::<Bytes>::None).unwrap().len();
+        assert_eq!(
+            ReadLimiter::new(ReadBudget::new(1, absent_bytes).unwrap(), "bounded KV miss",)
+                .unwrap()
+                .finish_optional(Option::<Bytes>::None)
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            ReadLimiter::new(
+                ReadBudget::new(1, absent_bytes - 1).unwrap(),
+                "bounded KV miss",
+            )
+            .unwrap()
+            .finish_optional(Option::<Bytes>::None),
+            Err(Error::ReadBudgetExceeded { unit: "bytes", .. })
+        ));
+
+        let snapshot = crate::model::KeyValueSnapshot {
+            value: Bytes::from_static(b"snapshot"),
+            expiry: crate::model::KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123),
+        };
+        let snapshot_bytes = serde_json::to_vec(&Some(snapshot.clone())).unwrap().len();
+        assert_eq!(
+            ReadLimiter::new(
+                ReadBudget::new(1, snapshot_bytes).unwrap(),
+                "bounded KV snapshot",
+            )
+            .unwrap()
+            .finish_optional(Some(snapshot.clone()))
+            .unwrap(),
+            Some(snapshot)
+        );
+
+        let raw = Value::Map(BTreeMap::from([(
+            "payload".to_owned(),
+            Value::Bytes(vec![0, 1, 2]),
+        )]));
+        let raw_bytes = serde_json::to_vec(&raw).unwrap().len();
+        assert_eq!(
+            ReadLimiter::new(
+                ReadBudget::new(1, raw_bytes).unwrap(),
+                "bounded scalar raw response",
+            )
+            .unwrap()
+            .finish_single(raw.clone())
+            .unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn read_limiter_bounds_kv_scan_keys_with_one_exact_probe() {
+        let retained = vec!["app:one".to_owned(), "app:two".to_owned()];
+        let probe = "app:probe".to_owned();
+        let expected = BoundedList {
+            items: retained.clone(),
+            truncated: true,
+        };
+        let required = serde_json::to_vec(&expected).unwrap().len()
+            + serde_json::to_vec(&probe).unwrap().len();
+
+        let mut exact =
+            ReadLimiter::new(ReadBudget::new(2, required).unwrap(), "bounded KV scan").unwrap();
+        let mut keys = Vec::new();
+        for key in retained
+            .clone()
+            .into_iter()
+            .chain(std::iter::once(probe.clone()))
+        {
+            exact.retain_item(key, &mut keys).unwrap();
+        }
+        assert_eq!(exact.finish(keys).unwrap(), expected);
+
+        let mut short =
+            ReadLimiter::new(ReadBudget::new(2, required - 1).unwrap(), "bounded KV scan").unwrap();
+        let mut keys = Vec::new();
+        for key in retained.into_iter().chain(std::iter::once(probe)) {
+            short.retain_item(key, &mut keys).unwrap();
+        }
+        assert!(matches!(
+            short.finish(keys),
             Err(Error::ReadBudgetExceeded {
                 unit: "bytes",
                 limit,

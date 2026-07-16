@@ -182,6 +182,32 @@ pub trait CqlEngine: Connector {
 #[async_trait]
 pub trait KeyValueStore: Connector {
     async fn get(&self, key: &str) -> Result<Option<bytes::Bytes>>;
+    /// Check key existence without materializing its value.
+    ///
+    /// This optional method must be implemented by a backend-native existence
+    /// primitive and explicitly advertised as `kv.exists`. The fail-closed
+    /// default deliberately does not call [`Self::get`], because replacement
+    /// preflight must not read an arbitrarily large old value merely to learn
+    /// whether its key exists.
+    async fn exists(&self, _key: &str) -> Result<bool> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "KeyValueStore.exists",
+        })
+    }
+    /// Read one complete value inside a caller-owned item/byte envelope.
+    ///
+    /// Implementations must validate `budget` before backend access and must
+    /// enforce a protocol/transport ceiling before an oversized bulk value can
+    /// be retained. A missing key is a complete `None` response; an oversized
+    /// value fails with `READ_BUDGET_EXCEEDED` rather than returning a prefix.
+    /// This optional contract is authorized only by `kv.get_bounded`.
+    async fn get_bounded(&self, _key: &str, _budget: ReadBudget) -> Result<Option<bytes::Bytes>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "KeyValueStore.get_bounded",
+        })
+    }
     /// Read a value and its absolute expiry in one backend operation.
     ///
     /// This optional method must not be emulated with separate `GET` and TTL
@@ -192,6 +218,21 @@ pub trait KeyValueStore: Connector {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
             needed: "KeyValueStore.get_with_expiry",
+        })
+    }
+    /// Atomically read one complete value/lifetime snapshot inside a budget.
+    ///
+    /// The value and expiry must come from the same backend operation. Neither
+    /// `kv.get_with_expiry` nor the coarse key-value capability authorizes this
+    /// method; adapters must advertise `kv.get_with_expiry_bounded` explicitly.
+    async fn get_with_expiry_bounded(
+        &self,
+        _key: &str,
+        _budget: ReadBudget,
+    ) -> Result<Option<KeyValueSnapshot>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "KeyValueStore.get_with_expiry_bounded",
         })
     }
     async fn set(&self, key: &str, value: &[u8], options: SetOptions) -> Result<()>;
@@ -216,8 +257,37 @@ pub trait KeyValueStore: Connector {
     }
     async fn delete(&self, keys: &[String]) -> Result<u64>;
     async fn scan(&self, pattern: &str, limit: usize) -> Result<Vec<String>>;
+    /// Return an exact N/N+1 key page inside one caller-owned byte envelope.
+    ///
+    /// Implementations must observe at most `budget.max_items + 1` unique keys,
+    /// charge the probe key as well as the complete returned `BoundedList`, and
+    /// stop backend pagination immediately after that probe. This optional
+    /// contract is authorized only by `kv.scan_bounded`.
+    async fn scan_bounded(
+        &self,
+        _pattern: &str,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "KeyValueStore.scan_bounded",
+        })
+    }
     /// Escape hatch for raw protocol commands (e.g. `XLEN mystream`).
     async fn raw_command(&self, args: &[String]) -> Result<Value>;
+    /// Execute an allowlisted raw command inside one complete response budget.
+    ///
+    /// Adapters must reject commands whose response shape cannot be bounded
+    /// before protocol decoding. Collection responses must account their
+    /// caller-visible items and nested bytes without returning a partial typed
+    /// `Value`. This optional contract is authorized only by
+    /// `kv.raw_command_bounded`.
+    async fn raw_command_bounded(&self, _args: &[String], _budget: ReadBudget) -> Result<Value> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "KeyValueStore.raw_command_bounded",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -554,6 +624,7 @@ mod tests {
         port::{Capabilities, CapabilityOperation, ConnectorKind},
         Error,
     };
+    use bytes::Bytes;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct LegacyCatalogs {
@@ -584,6 +655,7 @@ mod tests {
                 sql: true,
                 cql: true,
                 db2: true,
+                key_value: true,
                 document: true,
                 time_series: true,
                 search: true,
@@ -598,6 +670,29 @@ mod tests {
 
         async fn close(self: Box<Self>) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl KeyValueStore for LegacyCatalogs {
+        async fn get(&self, _key: &str) -> Result<Option<Bytes>> {
+            Ok(self.record_unbounded(Some(Bytes::from_static(b"legacy"))))
+        }
+
+        async fn set(&self, _key: &str, _value: &[u8], _options: SetOptions) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _keys: &[String]) -> Result<u64> {
+            Ok(0)
+        }
+
+        async fn scan(&self, _pattern: &str, _limit: usize) -> Result<Vec<String>> {
+            Ok(self.record_unbounded(vec!["legacy".to_owned()]))
+        }
+
+        async fn raw_command(&self, _args: &[String]) -> Result<Value> {
+            Ok(self.record_unbounded(Value::Text("legacy".to_owned())))
         }
     }
 
@@ -867,6 +962,31 @@ mod tests {
             DocumentStore::aggregate_budgeted(&connector, "users", Vec::new(), read_budget).await,
             "DocumentStore.aggregate_budgeted",
         );
+        assert_unsupported(
+            KeyValueStore::exists(&connector, "key").await,
+            "KeyValueStore.exists",
+        );
+        assert_unsupported(
+            KeyValueStore::get_bounded(&connector, "key", read_budget).await,
+            "KeyValueStore.get_bounded",
+        );
+        assert_unsupported(
+            KeyValueStore::get_with_expiry_bounded(&connector, "key", read_budget).await,
+            "KeyValueStore.get_with_expiry_bounded",
+        );
+        assert_unsupported(
+            KeyValueStore::scan_bounded(&connector, "*", read_budget).await,
+            "KeyValueStore.scan_bounded",
+        );
+        assert_unsupported(
+            KeyValueStore::raw_command_bounded(
+                &connector,
+                &["GET".to_owned(), "key".to_owned()],
+                read_budget,
+            )
+            .await,
+            "KeyValueStore.raw_command_bounded",
+        );
 
         assert_unsupported(
             SqlEngine::list_schemas_bounded(&connector, 10).await,
@@ -945,6 +1065,12 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BUDGETED_READS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::KEY_VALUE_EXISTENCE
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
     }

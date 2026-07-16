@@ -15,9 +15,13 @@ pub const DEFAULT_READ_BYTES: usize = 8 * 1024 * 1024;
 /// Caller budget for a bounded read envelope.
 ///
 /// `max_items` is interpreted by the operation applying the envelope. For
-/// SQL/CQL queries it is the maximum number of returned rows. `max_bytes` is
-/// cumulative across the compact `serde_json` encoding of headers and every
-/// observed item, including the N+1 item used to prove truncation.
+/// SQL/CQL queries it is the maximum number of returned rows; for key scans it
+/// is the number of retained keys, and scalar key-value reads require one item
+/// of capacity. `max_bytes` is cumulative across the compact `serde_json`
+/// encoding of headers and every observed item, including the N+1 item used to
+/// prove truncation. Raw protocol operations must additionally define how
+/// their allowlisted response shape maps collection members to this item
+/// budget before advertising the exact bounded capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadBudget {
     pub max_items: usize,
