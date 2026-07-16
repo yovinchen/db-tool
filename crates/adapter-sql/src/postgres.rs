@@ -2,8 +2,8 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, MetadataBudget, ReadBudget, ResultSet, TableInfo,
-        TableKind, TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, InputBudget, MetadataBudget, ReadBudget, ResultSet,
+        TableInfo, TableKind, TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
@@ -21,9 +21,10 @@ use sqlx::{types::Json, Column, Encode, PgPool, Postgres, Row, Type};
 use crate::{
     bounded_catalog_limit, bounded_metadata_limit, budgeted_catalog_limit, group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
-    quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
+    mutation_outcome_indeterminate, preflight_sql_atomic_insert, preflight_sql_execute,
+    quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_sql_statement,
     value::{column_type_name, postgres_value},
-    SqlReadEnvelope,
+    SqlMutationLimits, SqlReadEnvelope, PORTABLE_SQL_STATEMENT_BYTES,
 };
 
 pub struct PostgresAdapter {
@@ -31,11 +32,21 @@ pub struct PostgresAdapter {
     kind: ConnectorKind,
 }
 
+const POSTGRES_MUTATION_LIMITS: SqlMutationLimits = SqlMutationLimits {
+    backend: "PostgreSQL",
+    max_statement_bytes: PORTABLE_SQL_STATEMENT_BYTES,
+    max_parameters: 65_535,
+    // PostgreSQL NAMEDATALEN defaults to 64 including the trailing NUL.
+    max_identifier_bytes: 63,
+};
+
 fn postgres_operations() -> Vec<CapabilityOperation> {
     let mut operations = CapabilityOperation::SQL.to_vec();
     operations.extend([
         CapabilityOperation::SqlQueryBudgeted,
+        CapabilityOperation::SqlExecuteBudgeted,
         CapabilityOperation::SqlInsertRowsAtomic,
+        CapabilityOperation::SqlInsertRowsAtomicBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
@@ -325,10 +336,21 @@ impl SqlEngine for PostgresAdapter {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
+        self.execute_budgeted(sql, params, InputBudget::default())
+            .await
+    }
+
+    async fn execute_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: InputBudget,
+    ) -> Result<ExecOutcome> {
+        preflight_sql_execute(sql, params, budget, POSTGRES_MUTATION_LIMITS)?;
         let result = bind_postgres_params(sql, params)?
             .execute(&self.pool)
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
+            .map_err(|error| mutation_outcome_indeterminate("PostgreSQL", "execute", error))?;
         Ok(ExecOutcome {
             rows_affected: result.rows_affected(),
             last_insert_id: None,
@@ -341,7 +363,19 @@ impl SqlEngine for PostgresAdapter {
         columns: &[String],
         rows: &[Vec<Value>],
     ) -> Result<u64> {
-        let table = validate_atomic_insert(table, columns, rows)?;
+        self.insert_rows_atomic_budgeted(table, columns, rows, InputBudget::default())
+            .await
+    }
+
+    async fn insert_rows_atomic_budgeted(
+        &self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+        budget: InputBudget,
+    ) -> Result<u64> {
+        let table =
+            preflight_sql_atomic_insert(table, columns, rows, budget, POSTGRES_MUTATION_LIMITS)?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -359,32 +393,28 @@ impl SqlEngine for PostgresAdapter {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        validate_sql_statement(&statement, POSTGRES_MUTATION_LIMITS)?;
+        let queries = rows
+            .iter()
+            .map(|row| bind_postgres_params(&statement, row))
+            .collect::<Result<Vec<_>>>()?;
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(|error| Error::Query(error.to_string()))?;
 
-        for row in rows {
-            let query = match bind_postgres_params(&statement, row) {
-                Ok(query) => query,
-                Err(error) => {
-                    return match transaction.rollback().await {
-                        Ok(()) => Err(error),
-                        Err(rollback) => Err(Error::Query(format!(
-                            "{error}; PostgreSQL transaction rollback also failed: {rollback}"
-                        ))),
-                    };
-                }
-            };
+        for query in queries {
             let result = match query.execute(&mut *transaction).await {
                 Ok(result) => result,
                 Err(error) => {
                     return match transaction.rollback().await {
                         Ok(()) => Err(Error::Query(error.to_string())),
-                        Err(rollback) => Err(Error::Query(format!(
-                            "{error}; PostgreSQL transaction rollback also failed: {rollback}"
-                        ))),
+                        Err(rollback) => Err(mutation_outcome_indeterminate(
+                            "PostgreSQL",
+                            "atomic insert rollback",
+                            format!("write failed: {error}; rollback failed: {rollback}"),
+                        )),
                     };
                 }
             };
@@ -395,17 +425,18 @@ impl SqlEngine for PostgresAdapter {
                 ));
                 return match transaction.rollback().await {
                     Ok(()) => Err(error),
-                    Err(rollback) => Err(Error::Query(format!(
-                        "{error}; PostgreSQL transaction rollback also failed: {rollback}"
-                    ))),
+                    Err(rollback) => Err(mutation_outcome_indeterminate(
+                        "PostgreSQL",
+                        "atomic insert rollback",
+                        format!("{error}; rollback failed: {rollback}"),
+                    )),
                 };
             }
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|error| Error::Query(error.to_string()))?;
+        transaction.commit().await.map_err(|error| {
+            mutation_outcome_indeterminate("PostgreSQL", "atomic insert commit", error)
+        })?;
         u64::try_from(rows.len())
             .map_err(|_| Error::Internal("PostgreSQL inserted row count exceeded u64".into()))
     }
@@ -1081,6 +1112,8 @@ mod tests {
     #[test]
     fn postgres_and_redshift_advertise_budgeted_reads_and_bounded_table_description() {
         assert!(postgres_operations().contains(&CapabilityOperation::SqlQueryBudgeted));
+        assert!(postgres_operations().contains(&CapabilityOperation::SqlExecuteBudgeted));
+        assert!(postgres_operations().contains(&CapabilityOperation::SqlInsertRowsAtomicBudgeted));
         assert!(postgres_operations().contains(&CapabilityOperation::SqlListSchemasBudgeted));
         assert!(postgres_operations().contains(&CapabilityOperation::SqlListTablesBudgeted));
         assert!(postgres_operations().contains(&CapabilityOperation::SqlDescribeTableBounded));
@@ -1420,6 +1453,125 @@ mod tests {
 
         let cleanup = sql.execute(&format!("DROP TABLE {table}"), &[]).await;
         cleanup.unwrap();
+        exercise.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_live_budgeted_mutation_crud_rejects_before_write_and_cleans_up() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_POSTGRES_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = format!("dbtool_exact_{suffix}");
+        let rejected_table = format!("dbtool_rejected_{suffix}");
+        let connector = postgres_factory(Dsn::parse(&raw_dsn).unwrap())
+            .await
+            .unwrap();
+        for operation in [
+            CapabilityOperation::SqlExecuteBudgeted,
+            CapabilityOperation::SqlInsertRowsAtomicBudgeted,
+        ] {
+            assert!(connector.operations().contains(&operation));
+        }
+        let sql = connector.as_sql().unwrap();
+
+        assert!(matches!(
+            sql.execute_budgeted(
+                &format!("CREATE TABLE {rejected_table} (id bigint)"),
+                &[],
+                InputBudget::new(1, 1, 1).unwrap(),
+            )
+            .await,
+            Err(Error::InputBudgetExceeded { .. })
+        ));
+        let absent = sql
+            .query(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = $1",
+                &[Value::Text(rejected_table)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(absent.rows[0][0], Value::Int(0));
+
+        sql.execute_budgeted(
+            &format!("CREATE TABLE {table} (id bigint PRIMARY KEY, note text NOT NULL)"),
+            &[],
+            InputBudget::default(),
+        )
+        .await
+        .unwrap();
+        let exercise = async {
+            sql.execute_budgeted(
+                &format!("INSERT INTO {table} (id, note) VALUES ($1, $2)"),
+                &[Value::Int(1), Value::Text("created".into())],
+                InputBudget::default(),
+            )
+            .await?;
+
+            let late_rows = vec![
+                vec![Value::Int(2), Value::Text("short".into())],
+                vec![Value::Int(3), Value::Text("late".repeat(128))],
+            ];
+            let short_row_bytes = serde_json::to_vec(&late_rows[0]).unwrap().len();
+            assert!(matches!(
+                sql.insert_rows_atomic_budgeted(
+                    &table,
+                    &["id".into(), "note".into()],
+                    &late_rows,
+                    InputBudget::new(
+                        2,
+                        short_row_bytes,
+                        dbtool_core::model::DEFAULT_INPUT_BATCH_BYTES,
+                    )?,
+                )
+                .await,
+                Err(Error::InputBudgetExceeded { .. })
+            ));
+            let unchanged = sql
+                .query(&format!("SELECT count(*) FROM {table}"), &[])
+                .await?;
+            assert_eq!(unchanged.rows[0][0], Value::Int(1));
+
+            assert_eq!(
+                sql.insert_rows_atomic_budgeted(
+                    &table,
+                    &["id".into(), "note".into()],
+                    &[
+                        vec![Value::Int(2), Value::Text("atomic-two".into())],
+                        vec![Value::Int(3), Value::Text("atomic-three".into())],
+                    ],
+                    InputBudget::default(),
+                )
+                .await?,
+                2
+            );
+            sql.execute_budgeted(
+                &format!("UPDATE {table} SET note = $1 WHERE id = $2"),
+                &[Value::Text("updated".into()), Value::Int(1)],
+                InputBudget::default(),
+            )
+            .await?;
+            sql.execute_budgeted(
+                &format!("DELETE FROM {table} WHERE id = $1"),
+                &[Value::Int(3)],
+                InputBudget::default(),
+            )
+            .await?;
+            let readback = sql
+                .query(&format!("SELECT id, note FROM {table} ORDER BY id"), &[])
+                .await?;
+            assert_eq!(readback.rows.len(), 2);
+            assert_eq!(readback.rows[0][1], Value::Text("updated".into()));
+            Ok::<_, Error>(())
+        }
+        .await;
+
+        sql.execute_budgeted(&format!("DROP TABLE {table}"), &[], InputBudget::default())
+            .await
+            .unwrap();
         exercise.unwrap();
     }
 }

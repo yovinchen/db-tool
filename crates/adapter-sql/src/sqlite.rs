@@ -2,8 +2,8 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ReadBudget, ResultSet,
-        TableInfo, TableKind, TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, InputBudget, MetadataBudget, ReadBudget,
+        ResultSet, TableInfo, TableKind, TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
@@ -19,14 +19,26 @@ use sqlx::{types::Json, Column, Row, Sqlite, SqlitePool};
 use crate::{
     bounded_catalog_limit, bounded_metadata_limit, budgeted_catalog_limit,
     identifier::{parse_table_ref, validate_optional_schema},
-    quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
+    mutation_outcome_indeterminate, preflight_sql_atomic_insert, preflight_sql_execute,
+    quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_sql_statement,
     value::{column_type_name, sqlite_value},
-    SqlReadEnvelope,
+    SqlMutationLimits, SqlReadEnvelope, PORTABLE_SQL_STATEMENT_BYTES,
 };
 
 pub struct SqliteAdapter {
     pool: SqlitePool,
 }
+
+const SQLITE_MUTATION_LIMITS: SqlMutationLimits = SqlMutationLimits {
+    backend: "SQLite",
+    max_statement_bytes: PORTABLE_SQL_STATEMENT_BYTES,
+    // SQLite 3.32+ raises SQLITE_MAX_VARIABLE_NUMBER to 32766. Applying that
+    // fixed ceiling locally avoids version-dependent partial transaction work.
+    max_parameters: 32_766,
+    // SQLite's default identifier/SQL length ceiling is above dbtool's 16 MiB
+    // portable process ceiling, so the portable ceiling is the tighter bound.
+    max_identifier_bytes: PORTABLE_SQL_STATEMENT_BYTES,
+};
 
 fn bind_sqlite_params<'q>(
     sql: &'q str,
@@ -79,7 +91,9 @@ impl Connector for SqliteAdapter {
         let mut operations = CapabilityOperation::SQL.to_vec();
         operations.extend([
             CapabilityOperation::SqlQueryBudgeted,
+            CapabilityOperation::SqlExecuteBudgeted,
             CapabilityOperation::SqlInsertRowsAtomic,
+            CapabilityOperation::SqlInsertRowsAtomicBudgeted,
             CapabilityOperation::SqlListSchemasBounded,
             CapabilityOperation::SqlListSchemasBudgeted,
             CapabilityOperation::SqlListTablesBounded,
@@ -245,10 +259,21 @@ impl SqlEngine for SqliteAdapter {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
+        self.execute_budgeted(sql, params, InputBudget::default())
+            .await
+    }
+
+    async fn execute_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: InputBudget,
+    ) -> Result<ExecOutcome> {
+        preflight_sql_execute(sql, params, budget, SQLITE_MUTATION_LIMITS)?;
         let r = bind_sqlite_params(sql, params)?
             .execute(&self.pool)
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
+            .map_err(|error| mutation_outcome_indeterminate("SQLite", "execute", error))?;
         Ok(ExecOutcome {
             rows_affected: r.rows_affected(),
             last_insert_id: Some(r.last_insert_rowid() as u64),
@@ -261,7 +286,19 @@ impl SqlEngine for SqliteAdapter {
         columns: &[String],
         rows: &[Vec<Value>],
     ) -> Result<u64> {
-        let table = validate_atomic_insert(table, columns, rows)?;
+        self.insert_rows_atomic_budgeted(table, columns, rows, InputBudget::default())
+            .await
+    }
+
+    async fn insert_rows_atomic_budgeted(
+        &self,
+        table: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+        budget: InputBudget,
+    ) -> Result<u64> {
+        let table =
+            preflight_sql_atomic_insert(table, columns, rows, budget, SQLITE_MUTATION_LIMITS)?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -276,32 +313,31 @@ impl SqlEngine for SqliteAdapter {
                 .join(", "),
             vec!["?"; columns.len()].join(", ")
         );
+        validate_sql_statement(&statement, SQLITE_MUTATION_LIMITS)?;
+        // Binding can validate timestamps and recursive structured values. Do
+        // it for every late row before opening the transaction so no local
+        // validation failure can occur after an earlier insert was sent.
+        let queries = rows
+            .iter()
+            .map(|row| bind_sqlite_params(&statement, row))
+            .collect::<Result<Vec<_>>>()?;
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(|error| Error::Query(error.to_string()))?;
 
-        for row in rows {
-            let query = match bind_sqlite_params(&statement, row) {
-                Ok(query) => query,
-                Err(error) => {
-                    return match transaction.rollback().await {
-                        Ok(()) => Err(error),
-                        Err(rollback) => Err(Error::Query(format!(
-                            "{error}; SQLite transaction rollback also failed: {rollback}"
-                        ))),
-                    };
-                }
-            };
+        for query in queries {
             let result = match query.execute(&mut *transaction).await {
                 Ok(result) => result,
                 Err(error) => {
                     return match transaction.rollback().await {
                         Ok(()) => Err(Error::Query(error.to_string())),
-                        Err(rollback) => Err(Error::Query(format!(
-                            "{error}; SQLite transaction rollback also failed: {rollback}"
-                        ))),
+                        Err(rollback) => Err(mutation_outcome_indeterminate(
+                            "SQLite",
+                            "atomic insert rollback",
+                            format!("write failed: {error}; rollback failed: {rollback}"),
+                        )),
                     };
                 }
             };
@@ -312,17 +348,18 @@ impl SqlEngine for SqliteAdapter {
                 ));
                 return match transaction.rollback().await {
                     Ok(()) => Err(error),
-                    Err(rollback) => Err(Error::Query(format!(
-                        "{error}; SQLite transaction rollback also failed: {rollback}"
-                    ))),
+                    Err(rollback) => Err(mutation_outcome_indeterminate(
+                        "SQLite",
+                        "atomic insert rollback",
+                        format!("{error}; rollback failed: {rollback}"),
+                    )),
                 };
             }
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|error| Error::Query(error.to_string()))?;
+        transaction.commit().await.map_err(|error| {
+            mutation_outcome_indeterminate("SQLite", "atomic insert commit", error)
+        })?;
         u64::try_from(rows.len())
             .map_err(|_| Error::Internal("SQLite inserted row count exceeded u64".into()))
     }
@@ -1318,6 +1355,139 @@ mod tests {
                 .await
                 .is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn sqlite_budgeted_mutations_reject_before_write_and_complete_crud_atomic_cleanup() {
+        let connector = memory_sqlite().await;
+        for operation in [
+            CapabilityOperation::SqlExecuteBudgeted,
+            CapabilityOperation::SqlInsertRowsAtomicBudgeted,
+        ] {
+            assert!(connector.operations().contains(&operation));
+        }
+        let sql = connector.as_sql().unwrap();
+
+        let rejected = sql
+            .execute_budgeted(
+                "create table rejected_budget (id integer)",
+                &[],
+                InputBudget::new(1, 1, 1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(rejected, Error::InputBudgetExceeded { .. }));
+        let absent = sql
+            .query(
+                "select count(*) from sqlite_master where name = 'rejected_budget'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(absent.rows[0][0], Value::Int(0));
+
+        sql.execute_budgeted(
+            "create table exact_crud (id integer primary key, note text not null)",
+            &[],
+            InputBudget::default(),
+        )
+        .await
+        .unwrap();
+        sql.execute_budgeted(
+            "insert into exact_crud (id, note) values (?, ?)",
+            &[Value::Int(1), Value::Text("created".into())],
+            InputBudget::default(),
+        )
+        .await
+        .unwrap();
+        sql.execute_budgeted(
+            "update exact_crud set note = ? where id = ?",
+            &[Value::Text("updated".into()), Value::Int(1)],
+            InputBudget::default(),
+        )
+        .await
+        .unwrap();
+        let duplicate = sql
+            .execute_budgeted(
+                "insert into exact_crud (id, note) values (?, ?)",
+                &[Value::Int(1), Value::Text("duplicate".into())],
+                InputBudget::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(duplicate, Error::OutcomeIndeterminate(_)));
+
+        let late_rows = vec![
+            vec![Value::Int(2), Value::Text("short".into())],
+            vec![Value::Int(3), Value::Text("late".repeat(128))],
+        ];
+        let first_row_bytes = serde_json::to_vec(&late_rows[0]).unwrap().len();
+        let late_error = sql
+            .insert_rows_atomic_budgeted(
+                "exact_crud",
+                &["id".into(), "note".into()],
+                &late_rows,
+                InputBudget::new(
+                    2,
+                    first_row_bytes,
+                    dbtool_core::model::DEFAULT_INPUT_BATCH_BYTES,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(late_error, Error::InputBudgetExceeded { .. }));
+        let unchanged = sql
+            .query("select count(*) from exact_crud", &[])
+            .await
+            .unwrap();
+        assert_eq!(unchanged.rows[0][0], Value::Int(1));
+
+        assert_eq!(
+            sql.insert_rows_atomic_budgeted(
+                "exact_crud",
+                &["id".into(), "note".into()],
+                &[
+                    vec![Value::Int(2), Value::Text("atomic-two".into())],
+                    vec![Value::Int(3), Value::Text("atomic-three".into())],
+                ],
+                InputBudget::default(),
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        let readback = sql
+            .query("select id, note from exact_crud order by id", &[])
+            .await
+            .unwrap();
+        assert_eq!(readback.rows.len(), 3);
+        assert_eq!(readback.rows[0][1], Value::Text("updated".into()));
+
+        sql.execute_budgeted(
+            "delete from exact_crud where id = ?",
+            &[Value::Int(1)],
+            InputBudget::default(),
+        )
+        .await
+        .unwrap();
+        let after_delete = sql
+            .query("select count(*) from exact_crud", &[])
+            .await
+            .unwrap();
+        assert_eq!(after_delete.rows[0][0], Value::Int(2));
+
+        sql.execute_budgeted("drop table exact_crud", &[], InputBudget::default())
+            .await
+            .unwrap();
+        let cleaned = sql
+            .query(
+                "select count(*) from sqlite_master where name = 'exact_crud'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleaned.rows[0][0], Value::Int(0));
     }
 
     #[tokio::test]

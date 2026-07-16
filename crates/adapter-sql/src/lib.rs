@@ -11,12 +11,176 @@ pub use sqlite::sqlite_factory;
 use chrono::{DateTime, Utc};
 use dbtool_core::{
     error::{Error, Result},
-    model::{ColumnMeta, IndexInfo, ReadBudget, ResultSet, Value},
-    service::limiter::{ListLimiter, MetadataLimiter, ReadLimiter},
+    model::{ColumnMeta, IndexInfo, InputBudget, ReadBudget, ResultSet, Value, MAX_INPUT_BYTES},
+    service::limiter::{InputLimiter, ListLimiter, MetadataLimiter, ReadLimiter},
 };
+use serde::Serialize;
 use std::collections::BTreeSet;
 
 use crate::identifier::{parse_table_ref, validate_identifier, TableRef};
+
+/// Backend-fixed ceilings applied after the caller-owned portable envelope and
+/// before SQLx sees a statement or value. The statement ceiling intentionally
+/// never exceeds the core process ceiling; parameter and identifier limits are
+/// the narrower protocol/product limits for each SQL family.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SqlMutationLimits {
+    pub(crate) backend: &'static str,
+    pub(crate) max_statement_bytes: usize,
+    pub(crate) max_parameters: usize,
+    pub(crate) max_identifier_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct SqlExecuteInput<'a> {
+    sql: &'a str,
+    params: &'a [Value],
+}
+
+#[derive(Serialize)]
+struct SqlAtomicInsertInput<'a> {
+    table: &'a str,
+    columns: &'a [String],
+    rows: &'a [Vec<Value>],
+}
+
+/// Validate a complete SQL execute request without acquiring a connection.
+/// Non-empty parameter lists charge every parameter as a logical item; an
+/// execute without parameters is one scalar request so the SQL text itself is
+/// still charged against both byte dimensions.
+pub(crate) fn preflight_sql_execute(
+    sql: &str,
+    params: &[Value],
+    budget: InputBudget,
+    limits: SqlMutationLimits,
+) -> Result<()> {
+    let request = SqlExecuteInput { sql, params };
+    let limiter = InputLimiter::new(budget, format!("{} SQL execute input", limits.backend))?;
+    if params.is_empty() {
+        limiter.validate_request(&request)?;
+    } else {
+        limiter.validate_items_with_request(params, &request)?;
+    }
+
+    validate_sql_statement(sql, limits)?;
+    validate_sql_parameter_count(params.len(), limits)?;
+    validate_sql_values(params, limits.backend)
+}
+
+/// Validate every caller-controlled part of an atomic insert before a pool,
+/// transaction, engine inspection, or generated statement is touched.
+pub(crate) fn preflight_sql_atomic_insert(
+    table: &str,
+    columns: &[String],
+    rows: &[Vec<Value>],
+    budget: InputBudget,
+    limits: SqlMutationLimits,
+) -> Result<TableRef> {
+    let request = SqlAtomicInsertInput {
+        table,
+        columns,
+        rows,
+    };
+    let limiter = InputLimiter::new(
+        budget,
+        format!("{} atomic SQL insert input", limits.backend),
+    )?;
+    if rows.is_empty() {
+        // Preserve the legacy harmless empty-batch result while still
+        // validating the exact caller envelope and identifiers.
+        limiter.validate_request(&request)?;
+    } else {
+        limiter.validate_items_with_request(rows, &request)?;
+    }
+
+    let table_ref = validate_atomic_insert(table, columns, rows)?;
+    validate_sql_identifier_lengths(&table_ref, columns, limits)?;
+    validate_sql_parameter_count(columns.len(), limits)?;
+    for row in rows {
+        validate_sql_values(row, limits.backend)?;
+    }
+    Ok(table_ref)
+}
+
+pub(crate) fn validate_sql_statement(sql: &str, limits: SqlMutationLimits) -> Result<()> {
+    if sql.as_bytes().contains(&0) {
+        return Err(Error::Query(format!(
+            "{} SQL statement contains a NUL byte",
+            limits.backend
+        )));
+    }
+    if sql.len() > limits.max_statement_bytes {
+        return Err(Error::Query(format!(
+            "{} SQL statement exceeds the fixed {}-byte ceiling",
+            limits.backend, limits.max_statement_bytes
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn mutation_outcome_indeterminate(
+    backend: &str,
+    action: &str,
+    error: impl std::fmt::Display,
+) -> Error {
+    Error::OutcomeIndeterminate(format!(
+        "{backend} {action} may have reached the backend: {error}; inspect database state before retrying"
+    ))
+}
+
+fn validate_sql_parameter_count(count: usize, limits: SqlMutationLimits) -> Result<()> {
+    if count > limits.max_parameters {
+        return Err(Error::Query(format!(
+            "{} SQL request has {count} parameters but the fixed protocol ceiling is {}",
+            limits.backend, limits.max_parameters
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sql_identifier_lengths(
+    table: &TableRef,
+    columns: &[String],
+    limits: SqlMutationLimits,
+) -> Result<()> {
+    for (label, identifier) in table
+        .schema
+        .iter()
+        .map(|schema| ("schema", schema.as_str()))
+        .chain(std::iter::once(("table", table.name.as_str())))
+        .chain(columns.iter().map(|column| ("column", column.as_str())))
+    {
+        if identifier.len() > limits.max_identifier_bytes {
+            return Err(Error::Query(format!(
+                "{} SQL {label} identifier exceeds the fixed {}-byte ceiling: {identifier}",
+                limits.backend, limits.max_identifier_bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sql_values(values: &[Value], backend: &str) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        match value {
+            Value::Timestamp(value) => {
+                timestamp_utc(*value, index + 1, backend)?;
+            }
+            Value::Json(_) | Value::Array(_) | Value::Map(_) => {
+                structured_json(value)?;
+            }
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Text(_)
+            | Value::Bytes(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) const PORTABLE_SQL_STATEMENT_BYTES: usize = MAX_INPUT_BYTES;
 
 /// Builds one SQL result under the shared row-and-recursive-byte envelope.
 ///
@@ -354,5 +518,161 @@ mod read_envelope_tests {
                 Err(Error::ReadBudgetExceeded { .. })
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod mutation_preflight_tests {
+    use super::*;
+
+    const TEST_LIMITS: SqlMutationLimits = SqlMutationLimits {
+        backend: "test SQL",
+        max_statement_bytes: 1024,
+        max_parameters: 8,
+        max_identifier_bytes: 16,
+    };
+
+    #[test]
+    fn sql_execute_input_accepts_exact_n_and_bytes_and_rejects_n_plus_one_or_n_minus_one() {
+        let params = [Value::Text("one".into()), Value::Text("two".into())];
+        let request = SqlExecuteInput {
+            sql: "update items set note = ? where id = ?",
+            params: &params,
+        };
+        let item_bytes = params
+            .iter()
+            .map(|value| serde_json::to_vec(value).unwrap().len())
+            .max()
+            .unwrap();
+        let batch_bytes = serde_json::to_vec(&request).unwrap().len();
+
+        preflight_sql_execute(
+            request.sql,
+            request.params,
+            InputBudget::new(2, item_bytes, batch_bytes).unwrap(),
+            TEST_LIMITS,
+        )
+        .unwrap();
+
+        for budget in [
+            InputBudget::new(1, item_bytes, batch_bytes).unwrap(),
+            InputBudget::new(2, item_bytes - 1, batch_bytes).unwrap(),
+            InputBudget::new(2, item_bytes, batch_bytes - 1).unwrap(),
+        ] {
+            assert!(matches!(
+                preflight_sql_execute(request.sql, request.params, budget, TEST_LIMITS),
+                Err(Error::InputBudgetExceeded { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn parameterless_execute_is_charged_as_one_complete_scalar_request() {
+        let request = SqlExecuteInput {
+            sql: "delete from items",
+            params: &[],
+        };
+        let bytes = serde_json::to_vec(&request).unwrap().len();
+        preflight_sql_execute(
+            request.sql,
+            request.params,
+            InputBudget::new(1, bytes, bytes).unwrap(),
+            TEST_LIMITS,
+        )
+        .unwrap();
+        assert!(matches!(
+            preflight_sql_execute(
+                request.sql,
+                request.params,
+                InputBudget::new(1, bytes, bytes - 1).unwrap(),
+                TEST_LIMITS,
+            ),
+            Err(Error::InputBudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn atomic_insert_preflights_every_late_row_and_complete_target_envelope() {
+        let columns = vec!["id".into(), "note".into()];
+        let rows = vec![
+            vec![Value::Int(1), Value::Text("short".into())],
+            vec![Value::Int(2), Value::Text("late payload".repeat(8))],
+        ];
+        let request = SqlAtomicInsertInput {
+            table: "items",
+            columns: &columns,
+            rows: &rows,
+        };
+        let row_bytes = rows
+            .iter()
+            .map(|row| serde_json::to_vec(row).unwrap().len())
+            .collect::<Vec<_>>();
+        let batch_bytes = serde_json::to_vec(&request).unwrap().len();
+
+        preflight_sql_atomic_insert(
+            request.table,
+            request.columns,
+            request.rows,
+            InputBudget::new(2, row_bytes[1], batch_bytes).unwrap(),
+            TEST_LIMITS,
+        )
+        .unwrap();
+        assert!(matches!(
+            preflight_sql_atomic_insert(
+                request.table,
+                request.columns,
+                request.rows,
+                InputBudget::new(2, row_bytes[0], batch_bytes).unwrap(),
+                TEST_LIMITS,
+            ),
+            Err(Error::InputBudgetExceeded { .. })
+        ));
+        assert!(matches!(
+            preflight_sql_atomic_insert(
+                request.table,
+                request.columns,
+                request.rows,
+                InputBudget::new(2, row_bytes[1], batch_bytes - 1).unwrap(),
+                TEST_LIMITS,
+            ),
+            Err(Error::InputBudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn sql_protocol_fixed_limits_are_checked_locally() {
+        let narrow = SqlMutationLimits {
+            max_statement_bytes: 8,
+            max_parameters: 1,
+            max_identifier_bytes: 4,
+            ..TEST_LIMITS
+        };
+        assert!(matches!(
+            preflight_sql_execute("123456789", &[], InputBudget::default(), narrow),
+            Err(Error::Query(_))
+        ));
+        assert!(matches!(
+            preflight_sql_execute("x\0y", &[], InputBudget::default(), TEST_LIMITS),
+            Err(Error::Query(_))
+        ));
+        assert!(matches!(
+            preflight_sql_execute(
+                "x",
+                &[Value::Int(1), Value::Int(2)],
+                InputBudget::default(),
+                narrow
+            ),
+            Err(Error::Query(_))
+        ));
+        assert!(matches!(
+            preflight_sql_atomic_insert(
+                "items",
+                &["id".into()],
+                &[vec![Value::Int(1)]],
+                InputBudget::default(),
+                narrow
+            ),
+            Err(Error::Query(_))
+        ));
     }
 }
