@@ -1,29 +1,22 @@
-/// Replace credentials and secret query parameters of a DSN with `***` for
-/// safe logging. The fallback also masks common assignment forms so malformed
-/// configured DSNs are never echoed verbatim in `conn list` or errors.
+/// Replace credentials, the complete query, and the complete fragment of a DSN
+/// with `***` for safe logging. Query keys are not an authentication contract,
+/// so retaining unknown parameters could disclose provider-specific tokens.
+/// The fallback applies the same fail-closed rule to malformed configured DSNs.
 pub fn redact_dsn(raw: &str) -> String {
     if let Ok(mut url) = url::Url::parse(raw) {
         if !url.username().is_empty() || url.password().is_some() {
             let _ = url.set_username("***");
             let _ = url.set_password(None);
         }
-        let pairs: Vec<(String, String)> = url
-            .query_pairs()
-            .map(|(key, value)| {
-                let value = if is_secret_key(&key) {
-                    "***".to_owned()
-                } else {
-                    value.into_owned()
-                };
-                (key.into_owned(), value)
-            })
-            .collect();
         if url.query().is_some() {
-            url.query_pairs_mut().clear().extend_pairs(pairs);
+            url.set_query(Some("***"));
+        }
+        if url.fragment().is_some() {
+            url.set_fragment(Some("***"));
         }
         url.to_string()
     } else {
-        redact_assignments(&redact_userinfo(raw))
+        redact_assignments(&redact_query_and_fragment(&redact_userinfo(raw)))
     }
 }
 
@@ -68,6 +61,31 @@ fn redact_userinfo(raw: &str) -> String {
     };
     let userinfo_end = authority_start + at;
     format!("{}***{}", &raw[..authority_start], &raw[userinfo_end..])
+}
+
+fn redact_query_and_fragment(raw: &str) -> String {
+    let query = raw.find('?');
+    let fragment = raw.find('#');
+    let Some(suffix_start) = (match (query, fragment) {
+        (Some(query), Some(fragment)) => Some(query.min(fragment)),
+        (Some(query), None) => Some(query),
+        (None, Some(fragment)) => Some(fragment),
+        (None, None) => None,
+    }) else {
+        return raw.to_owned();
+    };
+
+    let mut output = String::with_capacity(suffix_start + 8);
+    output.push_str(&raw[..suffix_start]);
+    if query.is_some_and(|index| index == suffix_start) {
+        output.push_str("?***");
+        if fragment.is_some_and(|index| index > suffix_start) {
+            output.push_str("#***");
+        }
+    } else {
+        output.push_str("#***");
+    }
+    output
 }
 
 fn redact_assignments(raw: &str) -> String {
@@ -131,8 +149,8 @@ mod tests {
     }
 
     #[test]
-    fn masks_secret_query_parameters_without_hiding_normal_options() {
-        let raw = "postgres://user:credential-one@host/db?sslmode=require&token=credential-two&access_token=credential-three&sasl-password=credential-four";
+    fn masks_complete_query_and_fragment_including_unknown_auth_keys() {
+        let raw = "postgres://user:credential-one@host/db?sslmode=require&auth=credential-two&access_token=credential-three#credential-four";
         let redacted = redact_dsn(raw);
 
         for secret in [
@@ -140,10 +158,11 @@ mod tests {
             "credential-two",
             "credential-three",
             "credential-four",
+            "sslmode=require",
         ] {
             assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
         }
-        assert!(redacted.contains("sslmode=require"));
+        assert!(redacted.ends_with("?***#***"));
     }
 
     #[test]
@@ -153,7 +172,8 @@ mod tests {
 
         assert!(!redacted.contains("plain-secret"));
         assert!(!redacted.contains("query-secret"));
-        assert!(redacted.contains("mode=safe"));
+        assert!(!redacted.contains("mode=safe"));
+        assert!(redacted.ends_with("?***"));
     }
 
     #[test]
@@ -163,6 +183,16 @@ mod tests {
 
         assert_eq!(redacted, "not a url://***@bad host/path");
         assert!(!redacted.contains("NATS_USERNAME_TOKEN_MARKER"));
+    }
+
+    #[test]
+    fn malformed_unknown_query_and_fragment_are_redacted() {
+        let raw = "not a url://host/path?auth=UNKNOWN_AUTH_QUERY_MARKER#FRAGMENT_MARKER";
+        let redacted = redact_dsn(raw);
+
+        assert_eq!(redacted, "not a url://host/path?***#***");
+        assert!(!redacted.contains("UNKNOWN_AUTH_QUERY_MARKER"));
+        assert!(!redacted.contains("FRAGMENT_MARKER"));
     }
 
     #[test]
