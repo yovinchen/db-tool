@@ -779,6 +779,7 @@ services:
       [
         "--config.file=/etc/prometheus/prometheus.yml",
         "--web.enable-remote-write-receiver",
+        "--web.enable-admin-api",
         "--storage.tsdb.retention.time=1h",
         "--storage.tsdb.path=/prometheus",
       ]

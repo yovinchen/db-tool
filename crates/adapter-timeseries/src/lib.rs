@@ -2,13 +2,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        series::Series, BoundedList, Point, ReadBudget, SeriesSet, TimeRange, TimeSeriesReadBudget,
+        series::Series, BoundedList, InputBudget, Point, ReadBudget, SeriesSet, TimeRange,
+        TimeSeriesReadBudget,
     },
     port::{
         capability::TimeSeriesStore,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::{ListLimiter, ReadLimiter, TimeSeriesReadLimiter},
+    service::{InputLimiter, ListLimiter, ReadLimiter, TimeSeriesReadLimiter},
 };
 use futures::future::BoxFuture;
 use serde_json::{Map, Value as JsonValue};
@@ -20,6 +21,8 @@ use url::{form_urlencoded, Url};
 
 const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HTTP_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
+const MAX_REMOTE_WRITE_PROTOBUF_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REMOTE_WRITE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct PrometheusAdapter {
     client: PrometheusHttpClient,
@@ -104,8 +107,12 @@ impl TimeSeriesStore for PrometheusAdapter {
             return Ok(());
         }
 
-        let protobuf = remote_write_protobuf(&points)?;
-        let payload = snappy_literal_block(&protobuf)?;
+        self.write_points_budgeted(points, InputBudget::default())
+            .await
+    }
+
+    async fn write_points_budgeted(&self, points: Vec<Point>, budget: InputBudget) -> Result<()> {
+        let payload = preflight_remote_write(&points, budget)?;
         self.client.request_remote_write(&payload).await
     }
 
@@ -218,15 +225,27 @@ impl PrometheusHttpClient {
         stream
             .write_all(request.as_bytes())
             .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
-        stream
-            .write_all(body)
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+            .map_err(|error| {
+                map_prometheus_after_possible_write(
+                    "Prometheus remote write request",
+                    Error::Connection(error.to_string()),
+                )
+            })?;
+        stream.write_all(body).await.map_err(|error| {
+            map_prometheus_after_possible_write(
+                "Prometheus remote write body",
+                Error::Connection(error.to_string()),
+            )
+        })?;
 
-        let response =
-            read_bounded_http_response(&mut stream, MAX_HTTP_RESPONSE_BODY_BYTES).await?;
-        parse_http_success(&response, "prometheus remote write")
+        let response = read_bounded_http_response(&mut stream, MAX_HTTP_RESPONSE_BODY_BYTES)
+            .await
+            .map_err(|error| {
+                map_prometheus_after_possible_write("Prometheus remote write response", error)
+            })?;
+        parse_http_success(&response, "prometheus remote write").map_err(|error| {
+            map_prometheus_after_possible_write("Prometheus remote write response", error)
+        })
     }
 
     fn build_request(
@@ -442,6 +461,7 @@ fn time_series_operations(capabilities: Capabilities) -> Vec<CapabilityOperation
     let mut operations = capabilities.operations();
     operations.push(CapabilityOperation::TimeSeriesListMeasurementsBounded);
     operations.push(CapabilityOperation::TimeSeriesListMeasurementsBudgeted);
+    operations.push(CapabilityOperation::TimeSeriesWritePointsBudgeted);
     operations.push(CapabilityOperation::TimeSeriesQueryRangeBounded);
     operations
 }
@@ -601,11 +621,57 @@ fn ensure_success(response: &JsonValue) -> Result<()> {
     Err(Error::Query(error.to_owned()))
 }
 
+fn preflight_remote_write(points: &[Point], budget: InputBudget) -> Result<Vec<u8>> {
+    InputLimiter::new(budget, "Prometheus remote-write request")?.validate_batch(points)?;
+    let protobuf = remote_write_protobuf(points)?;
+    ensure_remote_write_size(
+        "Prometheus remote-write protobuf",
+        protobuf.len(),
+        MAX_REMOTE_WRITE_PROTOBUF_BYTES,
+    )?;
+    let payload = snappy_literal_block(&protobuf)?;
+    ensure_remote_write_size(
+        "Prometheus remote-write Snappy body",
+        payload.len(),
+        MAX_REMOTE_WRITE_BODY_BYTES,
+    )?;
+    Ok(payload)
+}
+
+fn ensure_remote_write_size(subject: &str, bytes: usize, limit: usize) -> Result<()> {
+    if bytes > limit {
+        return Err(Error::Config(format!(
+            "{subject} is {bytes} bytes and exceeds the fixed {limit}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn map_prometheus_after_possible_write(operation: &str, error: Error) -> Error {
+    match error {
+        Error::OutcomeIndeterminate(_) => error,
+        other => Error::OutcomeIndeterminate(format!(
+            "{operation} may have reached the backend; inspect the target series before retrying: {other}"
+        )),
+    }
+}
+
 fn remote_write_protobuf(points: &[Point]) -> Result<Vec<u8>> {
     let mut request = Vec::new();
 
     for point in points {
         validate_metric_name(&point.measurement)?;
+        if point.fields.is_empty() {
+            return Err(Error::Config(format!(
+                "Prometheus point '{}' must contain at least one field",
+                point.measurement
+            )));
+        }
+        if point.tags.contains_key("__name__") {
+            return Err(Error::Config(
+                "Prometheus point tags must not redefine the reserved __name__ label".into(),
+            ));
+        }
         let mut fields = point.fields.iter().collect::<Vec<_>>();
         fields.sort_by(|a, b| a.0.cmp(b.0));
         for (field, value) in fields {
@@ -1080,6 +1146,15 @@ mod tests {
         result.series.iter().map(|series| series.values.len()).sum()
     }
 
+    fn test_point(measurement: &str, slot: &str, timestamp: i64) -> Point {
+        Point {
+            measurement: measurement.to_owned(),
+            tags: HashMap::from([("slot".to_owned(), slot.to_owned())]),
+            fields: HashMap::from([("value".to_owned(), 1.0)]),
+            timestamp,
+        }
+    }
+
     #[test]
     fn parses_measurement_names() {
         let names = measurement_names_from_response(&json!({
@@ -1184,8 +1259,107 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurements));
         assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurementsBounded));
         assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurementsBudgeted));
+        assert!(operations.contains(&CapabilityOperation::TimeSeriesWritePointsBudgeted));
         assert!(operations.contains(&CapabilityOperation::TimeSeriesQueryRangeBounded));
         assert!(!operations.contains(&CapabilityOperation::SearchListIndicesBounded));
+    }
+
+    #[test]
+    fn remote_write_preflight_enforces_exact_count_and_byte_envelopes() {
+        let first = test_point("dbtool_input_metric", "one", 1_710_000_000_123);
+        let item_bytes = serde_json::to_vec(&first).unwrap().len();
+        let one = vec![first.clone()];
+        let batch_bytes = serde_json::to_vec(&one).unwrap().len();
+
+        assert!(preflight_remote_write(
+            &one,
+            InputBudget::new(1, item_bytes, batch_bytes).unwrap(),
+        )
+        .is_ok());
+        assert!(matches!(
+            preflight_remote_write(
+                &one,
+                InputBudget::new(1, item_bytes - 1, batch_bytes).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == item_bytes - 1
+        ));
+        assert!(matches!(
+            preflight_remote_write(
+                &one,
+                InputBudget::new(1, item_bytes, batch_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == batch_bytes - 1
+        ));
+
+        let two = vec![
+            first,
+            test_point("dbtool_input_metric", "two", 1_710_000_000_123),
+        ];
+        assert!(preflight_remote_write(&two, InputBudget::default()).is_ok());
+        let two_item_bytes = two
+            .iter()
+            .map(|point| serde_json::to_vec(point).unwrap().len())
+            .max()
+            .unwrap();
+        let two_batch_bytes = serde_json::to_vec(&two).unwrap().len();
+        assert!(matches!(
+            preflight_remote_write(
+                &two,
+                InputBudget::new(1, two_item_bytes, two_batch_bytes).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            preflight_remote_write(&[], InputBudget::default()),
+            Err(Error::Config(message)) if message.contains("at least one")
+        ));
+    }
+
+    #[test]
+    fn remote_write_preflight_rejects_noop_and_reserved_label_points() {
+        let mut point = test_point("dbtool_input_metric", "one", 1);
+        point.fields.clear();
+        assert!(matches!(
+            preflight_remote_write(&[point], InputBudget::default()),
+            Err(Error::Config(message)) if message.contains("at least one field")
+        ));
+
+        let mut point = test_point("dbtool_input_metric", "one", 1);
+        point
+            .tags
+            .insert("__name__".to_owned(), "collision".to_owned());
+        assert!(matches!(
+            preflight_remote_write(&[point], InputBudget::default()),
+            Err(Error::Config(message)) if message.contains("reserved __name__")
+        ));
+    }
+
+    #[test]
+    fn remote_write_native_limits_and_post_send_errors_are_stable() {
+        assert!(ensure_remote_write_size("payload", 8, 8).is_ok());
+        assert!(matches!(
+            ensure_remote_write_size("payload", 9, 8),
+            Err(Error::Config(message)) if message.contains("9 bytes") && message.contains("8-byte")
+        ));
+
+        let error = map_prometheus_after_possible_write(
+            "Prometheus remote write response",
+            Error::Query("HTTP 500".into()),
+        );
+        assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+        assert!(!error.is_retryable());
     }
 
     #[test]
@@ -1396,6 +1570,123 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, Error::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn prometheus_live_budgeted_write_rejects_before_send_and_cleans_series() {
+        if std::env::var("DBTOOL_RUN_OBSERVABILITY_INTEGRATION").as_deref() != Ok("1") {
+            return;
+        }
+
+        let raw_dsn = std::env::var("DBTOOL_IT_PROMETHEUS_DSN")
+            .expect("DBTOOL_IT_PROMETHEUS_DSN is required for the live Prometheus test");
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let adapter = PrometheusAdapter {
+            client: PrometheusHttpClient::from_dsn(&dsn).unwrap(),
+            kind: ConnectorKind(dsn.scheme),
+        };
+        assert!(adapter
+            .operations()
+            .contains(&CapabilityOperation::TimeSeriesWritePointsBudgeted));
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let now_millis = i64::try_from(now).unwrap();
+        let timestamp = now_millis.div_euclid(1000) * 1000 - 5_000;
+        let metric = format!("dbtool_it_ts_input_{}_{}", std::process::id(), now);
+        let points = vec![
+            test_point(&metric, "one", timestamp),
+            test_point(&metric, "two", timestamp),
+        ];
+        let item_bytes = points
+            .iter()
+            .map(|point| serde_json::to_vec(point).unwrap().len())
+            .max()
+            .unwrap();
+        let batch_bytes = serde_json::to_vec(&points).unwrap().len();
+        let range = TimeRange::closed(timestamp, timestamp + 1_000).unwrap();
+
+        let exercise = async {
+            let error = adapter
+                .write_points_budgeted(
+                    points.clone(),
+                    InputBudget::new(points.len(), item_bytes, batch_bytes - 1)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+
+            let error = adapter
+                .write_points_budgeted(
+                    points.clone(),
+                    InputBudget::new(1, item_bytes, batch_bytes)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+            assert!(adapter
+                .query_range(&metric, range.clone())
+                .await?
+                .series
+                .is_empty());
+
+            adapter
+                .write_points_budgeted(
+                    points.clone(),
+                    InputBudget::new(points.len(), item_bytes, batch_bytes)?,
+                )
+                .await?;
+            let mut observed = None;
+            for _ in 0..40 {
+                let result = adapter.query_range(&metric, range.clone()).await?;
+                if result.series.len() == points.len()
+                    && result.series.iter().all(|series| !series.values.is_empty())
+                {
+                    observed = Some(result);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let observed = observed.ok_or_else(|| {
+                Error::Query("Prometheus did not expose the exact write fixture".into())
+            })?;
+            assert_eq!(observed.series.len(), 2);
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        let selector = format!("{{__name__=\"{metric}\"}}");
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        query.append_pair("match[]", &selector);
+        let delete_path = format!("/api/v1/admin/tsdb/delete_series?{}", query.finish());
+        adapter
+            .client
+            .request_json("POST", &delete_path, None)
+            .await
+            .expect("Prometheus test container must enable the admin cleanup API");
+        adapter
+            .client
+            .request_json("POST", "/api/v1/admin/tsdb/clean_tombstones", None)
+            .await
+            .expect("Prometheus tombstone cleanup must succeed");
+        let mut cleaned = false;
+        for _ in 0..40 {
+            if adapter
+                .query_range(&metric, range.clone())
+                .await
+                .unwrap()
+                .series
+                .is_empty()
+            {
+                cleaned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(cleaned, "Prometheus test series must leave zero samples");
+        exercise.unwrap();
     }
 
     #[tokio::test]
