@@ -17,6 +17,8 @@ use std::{
 };
 
 #[tokio::test]
+// This test retains one explicit 0.1.x producer/catalog compatibility probe.
+#[allow(deprecated)]
 async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
     if std::env::var("DBTOOL_RUN_MQ_INTEGRATION").as_deref() != Ok("1") {
         return;
@@ -80,7 +82,10 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
         .expect("legacy empty produce should remain a no-op");
     assert_eq!(legacy_empty.produced, 0);
     assert!(legacy_empty.placements.is_empty());
-    assert!(producer.produce("", vec![]).await.is_err());
+    assert!(producer
+        .produce_budgeted("", vec![], ProduceBudget::default())
+        .await
+        .is_err());
     assert!(!admin
         .list_topics()
         .await
@@ -88,9 +93,10 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
         .iter()
         .any(|item| item.name == rejected_topic));
     let full_catalog = admin
-        .list_topics()
+        .list_topics_budgeted(ReadBudget::with_default_bytes(100_000).unwrap())
         .await
-        .expect("fixture topic catalog should list");
+        .expect("fixture topic catalog should list")
+        .items;
     assert!(full_catalog.iter().any(|item| item.name == topic));
     assert!(full_catalog.iter().any(|item| item.name == auxiliary_topic));
     let total = full_catalog.len();
@@ -169,9 +175,10 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
         Err(Error::InputBudgetExceeded { unit: "bytes", .. })
     ));
     assert!(!admin
-        .list_topics()
+        .list_topics_budgeted(ReadBudget::with_default_bytes(100_000).unwrap())
         .await
         .expect("Kafka topic catalog should remain readable")
+        .items
         .iter()
         .any(|item| item.name == rejected_topic));
     producer

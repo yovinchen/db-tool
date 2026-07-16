@@ -86,6 +86,8 @@ async fn delete_stream(connector: &dyn dbtool_core::port::connector::Connector, 
 }
 
 #[tokio::test]
+// This assertion intentionally locks the retained 0.1.x empty-batch no-op.
+#[allow(deprecated)]
 async fn budgeted_core_nats_publish_rejects_before_jetstream_write_then_round_trips() {
     let Some(dsn) = live_dsn() else {
         return;
@@ -201,6 +203,8 @@ async fn budgeted_core_nats_publish_rejects_before_jetstream_write_then_round_tr
 }
 
 #[tokio::test]
+// This test retains one explicit 0.1.x consumer-lag compatibility probe.
+#[allow(deprecated)]
 async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_supported() {
     let Some(dsn) = live_dsn() else {
         return;
@@ -369,7 +373,10 @@ async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_suppor
         .collect::<Vec<_>>();
 
     let lag = admin
-        .consumer_lag(&durable_name)
+        .consumer_lag_bounded(
+            &durable_name,
+            MetadataBudget::with_default_bytes(100_000).expect("lag budget should be valid"),
+        )
         .await
         .expect("JetStream lag should load");
     let lag = lag
@@ -472,7 +479,10 @@ async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_suppor
     let lag = connector
         .as_admin()
         .expect("NATS adapter should expose admin")
-        .consumer_lag(&durable_name)
+        .consumer_lag_bounded(
+            &durable_name,
+            MetadataBudget::with_default_bytes(100_000).expect("lag budget should be valid"),
+        )
         .await
         .expect("post-ACK lag should load");
     let lag = lag

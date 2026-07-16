@@ -1497,6 +1497,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // This test retains one explicit 0.1.x consumer-lag compatibility probe.
+    #[allow(deprecated)]
     async fn live_consumer_lag_reads_a_real_committed_group_offset() {
         if std::env::var("DBTOOL_RUN_KAFKA_NATIVE_LIVE").as_deref() != Ok("1") {
             return;
@@ -1531,19 +1533,22 @@ mod tests {
         let producer = connector
             .as_producer()
             .expect("native Kafka exposes MessageProducer");
-        let legacy_empty = producer
-            .produce(&rejected_topic, vec![])
+        let empty = producer
+            .produce_budgeted(&rejected_topic, vec![], ProduceBudget::default())
             .await
-            .expect("legacy empty produce should remain a no-op");
-        assert_eq!(legacy_empty.produced, 0);
-        assert!(legacy_empty.placements.is_empty());
-        assert!(producer.produce("", vec![]).await.is_err());
+            .expect_err("exact budgeted production must reject an empty batch");
+        assert!(matches!(empty, Error::Config(_)));
+        assert!(producer
+            .produce_budgeted("", vec![], ProduceBudget::default())
+            .await
+            .is_err());
         assert!(!connector
             .as_admin()
             .expect("native Kafka exposes AdminInspect")
-            .list_topics()
+            .list_topics_budgeted(ReadBudget::with_default_bytes(100_000).unwrap())
             .await
-            .expect("legacy no-op must leave the catalog readable")
+            .expect("budgeted no-op must leave the catalog readable")
+            .items
             .iter()
             .any(|item| item.name == rejected_topic));
         let messages = ["first", "second"]
@@ -1581,9 +1586,10 @@ mod tests {
         assert!(!connector
             .as_admin()
             .expect("native Kafka exposes AdminInspect")
-            .list_topics()
+            .list_topics_budgeted(ReadBudget::with_default_bytes(100_000).unwrap())
             .await
             .expect("topic catalog should remain readable")
+            .items
             .iter()
             .any(|item| item.name == rejected_topic));
         producer
@@ -1724,24 +1730,32 @@ mod tests {
         assert!(created[0].is_ok(), "topic creation failed: {created:?}");
 
         let connector = connect(dsn).await.expect("Kafka should connect");
+        let messages = [(0, "p0-a"), (0, "p0-b"), (1, "p1-a"), (1, "p1-b")]
+            .into_iter()
+            .map(|(partition, payload)| Message {
+                key: None,
+                payload: Bytes::copy_from_slice(payload.as_bytes()),
+                headers: HashMap::new(),
+                partition: Some(partition),
+                offset: None,
+                timestamp: None,
+                cursor: None,
+                metadata: None,
+            })
+            .collect::<Vec<_>>();
+        let max_message_bytes = messages
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len())
+            .max()
+            .unwrap();
+        let batch_bytes = serde_json::to_vec(&messages).unwrap().len();
         let produced = connector
             .as_producer()
             .expect("native Kafka exposes MessageProducer")
-            .produce(
+            .produce_budgeted(
                 &topic,
-                [(0, "p0-a"), (0, "p0-b"), (1, "p1-a"), (1, "p1-b")]
-                    .into_iter()
-                    .map(|(partition, payload)| Message {
-                        key: None,
-                        payload: Bytes::copy_from_slice(payload.as_bytes()),
-                        headers: HashMap::new(),
-                        partition: Some(partition),
-                        offset: None,
-                        timestamp: None,
-                        cursor: None,
-                        metadata: None,
-                    })
-                    .collect(),
+                messages,
+                ProduceBudget::new(4, max_message_bytes, batch_bytes).unwrap(),
             )
             .await
             .expect("messages should be produced to both partitions");
@@ -1785,7 +1799,10 @@ mod tests {
             .as_admin()
             .expect("native Kafka exposes AdminInspect");
         assert!(admin_inspect
-            .consumer_lag(&group)
+            .consumer_lag_bounded(
+                &group,
+                MetadataBudget::with_default_bytes(KAFKA_DELETE_MAX_PARTITIONS).unwrap(),
+            )
             .await
             .expect("uncommitted group lag inspection should succeed")
             .iter()
@@ -1802,7 +1819,10 @@ mod tests {
             })
         ));
         assert!(admin_inspect
-            .consumer_lag(&group)
+            .consumer_lag_bounded(
+                &group,
+                MetadataBudget::with_default_bytes(KAFKA_DELETE_MAX_PARTITIONS).unwrap(),
+            )
             .await
             .expect("budget failure must leave committed offsets absent")
             .iter()
@@ -1817,7 +1837,10 @@ mod tests {
             .expect("successful batch should commit");
         assert_eq!(committed.len(), 4);
         let lag = admin_inspect
-            .consumer_lag(&group)
+            .consumer_lag_bounded(
+                &group,
+                MetadataBudget::with_default_bytes(KAFKA_DELETE_MAX_PARTITIONS).unwrap(),
+            )
             .await
             .expect("committed group lag should be readable")
             .into_iter()
@@ -1851,9 +1874,10 @@ mod tests {
             .expect("test topic should be deleted");
         assert!(deleted.acknowledged && deleted.verified_absent);
         assert!(!admin_inspect
-            .list_topics()
+            .list_topics_budgeted(ReadBudget::with_default_bytes(100_000).unwrap())
             .await
             .expect("topics should remain inspectable")
+            .items
             .iter()
             .any(|entry| entry.name == topic));
     }
