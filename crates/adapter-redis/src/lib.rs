@@ -5,8 +5,8 @@ use dbtool_core::{
         AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
         DeleteResourceOptions, DeleteResourceOutcome, KeyExpiry, KeyValueRestoreOutcome,
         KeyValueSnapshot, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
-        MessageResourceKind, MetadataBudget, PartitionWatermark, ProduceOutcome, ReadBudget,
-        TopicDetail, TopicInfo, Value,
+        MessageResourceKind, MetadataBudget, PartitionWatermark, ProduceBudget, ProduceOutcome,
+        ReadBudget, TopicDetail, TopicInfo, Value,
     },
     port::{
         capability::{
@@ -14,7 +14,9 @@ use dbtool_core::{
         },
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter, ReadLimiter},
+    service::limiter::{
+        ListLimiter, MessageReadLimiter, MessageWriteLimiter, MetadataLimiter, ReadLimiter,
+    },
 };
 use futures::{future::BoxFuture, StreamExt};
 use redis::{
@@ -1028,20 +1030,21 @@ fn redis_set_command(key: &str, value: &[u8], options: SetOptions) -> redis::Cmd
 #[async_trait::async_trait]
 impl MessageProducer for RedisAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
-        match parse_message_target(target)? {
-            RedisMessageTarget::Stream(stream) => {
-                for message in &messages {
-                    validate_stream_produce_message(message)?;
-                }
-                self.produce_stream(stream, messages).await
-            }
-            RedisMessageTarget::PubSub(channel) => {
-                for message in &messages {
-                    validate_pubsub_produce_message(message)?;
-                }
-                self.publish_pubsub(channel, messages).await
-            }
+        parse_message_target(target)?;
+        if let Some(outcome) = legacy_empty_redis_produce_outcome(&messages) {
+            return Ok(outcome);
         }
+        self.produce_with_budget(target, messages, None).await
+    }
+
+    async fn produce_budgeted(
+        &self,
+        target: &str,
+        messages: Vec<Message>,
+        budget: ProduceBudget,
+    ) -> Result<ProduceOutcome> {
+        self.produce_with_budget(target, messages, Some(budget))
+            .await
     }
 }
 
@@ -1423,6 +1426,19 @@ return {deleted, messages}
 }
 
 impl RedisAdapter {
+    async fn produce_with_budget(
+        &self,
+        target: &str,
+        messages: Vec<Message>,
+        budget: Option<ProduceBudget>,
+    ) -> Result<ProduceOutcome> {
+        let target = validate_redis_produce_request(target, &messages, budget)?;
+        match target {
+            RedisMessageTarget::Stream(stream) => self.produce_stream(stream, messages).await,
+            RedisMessageTarget::PubSub(channel) => self.publish_pubsub(channel, messages).await,
+        }
+    }
+
     async fn produce_stream(&self, stream: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
         let mut placements = Vec::with_capacity(messages.len());
         let mut c = self.conn.lock().await;
@@ -1440,13 +1456,19 @@ impl RedisAdapter {
                 cmd.arg(format!("h:{key}")).arg(value);
             }
 
-            let id: String = cmd
-                .query_async(&mut *c)
-                .await
-                .map_err(|e| Error::Query(e.to_string()))?;
+            let id: String = cmd.query_async(&mut *c).await.map_err(|e| {
+                map_redis_after_possible_write(
+                    true,
+                    "Redis Stream XADD",
+                    Error::Query(e.to_string()),
+                )
+            })?;
+            let offset = redis_stream_offset(&id).map_err(|error| {
+                map_redis_after_possible_write(true, "Redis Stream XADD", error)
+            })?;
             placements.push(MessagePlacement {
                 partition: 0,
-                offset: redis_stream_offset(&id)?,
+                offset,
                 cursor: Some(MessageCursor::RedisStream {
                     stream: stream.to_owned(),
                     id,
@@ -1471,7 +1493,13 @@ impl RedisAdapter {
         for message in messages {
             c.publish::<_, _, i64>(channel, &message.payload[..])
                 .await
-                .map_err(|e| Error::Query(e.to_string()))?;
+                .map_err(|e| {
+                    map_redis_after_possible_write(
+                        true,
+                        "Redis PubSub publish",
+                        Error::Query(e.to_string()),
+                    )
+                })?;
             produced += 1;
         }
 
@@ -2597,6 +2625,7 @@ fn redis_operations(
         CapabilityOperation::KeyValueRestoreWithExpiry,
         CapabilityOperation::KeyValueScanBounded,
         CapabilityOperation::KeyValueRawCommandBounded,
+        CapabilityOperation::MessageProduceBudgeted,
         CapabilityOperation::MessageConsumeGroup,
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
@@ -2726,6 +2755,52 @@ enum RedisMessageTarget<'a> {
     PubSub(&'a str),
 }
 
+// Redis protocol bulk strings are capped at 512 MiB. Message bodies and
+// fields are already held to the stricter portable 16 MiB hard ceiling by
+// ProduceBudget; resource names live outside Message and need their own
+// protocol preflight before a command is built.
+const REDIS_BULK_STRING_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+fn validate_redis_produce_request<'a>(
+    target: &'a str,
+    messages: &[Message],
+    budget: Option<ProduceBudget>,
+) -> Result<RedisMessageTarget<'a>> {
+    let target = parse_message_target(target)?;
+    MessageWriteLimiter::new(budget.unwrap_or_default(), "Redis produce request")?
+        .validate(messages)?;
+    match target {
+        RedisMessageTarget::Stream(_) => {
+            for message in messages {
+                validate_stream_produce_message(message)?;
+            }
+        }
+        RedisMessageTarget::PubSub(_) => {
+            for message in messages {
+                validate_pubsub_produce_message(message)?;
+            }
+        }
+    }
+    Ok(target)
+}
+
+fn legacy_empty_redis_produce_outcome(messages: &[Message]) -> Option<ProduceOutcome> {
+    messages.is_empty().then(|| ProduceOutcome {
+        produced: 0,
+        placements: Vec::new(),
+    })
+}
+
+fn map_redis_after_possible_write(possible_write: bool, operation: &str, error: Error) -> Error {
+    if !possible_write {
+        return error;
+    }
+    Error::OutcomeIndeterminate(format!(
+        "{operation} may have reached Redis; inspect remote state before retrying ({})",
+        error.code()
+    ))
+}
+
 fn parse_message_target(target: &str) -> Result<RedisMessageTarget<'_>> {
     let parsed = if let Some(stream) = target.strip_prefix("stream:") {
         RedisMessageTarget::Stream(stream)
@@ -2744,8 +2819,15 @@ fn parse_message_target(target: &str) -> Result<RedisMessageTarget<'_>> {
 }
 
 fn validate_redis_name(kind: &str, name: &str) -> Result<()> {
-    if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(Error::Query(format!("invalid Redis {kind} name: {name:?}")));
+    if name.is_empty() || name.len() > REDIS_BULK_STRING_MAX_BYTES {
+        return Err(Error::Query(format!(
+            "invalid Redis {kind} name: expected 1..={REDIS_BULK_STRING_MAX_BYTES} bytes"
+        )));
+    }
+    if name.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::Query(format!(
+            "invalid Redis {kind} name: control characters are not allowed"
+        )));
     }
     Ok(())
 }
@@ -4376,6 +4458,113 @@ mod tests {
         assert_eq!(resource_type, "none");
     }
 
+    #[tokio::test]
+    async fn redis_live_budgeted_produce_rejects_before_xadd_and_reads_back() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let rejected_stream = format!("dbtool_it_produce_rejected_{suffix}");
+        let accepted_stream = format!("dbtool_it_produce_accepted_{suffix}");
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let driver_url = dsn.raw_with_scheme("redis").unwrap();
+        let client = Client::open(driver_url.as_str()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&rejected_stream)
+            .arg(&accepted_stream)
+            .query_async::<u64>(&mut direct)
+            .await
+            .unwrap();
+
+        let connector = factory(dsn).await.unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::MessageProduceBudgeted));
+        let producer = connector.as_producer().unwrap();
+        let legacy_empty = producer
+            .produce(&rejected_stream, vec![])
+            .await
+            .expect("legacy empty produce should remain a no-op");
+        assert_eq!(legacy_empty.produced, 0);
+        assert!(legacy_empty.placements.is_empty());
+        assert!(producer.produce("stream:", vec![]).await.is_err());
+        let legacy_empty_type: String = redis::cmd("TYPE")
+            .arg(&rejected_stream)
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(legacy_empty_type, "none");
+        let fixture = Message {
+            key: Some(bytes::Bytes::from_static(b"key")),
+            payload: bytes::Bytes::from_static(b"budgeted-redis-message"),
+            headers: HashMap::from([("trace".to_owned(), "redis".to_owned())]),
+            ..message()
+        };
+        let message_bytes = serde_json::to_vec(&fixture).unwrap().len();
+        let batch_bytes = serde_json::to_vec(&vec![fixture.clone()]).unwrap().len();
+        let rejected = producer
+            .produce_budgeted(
+                &rejected_stream,
+                vec![fixture.clone()],
+                ProduceBudget::new(1, message_bytes - 1, batch_bytes).unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(Error::InputBudgetExceeded { unit: "bytes", .. })
+        ));
+        let rejected_type: String = redis::cmd("TYPE")
+            .arg(&rejected_stream)
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected_type, "none",
+            "oversize input must not create a stream"
+        );
+
+        let outcome = producer
+            .produce_budgeted(
+                &accepted_stream,
+                vec![fixture.clone()],
+                ProduceBudget::new(1, message_bytes, batch_bytes).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.produced, 1);
+        assert_eq!(outcome.placements.len(), 1);
+        let consumed = connector
+            .as_consumer()
+            .unwrap()
+            .consume(
+                &accepted_stream,
+                ConsumeOptions {
+                    max: 1,
+                    timeout: std::time::Duration::from_secs(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].payload, fixture.payload);
+        assert_eq!(consumed[0].key, fixture.key);
+        assert_eq!(consumed[0].headers["trace"], fixture.headers["trace"]);
+        assert!(consumed[0].headers.contains_key("redis_stream_id"));
+
+        redis::cmd("DEL")
+            .arg(&rejected_stream)
+            .arg(&accepted_stream)
+            .query_async::<u64>(&mut direct)
+            .await
+            .unwrap();
+        connector.close().await.unwrap();
+    }
+
     #[test]
     fn scan_collector_deduplicates_across_pages_and_stops_at_zero() {
         let mut collector = ScanCollector::new(4).unwrap();
@@ -4949,6 +5138,105 @@ mod tests {
     }
 
     #[test]
+    fn redis_produce_preflight_enforces_count_and_exact_bytes() {
+        let one = message();
+        let message_bytes = serde_json::to_vec(&one).unwrap().len();
+        let batch_bytes = serde_json::to_vec(&vec![one.clone()]).unwrap().len();
+        let exact = ProduceBudget::new(1, message_bytes, batch_bytes).unwrap();
+
+        let legacy_empty = legacy_empty_redis_produce_outcome(&[]).unwrap();
+        assert_eq!(legacy_empty.produced, 0);
+        assert!(legacy_empty.placements.is_empty());
+        assert!(matches!(
+            validate_redis_produce_request("stream:events", &[], Some(exact)),
+            Err(Error::Config(message)) if message.contains("at least one")
+        ));
+        assert_eq!(
+            validate_redis_produce_request(
+                "stream:events",
+                std::slice::from_ref(&one),
+                Some(exact)
+            )
+            .unwrap(),
+            RedisMessageTarget::Stream("events")
+        );
+        assert!(matches!(
+            validate_redis_produce_request(
+                "stream:events",
+                &[one.clone(), one.clone()],
+                Some(exact),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "messages",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_redis_produce_request("stream:events", &vec![one.clone(); 101], None),
+            Err(Error::InputBudgetExceeded {
+                unit: "messages",
+                limit: 100,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_redis_produce_request(
+                "stream:events",
+                std::slice::from_ref(&one),
+                Some(ProduceBudget::new(1, message_bytes - 1, batch_bytes).unwrap()),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == message_bytes - 1
+        ));
+        assert!(matches!(
+            validate_redis_produce_request(
+                "stream:events",
+                std::slice::from_ref(&one),
+                Some(ProduceBudget::new(1, message_bytes, batch_bytes - 1).unwrap()),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == batch_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn redis_produce_preflight_rejects_protocol_fields_before_dispatch() {
+        let mut invalid_stream = message();
+        invalid_stream.offset = Some(1);
+        assert!(matches!(
+            validate_redis_produce_request("stream:events", &[invalid_stream], None),
+            Err(Error::Config(message)) if message.contains("offset")
+        ));
+
+        let mut invalid_pubsub = message();
+        invalid_pubsub.key = Some(bytes::Bytes::from_static(b"key"));
+        assert!(matches!(
+            validate_redis_produce_request("pubsub:events", &[invalid_pubsub], None),
+            Err(Error::Config(message)) if message.contains("payload only")
+        ));
+    }
+
+    #[test]
+    fn redis_errors_after_a_possible_write_are_indeterminate() {
+        let before =
+            map_redis_after_possible_write(false, "Redis publish", Error::Connection("x".into()));
+        assert!(matches!(before, Error::Connection(_)));
+
+        let after =
+            map_redis_after_possible_write(true, "Redis publish", Error::Connection("x".into()));
+        assert!(matches!(after, Error::OutcomeIndeterminate(_)));
+        assert_eq!(after.code(), "OUTCOME_INDETERMINATE");
+        assert!(!after.is_retryable());
+    }
+
+    #[test]
     fn redis_pubsub_rejects_every_non_payload_field_and_position() {
         let mut unsupported = message();
         unsupported.key = Some(bytes::Bytes::from_static(b"key"));
@@ -5126,6 +5414,7 @@ mod tests {
             CapabilityOperation::KeyValueRestoreWithExpiry,
             CapabilityOperation::KeyValueScanBounded,
             CapabilityOperation::KeyValueRawCommandBounded,
+            CapabilityOperation::MessageProduceBudgeted,
             CapabilityOperation::MessageConsumeGroup,
             CapabilityOperation::MessageConsumeAck,
             CapabilityOperation::MessageAdminListTopics,
