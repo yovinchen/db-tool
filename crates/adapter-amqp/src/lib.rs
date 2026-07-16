@@ -116,7 +116,7 @@ impl MessageProducer for AmqpAdapter {
         messages: Vec<Message>,
         budget: ProduceBudget,
     ) -> Result<ProduceOutcome> {
-        validate_queue(target)?;
+        validate_publish_queue(target)?;
         let prepared = prepare_amqp_messages(messages, budget)?;
 
         let channel = self.channel().await?;
@@ -500,14 +500,20 @@ async fn declare_queue(
 }
 
 pub(crate) fn validate_queue(queue: &str) -> Result<()> {
-    if queue.is_empty()
-        || queue.len() > 255
-        || queue.starts_with("amq.")
-        || queue.bytes().any(|b| b.is_ascii_control())
-    {
+    if queue.is_empty() || queue.len() > 255 || queue.bytes().any(|b| b.is_ascii_control()) {
         return Err(Error::Query(format!("invalid AMQP queue name: {queue:?}")));
     }
 
+    Ok(())
+}
+
+fn validate_publish_queue(queue: &str) -> Result<()> {
+    validate_queue(queue)?;
+    if queue.starts_with("amq.") {
+        return Err(Error::Config(format!(
+            "AMQP queue names starting with amq. are broker-reserved: {queue:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -920,7 +926,8 @@ mod tests {
             prepare_amqp_messages(vec![valid, invalid], ProduceBudget::default()),
             Err(Error::Config(message)) if message.contains("message key")
         ));
-        assert!(validate_queue("amq.dbtool-reserved").is_err());
+        assert!(validate_publish_queue("amq.dbtool-reserved").is_err());
+        assert!(validate_queue("amq.dbtool-existing").is_ok());
     }
 
     #[test]
