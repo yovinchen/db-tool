@@ -5,7 +5,8 @@ use dbtool_core::{
         AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
         DeleteResourceOptions, DeleteResourceOutcome, KeyExpiry, KeyValueRestoreOutcome,
         KeyValueSnapshot, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
-        MessageResourceKind, PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo, Value,
+        MessageResourceKind, MetadataBudget, PartitionWatermark, ProduceOutcome, TopicDetail,
+        TopicInfo, Value,
     },
     port::{
         capability::{
@@ -13,7 +14,7 @@ use dbtool_core::{
         },
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ListLimiter,
+    service::limiter::{ListLimiter, MetadataLimiter},
 };
 use futures::{future::BoxFuture, StreamExt};
 use redis::{
@@ -44,6 +45,83 @@ for index = 1, #keys do
   end
 end
 return {page[1], keys}
+"#;
+// XINFO STREAM includes the complete first and last entry payloads. Keep
+// those payloads inside Redis and return only the scalar fields needed by the
+// portable TopicDetail so one large Stream entry cannot become an unbounded
+// RESP response.
+const REDIS_STREAM_DETAIL_SCRIPT: &str = r#"
+local resource_type = redis.call('TYPE', KEYS[1]).ok
+if resource_type == 'none' then
+  return redis.error_reply('dbtool stream does not exist')
+end
+if resource_type ~= 'stream' then
+  return redis.error_reply('dbtool resource is not a stream')
+end
+
+local info = redis.call('XINFO', 'STREAM', KEYS[1])
+local function field(name)
+  for index = 1, #info, 2 do
+    if info[index] == name then
+      return info[index + 1]
+    end
+  end
+  return nil
+end
+
+local length = field('length')
+local groups = field('groups')
+local last_generated_id = field('last-generated-id')
+local first_entry = field('first-entry')
+if length == nil or groups == nil or last_generated_id == nil then
+  return redis.error_reply('dbtool incomplete XINFO STREAM response')
+end
+local first_id = '0-0'
+if type(first_entry) == 'table' and first_entry[1] ~= nil then
+  first_id = first_entry[1]
+end
+return {length, groups, last_generated_id, first_id}
+"#;
+
+// XINFO GROUPS has no server-side name filter. Run it in Lua, inspect at most
+// the caller-owned N+1 work allowance, and return one fixed-shape match rather
+// than every consumer group's metadata over RESP.
+const REDIS_GROUP_LAG_SCRIPT: &str = r#"
+local resource_type = redis.call('TYPE', KEYS[1]).ok
+if resource_type ~= 'stream' then
+  return redis.error_reply('dbtool resource is not a stream')
+end
+local max_groups = tonumber(ARGV[2])
+if max_groups == nil or max_groups < 1 then
+  return redis.error_reply('dbtool invalid consumer group scan budget')
+end
+
+local groups = redis.call('XINFO', 'GROUPS', KEYS[1])
+local inspected = 0
+for _, info in ipairs(groups) do
+  inspected = inspected + 1
+  -- max_groups is the caller's remaining allowance plus one probe item.
+  -- Stop on that probe so server-side inspection is bounded by N+1 rather
+  -- than examining one additional group before reporting overflow.
+  if inspected >= max_groups then
+    return {-1, inspected, '', false, 0, false}
+  end
+  local values = {}
+  for index = 1, #info, 2 do
+    values[info[index]] = info[index + 1]
+  end
+  if values['name'] == ARGV[1] then
+    return {
+      1,
+      inspected,
+      values['last-delivered-id'] or '',
+      values['entries-read'] or false,
+      values['pending'] or 0,
+      values['lag'] or false
+    }
+  end
+end
+return {0, inspected, '', false, 0, false}
 "#;
 const REDIS_LUA_SAFE_INTEGER_MAX_MS: i64 = 9_007_199_254_740_991;
 
@@ -536,6 +614,18 @@ impl AdminInspect for RedisAdapter {
         }
     }
 
+    async fn topic_detail_bounded(
+        &self,
+        name: &str,
+        budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        let detail = match parse_message_target(name)? {
+            RedisMessageTarget::Stream(stream) => self.stream_detail_bounded(stream).await?,
+            RedisMessageTarget::PubSub(channel) => self.pubsub_detail(channel).await?,
+        };
+        enforce_redis_topic_detail_budget(detail, budget)
+    }
+
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>> {
         if !self.consumer_lag_supported {
             return Err(Error::UnsupportedCapability {
@@ -573,6 +663,90 @@ impl AdminInspect for RedisAdapter {
             }
         }
 
+        Ok(results)
+    }
+
+    async fn consumer_lag_bounded(
+        &self,
+        group: &str,
+        budget: MetadataBudget,
+    ) -> Result<Vec<LagInfo>> {
+        if !self.consumer_lag_supported {
+            return Err(Error::UnsupportedCapability {
+                kind: self.kind.0.clone(),
+                needed: CapabilityOperation::MessageAdminConsumerLagBounded.as_str(),
+            });
+        }
+        validate_redis_name("consumer group", group)?;
+        let budget = budget.validate()?;
+        let mut response_limiter = MetadataLimiter::new(budget, "Redis consumer lag")?;
+        let mut inspected_items = 0_usize;
+        let streams = self
+            .scan_stream_topics(Some(metadata_work_probe(inspected_items, budget)?))
+            .await?;
+        let mut results = Vec::new();
+
+        for stream in streams {
+            observe_metadata_work(&mut inspected_items, budget, "Redis consumer lag scan")?;
+            let group_probe = metadata_work_probe(inspected_items, budget)?;
+            let mut c = self.conn.lock().await;
+            let (status, inspected_groups, last_delivered_id, entries_read, pending, server_lag): (
+                i64,
+                usize,
+                String,
+                Option<usize>,
+                usize,
+                Option<usize>,
+            ) = redis::cmd("EVAL")
+                .arg(REDIS_GROUP_LAG_SCRIPT)
+                .arg(1)
+                .arg(&stream.name)
+                .arg(group)
+                .arg(group_probe)
+                .query_async(&mut *c)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+            drop(c);
+
+            for _ in 0..inspected_groups {
+                observe_metadata_work(&mut inspected_items, budget, "Redis consumer lag scan")?;
+            }
+            match status {
+                0 => {}
+                1 => {
+                    let (latest, committed, lag) = redis_lag_dimensions(
+                        &last_delivered_id,
+                        entries_read,
+                        pending,
+                        server_lag,
+                    )?;
+                    let item = LagInfo {
+                        topic: stream.name,
+                        partition: 0,
+                        group: group.to_owned(),
+                        committed,
+                        latest,
+                        lag,
+                    };
+                    response_limiter.observe(&item)?;
+                    results.push(item);
+                }
+                -1 => {
+                    return Err(Error::Serialization(
+                        "Redis consumer group scan exceeded its probe without tripping the metadata work budget"
+                            .into(),
+                    ))
+                }
+                other => {
+                    return Err(Error::Serialization(format!(
+                        "Redis consumer group scan returned unexpected status {other}"
+                    )))
+                }
+            }
+        }
+
+        results.sort_by(|left, right| left.topic.cmp(&right.topic));
+        response_limiter.ensure_complete(&results)?;
         Ok(results)
     }
 }
@@ -641,6 +815,37 @@ impl RedisAdapter {
 
         topics.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(topics)
+    }
+
+    async fn stream_detail_bounded(&self, stream: &str) -> Result<TopicDetail> {
+        let mut c = self.conn.lock().await;
+        let (length, groups, last_generated_id, first_id): (usize, usize, String, String) =
+            redis::cmd("EVAL")
+                .arg(REDIS_STREAM_DETAIL_SCRIPT)
+                .arg(1)
+                .arg(stream)
+                .query_async(&mut *c)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+
+        Ok(TopicDetail {
+            info: TopicInfo {
+                name: stream.to_owned(),
+                partitions: 1,
+                replicas: 1,
+            },
+            config: HashMap::from([
+                ("kind".to_owned(), "stream".to_owned()),
+                ("length".to_owned(), length.to_string()),
+                ("groups".to_owned(), groups.to_string()),
+                ("last_generated_id".to_owned(), last_generated_id.clone()),
+            ]),
+            watermarks: vec![PartitionWatermark {
+                partition: 0,
+                low: redis_stream_offset(&first_id)?,
+                high: redis_stream_offset(&last_generated_id)?,
+            }],
+        })
     }
 }
 
@@ -1706,12 +1911,55 @@ fn redis_operations(
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminDelete,
     ]);
     if consumer_lag_supported {
         operations.push(CapabilityOperation::MessageAdminConsumerLag);
+        operations.push(CapabilityOperation::MessageAdminConsumerLagBounded);
     }
     operations
+}
+
+fn enforce_redis_topic_detail_budget(
+    detail: TopicDetail,
+    budget: MetadataBudget,
+) -> Result<TopicDetail> {
+    let mut limiter = MetadataLimiter::new(budget, "Redis topic detail")?;
+    for item in &detail.config {
+        limiter.observe(&item)?;
+    }
+    for watermark in &detail.watermarks {
+        limiter.observe(watermark)?;
+    }
+    limiter.ensure_complete(&detail)?;
+    Ok(detail)
+}
+
+fn metadata_work_probe(observed: usize, budget: MetadataBudget) -> Result<usize> {
+    budget
+        .max_items
+        .saturating_sub(observed)
+        .checked_add(1)
+        .ok_or_else(|| Error::Config("metadata work budget cannot reserve a probe item".into()))
+}
+
+fn observe_metadata_work(
+    observed: &mut usize,
+    budget: MetadataBudget,
+    subject: &str,
+) -> Result<()> {
+    if *observed >= budget.max_items {
+        return Err(Error::MetadataBudgetExceeded {
+            subject: subject.to_owned(),
+            unit: "items",
+            limit: budget.max_items,
+        });
+    }
+    *observed = observed
+        .checked_add(1)
+        .ok_or_else(|| Error::Query(format!("{subject} item count overflow")))?;
+    Ok(())
 }
 
 fn validate_redis_delete_request(
@@ -2221,6 +2469,17 @@ mod tests {
         ConnectorKind("redis".to_owned())
     }
 
+    fn redis_dsn_for_database(raw: &str, database: u8) -> String {
+        let query_at = raw.find('?').unwrap_or(raw.len());
+        let (base, query) = raw.split_at(query_at);
+        let authority_start = base.find("://").map_or(0, |index| index + 3);
+        let path_at = base[authority_start..]
+            .find('/')
+            .map(|index| authority_start + index)
+            .unwrap_or(base.len());
+        format!("{}/{database}{query}", &base[..path_at])
+    }
+
     fn stream_entry(id: &str, fields: &[(&[u8], &[u8])]) -> RedisStreamEntry {
         RedisStreamEntry {
             id: id.to_owned(),
@@ -2383,6 +2642,75 @@ mod tests {
             .unwrap();
         let expiring_set_position = RESTORE_WITH_EXPIRY_SCRIPT.find("'PX', remaining").unwrap();
         assert!(time_position < expired_position && expired_position < expiring_set_position);
+    }
+
+    #[tokio::test]
+    async fn redis_live_bounded_lag_counts_sparse_scan_work_exactly() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        // Use a dedicated logical database so stale streams from other live
+        // tests cannot change the exact stream+group work count below.
+        let isolated_dsn = redis_dsn_for_database(&raw_dsn, 15);
+        let dsn = Dsn::parse(&isolated_dsn).unwrap();
+        let client = Client::open(dsn.raw_with_scheme("redis").unwrap()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut direct)
+            .await
+            .unwrap();
+
+        let target_stream = "dbtool_it_exact_target";
+        let sparse_stream = "dbtool_it_exact_sparse";
+        let target_group = "dbtool_it_exact_group";
+        for (stream, group) in [
+            (target_stream, target_group),
+            (sparse_stream, "dbtool_it_unrelated_group"),
+        ] {
+            redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg("fixture")
+                .query_async::<String>(&mut direct)
+                .await
+                .unwrap();
+            redis::cmd("XGROUP")
+                .arg("CREATE")
+                .arg(stream)
+                .arg(group)
+                .arg("0")
+                .query_async::<()>(&mut direct)
+                .await
+                .unwrap();
+        }
+
+        let connector = factory(dsn).await.unwrap();
+        let admin = connector.as_admin().unwrap();
+        // Work is exactly two stream candidates plus one group candidate per
+        // stream. The unrelated stream/group proves a sparse non-result still
+        // consumes caller-owned scan work.
+        let lag = admin
+            .consumer_lag_bounded(target_group, MetadataBudget::with_default_bytes(4).unwrap())
+            .await
+            .expect("exact stream+group work budget should prove completeness");
+        assert_eq!(lag.len(), 1);
+        assert_eq!(lag[0].topic, target_stream);
+        assert!(matches!(
+            admin
+                .consumer_lag_bounded(target_group, MetadataBudget::with_default_bytes(3).unwrap(),)
+                .await,
+            Err(Error::MetadataBudgetExceeded {
+                unit: "items",
+                limit: 3,
+                ..
+            })
+        ));
+
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut direct)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2579,6 +2907,22 @@ mod tests {
         };
         let consumer = connector.as_consumer().unwrap();
         let admin = connector.as_admin().unwrap();
+        let detail = admin
+            .topic_detail_bounded(&stream, MetadataBudget::with_default_bytes(5).unwrap())
+            .await
+            .expect("bounded Stream detail should use the fixed-shape Lua response");
+        assert_eq!(detail.info.name, stream);
+        assert_eq!(detail.config["length"], "3");
+        assert!(matches!(
+            admin
+                .topic_detail_bounded(&stream, MetadataBudget::with_default_bytes(4).unwrap())
+                .await,
+            Err(Error::MetadataBudgetExceeded {
+                unit: "items",
+                limit: 4,
+                ..
+            })
+        ));
         if lag_supported {
             let initial_lag = admin.consumer_lag(&group).await.unwrap();
             assert_eq!(initial_lag.len(), 1);
@@ -2588,6 +2932,18 @@ mod tests {
                     initial_lag[0].committed,
                     initial_lag[0].lag,
                 ),
+                (3, 0, 3)
+            );
+            let bounded_lag = admin
+                .consumer_lag_bounded(&group, MetadataBudget::with_default_bytes(10_000).unwrap())
+                .await
+                .expect("bounded group lag should use server-side group filtering");
+            let bounded_lag = bounded_lag
+                .iter()
+                .find(|item| item.topic == stream)
+                .expect("bounded lag should include the fixture stream");
+            assert_eq!(
+                (bounded_lag.latest, bounded_lag.committed, bounded_lag.lag,),
                 (3, 0, 3)
             );
         } else {
@@ -3481,7 +3837,9 @@ mod tests {
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminListTopicsBounded,
             CapabilityOperation::MessageAdminTopicDetail,
+            CapabilityOperation::MessageAdminTopicDetailBounded,
             CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminConsumerLagBounded,
             CapabilityOperation::MessageAdminDelete,
         ] {
             assert!(operations.contains(&operation));
@@ -3493,7 +3851,28 @@ mod tests {
         let keydb_operations = redis_operations(capabilities, false);
         assert!(keydb_operations.contains(&CapabilityOperation::MessageConsumeGroup));
         assert!(keydb_operations.contains(&CapabilityOperation::MessageConsumeAck));
+        assert!(keydb_operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
         assert!(!keydb_operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
+        assert!(!keydb_operations.contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
+    }
+
+    #[test]
+    fn redis_lag_work_budget_reserves_an_exact_probe() {
+        let budget = MetadataBudget::new(2, 1024).unwrap();
+        let mut observed = 0;
+        assert_eq!(metadata_work_probe(observed, budget).unwrap(), 3);
+        observe_metadata_work(&mut observed, budget, "test scan").unwrap();
+        assert_eq!(metadata_work_probe(observed, budget).unwrap(), 2);
+        observe_metadata_work(&mut observed, budget, "test scan").unwrap();
+        assert_eq!(metadata_work_probe(observed, budget).unwrap(), 1);
+        assert!(matches!(
+            observe_metadata_work(&mut observed, budget, "test scan"),
+            Err(Error::MetadataBudgetExceeded {
+                unit: "items",
+                limit: 2,
+                ..
+            })
+        ));
     }
 
     #[test]
