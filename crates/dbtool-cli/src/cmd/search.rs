@@ -2,7 +2,7 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::Value,
+    model::{ReadBudget, Value},
     port::{
         capability::{SearchHits, SearchOptions},
         CapabilityOperation,
@@ -14,7 +14,7 @@ use dbtool_core::{
 #[derive(Args)]
 #[command(
     about = "Inspect and query OpenSearch/Elasticsearch-compatible indices.",
-    long_about = "Search commands use JSON request bodies and the global --limit for hit count. Index, put, update, delete, and delete-index are write operations and require --allow-write; delete-index also requires a target-bound --confirm token."
+    long_about = "Search commands use JSON request bodies. Search applies the global --limit to returned hits without enlarging a smaller body size, and search/get apply the global --max-bytes to the complete response, including _source, aggregations, metadata, and backend-specific fields. Index, put, update, delete, and delete-index are write operations and require --allow-write; delete-index also requires a target-bound --confirm token."
 )]
 pub struct SearchCmd {
     #[command(subcommand)]
@@ -26,6 +26,9 @@ pub enum SearchAction {
     /// List indices from an OpenSearch/Elasticsearch-compatible endpoint.
     Indices,
     /// Run a JSON search query against one index.
+    #[command(
+        long_about = "Run a JSON search query against one index. The global --limit caps returned hits without enlarging a smaller size in the JSON body. The global --max-bytes bounds the complete response, including _source, aggregations, hit metadata, and backend-specific fields."
+    )]
     Search {
         /// Index name to query.
         index: String,
@@ -56,6 +59,9 @@ pub enum SearchAction {
         doc: String,
     },
     /// Read one document by stable ID. A missing document returns JSON null.
+    #[command(
+        long_about = "Read one document by stable ID. A missing document returns JSON null. A present document always uses a one-item envelope, while the global --max-bytes bounds the complete document including _source and backend-specific fields."
+    )]
     Get {
         /// Index name to read from.
         index: String,
@@ -89,6 +95,7 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
     if matches!(cmd.action, SearchAction::Indices) {
         ListLimiter::new(ctx.limit).probe_items()?;
     }
+    let read_budget = search_read_budget(&cmd.action, ctx.limit, ctx.max_bytes)?;
     let dsn = ctx.resolve_dsn()?;
     match &cmd.action {
         SearchAction::Index { .. }
@@ -138,6 +145,9 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
             from,
             source,
         } => {
+            let budget = read_budget.ok_or_else(|| {
+                Error::Internal("search read budget was not initialized".to_owned())
+            })?;
             let query: serde_json::Value =
                 serde_json::from_str(&q).map_err(|e| Error::Serialization(e.to_string()))?;
             let effective_from = effective_search_from(&query, from);
@@ -146,7 +156,9 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
                 from,
                 source,
             };
-            let hits = se.search(&index, query.into(), opts).await?;
+            let hits = se
+                .search_budgeted(&index, query.into(), opts, budget)
+                .await?;
             let truncated = search_results_truncated(&hits, effective_from);
             ctx.render_success(&kind, hits, start.elapsed().as_millis() as u64, truncated)
         }
@@ -161,7 +173,10 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
             ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
         }
         SearchAction::Get { index, id } => {
-            let document = se.get_doc(&index, &id).await?;
+            let budget = read_budget.ok_or_else(|| {
+                Error::Internal("search get budget was not initialized".to_owned())
+            })?;
+            let document = se.get_doc_budgeted(&index, &id, budget).await?;
             ctx.render_success(&kind, document, start.elapsed().as_millis() as u64, false)
         }
         SearchAction::Update { index, id, patch } => {
@@ -186,7 +201,10 @@ fn search_operation_for_action(action: &SearchAction) -> (CapabilityOperation, &
             CapabilityOperation::SearchListIndicesBounded,
             "SearchEngine.list_indices_bounded",
         ),
-        SearchAction::Search { .. } => (CapabilityOperation::SearchSearch, "SearchEngine.search"),
+        SearchAction::Search { .. } => (
+            CapabilityOperation::SearchSearchBudgeted,
+            "SearchEngine.search_budgeted",
+        ),
         SearchAction::Index { .. } => (
             CapabilityOperation::SearchIndexDocument,
             "SearchEngine.index_doc",
@@ -196,8 +214,8 @@ fn search_operation_for_action(action: &SearchAction) -> (CapabilityOperation, &
             "SearchEngine.put_doc",
         ),
         SearchAction::Get { .. } => (
-            CapabilityOperation::SearchGetDocument,
-            "SearchEngine.get_doc",
+            CapabilityOperation::SearchGetDocumentBudgeted,
+            "SearchEngine.get_doc_budgeted",
         ),
         SearchAction::Update { .. } => (
             CapabilityOperation::SearchUpdateDocument,
@@ -211,6 +229,18 @@ fn search_operation_for_action(action: &SearchAction) -> (CapabilityOperation, &
             CapabilityOperation::SearchDeleteIndex,
             "SearchEngine.delete_index",
         ),
+    }
+}
+
+fn search_read_budget(
+    action: &SearchAction,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<Option<ReadBudget>> {
+    match action {
+        SearchAction::Search { .. } => ReadBudget::new(max_items, max_bytes).map(Some),
+        SearchAction::Get { .. } => ReadBudget::new(1, max_bytes).map(Some),
+        _ => Ok(None),
     }
 }
 
@@ -292,6 +322,93 @@ mod tests {
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "legacy-search" && needed == "SearchEngine.list_indices_bounded"
         ));
+    }
+
+    #[test]
+    fn legacy_search_operations_do_not_authorize_complete_read_envelopes() {
+        for (operation, needed) in [
+            (
+                CapabilityOperation::SearchSearchBudgeted,
+                "SearchEngine.search_budgeted",
+            ),
+            (
+                CapabilityOperation::SearchGetDocumentBudgeted,
+                "SearchEngine.get_doc_budgeted",
+            ),
+        ] {
+            assert!(matches!(
+                require_search_operation(
+                    CapabilityOperation::SEARCH,
+                    operation,
+                    "legacy-search",
+                    needed,
+                ),
+                Err(Error::UnsupportedCapability {
+                    kind,
+                    needed: actual_needed,
+                }) if kind == "legacy-search" && actual_needed == needed
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn search_hit_budget_is_rejected_before_dsn_resolution() {
+        let error = run(
+            &test_context(0),
+            SearchCmd {
+                action: SearchAction::Search {
+                    index: "users".to_owned(),
+                    q: r#"{"query":{"match_all":{}}}"#.to_owned(),
+                    from: None,
+                    source: true,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Config(message) if message.contains("greater than zero")
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_byte_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(usize::MAX);
+        ctx.max_bytes = 0;
+        let error = run(
+            &ctx,
+            SearchCmd {
+                action: SearchAction::Get {
+                    index: "users".to_owned(),
+                    id: "user-1".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Config(message) if message.contains("byte budget")
+        ));
+    }
+
+    #[test]
+    fn get_uses_one_item_even_when_the_global_limit_is_larger() {
+        assert_eq!(
+            search_read_budget(
+                &SearchAction::Get {
+                    index: "users".to_owned(),
+                    id: "user-1".to_owned(),
+                },
+                10_000,
+                4096,
+            )
+            .unwrap(),
+            Some(ReadBudget::new(1, 4096).unwrap())
+        );
     }
 
     #[tokio::test]

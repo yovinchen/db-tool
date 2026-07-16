@@ -154,6 +154,13 @@ fn cli_help_documents_core_command_families() {
             "missing search action {action}"
         );
     }
+    let search_query_help = stdout_text(&dbtool(&["search", "search", "--help"]));
+    assert!(search_query_help.contains("--limit"));
+    assert!(search_query_help.contains("--max-bytes"));
+    assert!(search_query_help.contains("aggregations"));
+    let search_get_help = stdout_text(&dbtool(&["search", "get", "--help"]));
+    assert!(search_get_help.contains("one-item envelope"));
+    assert!(search_get_help.contains("--max-bytes"));
 
     let ts_help = stdout_text(&dbtool(&["ts", "--help"]));
     assert!(ts_help.contains("Prometheus-compatible"));

@@ -581,7 +581,10 @@ async fn run_search_command(
             "SearchEngine.index_doc",
         )
     } else {
-        (CapabilityOperation::SearchSearch, "SearchEngine.search")
+        (
+            CapabilityOperation::SearchSearchBudgeted,
+            "SearchEngine.search_budgeted",
+        )
     };
     require_operation(connector, operation, needed)?;
     let search = connector
@@ -600,7 +603,7 @@ async fn run_search_command(
         .split_once(' ')
         .ok_or_else(|| Error::Config("search requires index and JSON query".into()))?;
     let result = search
-        .search(
+        .search_budgeted(
             index,
             parse_json_value(query.trim())?,
             dbtool_core::port::capability::SearchOptions {
@@ -608,6 +611,7 @@ async fn run_search_command(
                 from: None,
                 source: false,
             },
+            ReadBudget::with_default_bytes(limit)?,
         )
         .await?;
     render_json(result)
@@ -722,7 +726,10 @@ fn validate_bounded_catalog_limit(command: &str, limit: usize) -> Result<()> {
         TimeSeriesReadBudget::with_default_bytes(limit, limit)?;
     }
     let is_sql_read = parts.first() == Some(&"sql") && parts.get(1) != Some(&"exec");
+    let is_search_read = parts.first() == Some(&"search")
+        && !matches!(parts.get(1), None | Some(&"indices") | Some(&"index"));
     if is_sql_read
+        || is_search_read
         || matches!(
             parts.as_slice(),
             ["doc", "find", ..] | ["kv", "get", _] | ["kv", "scan", ..]
@@ -1070,8 +1077,10 @@ readonli = true
                 "sql.insert_rows_atomic",
                 "sql.list_schemas",
                 "sql.list_schemas_bounded",
+                "sql.list_schemas_budgeted",
                 "sql.list_tables",
                 "sql.list_tables_bounded",
+                "sql.list_tables_budgeted",
                 "sql.query",
                 "sql.query_bounded",
                 "sql.query_budgeted"
@@ -1182,6 +1191,12 @@ readonli = true
                 "SearchEngine.list_indices_bounded",
             ),
             (
+                CapabilityOperation::SEARCH,
+                CapabilityOperation::SearchSearchBudgeted,
+                "legacy-search",
+                "SearchEngine.search_budgeted",
+            ),
+            (
                 CapabilityOperation::TIME_SERIES,
                 CapabilityOperation::TimeSeriesListMeasurementsBounded,
                 "legacy-time-series",
@@ -1220,6 +1235,7 @@ readonli = true
             "doc collections",
             "doc find users {}",
             "search indices",
+            "search users {}",
             "ts measurements",
         ] {
             assert!(matches!(

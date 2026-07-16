@@ -714,8 +714,7 @@ dbtool --dsn "$SEARCH_DSN" --allow-write \
 保留下来。`get` 对缺失文档返回 `data: null`；其他 HTTP 404/409/5xx 不会伪装成功，
 错误消息包含 HTTP 状态和后端 JSON。
 
-搜索请求可直接包含完整 body，CLI 的 `--limit` 会覆盖更大的 body `size`，显式
-`--from` 会覆盖 body offset，`--source` 会覆盖 body 中的 `_source:false`。响应返回：
+搜索请求可直接包含完整 body，CLI 的 `--limit` 会覆盖更大的 body `size`，但不会放大 body 中更小的 `size`；显式 `--from` 会覆盖 body offset，`--source` 会覆盖 body 中的 `_source:false`。CLI/TUI 只调用 `search.search_budgeted`，`search get` 只调用 `search.get_doc_budgeted`；旧 `search.search/get_doc` 和粗粒度 `search=true` 不授权完整读取。响应返回：
 
 - `total` 与 `total_relation`；
 - `hits`、`took_ms`、`timed_out`；
@@ -723,10 +722,14 @@ dbtool --dsn "$SEARCH_DSN" --allow-write \
 - 未被统一模型识别的顶层与 hits-container 元数据。
 
 ```bash
-dbtool --dsn "$SEARCH_DSN" --limit 20 search search users \
+dbtool --dsn "$SEARCH_DSN" --limit 20 --max-bytes 8388608 search search users \
   --q '{"query":{"match_all":{}},"aggs":{"roles":{"terms":{"field":"role.keyword"}}}}' \
   --source
 ```
+
+全局 `--limit` 是 search hit 数量预算；全局 `--max-bytes` 覆盖完整 hit、`_source`、aggregations、hits-container metadata、后端扩展字段和最终 `SearchHits` envelope。`get` 固定为一项预算，但存在文档与缺失文档的 optional envelope 都需完整计费。超限稳定返回 `READ_BUDGET_EXCEEDED`，不返回一份被字节截断的 JSON。
+
+Adapter 在 JSON 解析前对 Content-Length、chunked decoded body 和无长度 body 应用 `min(caller max_bytes,16 MiB)` transport ceiling，解析后再对 portable 结构精确计费。两层都通过才返回成功。
 
 删索引属于破坏性资源操作。第一次调用只获取目标绑定令牌，第二次才执行：
 
@@ -738,4 +741,4 @@ dbtool --dsn "$SEARCH_DSN" --allow-write --confirm '<confirm_token>' \
 
 令牌绑定 DSN/命名连接、操作和精确索引名；同一令牌改成另一个索引会在连接前被拒绝。
 OpenSearch 2.17.1 与 Elasticsearch 8.15.5 的完整生命周期已通过 Docker 实测，
-测试后没有 `dbtool_it_*` 索引残留。
+分别覆盖 exact capability、完整 source/aggregation/get、body size clamp、1-byte 失败、目标绑定删索引与零残留。TLS 兼容 fixture 只作 transport/CA/种子数据证据；因不提供 get/aggregation/delete-index 完整后端面，不写成产品级零残留 PASS。

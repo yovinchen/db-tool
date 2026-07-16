@@ -109,6 +109,47 @@ fn search_fixture_rows(value: &Value) -> Vec<(String, String, String)> {
     rows
 }
 
+fn delete_search_index_best_effort(dsn: &str, index: &str) {
+    let challenge = dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "search",
+        "delete-index",
+        index,
+    ]);
+    let Ok(challenge) = serde_json::from_slice::<Value>(&challenge.stderr) else {
+        return;
+    };
+    let Some(token) = challenge["error"]["confirm_token"].as_str() else {
+        return;
+    };
+    let _ = dbtool(&[
+        "--dsn",
+        dsn,
+        "--allow-write",
+        "--confirm",
+        token,
+        "search",
+        "delete-index",
+        index,
+    ]);
+}
+
+struct SearchIndexCleanup {
+    dsn: String,
+    index: String,
+    enabled: bool,
+}
+
+impl Drop for SearchIndexCleanup {
+    fn drop(&mut self) {
+        if self.enabled {
+            delete_search_index_best_effort(&self.dsn, &self.index);
+        }
+    }
+}
+
 #[test]
 fn opensearch_live_index_search_and_list() {
     if !integration_enabled() {
@@ -230,6 +271,11 @@ fn assert_tls_seed_fixture(dsn: &str) {
 
 fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str, full_crud: bool) {
     let index = unique_name(prefix);
+    let _cleanup = SearchIndexCleanup {
+        dsn: dsn.to_owned(),
+        index: index.clone(),
+        enabled: full_crud,
+    };
 
     let ping = stdout_json(dbtool(&["--dsn", dsn, "ping"]));
     assert_eq!(ping["kind"], expected_kind);
@@ -237,6 +283,14 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str, full_crud:
     let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
     assert_eq!(caps["kind"], expected_kind);
     assert_eq!(caps["data"]["search"], true);
+    for operation in ["search.search_budgeted", "search.get_doc_budgeted"] {
+        assert!(
+            caps["data"]["operations"]
+                .as_array()
+                .is_some_and(|operations| operations.iter().any(|value| value == operation)),
+            "missing exact operation {operation}: {caps}"
+        );
+    }
 
     let blocked = stderr_json(dbtool(&[
         "--dsn",
@@ -315,6 +369,18 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str, full_crud:
         assert_eq!(alice["data"]["found"], true);
         assert_eq!(alice["data"]["source"]["name"], "alice");
         assert_eq!(alice["data"]["source"]["role"], "search-reader");
+
+        let byte_limited_get = stderr_json(dbtool(&[
+            "--dsn",
+            dsn,
+            "--max-bytes",
+            "1",
+            "search",
+            "get",
+            &index,
+            "alice",
+        ]));
+        assert_eq!(byte_limited_get["error"]["code"], "READ_BUDGET_EXCEEDED");
 
         let missing = stdout_json(dbtool(&["--dsn", dsn, "search", "get", &index, "missing"]));
         assert!(missing["data"].is_null());
@@ -418,6 +484,22 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str, full_crud:
             ),
         ]
     );
+
+    let byte_limited_search = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--limit",
+        "10",
+        "--max-bytes",
+        "1",
+        "search",
+        "search",
+        &index,
+        "--q",
+        r#"{"query":{"match_all":{}}}"#,
+        "--source",
+    ]));
+    assert_eq!(byte_limited_search["error"]["code"], "READ_BUDGET_EXCEEDED");
 
     let oversized_body = stdout_json(dbtool(&[
         "--dsn",
