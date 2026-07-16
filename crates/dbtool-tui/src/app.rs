@@ -16,7 +16,7 @@ use dbtool_core::{
     registry::Registry,
     service::{
         safety::{SafetyGuard, StatementKind},
-        ConnectionManager, ListLimiter,
+        ConnectionManager,
     },
     Result,
 };
@@ -290,8 +290,8 @@ async fn execute_tui_command(
         "tables" => {
             require_operation(
                 connector,
-                CapabilityOperation::SqlListTablesBounded,
-                "SqlEngine.list_tables_bounded",
+                CapabilityOperation::SqlListTablesBudgeted,
+                "SqlEngine.list_tables_budgeted",
             )?;
             let schema = parts.next();
             if parts.next().is_some() {
@@ -302,7 +302,10 @@ async fn execute_tui_command(
             let sql = connector
                 .as_sql()
                 .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
-            render_bounded_list(sql.list_tables_bounded(schema, limit).await?)
+            render_bounded_list(
+                sql.list_tables_budgeted(schema, ReadBudget::with_default_bytes(limit)?)
+                    .await?,
+            )
         }
         "schemas" => {
             if parts.next().is_some() {
@@ -310,13 +313,16 @@ async fn execute_tui_command(
             }
             require_operation(
                 connector,
-                CapabilityOperation::SqlListSchemasBounded,
-                "SqlEngine.list_schemas_bounded",
+                CapabilityOperation::SqlListSchemasBudgeted,
+                "SqlEngine.list_schemas_budgeted",
             )?;
             let sql = connector
                 .as_sql()
                 .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
-            render_bounded_list(sql.list_schemas_bounded(limit).await?)
+            render_bounded_list(
+                sql.list_schemas_budgeted(ReadBudget::with_default_bytes(limit)?)
+                    .await?,
+            )
         }
         "schema" => {
             let table = parts
@@ -519,13 +525,16 @@ async fn run_doc_command(
     if command == "collections" {
         require_operation(
             connector,
-            CapabilityOperation::DocumentListCollectionsBounded,
-            "DocumentStore.list_collections_bounded",
+            CapabilityOperation::DocumentListCollectionsBudgeted,
+            "DocumentStore.list_collections_budgeted",
         )?;
         let doc = connector
             .as_document()
             .ok_or_else(|| unsupported(connector, "DocumentStore"))?;
-        return render_bounded_list(doc.list_collections_bounded(limit).await?);
+        return render_bounded_list(
+            doc.list_collections_budgeted(ReadBudget::with_default_bytes(limit)?)
+                .await?,
+        );
     }
     if let Some(rest) = command.strip_prefix("find ").map(str::trim) {
         require_operation(
@@ -567,13 +576,17 @@ async fn run_search_command(
     if command == "indices" {
         require_operation(
             connector,
-            CapabilityOperation::SearchListIndicesBounded,
-            "SearchEngine.list_indices_bounded",
+            CapabilityOperation::SearchListIndicesBudgeted,
+            "SearchEngine.list_indices_budgeted",
         )?;
         let search = connector
             .as_search()
             .ok_or_else(|| unsupported(connector, "SearchEngine"))?;
-        return render_bounded_list(search.list_indices_bounded(limit).await?);
+        return render_bounded_list(
+            search
+                .list_indices_budgeted(ReadBudget::with_default_bytes(limit)?)
+                .await?,
+        );
     }
     let (operation, needed) = if command.strip_prefix("index ").is_some() {
         (
@@ -625,13 +638,16 @@ async fn run_ts_command(
     if command == "measurements" {
         require_operation(
             connector,
-            CapabilityOperation::TimeSeriesListMeasurementsBounded,
-            "TimeSeriesStore.list_measurements_bounded",
+            CapabilityOperation::TimeSeriesListMeasurementsBudgeted,
+            "TimeSeriesStore.list_measurements_budgeted",
         )?;
         let ts = connector
             .as_timeseries()
             .ok_or_else(|| unsupported(connector, "TimeSeriesStore"))?;
-        return render_bounded_list(ts.list_measurements_bounded(limit).await?);
+        return render_bounded_list(
+            ts.list_measurements_budgeted(ReadBudget::with_default_bytes(limit)?)
+                .await?,
+        );
     }
     let (operation, needed) = if command.strip_prefix("write ").is_some() {
         (
@@ -717,7 +733,7 @@ fn validate_bounded_catalog_limit(command: &str, limit: usize) -> Result<()> {
             | ["search", "indices"]
             | ["ts", "measurements"]
     ) {
-        ListLimiter::new(limit).probe_items()?;
+        ReadBudget::with_default_bytes(limit)?;
     }
     if matches!(parts.as_slice(), ["schema", _]) {
         MetadataBudget::with_default_bytes(limit)?;
@@ -1045,12 +1061,12 @@ mod tests {
         assert!(matches!(
             require_declared_operation(
                 CapabilityOperation::SQL,
-                CapabilityOperation::SqlListTablesBounded,
+                CapabilityOperation::SqlListTablesBudgeted,
                 "legacy-sql".into(),
-                "SqlEngine.list_tables_bounded",
+                "SqlEngine.list_tables_budgeted",
             ),
             Err(Error::UnsupportedCapability { needed, .. })
-                if needed == "SqlEngine.list_tables_bounded"
+                if needed == "SqlEngine.list_tables_budgeted"
         ));
     }
 
@@ -1231,9 +1247,9 @@ readonli = true
             ),
             (
                 CapabilityOperation::DOCUMENT,
-                CapabilityOperation::DocumentListCollectionsBounded,
+                CapabilityOperation::DocumentListCollectionsBudgeted,
                 "legacy-document",
-                "DocumentStore.list_collections_bounded",
+                "DocumentStore.list_collections_budgeted",
             ),
             (
                 CapabilityOperation::DOCUMENT,
@@ -1243,9 +1259,9 @@ readonli = true
             ),
             (
                 CapabilityOperation::SEARCH,
-                CapabilityOperation::SearchListIndicesBounded,
+                CapabilityOperation::SearchListIndicesBudgeted,
                 "legacy-search",
-                "SearchEngine.list_indices_bounded",
+                "SearchEngine.list_indices_budgeted",
             ),
             (
                 CapabilityOperation::SEARCH,
@@ -1255,9 +1271,9 @@ readonli = true
             ),
             (
                 CapabilityOperation::TIME_SERIES,
-                CapabilityOperation::TimeSeriesListMeasurementsBounded,
+                CapabilityOperation::TimeSeriesListMeasurementsBudgeted,
                 "legacy-time-series",
-                "TimeSeriesStore.list_measurements_bounded",
+                "TimeSeriesStore.list_measurements_budgeted",
             ),
             (
                 CapabilityOperation::TIME_SERIES,

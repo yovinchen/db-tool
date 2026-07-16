@@ -2,9 +2,8 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::{Point, TimeRange, TimeSeriesReadBudget},
+    model::{Point, ReadBudget, TimeRange, TimeSeriesReadBudget},
     port::CapabilityOperation,
-    service::ListLimiter,
     Result,
 };
 use std::collections::HashMap;
@@ -16,7 +15,7 @@ const MAX_QUERY_SAMPLES: usize = 1_000_000;
 #[derive(Args)]
 #[command(
     about = "Read and write Prometheus-compatible time-series data.",
-    long_about = "Time-series commands list metric names, run bounded range queries, and write single samples through Prometheus remote write behind --allow-write. Query ranges use either --last-minutes (60 by default) or an explicit --start-ms/--end-ms pair in Unix epoch milliseconds."
+    long_about = "Time-series commands list metric names, run bounded range queries, and write single samples through Prometheus remote write behind --allow-write. Metric catalogs honor both the global --limit item budget and --max-bytes response budget. Query ranges use either --last-minutes (60 by default) or an explicit --start-ms/--end-ms pair in Unix epoch milliseconds."
 )]
 pub struct TsCmd {
     #[command(subcommand)]
@@ -69,6 +68,10 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
     if matches!(cmd.action, TsAction::Write { .. }) {
         ensure_write_allowed(ctx)?;
     }
+    let measurements_budget = match &cmd.action {
+        TsAction::Measurements => Some(ReadBudget::new(ctx.limit, ctx.max_bytes)?),
+        TsAction::Query { .. } | TsAction::Write { .. } => None,
+    };
     let query_request = match &cmd.action {
         TsAction::Query {
             last_minutes,
@@ -87,10 +90,7 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
                 budget,
             ))
         }
-        TsAction::Measurements => {
-            ListLimiter::new(ctx.limit).probe_items()?;
-            None
-        }
+        TsAction::Measurements => None,
         TsAction::Write { .. } => None,
     };
 
@@ -110,7 +110,11 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
 
     Ok(match cmd.action {
         TsAction::Measurements => {
-            let measurements = ts.list_measurements_bounded(ctx.limit).await?;
+            let measurements = ts
+                .list_measurements_budgeted(measurements_budget.ok_or_else(|| {
+                    Error::Internal("measurement-list budget was not initialized".into())
+                })?)
+                .await?;
             let truncated = measurements.truncated;
             ctx.render_success(
                 &kind,
@@ -160,8 +164,8 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
 fn time_series_operation_for_action(action: &TsAction) -> (CapabilityOperation, &'static str) {
     match action {
         TsAction::Measurements => (
-            CapabilityOperation::TimeSeriesListMeasurementsBounded,
-            "TimeSeriesStore.list_measurements_bounded",
+            CapabilityOperation::TimeSeriesListMeasurementsBudgeted,
+            "TimeSeriesStore.list_measurements_budgeted",
         ),
         TsAction::Query { .. } => (
             CapabilityOperation::TimeSeriesQueryRangeBounded,
@@ -329,17 +333,17 @@ mod tests {
     }
 
     #[test]
-    fn coarse_time_series_capability_does_not_authorize_bounded_reads() {
+    fn coarse_time_series_capability_does_not_authorize_budgeted_catalog_reads() {
         assert!(matches!(
             require_time_series_operation(
                 CapabilityOperation::TIME_SERIES,
-                CapabilityOperation::TimeSeriesListMeasurementsBounded,
+                CapabilityOperation::TimeSeriesListMeasurementsBudgeted,
                 "legacy-time-series",
-                "TimeSeriesStore.list_measurements_bounded",
+                "TimeSeriesStore.list_measurements_budgeted",
             ),
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "legacy-time-series"
-                    && needed == "TimeSeriesStore.list_measurements_bounded"
+                    && needed == "TimeSeriesStore.list_measurements_budgeted"
         ));
         assert!(matches!(
             require_time_series_operation(
@@ -383,6 +387,18 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, Error::Config(message) if message.contains("too large")));
+
+        let mut ctx = test_context(false);
+        ctx.max_bytes = 0;
+        let error = run(
+            &ctx,
+            TsCmd {
+                action: TsAction::Measurements,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
     }
 
     #[test]

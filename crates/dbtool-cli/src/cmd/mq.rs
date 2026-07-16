@@ -8,7 +8,7 @@ use dbtool_core::{
         MessageResource, MessageResourceKind, DEFAULT_CONSUME_MESSAGE_BYTES, MAX_READ_BYTES,
     },
     port::CapabilityOperation,
-    service::{limiter::ListLimiter, safety::SafetyGuard},
+    service::safety::SafetyGuard,
     Result,
 };
 use std::{
@@ -19,7 +19,7 @@ use std::{
 #[derive(Args)]
 #[command(
     about = "Produce, consume, and inspect bounded message queue workflows.",
-    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write. Stateful group/durable consumption and successful-delivery acknowledgement also require --allow-write. AMQP/AMQPS consume requires explicit --ack on-success because successful delivery is ACKed and removed from the queue. Persistent resource deletion requires both --allow-write and a target-bound --confirm token. Topic/stream/queue catalogs honor the positive global --limit and require a backend-bounded operation; no unbounded fallback is attempted. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
+    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write. Stateful group/durable consumption and successful-delivery acknowledgement also require --allow-write. AMQP/AMQPS consume requires explicit --ack on-success because successful delivery is ACKed and removed from the queue. Persistent resource deletion requires both --allow-write and a target-bound --confirm token. Topic/stream/queue catalogs honor both the positive global --limit item budget and --max-bytes response budget and require an exact backend-budgeted operation; no unbounded fallback is attempted. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
 )]
 pub struct MqCmd {
     #[command(subcommand)]
@@ -161,9 +161,10 @@ struct ConsumeRequest {
 }
 
 pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
-    if matches!(cmd.action, MqAction::Topics) {
-        ListLimiter::new(ctx.limit).probe_items()?;
-    }
+    let topics_budget = match &cmd.action {
+        MqAction::Topics => Some(ctx.read_budget()?),
+        _ => None,
+    };
     if matches!(cmd.action, MqAction::Produce { .. }) {
         ensure_write_allowed(ctx)?;
     }
@@ -314,7 +315,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
         MqAction::Topics => {
             require_message_operation(
                 &operations,
-                CapabilityOperation::MessageAdminListTopicsBounded,
+                CapabilityOperation::MessageAdminListTopicsBudgeted,
                 &kind,
             )?;
             let admin = conn
@@ -323,7 +324,11 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                     kind: kind.clone(),
                     needed: "AdminInspect",
                 })?;
-            let topics = admin.list_topics_bounded(ctx.limit).await?;
+            let topics = admin
+                .list_topics_budgeted(topics_budget.ok_or_else(|| {
+                    Error::Internal("topic-list budget was not initialized".into())
+                })?)
+                .await?;
             let truncated = topics.truncated;
             ctx.render_success(&kind, topics.items, elapsed(), truncated)
         }
@@ -700,25 +705,50 @@ mod tests {
     }
 
     #[test]
-    fn legacy_topic_listing_never_satisfies_bounded_catalog_negotiation() {
+    fn legacy_topic_listing_never_satisfies_budgeted_catalog_negotiation() {
         let operations = [CapabilityOperation::MessageAdminListTopics];
         assert!(matches!(
             require_message_operation(
                 &operations,
-                CapabilityOperation::MessageAdminListTopicsBounded,
+                CapabilityOperation::MessageAdminListTopicsBudgeted,
                 "legacy-mq"
             ),
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "legacy-mq"
-                    && needed == CapabilityOperation::MessageAdminListTopicsBounded.as_str()
+                    && needed == CapabilityOperation::MessageAdminListTopicsBudgeted.as_str()
         ));
+    }
+
+    #[tokio::test]
+    async fn topic_catalog_byte_budget_is_rejected_before_dsn_resolution() {
+        let ctx = Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: dbtool_core::service::formatter::Format::Json,
+            limit: 1,
+            max_bytes: 0,
+            throttle_overrides: Default::default(),
+            allow_write: false,
+            confirm: None,
+        };
+        let error = run(
+            &ctx,
+            MqCmd {
+                action: MqAction::Topics,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
     }
 
     #[test]
     fn partial_admin_profiles_cannot_dispatch_unadvertised_methods() {
         let legacy_admin_without_operations = [];
         for operation in [
-            CapabilityOperation::MessageAdminListTopicsBounded,
+            CapabilityOperation::MessageAdminListTopicsBudgeted,
             CapabilityOperation::MessageAdminTopicDetailBounded,
             CapabilityOperation::MessageAdminConsumerLagBounded,
             CapabilityOperation::MessageAdminDelete,
@@ -754,7 +784,7 @@ mod tests {
         .is_ok());
 
         for operation in [
-            CapabilityOperation::MessageAdminListTopicsBounded,
+            CapabilityOperation::MessageAdminListTopicsBudgeted,
             CapabilityOperation::MessageAdminConsumerLagBounded,
             CapabilityOperation::MessageAdminDelete,
         ] {
@@ -765,10 +795,10 @@ mod tests {
             ));
         }
 
-        let list_only = [CapabilityOperation::MessageAdminListTopicsBounded];
+        let list_only = [CapabilityOperation::MessageAdminListTopicsBudgeted];
         assert!(require_message_operation(
             &list_only,
-            CapabilityOperation::MessageAdminListTopicsBounded,
+            CapabilityOperation::MessageAdminListTopicsBudgeted,
             "list-only"
         )
         .is_ok());

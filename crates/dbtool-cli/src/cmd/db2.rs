@@ -1,13 +1,14 @@
 use super::Context;
 use clap::{Args, Subcommand};
-use dbtool_core::{error::Error, port::CapabilityOperation, service::limiter::ListLimiter, Result};
+use dbtool_core::{error::Error, port::CapabilityOperation, Result};
 
 #[derive(Args)]
 #[command(
     about = "IBM Db2 schema inspection (sequences / routines / tablespaces / fk / ddl).",
     long_about = "Db2 commands query the SYSCAT catalog to expose Db2-specific metadata: \
                   sequences, stored procedures/UDFs, tablespaces, foreign-key constraints, \
-                  and generated DDL. Catalog lists honor the global --limit and report truncation. \
+                  and generated DDL. Catalog lists honor both the global --limit item budget and \
+                  --max-bytes response budget, and report truncation. \
                   All commands are read-only and do not require --allow-write."
 )]
 pub struct Db2Cmd {
@@ -57,16 +58,22 @@ pub enum Db2Action {
 }
 
 pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
+    let read_budget = match &cmd.action {
+        Db2Action::Sequences { .. }
+        | Db2Action::Routines { .. }
+        | Db2Action::Tablespaces
+        | Db2Action::ForeignKeys { .. }
+        | Db2Action::Schemas
+        | Db2Action::Tables { .. } => Some(ctx.read_budget()?),
+        Db2Action::Ddl { .. } | Db2Action::Schema { .. } => None,
+    };
     let metadata_budget = match &cmd.action {
         Db2Action::Sequences { .. }
         | Db2Action::Routines { .. }
         | Db2Action::Tablespaces
         | Db2Action::ForeignKeys { .. }
         | Db2Action::Schemas
-        | Db2Action::Tables { .. } => {
-            ListLimiter::new(ctx.limit).probe_items()?;
-            None
-        }
+        | Db2Action::Tables { .. } => None,
         Db2Action::Ddl { .. } | Db2Action::Schema { .. } => Some(ctx.metadata_budget()?),
     };
     let dsn = ctx.resolve_dsn()?;
@@ -83,25 +90,40 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
         Db2Action::Sequences { schema } => {
             let db2 = require_db2(&*conn)?;
             let seqs = db2
-                .list_sequences_bounded(schema.as_deref(), ctx.limit)
+                .list_sequences_budgeted(
+                    schema.as_deref(),
+                    read_budget.expect("sequence-list actions construct a read budget"),
+                )
                 .await?;
             Ok(ctx.render_success(&kind, seqs.items, elapsed(), seqs.truncated))
         }
         Db2Action::Routines { schema } => {
             let db2 = require_db2(&*conn)?;
             let routines = db2
-                .list_routines_bounded(schema.as_deref(), ctx.limit)
+                .list_routines_budgeted(
+                    schema.as_deref(),
+                    read_budget.expect("routine-list actions construct a read budget"),
+                )
                 .await?;
             Ok(ctx.render_success(&kind, routines.items, elapsed(), routines.truncated))
         }
         Db2Action::Tablespaces => {
             let db2 = require_db2(&*conn)?;
-            let tablespaces = db2.list_tablespaces_bounded(ctx.limit).await?;
+            let tablespaces = db2
+                .list_tablespaces_budgeted(
+                    read_budget.expect("tablespace-list actions construct a read budget"),
+                )
+                .await?;
             Ok(ctx.render_success(&kind, tablespaces.items, elapsed(), tablespaces.truncated))
         }
         Db2Action::ForeignKeys { table } => {
             let db2 = require_db2(&*conn)?;
-            let foreign_keys = db2.list_foreign_keys_bounded(&table, ctx.limit).await?;
+            let foreign_keys = db2
+                .list_foreign_keys_budgeted(
+                    &table,
+                    read_budget.expect("foreign-key-list actions construct a read budget"),
+                )
+                .await?;
             Ok(ctx.render_success(&kind, foreign_keys.items, elapsed(), foreign_keys.truncated))
         }
         Db2Action::Ddl { table } => {
@@ -119,13 +141,20 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
         // ── SqlEngine operations (same surface as `sql` but Db2-flavoured) ──
         Db2Action::Schemas => {
             let sql = require_sql(&*conn)?;
-            let schemas = sql.list_schemas_bounded(ctx.limit).await?;
+            let schemas = sql
+                .list_schemas_budgeted(
+                    read_budget.expect("schema-list actions construct a read budget"),
+                )
+                .await?;
             Ok(ctx.render_success(&kind, schemas.items, elapsed(), schemas.truncated))
         }
         Db2Action::Tables { schema } => {
             let sql = require_sql(&*conn)?;
             let tables = sql
-                .list_tables_bounded(schema.as_deref(), ctx.limit)
+                .list_tables_budgeted(
+                    schema.as_deref(),
+                    read_budget.expect("table-list actions construct a read budget"),
+                )
                 .await?;
             Ok(ctx.render_success(&kind, tables.items, elapsed(), tables.truncated))
         }
@@ -145,32 +174,32 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
 fn db2_operation_for_action(action: &Db2Action) -> (CapabilityOperation, &'static str) {
     match action {
         Db2Action::Sequences { .. } => (
-            CapabilityOperation::Db2ListSequencesBounded,
-            "Db2Engine.list_sequences_bounded",
+            CapabilityOperation::Db2ListSequencesBudgeted,
+            "Db2Engine.list_sequences_budgeted",
         ),
         Db2Action::Routines { .. } => (
-            CapabilityOperation::Db2ListRoutinesBounded,
-            "Db2Engine.list_routines_bounded",
+            CapabilityOperation::Db2ListRoutinesBudgeted,
+            "Db2Engine.list_routines_budgeted",
         ),
         Db2Action::Tablespaces => (
-            CapabilityOperation::Db2ListTablespacesBounded,
-            "Db2Engine.list_tablespaces_bounded",
+            CapabilityOperation::Db2ListTablespacesBudgeted,
+            "Db2Engine.list_tablespaces_budgeted",
         ),
         Db2Action::ForeignKeys { .. } => (
-            CapabilityOperation::Db2ListForeignKeysBounded,
-            "Db2Engine.list_foreign_keys_bounded",
+            CapabilityOperation::Db2ListForeignKeysBudgeted,
+            "Db2Engine.list_foreign_keys_budgeted",
         ),
         Db2Action::Ddl { .. } => (
             CapabilityOperation::Db2GenerateDdlBounded,
             "Db2Engine.generate_ddl_bounded",
         ),
         Db2Action::Schemas => (
-            CapabilityOperation::SqlListSchemasBounded,
-            "SqlEngine.list_schemas_bounded",
+            CapabilityOperation::SqlListSchemasBudgeted,
+            "SqlEngine.list_schemas_budgeted",
         ),
         Db2Action::Tables { .. } => (
-            CapabilityOperation::SqlListTablesBounded,
-            "SqlEngine.list_tables_bounded",
+            CapabilityOperation::SqlListTablesBudgeted,
+            "SqlEngine.list_tables_budgeted",
         ),
         Db2Action::Schema { .. } => (
             CapabilityOperation::SqlDescribeTableBounded,
@@ -242,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_db2_capabilities_do_not_authorize_bounded_catalog_calls() {
+    fn legacy_db2_capabilities_do_not_authorize_budgeted_catalog_calls() {
         let operations = Capabilities {
             sql: true,
             db2: true,
@@ -253,12 +282,12 @@ mod tests {
         assert!(matches!(
             require_operation(
                 &operations,
-                CapabilityOperation::Db2ListSequencesBounded,
+                CapabilityOperation::Db2ListSequencesBudgeted,
                 "legacy-db2",
-                "Db2Engine.list_sequences_bounded",
+                "Db2Engine.list_sequences_budgeted",
             ),
             Err(Error::UnsupportedCapability { needed, .. })
-                if needed == "Db2Engine.list_sequences_bounded"
+                if needed == "Db2Engine.list_sequences_budgeted"
         ));
     }
 
@@ -326,5 +355,21 @@ mod tests {
             let error = run(&ctx, Db2Cmd { action }).await.unwrap_err();
             assert!(matches!(error, Error::Config(message) if message.contains("too large")));
         }
+    }
+
+    #[tokio::test]
+    async fn catalog_byte_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context();
+        ctx.max_bytes = 0;
+        let error = run(
+            &ctx,
+            Db2Cmd {
+                action: Db2Action::Tablespaces,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
     }
 }

@@ -5,7 +5,7 @@ use dbtool_core::{
     error::Error,
     model::{Document, FindOptions, Value},
     port::CapabilityOperation,
-    service::{limiter::ListLimiter, safety::SafetyGuard},
+    service::safety::SafetyGuard,
     Result,
 };
 
@@ -86,11 +86,10 @@ pub enum DocAction {
 }
 
 pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
-    if matches!(cmd.action, DocAction::Collections) {
-        ListLimiter::new(ctx.limit).probe_items()?;
-    }
     let read_budget = match &cmd.action {
-        DocAction::Find { .. } | DocAction::Aggregate { .. } => Some(ctx.read_budget()?),
+        DocAction::Collections | DocAction::Find { .. } | DocAction::Aggregate { .. } => {
+            Some(ctx.read_budget()?)
+        }
         _ => None,
     };
     let dsn = ctx.resolve_dsn()?;
@@ -144,7 +143,11 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
 
     Ok(match cmd.action {
         DocAction::Collections => {
-            let collections = doc.list_collections_bounded(ctx.limit).await?;
+            let collections = doc
+                .list_collections_budgeted(
+                    read_budget.expect("collection-list actions construct a read budget"),
+                )
+                .await?;
             let truncated = collections.truncated;
             ctx.render_success(&kind, collections.items, elapsed(), truncated)
         }
@@ -245,8 +248,8 @@ fn document_operation_for_action(
 ) -> Option<(CapabilityOperation, &'static str)> {
     match action {
         DocAction::Collections => Some((
-            CapabilityOperation::DocumentListCollectionsBounded,
-            "DocumentStore.list_collections_bounded",
+            CapabilityOperation::DocumentListCollectionsBudgeted,
+            "DocumentStore.list_collections_budgeted",
         )),
         DocAction::Update { many: true, .. } => Some((
             CapabilityOperation::DocumentUpdateMany,
@@ -1086,17 +1089,17 @@ mod tests {
     }
 
     #[test]
-    fn coarse_document_capability_does_not_authorize_bounded_collection_listing() {
+    fn coarse_document_capability_does_not_authorize_budgeted_collection_listing() {
         assert!(matches!(
             require_document_operation(
                 CapabilityOperation::DOCUMENT,
-                CapabilityOperation::DocumentListCollectionsBounded,
+                CapabilityOperation::DocumentListCollectionsBudgeted,
                 "legacy-document",
-                "DocumentStore.list_collections_bounded",
+                "DocumentStore.list_collections_budgeted",
             ),
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "legacy-document"
-                    && needed == "DocumentStore.list_collections_bounded"
+                    && needed == "DocumentStore.list_collections_budgeted"
         ));
     }
 
@@ -1119,6 +1122,19 @@ mod tests {
             error,
             Error::Config(message) if message.contains("greater than zero")
         ));
+
+        let mut ctx = test_context(false, "mongodb://127.0.0.1:1/app");
+        ctx.dsn = None;
+        ctx.max_bytes = 0;
+        let error = run(
+            &ctx,
+            DocCmd {
+                action: DocAction::Collections,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
     }
 
     #[tokio::test]

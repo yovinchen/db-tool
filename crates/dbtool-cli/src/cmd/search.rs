@@ -7,14 +7,14 @@ use dbtool_core::{
         capability::{SearchHits, SearchOptions},
         CapabilityOperation,
     },
-    service::{limiter::ListLimiter, safety::SafetyGuard},
+    service::safety::SafetyGuard,
     Result,
 };
 
 #[derive(Args)]
 #[command(
     about = "Inspect and query OpenSearch/Elasticsearch-compatible indices.",
-    long_about = "Search commands use JSON request bodies. Search applies the global --limit to returned hits without enlarging a smaller body size, and search/get apply the global --max-bytes to the complete response, including _source, aggregations, metadata, and backend-specific fields. Index, put, update, delete, and delete-index are write operations and require --allow-write; delete-index also requires a target-bound --confirm token."
+    long_about = "Search commands use JSON request bodies. Index catalogs and searches apply the global --limit item budget and --max-bytes complete-response budget. Search never enlarges a smaller body size; search/get byte accounting includes _source, aggregations, metadata, and backend-specific fields. Index, put, update, delete, and delete-index are write operations and require --allow-write; delete-index also requires a target-bound --confirm token."
 )]
 pub struct SearchCmd {
     #[command(subcommand)]
@@ -92,9 +92,6 @@ pub enum SearchAction {
 }
 
 pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
-    if matches!(cmd.action, SearchAction::Indices) {
-        ListLimiter::new(ctx.limit).probe_items()?;
-    }
     let read_budget = search_read_budget(&cmd.action, ctx.limit, ctx.max_bytes)?;
     let dsn = ctx.resolve_dsn()?;
     match &cmd.action {
@@ -130,7 +127,11 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
 
     Ok(match cmd.action {
         SearchAction::Indices => {
-            let indices = se.list_indices_bounded(ctx.limit).await?;
+            let indices = se
+                .list_indices_budgeted(read_budget.ok_or_else(|| {
+                    Error::Internal("search index-list budget was not initialized".to_owned())
+                })?)
+                .await?;
             let truncated = indices.truncated;
             ctx.render_success(
                 &kind,
@@ -198,8 +199,8 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
 fn search_operation_for_action(action: &SearchAction) -> (CapabilityOperation, &'static str) {
     match action {
         SearchAction::Indices => (
-            CapabilityOperation::SearchListIndicesBounded,
-            "SearchEngine.list_indices_bounded",
+            CapabilityOperation::SearchListIndicesBudgeted,
+            "SearchEngine.list_indices_budgeted",
         ),
         SearchAction::Search { .. } => (
             CapabilityOperation::SearchSearchBudgeted,
@@ -238,7 +239,9 @@ fn search_read_budget(
     max_bytes: usize,
 ) -> Result<Option<ReadBudget>> {
     match action {
-        SearchAction::Search { .. } => ReadBudget::new(max_items, max_bytes).map(Some),
+        SearchAction::Indices | SearchAction::Search { .. } => {
+            ReadBudget::new(max_items, max_bytes).map(Some)
+        }
         SearchAction::Get { .. } => ReadBudget::new(1, max_bytes).map(Some),
         _ => Ok(None),
     }
@@ -311,16 +314,16 @@ mod tests {
     }
 
     #[test]
-    fn coarse_search_capability_does_not_authorize_bounded_index_listing() {
+    fn coarse_search_capability_does_not_authorize_budgeted_index_listing() {
         assert!(matches!(
             require_search_operation(
                 CapabilityOperation::SEARCH,
-                CapabilityOperation::SearchListIndicesBounded,
+                CapabilityOperation::SearchListIndicesBudgeted,
                 "legacy-search",
-                "SearchEngine.list_indices_bounded",
+                "SearchEngine.list_indices_budgeted",
             ),
             Err(Error::UnsupportedCapability { kind, needed })
-                if kind == "legacy-search" && needed == "SearchEngine.list_indices_bounded"
+                if kind == "legacy-search" && needed == "SearchEngine.list_indices_budgeted"
         ));
     }
 
@@ -426,6 +429,18 @@ mod tests {
             error,
             Error::Config(message) if message.contains("greater than zero")
         ));
+
+        let mut ctx = test_context(1);
+        ctx.max_bytes = 0;
+        let error = run(
+            &ctx,
+            SearchCmd {
+                action: SearchAction::Indices,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
     }
 
     #[test]

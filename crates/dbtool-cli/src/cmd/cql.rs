@@ -3,17 +3,14 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     port::CapabilityOperation,
-    service::{
-        limiter::ListLimiter,
-        safety::{SafetyGuard, StatementKind},
-    },
+    service::safety::{SafetyGuard, StatementKind},
     Result,
 };
 
 #[derive(Args)]
 #[command(
     about = "Run Cassandra/ScyllaDB CQL commands.",
-    long_about = "CQL commands expose Cassandra-specific keyspace/table wording while reusing dbtool's JSON output, result limits, timeouts, and safety path. CQL writes and DDL use cql exec, require --allow-write, and destructive statements require target-bound confirmation."
+    long_about = "CQL commands expose Cassandra-specific keyspace/table wording while reusing dbtool's JSON output, result limits, timeouts, and safety path. Keyspace and table catalogs honor both the global --limit item budget and --max-bytes response budget. CQL writes and DDL use cql exec, require --allow-write, and destructive statements require target-bound confirmation."
 )]
 pub struct CqlCmd {
     #[command(subcommand)]
@@ -52,15 +49,13 @@ pub enum CqlAction {
 
 pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
     let read_budget = match &cmd.action {
-        CqlAction::Query { .. } => Some(ctx.read_budget()?),
+        CqlAction::Query { .. } | CqlAction::Keyspaces | CqlAction::Tables { .. } => {
+            Some(ctx.read_budget()?)
+        }
         _ => None,
     };
     let metadata_budget = match &cmd.action {
-        CqlAction::Query { .. } => None,
-        CqlAction::Keyspaces | CqlAction::Tables { .. } => {
-            ListLimiter::new(ctx.limit).probe_items()?;
-            None
-        }
+        CqlAction::Query { .. } | CqlAction::Keyspaces | CqlAction::Tables { .. } => None,
         CqlAction::Schema { .. } => Some(ctx.metadata_budget()?),
         CqlAction::Exec { .. } => None,
     };
@@ -102,13 +97,20 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
         CqlAction::Keyspaces => {
-            let keyspaces = cql.list_keyspaces_bounded(ctx.limit).await?;
+            let keyspaces = cql
+                .list_keyspaces_budgeted(
+                    read_budget.expect("keyspace-list actions construct a read budget"),
+                )
+                .await?;
             let truncated = keyspaces.truncated;
             ctx.render_success(&kind, keyspaces.items, elapsed(), truncated)
         }
         CqlAction::Tables { keyspace } => {
             let tables = cql
-                .list_cql_tables_bounded(keyspace.as_deref(), ctx.limit)
+                .list_cql_tables_budgeted(
+                    keyspace.as_deref(),
+                    read_budget.expect("table-list actions construct a read budget"),
+                )
                 .await?;
             let truncated = tables.truncated;
             ctx.render_success(&kind, tables.items, elapsed(), truncated)
@@ -133,12 +135,12 @@ fn cql_operation_for_action(action: &CqlAction) -> Option<(CapabilityOperation, 
             "CqlEngine.query_cql_budgeted",
         )),
         CqlAction::Keyspaces => Some((
-            CapabilityOperation::CqlListKeyspacesBounded,
-            "CqlEngine.list_keyspaces_bounded",
+            CapabilityOperation::CqlListKeyspacesBudgeted,
+            "CqlEngine.list_keyspaces_budgeted",
         )),
         CqlAction::Tables { .. } => Some((
-            CapabilityOperation::CqlListTablesBounded,
-            "CqlEngine.list_cql_tables_bounded",
+            CapabilityOperation::CqlListTablesBudgeted,
+            "CqlEngine.list_cql_tables_budgeted",
         )),
         CqlAction::Exec { .. } => Some((CapabilityOperation::CqlExecute, "CqlEngine.execute_cql")),
         CqlAction::Schema { .. } => Some((
@@ -275,25 +277,25 @@ mod tests {
     }
 
     #[test]
-    fn cql_catalogs_require_explicit_bounded_operations_without_fallback() {
+    fn cql_catalogs_require_explicit_budgeted_operations_without_fallback() {
         assert!(matches!(
             require_cql_operation(
                 CapabilityOperation::CQL,
-                CapabilityOperation::CqlListKeyspacesBounded,
+                CapabilityOperation::CqlListKeyspacesBudgeted,
                 "legacy-cql",
-                "CqlEngine.list_keyspaces_bounded",
+                "CqlEngine.list_keyspaces_budgeted",
             ),
             Err(Error::UnsupportedCapability { needed, .. })
-                if needed == "CqlEngine.list_keyspaces_bounded"
+                if needed == "CqlEngine.list_keyspaces_budgeted"
         ));
 
         let mut operations = CapabilityOperation::CQL.to_vec();
-        operations.push(CapabilityOperation::CqlListTablesBounded);
+        operations.push(CapabilityOperation::CqlListTablesBudgeted);
         assert!(require_cql_operation(
             &operations,
-            CapabilityOperation::CqlListTablesBounded,
+            CapabilityOperation::CqlListTablesBudgeted,
             "cassandra",
-            "CqlEngine.list_cql_tables_bounded",
+            "CqlEngine.list_cql_tables_budgeted",
         )
         .is_ok());
 
@@ -372,6 +374,21 @@ mod tests {
                 action: CqlAction::Query {
                     cql: "select now() from system.local".to_owned(),
                 },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
+    }
+
+    #[tokio::test]
+    async fn cql_catalog_byte_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(false);
+        ctx.max_bytes = 0;
+        let error = run(
+            &ctx,
+            CqlCmd {
+                action: CqlAction::Keyspaces,
             },
         )
         .await

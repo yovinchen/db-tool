@@ -4,17 +4,14 @@ use dbtool_core::{
     error::Error,
     model::Value,
     port::CapabilityOperation,
-    service::{
-        limiter::ListLimiter,
-        safety::{SafetyGuard, StatementKind},
-    },
+    service::safety::{SafetyGuard, StatementKind},
     Result,
 };
 
 #[derive(Args)]
 #[command(
     about = "Run SQL queries, writes, and schema inspection commands.",
-    long_about = "SQL commands use the shared safety path: read queries run directly, writes require --allow-write, and destructive statements may return a target-bound confirmation token. Table and schema lists honor the global --limit and report truncation in JSON metadata."
+    long_about = "SQL commands use the shared safety path: read queries run directly, writes require --allow-write, and destructive statements may return a target-bound confirmation token. Table and schema lists honor both the global --limit item budget and --max-bytes response budget, and report truncation in JSON metadata."
 )]
 pub struct SqlCmd {
     #[command(subcommand)]
@@ -58,15 +55,13 @@ pub enum SqlAction {
 
 pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
     let read_budget = match &cmd.action {
-        SqlAction::Query { .. } => Some(ctx.read_budget()?),
+        SqlAction::Query { .. } | SqlAction::Tables { .. } | SqlAction::Schemas => {
+            Some(ctx.read_budget()?)
+        }
         _ => None,
     };
     let metadata_budget = match &cmd.action {
-        SqlAction::Query { .. } => None,
-        SqlAction::Tables { .. } | SqlAction::Schemas => {
-            ListLimiter::new(ctx.limit).probe_items()?;
-            None
-        }
+        SqlAction::Query { .. } | SqlAction::Tables { .. } | SqlAction::Schemas => None,
         SqlAction::Schema { .. } => Some(ctx.metadata_budget()?),
         SqlAction::Exec { .. } => None,
     };
@@ -139,7 +134,10 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
         }
         SqlAction::Tables { schema } => {
             let tables = sql_engine
-                .list_tables_bounded(schema.as_deref(), ctx.limit)
+                .list_tables_budgeted(
+                    schema.as_deref(),
+                    read_budget.expect("table-list actions construct a read budget"),
+                )
                 .await?;
             let truncated = tables.truncated;
             ctx.render_success(
@@ -164,7 +162,11 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Schemas => {
-            let schemas = sql_engine.list_schemas_bounded(ctx.limit).await?;
+            let schemas = sql_engine
+                .list_schemas_budgeted(
+                    read_budget.expect("schema-list actions construct a read budget"),
+                )
+                .await?;
             let truncated = schemas.truncated;
             ctx.render_success(
                 conn.kind().0.as_str(),
@@ -185,12 +187,12 @@ fn sql_operation_for_action(action: &SqlAction) -> Option<(CapabilityOperation, 
             "SqlEngine.query_budgeted",
         )),
         SqlAction::Tables { .. } => Some((
-            CapabilityOperation::SqlListTablesBounded,
-            "SqlEngine.list_tables_bounded",
+            CapabilityOperation::SqlListTablesBudgeted,
+            "SqlEngine.list_tables_budgeted",
         )),
         SqlAction::Schemas => Some((
-            CapabilityOperation::SqlListSchemasBounded,
-            "SqlEngine.list_schemas_bounded",
+            CapabilityOperation::SqlListSchemasBudgeted,
+            "SqlEngine.list_schemas_budgeted",
         )),
         SqlAction::Exec { .. } => Some((CapabilityOperation::SqlExecute, "SqlEngine.execute")),
         SqlAction::Schema { .. } => Some((
@@ -351,29 +353,29 @@ mod tests {
     }
 
     #[test]
-    fn metadata_lists_require_explicit_bounded_operations_without_legacy_fallback() {
+    fn metadata_lists_require_explicit_budgeted_operations_without_legacy_fallback() {
         let legacy_only = CapabilityOperation::SQL;
         assert!(matches!(
             require_sql_operation(
                 legacy_only,
-                CapabilityOperation::SqlListTablesBounded,
+                CapabilityOperation::SqlListTablesBudgeted,
                 "legacy-sql",
-                "SqlEngine.list_tables_bounded",
+                "SqlEngine.list_tables_budgeted",
             ),
             Err(Error::UnsupportedCapability { needed, .. })
-                if needed == "SqlEngine.list_tables_bounded"
+                if needed == "SqlEngine.list_tables_budgeted"
         ));
 
         let mut explicit = legacy_only.to_vec();
         explicit.extend([
-            CapabilityOperation::SqlListSchemasBounded,
-            CapabilityOperation::SqlListTablesBounded,
+            CapabilityOperation::SqlListSchemasBudgeted,
+            CapabilityOperation::SqlListTablesBudgeted,
         ]);
         assert!(require_sql_operation(
             &explicit,
-            CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListSchemasBudgeted,
             "sqlite",
-            "SqlEngine.list_schemas_bounded",
+            "SqlEngine.list_schemas_budgeted",
         )
         .is_ok());
 
@@ -443,6 +445,30 @@ mod tests {
                     sql: "select 1".to_owned(),
                     params: "[]".to_owned(),
                 },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
+    }
+
+    #[tokio::test]
+    async fn sql_catalog_byte_budget_is_rejected_before_dsn_resolution() {
+        let ctx = Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: dbtool_core::service::formatter::Format::Json,
+            limit: 1,
+            max_bytes: 0,
+            throttle_overrides: Default::default(),
+            allow_write: false,
+            confirm: None,
+        };
+        let error = run(
+            &ctx,
+            SqlCmd {
+                action: SqlAction::Schemas,
             },
         )
         .await
