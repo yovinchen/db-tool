@@ -6,13 +6,13 @@ use dbtool_core::{
     model::{
         AckMode, BoundedList, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
         DeleteResourceOutcome, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
-        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
+        MetadataBudget, PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ListLimiter,
+    service::limiter::{ListLimiter, MetadataLimiter},
 };
 use futures::future::BoxFuture;
 use rdkafka::{
@@ -41,6 +41,7 @@ use super::{
 const KAFKA_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const KAFKA_RESPONSE_OVERHEAD_BYTES: usize = 512;
 const KAFKA_MAX_FETCH_BYTES: usize = KAFKA_MAX_RESPONSE_BYTES - KAFKA_RESPONSE_OVERHEAD_BYTES;
+const KAFKA_DELETE_MAX_PARTITIONS: usize = 100_000;
 
 pub struct RdkafkaAdapter {
     producer: FutureProducer,
@@ -126,7 +127,9 @@ fn native_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminConsumerLag,
+        CapabilityOperation::MessageAdminConsumerLagBounded,
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
@@ -260,6 +263,15 @@ impl AdminInspect for RdkafkaAdapter {
         })
     }
 
+    async fn topic_detail_bounded(
+        &self,
+        name: &str,
+        budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        let consumer = bounded_admin_consumer(&self.consumer_config, "dbtool-topic-detail")?;
+        self.topic_detail_with_bounded_consumer(&consumer, name, budget)
+    }
+
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>> {
         let group = normalize_consumer_group(group)?;
         let consumer = self.consumer(group)?;
@@ -332,6 +344,93 @@ impl AdminInspect for RdkafkaAdapter {
         });
         Ok(lag)
     }
+
+    async fn consumer_lag_bounded(
+        &self,
+        group: &str,
+        budget: MetadataBudget,
+    ) -> Result<Vec<LagInfo>> {
+        let budget = budget.validate()?;
+        let group = normalize_consumer_group(group)?;
+        // Preserve the requested group identity, then force receive ceilings
+        // after every DSN override. Reusing the catalog helper here would
+        // silently query committed offsets for "dbtool-catalog" instead.
+        let consumer = bounded_admin_consumer(&self.consumer_config, group)?;
+        let deadline = consume_deadline(Duration::from_secs(5))?;
+        let metadata = consumer
+            .fetch_metadata(
+                None,
+                native_timeout(remaining_until(deadline).ok_or(Error::Timeout)?),
+            )
+            .map_err(kafka_connection_error)?;
+        let mut response_limiter = MetadataLimiter::new(budget, "Kafka consumer lag")?;
+        let mut inspected_partitions = 0_usize;
+        let mut requested = TopicPartitionList::new();
+        for topic in metadata
+            .topics()
+            .iter()
+            .filter(|topic| !topic.name().starts_with("__"))
+        {
+            if let Some(error) = topic.error() {
+                return Err(Error::Query(format!(
+                    "failed to inspect Kafka topic {:?}: {error:?}",
+                    topic.name()
+                )));
+            }
+            for partition in topic.partitions() {
+                observe_kafka_lag_work(&mut inspected_partitions, budget)?;
+                if let Some(error) = partition.error() {
+                    return Err(Error::Query(format!(
+                        "failed to inspect Kafka topic {:?} partition {}: {error:?}",
+                        topic.name(),
+                        partition.id()
+                    )));
+                }
+                requested.add_partition(topic.name(), partition.id());
+            }
+        }
+
+        if requested.count() == 0 {
+            response_limiter.ensure_complete(&Vec::<LagInfo>::new())?;
+            return Ok(vec![]);
+        }
+        let committed = consumer
+            .committed_offsets(
+                requested,
+                native_timeout(remaining_until(deadline).ok_or(Error::Timeout)?),
+            )
+            .map_err(kafka_query_error)?;
+        let mut lag = Vec::with_capacity(committed.count());
+        for entry in committed.elements() {
+            entry.error().map_err(kafka_query_error)?;
+            let Some(committed_offset) = committed_offset(entry.offset())? else {
+                continue;
+            };
+            let (_, latest) = consumer
+                .fetch_watermarks(
+                    entry.topic(),
+                    entry.partition(),
+                    native_timeout(remaining_until(deadline).ok_or(Error::Timeout)?),
+                )
+                .map_err(kafka_query_error)?;
+            let item = lag_info(
+                group,
+                entry.topic(),
+                entry.partition(),
+                committed_offset,
+                latest,
+            )?;
+            response_limiter.observe(&item)?;
+            lag.push(item);
+        }
+        lag.sort_by(|a, b| {
+            a.topic
+                .cmp(&b.topic)
+                .then_with(|| a.partition.cmp(&b.partition))
+        });
+        response_limiter.ensure_complete(&lag)?;
+        Ok(lag)
+    }
 }
 
 #[async_trait::async_trait]
@@ -344,7 +443,13 @@ impl AdminMutate for RdkafkaAdapter {
         validate_kafka_delete_request(&resource, options)?;
         validate_topic(&resource.name)?;
 
-        let detail = self.topic_detail(&resource.name).await?;
+        let bounded_consumer =
+            bounded_admin_consumer(&self.consumer_config, "dbtool-delete-inspect")?;
+        let detail = self.topic_detail_with_bounded_consumer(
+            &bounded_consumer,
+            &resource.name,
+            MetadataBudget::new(KAFKA_DELETE_MAX_PARTITIONS, KAFKA_MAX_RESPONSE_BYTES)?,
+        )?;
         let messages_before = kafka_messages_before(&detail.watermarks);
         let admin_options = AdminOptions::new()
             .request_timeout(Some(Duration::from_secs(5)))
@@ -355,7 +460,8 @@ impl AdminMutate for RdkafkaAdapter {
             .await
             .map_err(kafka_query_error)?;
         require_deleted_topic(results, &resource.name)?;
-        self.wait_for_topic_absence(&resource.name).await?;
+        self.wait_for_topic_absence_with(&bounded_consumer, &resource.name)
+            .await?;
 
         Ok(DeleteResourceOutcome {
             resource,
@@ -372,6 +478,73 @@ impl RdkafkaAdapter {
         consumer_client_config(&self.consumer_config, group)?
             .create::<BaseConsumer>()
             .map_err(kafka_connection_error)
+    }
+
+    fn topic_detail_with_bounded_consumer(
+        &self,
+        consumer: &BaseConsumer,
+        name: &str,
+        budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        validate_topic(name)?;
+        let mut limiter = MetadataLimiter::new(budget, format!("Kafka topic detail {name}"))?;
+        let deadline = consume_deadline(Duration::from_secs(5))?;
+        let metadata = consumer
+            .fetch_metadata(
+                Some(name),
+                native_timeout(remaining_until(deadline).ok_or(Error::Timeout)?),
+            )
+            .map_err(kafka_connection_error)?;
+        let topic = metadata
+            .topics()
+            .iter()
+            .find(|topic| topic.name() == name)
+            .ok_or_else(|| Error::Query(format!("topic not found: {name}")))?;
+        if let Some(error) = topic.error() {
+            return Err(Error::Query(format!(
+                "Kafka topic {name:?} is unavailable: {error:?}"
+            )));
+        }
+        if topic.partitions().len() > budget.max_items {
+            return Err(Error::MetadataBudgetExceeded {
+                subject: format!("Kafka topic detail {name}"),
+                unit: "items",
+                limit: budget.max_items,
+            });
+        }
+        let mut info = topic_info(topic);
+        info.partitions = i32::try_from(topic.partitions().len())
+            .map_err(|_| Error::Serialization("Kafka partition count exceeds i32".into()))?;
+        let mut watermarks = Vec::with_capacity(topic.partitions().len());
+        for partition in topic.partitions() {
+            if let Some(error) = partition.error() {
+                return Err(Error::Query(format!(
+                    "Kafka topic {name:?} partition {} is unavailable: {error:?}",
+                    partition.id()
+                )));
+            }
+            let (low, high) = consumer
+                .fetch_watermarks(
+                    name,
+                    partition.id(),
+                    native_timeout(remaining_until(deadline).ok_or(Error::Timeout)?),
+                )
+                .map_err(kafka_query_error)?;
+            let watermark = PartitionWatermark {
+                partition: partition.id(),
+                low,
+                high,
+            };
+            limiter.observe(&watermark)?;
+            watermarks.push(watermark);
+        }
+        let detail = TopicDetail {
+            info,
+            config: HashMap::new(),
+            watermarks,
+        };
+        limiter.ensure_complete(&detail)?;
+        Ok(detail)
     }
 
     fn consume_stateless(
@@ -492,14 +665,13 @@ impl RdkafkaAdapter {
             .map_err(kafka_query_error)
     }
 
-    async fn wait_for_topic_absence(&self, name: &str) -> Result<()> {
-        let consumer = self.consumer("dbtool")?;
+    async fn wait_for_topic_absence_with(&self, consumer: &BaseConsumer, name: &str) -> Result<()> {
         let deadline = consume_deadline(Duration::from_secs(5))?;
         loop {
             let Some(remaining) = remaining_until(deadline) else {
                 return Err(topic_deletion_not_verified(name));
             };
-            let topics = self.topic_infos_with(&consumer, remaining)?;
+            let topics = self.topic_infos_with(consumer, remaining)?;
             if !topics.iter().any(|topic| topic.name == name) {
                 return Ok(());
             }
@@ -645,7 +817,17 @@ fn bounded_catalog_consumer(base: &ClientConfig) -> Result<BaseConsumer> {
 }
 
 fn bounded_catalog_config(base: &ClientConfig) -> Result<ClientConfig> {
-    let mut config = consumer_client_config(base, "dbtool-catalog")?;
+    bounded_admin_config(base, "dbtool-catalog")
+}
+
+fn bounded_admin_consumer(base: &ClientConfig, group: &str) -> Result<BaseConsumer> {
+    bounded_admin_config(base, group)?
+        .create::<BaseConsumer>()
+        .map_err(kafka_connection_error)
+}
+
+fn bounded_admin_config(base: &ClientConfig, group: &str) -> Result<ClientConfig> {
+    let mut config = consumer_client_config(base, group)?;
     // Apply after DSN parameters so callers cannot raise the receive budget
     // and silently turn this admin catalog request back into an unbounded read.
     config.set(
@@ -656,6 +838,20 @@ fn bounded_catalog_config(base: &ClientConfig) -> Result<ClientConfig> {
     // ceiling by at least 512 bytes. Bound both values after DSN overrides.
     config.set("fetch.max.bytes", KAFKA_MAX_FETCH_BYTES.to_string());
     Ok(config)
+}
+
+fn observe_kafka_lag_work(observed: &mut usize, budget: MetadataBudget) -> Result<()> {
+    if *observed >= budget.max_items {
+        return Err(Error::MetadataBudgetExceeded {
+            subject: "Kafka consumer lag scan".to_owned(),
+            unit: "items",
+            limit: budget.max_items,
+        });
+    }
+    *observed = observed
+        .checked_add(1)
+        .ok_or_else(|| Error::Query("Kafka consumer lag scan item count overflow".into()))?;
+    Ok(())
 }
 
 fn consumer_client_config(base: &ClientConfig, group: &str) -> Result<ClientConfig> {
@@ -1018,6 +1214,8 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::MessageConsumeGroup));
         assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
         assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
         assert!(!operations.contains(&CapabilityOperation::MessageConsumeDurable));
 
         let stateless = ConsumeOptions::default();
@@ -1080,6 +1278,17 @@ mod tests {
         );
         assert_eq!(
             catalog.get("fetch.max.bytes"),
+            Some(KAFKA_MAX_FETCH_BYTES.to_string().as_str())
+        );
+
+        let lag = bounded_admin_config(&config, "requested-group").unwrap();
+        assert_eq!(lag.get("group.id"), Some("requested-group"));
+        assert_eq!(
+            lag.get("receive.message.max.bytes"),
+            Some(KAFKA_MAX_RESPONSE_BYTES.to_string().as_str())
+        );
+        assert_eq!(
+            lag.get("fetch.max.bytes"),
             Some(KAFKA_MAX_FETCH_BYTES.to_string().as_str())
         );
     }
@@ -1187,6 +1396,21 @@ mod tests {
         let topic = format!("dbtool_it_native_lag_{}_{}", std::process::id(), unique);
         let group = format!("dbtool-it-native-lag-{}-{unique}", std::process::id());
 
+        let brokers = brokers_from_dsn(&dsn);
+        let base = kafka_config(&dsn, &brokers);
+        let admin = base
+            .create::<AdminClient<DefaultClientContext>>()
+            .expect("fixture admin client should be created");
+        let created = admin
+            .create_topics(
+                &[NewTopic::new(&topic, 2, TopicReplication::Fixed(1))],
+                &AdminOptions::new(),
+            )
+            .await
+            .expect("two-partition topic creation should complete");
+        assert_eq!(created.len(), 1);
+        assert!(created[0].is_ok(), "topic creation failed: {created:?}");
+
         let connector = connect(dsn.clone()).await.expect("Kafka should connect");
         let messages = ["first", "second"]
             .into_iter()
@@ -1208,8 +1432,6 @@ mod tests {
             .await
             .expect("messages should be produced");
 
-        let brokers = brokers_from_dsn(&dsn);
-        let base = kafka_config(&dsn, &brokers);
         let consumer = consumer_client_config(&base, &group)
             .expect("consumer config should be valid")
             .create::<BaseConsumer>()
@@ -1237,9 +1459,67 @@ mod tests {
         assert!(item.latest >= 2);
         assert_eq!(item.lag, item.latest - 1);
 
-        let admin = base
-            .create::<AdminClient<DefaultClientContext>>()
-            .expect("cleanup admin client should be created");
+        assert!(matches!(
+            connector
+                .as_admin()
+                .expect("native Kafka exposes AdminInspect")
+                .topic_detail_bounded(&topic, MetadataBudget::with_default_bytes(1).unwrap())
+                .await,
+            Err(Error::MetadataBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+        let bounded_detail = connector
+            .as_admin()
+            .expect("native Kafka exposes AdminInspect")
+            .topic_detail_bounded(&topic, MetadataBudget::with_default_bytes(2).unwrap())
+            .await
+            .expect("two-partition topic detail should fit exact item budget");
+        assert_eq!(bounded_detail.watermarks.len(), 2);
+
+        let candidate_partitions = consumer
+            .fetch_metadata(None, Timeout::After(Duration::from_secs(5)))
+            .expect("candidate metadata should load")
+            .topics()
+            .iter()
+            .filter(|topic| !topic.name().starts_with("__"))
+            .map(|topic| topic.partitions().len())
+            .sum::<usize>();
+        assert!(candidate_partitions >= 2);
+        assert!(matches!(
+            connector
+                .as_admin()
+                .expect("native Kafka exposes AdminInspect")
+                .consumer_lag_bounded(
+                    &group,
+                    MetadataBudget::with_default_bytes(candidate_partitions - 1).unwrap(),
+                )
+                .await,
+            Err(Error::MetadataBudgetExceeded {
+                unit: "items",
+                limit,
+                ..
+            }) if limit == candidate_partitions - 1
+        ));
+        let bounded_lag = connector
+            .as_admin()
+            .expect("native Kafka exposes AdminInspect")
+            .consumer_lag_bounded(
+                &group,
+                MetadataBudget::with_default_bytes(candidate_partitions).unwrap(),
+            )
+            .await
+            .expect("bounded lag must preserve the requested committed-offset group");
+        let bounded_item = bounded_lag
+            .iter()
+            .find(|item| item.topic == topic && item.partition == 0)
+            .expect("bounded lag should include the test topic");
+        assert_eq!(bounded_item.group, group);
+        assert_eq!(bounded_item.committed, 1);
+        assert_eq!(bounded_item.lag, bounded_item.latest - 1);
+
         let deleted = admin
             .delete_topics(&[&topic], &AdminOptions::new())
             .await

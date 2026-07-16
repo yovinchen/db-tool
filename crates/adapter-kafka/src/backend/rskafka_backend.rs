@@ -6,14 +6,14 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         BoundedList, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo,
-        Message, MessageCursor, MessagePlacement, MessageResource, PartitionWatermark,
-        ProduceOutcome, TopicDetail, TopicInfo,
+        Message, MessageCursor, MessagePlacement, MessageResource, MetadataBudget,
+        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ListLimiter,
+    service::limiter::{ListLimiter, MetadataLimiter},
 };
 use futures::future::BoxFuture;
 use rskafka::{
@@ -37,6 +37,7 @@ use super::{
 // bounded before rskafka allocates or decodes it, then retain only the N+1
 // catalog probe at the portable boundary.
 const KAFKA_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const KAFKA_DELETE_MAX_PARTITIONS: usize = 100_000;
 
 pub struct RskafkaAdapter {
     client: Client,
@@ -116,6 +117,7 @@ fn pure_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
@@ -285,12 +287,7 @@ impl AdminInspect for RskafkaAdapter {
         let probe_items = limiter.probe_items()?;
         // Use a dedicated client so the metadata frame ceiling cannot lower
         // the established producer/consumer receive budget.
-        let catalog_client = ClientBuilder::new(self.catalog_brokers.clone())
-            .client_id("dbtool-catalog")
-            .max_message_size(KAFKA_MAX_RESPONSE_BYTES)
-            .build()
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let catalog_client = self.bounded_client().await?;
         let mut topics = catalog_client
             .list_topics()
             .await
@@ -344,6 +341,16 @@ impl AdminInspect for RskafkaAdapter {
         })
     }
 
+    async fn topic_detail_bounded(
+        &self,
+        name: &str,
+        budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        let client = self.bounded_client().await?;
+        self.topic_detail_with_bounded_client(&client, name, budget)
+            .await
+    }
+
     async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
         Err(Error::UnsupportedCapability {
             kind: self.kind.0.clone(),
@@ -362,7 +369,14 @@ impl AdminMutate for RskafkaAdapter {
         validate_kafka_delete_request(&resource, options)?;
         validate_topic(&resource.name)?;
 
-        let detail = self.topic_detail(&resource.name).await?;
+        let bounded_client = self.bounded_client().await?;
+        let detail = self
+            .topic_detail_with_bounded_client(
+                &bounded_client,
+                &resource.name,
+                MetadataBudget::new(KAFKA_DELETE_MAX_PARTITIONS, KAFKA_MAX_RESPONSE_BYTES)?,
+            )
+            .await?;
         let messages_before = kafka_messages_before(&detail.watermarks);
         self.client
             .controller_client()
@@ -370,7 +384,8 @@ impl AdminMutate for RskafkaAdapter {
             .delete_topic(resource.name.clone(), 5_000)
             .await
             .map_err(|error| Error::Query(error.to_string()))?;
-        self.wait_for_topic_absence(&resource.name).await?;
+        self.wait_for_topic_absence_with(&bounded_client, &resource.name)
+            .await?;
 
         Ok(DeleteResourceOutcome {
             resource,
@@ -383,6 +398,74 @@ impl AdminMutate for RskafkaAdapter {
 }
 
 impl RskafkaAdapter {
+    async fn bounded_client(&self) -> Result<Client> {
+        ClientBuilder::new(self.catalog_brokers.clone())
+            .client_id("dbtool-bounded-admin")
+            .max_message_size(KAFKA_MAX_RESPONSE_BYTES)
+            .build()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))
+    }
+
+    async fn topic_detail_with_bounded_client(
+        &self,
+        client: &Client,
+        name: &str,
+        budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        validate_topic(name)?;
+        let mut limiter = MetadataLimiter::new(budget, format!("Kafka topic detail {name}"))?;
+        let topic = client
+            .list_topics()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?
+            .into_iter()
+            .find(|topic| topic.name == name)
+            .ok_or_else(|| Error::Query(format!("topic not found: {name}")))?;
+        if topic.partitions.len() > budget.max_items {
+            return Err(Error::MetadataBudgetExceeded {
+                subject: format!("Kafka topic detail {name}"),
+                unit: "items",
+                limit: budget.max_items,
+            });
+        }
+        let partition_count = i32::try_from(topic.partitions.len())
+            .map_err(|_| Error::Serialization("Kafka partition count exceeds i32".into()))?;
+        let mut watermarks = Vec::with_capacity(topic.partitions.len());
+        for partition in topic.partitions {
+            let partition_client = client
+                .partition_client(name, partition, UnknownTopicHandling::Retry)
+                .await
+                .map_err(|e| Error::Connection(e.to_string()))?;
+            let low = partition_client
+                .get_offset(OffsetAt::Earliest)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+            let high = partition_client
+                .get_offset(OffsetAt::Latest)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+            let watermark = PartitionWatermark {
+                partition,
+                low,
+                high,
+            };
+            limiter.observe(&watermark)?;
+            watermarks.push(watermark);
+        }
+        let detail = TopicDetail {
+            info: TopicInfo {
+                name: name.to_owned(),
+                partitions: partition_count,
+                replicas: 1,
+            },
+            config: HashMap::new(),
+            watermarks,
+        };
+        limiter.ensure_complete(&detail)?;
+        Ok(detail)
+    }
+
     async fn ensure_topic(&self, name: &str) -> Result<()> {
         if self
             .client
@@ -420,14 +503,15 @@ impl RskafkaAdapter {
         Ok(topics)
     }
 
-    async fn wait_for_topic_absence(&self, name: &str) -> Result<()> {
+    async fn wait_for_topic_absence_with(&self, client: &Client, name: &str) -> Result<()> {
         let deadline = consume_deadline(Duration::from_secs(5))?;
         loop {
             let Some(remaining) = remaining_until(deadline) else {
                 return Err(topic_deletion_not_verified(name));
             };
-            let topics = match tokio::time::timeout(remaining, self.topic_infos()).await {
-                Ok(result) => result?,
+            let topics = match tokio::time::timeout(remaining, client.list_topics()).await {
+                Ok(Ok(topics)) => topics,
+                Ok(Err(error)) => return Err(Error::Connection(error.to_string())),
                 Err(_) => return Err(topic_deletion_not_verified(name)),
             };
             if !topics.iter().any(|topic| topic.name == name) {
@@ -622,6 +706,8 @@ mod tests {
         });
 
         assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
+        assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
         assert!(!operations.contains(&CapabilityOperation::MessageConsumeGroup));
         assert!(!operations.contains(&CapabilityOperation::MessageConsumeAck));
     }
