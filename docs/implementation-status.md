@@ -138,8 +138,9 @@ read-envelope audit is tracked as IF-T67 through IF-T75 in
 recursive SQL/CQL result bytes, multi-document accumulation, message batch bytes
 before ACK, and Redis-compatible KV read envelopes are complete. Cross-platform
 artifact replacement is implemented but still awaits current-SHA Windows CI
-evidence. Catalog scalar bytes, producer/general mutation input envelopes, and
-the legacy unbounded API lifecycle remain open. Structured time-series budgets,
+evidence. Catalog scalar bytes are closed across every registered top-level
+directory. Producer/general mutation input envelopes and the legacy unbounded
+API lifecycle remain open. Structured time-series budgets,
 Search complete read envelopes, and bounded local connection configuration are
 closed.
 A bounded top-level name or row count is not evidence that nested values are
@@ -172,4 +173,5 @@ cannot mask another:
 - `docs/test-evidence/db2-catalog-bounded.md`
 - `docs/test-evidence/bounded-document-search-timeseries.md`
 - `docs/test-evidence/messaging-bounded-catalogs.md`
+- `docs/test-evidence/catalog-scalar-byte-budgets.md`
 - `docs/test-evidence/kv-read-envelopes.md`

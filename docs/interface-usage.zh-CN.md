@@ -9,7 +9,7 @@
   `--allow-write --confirm <token>`；公开 `impact.target` 只含脱敏标签，令牌内部同时绑定
   完整 resolved DSN、操作和资源，不能跨 credential、tenant/query、命名连接内容或目标复用。
 - `--limit` 必须大于零。`--max-bytes` 默认 8 MiB、必须在 `1..=16 MiB`；SQL/CQL、
-  KV、Document 与消息批次使用它限制一个完整调用方响应。已经声明 bounded operation 的用户查询和顶层名称目录，在可分页
+  KV、Document、Search、TimeSeries、消息批次和所有顶层名称目录使用它限制一个完整调用方响应。已经声明 exact budgeted operation 的用户查询和顶层名称目录，在可分页
   协议的适配器边界读取到 `limit + 1` 即停止；无法按条目分页的协议使用独立响应字节上限
   并只保留 N+1 个可移植结果。输出最多保留 `limit` 条，`meta.truncated` 只在实际观察到
   探针项或后端明确报告不完整时为真。二级元数据集合由 IF-T67 单独收口。
@@ -49,7 +49,9 @@ dbtool --conn prod caps
       "sql.execute",
       "sql.insert_rows_atomic",
       "sql.list_schemas_bounded",
+      "sql.list_schemas_budgeted",
       "sql.list_tables_bounded",
+      "sql.list_tables_budgeted",
       "sql.query_bounded",
       "sql.query_budgeted"
     ]
@@ -98,9 +100,32 @@ assert!(!rows.truncated);
 ```
 
 `Capabilities` 的布尔字段只用于旧调用方的族发现。以下扩展永远不能由粗粒度字段猜测：
-SQL/CQL/Document budgeted read、SQL 原子导入、KV expiry、Document one/many 与 drop、所有 bounded catalog、Messaging
+SQL/CQL/Document budgeted read、SQL 原子导入、KV expiry、Document one/many 与 drop、所有 budgeted catalog、Messaging
 group/durable/ack，以及 list/detail/lag/delete 各自独立的 partial admin 方法。读取旧版、不含
 `operations` 的 `CapabilityReport` 时，operation 集按空处理，即“不声明任何新扩展”。
+
+## 顶层目录 items + bytes 范式
+
+所有一方 CLI/TUI 目录路径统一构造 `ReadBudget(max_items,max_bytes)`，先在 DSN 解析和
+连接之前校验，再协商 exact `*_budgeted` operation。旧 `*_bounded` 只控制条目数，保留给
+嵌入式兼容调用方；一方路径不会回退。
+
+| 接口族 | CLI | exact operation |
+| --- | --- | --- |
+| SQL | `sql schemas`、`sql tables` | `sql.list_schemas_budgeted`、`sql.list_tables_budgeted` |
+| CQL | `cql keyspaces`、`cql tables` | `cql.list_keyspaces_budgeted`、`cql.list_tables_budgeted` |
+| Db2 | `db2 schemas/tables/sequences/routines/tablespaces/foreign-keys` | 对应 `sql.*_budgeted` 或 `db2.*_budgeted` |
+| Document | `doc collections` | `document.list_collections_budgeted` |
+| Search | `search indices` | `search.list_indices_budgeted` |
+| TimeSeries | `ts measurements` | `time_series.list_measurements_budgeted` |
+| Messaging admin | `mq topics` | `message.admin.list_topics_budgeted` |
+
+适配器必须在保留前计费每个完整标量或结构体，并在返回前计费完整
+`BoundedList { items, truncated }` 和唯一 N+1 探针。`items.len()` 永远不超过
+`max_items`；只有真实观察到第 N+1 项时才标记截断。可分页后端把 N+1 下推到 SQL
+`LIMIT`、Mongo cursor、Prometheus label-values 或管理分页；不能分页的 Kafka metadata、
+Search CAT 等接口使用独立协议响应硬上限，再只构造和观察 N+1 个 portable 对象。调用方
+字节不足时统一返回 `READ_BUDGET_EXCEEDED`，不返回部分目录。
 
 ## 命名连接配置 CRUD
 

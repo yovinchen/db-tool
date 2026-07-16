@@ -2,23 +2,31 @@
 
 状态：PASS（2026-07-16）
 
-范围：IF-T66 顶层目录读取的 Document、Search、TimeSeries 分支。本证据只覆盖 collection、index、measurement 名称目录；表结构中的列/索引等二级元数据不在本分支范围内。
+范围：IF-T66 顶层目录条目边界与 IF-T74 标量字节信封的 Document、Search、TimeSeries
+分支。本证据只覆盖 collection、index、measurement 名称目录；表结构中的列/索引等二级
+元数据不在本分支范围内。
 
 ## 公共合同
 
-三个目录都使用 `BoundedList<T> { items, truncated }` 和严格 N+1 探针：
+三个目录都使用 `ReadBudget(max_items,max_bytes)`、`BoundedList<T> { items, truncated }`
+和严格 N+1 探针：
 
-- `max_items=0` 和 `max_items=usize::MAX` 在解析 DSN、建立连接之前返回 `CONFIG_ERROR`。
+- `max_items=0`、`max_items=usize::MAX`、`max_bytes=0` 和超出 16 MiB 的字节预算在解析
+  DSN、建立连接之前返回 `CONFIG_ERROR`。
 - CLI 和 TUI 必须先协商各自的显式 operation；只有旧的粗粒度 capability 时返回 `UNSUPPORTED_CAPABILITY`，不会回退到无界的 legacy list。
 - `items.len()` 永远不超过调用方的 `--limit`；只有实际观察到第 N+1 项时，`meta.truncated=true`。
+- 每个完整名称/`IndexInfo` 在 retention 前计费；返回前再计费完整 `BoundedList` 与探针。
+  exact byte N 成功、N-1 返回 `READ_BUDGET_EXCEEDED`，不返回部分目录。
 
 | 接口 | 显式 operation | Adapter 侧边界 | 已知限制 |
 | --- | --- | --- | --- |
-| MongoDB collections | `document.list_collections_bounded` | `listCollections` cursor 的 server `batchSize=N+1`，客户端读取到 N+1 后立即停止 | MongoDB 协议没有该命令的总结果 `limit`；`batchSize` 限制单批传输，dbtool 不再请求超出探针所需的项 |
-| OpenSearch / Elasticsearch indices | `search.list_indices_bounded` | CAT indices 只请求 `index` 字段并按名称排序；响应体硬上限 1 MiB；解析和保留最多 N+1 | CAT indices 在兼容版本间没有可靠分页/总量 limit，因此不能声称服务端 N+1；超出 1 MiB 时失败关闭，而不是读取完整无界目录后伪装成有界结果 |
-| Prometheus measurements | `time_series.list_measurements_bounded` | label-values 请求带 `limit=N+1`，解析和保留最多 N+1 | 依赖 Prometheus-compatible 后端遵守 label-values `limit`；即使兼容实现忽略参数，通用 HTTP 16 MiB 上限仍会失败关闭 |
+| MongoDB collections | `document.list_collections_budgeted` | `listCollections` cursor 的 server `batchSize=N+1`；完整 name、envelope、probe 由 `ReadLimiter` 计费 | MongoDB 协议没有该命令的总结果 `limit`；driver 先解码单个 `CollectionSpecification`，`batchSize` 限制协议 cursor 批次 |
+| OpenSearch / Elasticsearch indices | `search.list_indices_budgeted` | CAT JSON 受 `min(caller max_bytes,1 MiB)` 限制；只构造/观察 N+1 个完整 `IndexInfo` | CAT indices 在兼容版本间没有可靠分页/总量 limit，因此不能声称服务端只扫描 N+1 |
+| Prometheus measurements | `time_series.list_measurements_budgeted` | label-values 请求带 `limit=N+1`；完整 name、envelope、probe 计费 | raw HTTP JSON wrapper 仍受独立 16 MiB transport ceiling；它不冒充 portable caller budget |
 
-CLI 的 `doc collections`、`search indices`、`ts measurements` 和 TUI 对应命令统一输出 `data` 加 `meta.truncated`。Legacy `list_collections`、`list_indices`、`list_measurements` 仅为嵌入式兼容接口，新的 CLI/TUI 路径不调用它们。
+CLI 的 `doc collections`、`search indices`、`ts measurements` 和 TUI 对应命令统一输出
+`data` 加 `meta.truncated`。Legacy `list_*` 与 item-only `list_*_bounded` 仅为嵌入式兼容
+接口，新的 CLI/TUI 路径只调用 exact `list_*_budgeted`。
 
 ## 自动化验证
 
@@ -31,7 +39,9 @@ cargo test -p dbtool-tui --bin dbtool-tui
 cargo test -p dbtool-cli --test bounded_document_search_ts invalid_catalog_limits_fail_before_connection_for_all_three_surfaces -- --exact --nocapture
 ```
 
-结果：三个 adapter 的 bounded parser、N/N+1、operation 声明和 HTTP body cap 单测通过；CLI 全量命令单测通过；三种无效 limit 的公共 CLI 测试通过。TUI 的显式能力门禁、连接前校验及 32/32 全量测试通过。配置诊断测试已与“不泄露未知字段原文”的核心策略统一，不再保留过期失败说明。
+结果：Mongo 15/15、Search 37/37、TimeSeries 26/26；均覆盖 item N/N+1、byte
+N/N-1、无效预算、exact operation 与协议 transport cap。CLI 106/106、TUI 33/33，目录
+命令在连接前同时校验 item/byte，且拒绝 legacy fallback；严格 Clippy 与 diff check 通过。
 
 Docker 真实验证：
 
@@ -57,8 +67,9 @@ cargo test -p dbtool-cli --test bounded_document_search_ts \
 
 | 后端 | N 完整结果 | N+1 截断结果 | operation | 清理 |
 | --- | --- | --- | --- | --- |
-| MongoDB 7 | 隔离数据库 3 collections、`limit=3`、`truncated=false` PASS | 同一目录 `limit=2`、返回 2、`truncated=true` PASS | PASS | 三个 collection 全部经公共确认式 drop 删除；空目录复查 PASS |
-| OpenSearch 2.17.1 | 当前基线加 3 个临时 index、`limit=N`、`truncated=false` PASS | `limit=N-1`、精确返回 N-1、`truncated=true` PASS | PASS | 三个临时 index 全部经公共确认式 delete-index 删除；前缀复查无残留 PASS |
-| Prometheus 2.55.1 | 对现有 measurement 总数使用 `limit=N`、`truncated=false` PASS | 同一快照使用 `limit=N-1`、`truncated=true` PASS | PASS | 测试只读，不创建 metric 或其他资源 |
+| MongoDB 7 | 隔离数据库 3 collections，完整 item/byte N PASS | item N+1 截断、byte N-1 稳定失败 PASS | PASS | 三个 collection 全部 drop；测试前缀复查无残留 PASS |
+| OpenSearch 2.17.1 | 公共目录 3-index 生命周期及 adapter 两个隔离 index 的 exact byte N PASS | item N+1 截断、byte N-1 稳定失败 PASS | PASS | 所有临时 index 删除；只剩原系统 index PASS |
+| Elasticsearch 8.15.5 | 两个隔离 index 的完整目录和 exact byte N PASS | item N+1 截断、byte N-1 稳定失败 PASS | PASS | 两个 index 删除后 `_cat/indices` 为 `[]` PASS |
+| Prometheus 2.55.1 | unique remote-write metric 的完整 measurement item/byte N PASS | item N+1 截断、byte N-1 稳定失败 PASS | PASS | 产品无通用即时 series delete；一次性 volume 与 1h retention 清理 PASS |
 
 测试后的 OpenSearch 目录只剩已有系统 index；所有 `dbtool_it_bounded_search_*` 资源均不存在。MongoDB 隔离数据库在最后一个 collection 删除后无可见目录内容。

@@ -59,8 +59,9 @@ Use `ConnectionResolver` instead of duplicating lookup logic. The resolver accep
 validate legacy item budgets and N+1 probes. New first-party row/document paths use
 `ReadBudget`; complete schema, DDL, topic detail, and lag paths use `MetadataBudget`.
 Both pair item accounting with a caller byte ceiling and exact negotiated operations.
-Top-level catalog item bounds are complete; caller-owned scalar byte accounting remains
-tracked by IF-T74.
+Top-level catalogs now use exact `*_budgeted` siblings so every complete scalar/object,
+the returned envelope, and the N+1 probe are caller-byte-accounted. Legacy item-only
+methods remain only for the IF-T75 compatibility lifecycle.
 
 These services are intentionally adapter-agnostic so the CLI, TUI, and embedded library paths can share the same behavior.
 

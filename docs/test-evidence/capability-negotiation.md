@@ -36,6 +36,7 @@ connect -> operations contains exact method -> capability accessor -> invoke
 | Document 精确 cardinality | `document.update_one`, `document.update_many`, `document.delete_one`, `document.delete_many` |
 | Document 生命周期 | `document.drop_collection` |
 | 有界目录 | 所有 `*.list_*_bounded` operation |
+| item + byte 目录 | 所有 `*.list_*_budgeted` operation；不能由旧 bounded operation 推导 |
 | Stateful messaging | `message.consume_group`, `message.consume_durable`, `message.consume_ack` |
 | Messaging admin | list-bounded、detail、lag、delete 四项分别声明 |
 
