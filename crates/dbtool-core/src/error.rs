@@ -34,6 +34,14 @@ pub enum Error {
         unit: &'static str,
         limit: usize,
     },
+    /// A caller-visible read exceeded its cumulative serialized byte envelope.
+    /// No partial collection or result set is returned.
+    #[error("{subject} exceeds the read {unit} budget of {limit}")]
+    ReadBudgetExceeded {
+        subject: String,
+        unit: &'static str,
+        limit: usize,
+    },
     /// The client submitted an irreversible protocol operation but could not
     /// prove whether the remote system applied it. Callers must inspect remote
     /// state before retrying instead of treating this as a normal transient
@@ -86,6 +94,7 @@ impl Error {
             Error::Auth(_) => "AUTH_ERROR",
             Error::Query(_) => "QUERY_ERROR",
             Error::MetadataBudgetExceeded { .. } => "METADATA_BUDGET_EXCEEDED",
+            Error::ReadBudgetExceeded { .. } => "READ_BUDGET_EXCEEDED",
             Error::OutcomeIndeterminate(_) => "OUTCOME_INDETERMINATE",
             Error::ConfirmRequired { .. } => "CONFIRM_REQUIRED",
             Error::ReadOnly => "READ_ONLY",
@@ -124,6 +133,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "table schema exceeds the metadata items budget of 100"
+        );
+    }
+
+    #[test]
+    fn read_budget_errors_have_a_stable_machine_code() {
+        let error = Error::ReadBudgetExceeded {
+            subject: "SQL query result".to_owned(),
+            unit: "bytes",
+            limit: 1024,
+        };
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+        assert!(!error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "SQL query result exceeds the read bytes budget of 1024"
         );
     }
 }

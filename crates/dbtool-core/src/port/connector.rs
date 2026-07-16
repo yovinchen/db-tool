@@ -36,6 +36,7 @@ macro_rules! capability_operations {
 capability_operations! {
     SqlQuery => "sql.query",
     SqlQueryBounded => "sql.query_bounded",
+    SqlQueryBudgeted => "sql.query_budgeted",
     SqlExecute => "sql.execute",
     SqlInsertRowsAtomic => "sql.insert_rows_atomic",
     SqlListSchemas => "sql.list_schemas",
@@ -46,6 +47,7 @@ capability_operations! {
     SqlDescribeTableBounded => "sql.describe_table_bounded",
     CqlQuery => "cql.query",
     CqlQueryBounded => "cql.query_bounded",
+    CqlQueryBudgeted => "cql.query_budgeted",
     CqlExecute => "cql.execute",
     CqlListKeyspaces => "cql.list_keyspaces",
     CqlListKeyspacesBounded => "cql.list_keyspaces_bounded",
@@ -127,6 +129,9 @@ impl CapabilityOperation {
         Self::CqlListTables,
         Self::CqlDescribeTable,
     ];
+    /// Item-and-byte read envelopes are optional backend-aware contracts.
+    /// Legacy SQL/CQL booleans and row-only bounded methods never imply them.
+    pub const BUDGETED_READS: &'static [Self] = &[Self::SqlQueryBudgeted, Self::CqlQueryBudgeted];
     pub const DB2: &'static [Self] = &[
         Self::Db2ListSequences,
         Self::Db2ListRoutines,
@@ -540,6 +545,15 @@ mod tests {
                 *operation
             );
         }
+
+        assert_eq!(
+            serde_json::to_value(CapabilityOperation::SqlQueryBudgeted).unwrap(),
+            serde_json::json!("sql.query_budgeted")
+        );
+        assert_eq!(
+            serde_json::to_value(CapabilityOperation::CqlQueryBudgeted).unwrap(),
+            serde_json::json!("cql.query_budgeted")
+        );
     }
 
     #[test]
@@ -608,6 +622,7 @@ mod tests {
                     && !CapabilityOperation::DOCUMENT_LIFECYCLE.contains(operation)
                     && !CapabilityOperation::BOUNDED_CATALOGS.contains(operation)
                     && !CapabilityOperation::BOUNDED_NESTED_METADATA.contains(operation)
+                    && !CapabilityOperation::BUDGETED_READS.contains(operation)
                     && ![
                         CapabilityOperation::DocumentUpdateOne,
                         CapabilityOperation::DocumentUpdateMany,
@@ -639,6 +654,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BOUNDED_NESTED_METADATA
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::BUDGETED_READS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         for operation in [

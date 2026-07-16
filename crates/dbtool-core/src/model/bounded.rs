@@ -2,6 +2,68 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
+/// Absolute byte ceiling for one caller-visible read response.
+///
+/// This guard is intentionally shared by SQL/CQL rows and future key-value,
+/// document, time-series, and catalog envelopes. Callers may choose a smaller
+/// budget but cannot disable the process-level ceiling.
+pub const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default cumulative byte budget for caller-visible reads.
+pub const DEFAULT_READ_BYTES: usize = 8 * 1024 * 1024;
+
+/// Caller budget for a bounded read envelope.
+///
+/// `max_items` is interpreted by the operation applying the envelope. For
+/// SQL/CQL queries it is the maximum number of returned rows. `max_bytes` is
+/// cumulative across the compact `serde_json` encoding of headers and every
+/// observed item, including the N+1 item used to prove truncation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadBudget {
+    pub max_items: usize,
+    pub max_bytes: usize,
+}
+
+impl ReadBudget {
+    pub fn new(max_items: usize, max_bytes: usize) -> Result<Self> {
+        let budget = Self {
+            max_items,
+            max_bytes,
+        };
+        budget.validate()?;
+        Ok(budget)
+    }
+
+    pub fn with_default_bytes(max_items: usize) -> Result<Self> {
+        Self::new(max_items, DEFAULT_READ_BYTES)
+    }
+
+    /// Validate deserialized or directly constructed budgets at the boundary.
+    pub fn validate(self) -> Result<Self> {
+        if self.max_items == 0 {
+            return Err(Error::Config(
+                "read item budget must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_items.checked_add(1).is_none() {
+            return Err(Error::Config(
+                "read item budget is too large to reserve a probe item".to_owned(),
+            ));
+        }
+        if self.max_bytes == 0 {
+            return Err(Error::Config(
+                "read byte budget must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_bytes > MAX_READ_BYTES {
+            return Err(Error::Config(format!(
+                "read byte budget exceeds the hard {MAX_READ_BYTES}-byte ceiling"
+            )));
+        }
+        Ok(self)
+    }
+}
+
 /// Absolute ceiling for a single complete metadata object.
 ///
 /// Callers may choose a smaller byte budget, but cannot opt out of this guard.
@@ -130,5 +192,36 @@ mod tests {
         let budget = MetadataBudget::with_default_bytes(7).unwrap();
         assert_eq!(budget.max_items, 7);
         assert_eq!(budget.max_bytes, DEFAULT_METADATA_BYTES);
+    }
+
+    #[test]
+    fn read_budget_rejects_invalid_or_unbounded_inputs_and_round_trips() {
+        assert!(matches!(
+            ReadBudget::new(0, DEFAULT_READ_BYTES),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            ReadBudget::new(usize::MAX, DEFAULT_READ_BYTES),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(ReadBudget::new(1, 0), Err(Error::Config(_))));
+        assert!(matches!(
+            ReadBudget::new(1, MAX_READ_BYTES + 1),
+            Err(Error::Config(_))
+        ));
+        assert_eq!(
+            ReadBudget::new(usize::MAX - 1, MAX_READ_BYTES)
+                .unwrap()
+                .max_items,
+            usize::MAX - 1
+        );
+
+        let budget = ReadBudget::with_default_bytes(7).unwrap();
+        assert_eq!(budget.max_items, 7);
+        assert_eq!(budget.max_bytes, DEFAULT_READ_BYTES);
+        assert_eq!(
+            serde_json::from_value::<ReadBudget>(serde_json::to_value(budget).unwrap()).unwrap(),
+            budget
+        );
     }
 }

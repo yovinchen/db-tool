@@ -3,8 +3,8 @@ use crate::{
         BoundedList, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, Document,
         ExecOutcome, FindOptions, ForeignKeyInfo, InsertOutcome, KeyExpiry, KeyValueRestoreOutcome,
         KeyValueSnapshot, LagInfo, Message, MessageResource, MetadataBudget, Point, ProduceOutcome,
-        ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema, TablespaceInfo,
-        TimeRange, TopicDetail, TopicInfo, UpdateOutcome, Value,
+        ReadBudget, ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema,
+        TablespaceInfo, TimeRange, TopicDetail, TopicInfo, UpdateOutcome, Value,
     },
     Result,
 };
@@ -17,8 +17,9 @@ pub use crate::port::connector::Connector;
 pub trait SqlEngine: Connector {
     /// Execute a query without a client-side row budget.
     ///
-    /// Interactive, export, and other user-controlled paths should use
-    /// [`Self::query_bounded`] instead.
+    /// Interactive, export, and other user-controlled paths should prefer
+    /// [`Self::query_budgeted`]. [`Self::query_bounded`] remains the compatible
+    /// row-only contract for callers that have not adopted byte envelopes.
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet>;
     /// Execute a query while returning at most `max_rows` rows.
     ///
@@ -33,6 +34,24 @@ pub trait SqlEngine: Connector {
         params: &[Value],
         max_rows: usize,
     ) -> Result<ResultSet>;
+    /// Execute a query within a cumulative item-and-byte read envelope.
+    ///
+    /// For SQL, `budget.max_items` is the returned-row limit. Implementations
+    /// must account complete column metadata and every recursively serialized
+    /// row before retention, observe at most N+1 rows, and fail without a
+    /// partial result when the byte budget is exceeded. This exact operation
+    /// is optional and never inferred from the legacy `sql=true` capability.
+    async fn query_budgeted(
+        &self,
+        _sql: &str,
+        _params: &[Value],
+        _budget: ReadBudget,
+    ) -> Result<ResultSet> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SqlEngine.query_budgeted",
+        })
+    }
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome>;
     /// Insert a complete row batch using bound parameters in one transaction.
     ///
@@ -111,11 +130,22 @@ pub trait SqlEngine: Connector {
 
 #[async_trait]
 pub trait CqlEngine: Connector {
-    /// Execute CQL without a client-side row budget.
+    /// Execute CQL without a client-side row or byte budget.
     async fn query_cql(&self, cql: &str) -> Result<ResultSet>;
     /// Execute CQL while returning at most `max_rows` rows and probing one
-    /// additional row to report truncation accurately.
+    /// additional row to report truncation accurately. New interactive paths
+    /// should prefer [`Self::query_cql_budgeted`].
     async fn query_cql_bounded(&self, cql: &str, max_rows: usize) -> Result<ResultSet>;
+    /// Execute CQL within a cumulative row-and-byte read envelope.
+    ///
+    /// `budget.max_items` is the returned-row limit. This exact operation is
+    /// optional and never inferred from the legacy `cql=true` capability.
+    async fn query_cql_budgeted(&self, _cql: &str, _budget: ReadBudget) -> Result<ResultSet> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "CqlEngine.query_cql_budgeted",
+        })
+    }
     async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome>;
     async fn list_keyspaces(&self) -> Result<Vec<String>>;
     async fn list_keyspaces_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
@@ -539,7 +569,7 @@ mod tests {
     #[async_trait]
     impl SqlEngine for LegacyCatalogs {
         async fn query(&self, _sql: &str, _params: &[Value]) -> Result<ResultSet> {
-            Ok(ResultSet::empty())
+            Ok(self.record_unbounded(ResultSet::empty()))
         }
 
         async fn query_bounded(
@@ -548,7 +578,7 @@ mod tests {
             _params: &[Value],
             _max_rows: usize,
         ) -> Result<ResultSet> {
-            Ok(ResultSet::empty())
+            Ok(self.record_unbounded(ResultSet::empty()))
         }
 
         async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<ExecOutcome> {
@@ -574,11 +604,11 @@ mod tests {
     #[async_trait]
     impl CqlEngine for LegacyCatalogs {
         async fn query_cql(&self, _cql: &str) -> Result<ResultSet> {
-            Ok(ResultSet::empty())
+            Ok(self.record_unbounded(ResultSet::empty()))
         }
 
         async fn query_cql_bounded(&self, _cql: &str, _max_rows: usize) -> Result<ResultSet> {
-            Ok(ResultSet::empty())
+            Ok(self.record_unbounded(ResultSet::empty()))
         }
 
         async fn execute_cql(&self, _cql: &str) -> Result<ExecOutcome> {
@@ -769,9 +799,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_metadata_defaults_never_materialize_legacy_methods() {
+    async fn budgeted_read_and_metadata_defaults_never_materialize_legacy_methods() {
         let connector = LegacyCatalogs::new();
         let metadata_budget = MetadataBudget::with_default_bytes(10).unwrap();
+        let read_budget = ReadBudget::with_default_bytes(10).unwrap();
+
+        assert_unsupported(
+            SqlEngine::query_budgeted(&connector, "SELECT 1", &[], read_budget).await,
+            "SqlEngine.query_budgeted",
+        );
+        assert_unsupported(
+            CqlEngine::query_cql_budgeted(
+                &connector,
+                "SELECT now() FROM system.local",
+                read_budget,
+            )
+            .await,
+            "CqlEngine.query_cql_budgeted",
+        );
 
         assert_unsupported(
             SqlEngine::list_schemas_bounded(&connector, 10).await,
@@ -847,6 +892,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BOUNDED_NESTED_METADATA
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::BUDGETED_READS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
     }
