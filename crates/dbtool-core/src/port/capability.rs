@@ -4,7 +4,8 @@ use crate::{
         ExecOutcome, FindOptions, ForeignKeyInfo, InsertOutcome, KeyExpiry, KeyValueRestoreOutcome,
         KeyValueSnapshot, LagInfo, Message, MessageResource, MetadataBudget, Point, ProduceOutcome,
         ReadBudget, ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema,
-        TablespaceInfo, TimeRange, TopicDetail, TopicInfo, UpdateOutcome, Value,
+        TablespaceInfo, TimeRange, TimeSeriesReadBudget, TopicDetail, TopicInfo, UpdateOutcome,
+        Value,
     },
     Result,
 };
@@ -455,6 +456,24 @@ pub trait TimeSeriesStore: Connector {
     }
     async fn write_points(&self, points: Vec<Point>) -> Result<()>;
     async fn query_range(&self, query: &str, range: TimeRange) -> Result<SeriesSet>;
+
+    /// Run one range query inside caller-owned series, cumulative-sample, and
+    /// serialized-byte bounds.
+    ///
+    /// This optional contract must be advertised as
+    /// `time_series.query_range_bounded`. The legacy `time_series=true` family
+    /// and unbounded [`Self::query_range`] method never authorize it.
+    async fn query_range_bounded(
+        &self,
+        _query: &str,
+        _range: TimeRange,
+        _budget: TimeSeriesReadBudget,
+    ) -> Result<SeriesSet> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "TimeSeriesStore.query_range_bounded",
+        })
+    }
 }
 
 #[async_trait]
@@ -933,6 +952,7 @@ mod tests {
         let connector = LegacyCatalogs::new();
         let metadata_budget = MetadataBudget::with_default_bytes(10).unwrap();
         let read_budget = ReadBudget::with_default_bytes(10).unwrap();
+        let time_series_budget = TimeSeriesReadBudget::with_default_bytes(10, 100).unwrap();
 
         assert_unsupported(
             SqlEngine::query_budgeted(&connector, "SELECT 1", &[], read_budget).await,
@@ -986,6 +1006,16 @@ mod tests {
             )
             .await,
             "KeyValueStore.raw_command_bounded",
+        );
+        assert_unsupported(
+            TimeSeriesStore::query_range_bounded(
+                &connector,
+                "up",
+                TimeRange::closed(1, 2).unwrap(),
+                time_series_budget,
+            )
+            .await,
+            "TimeSeriesStore.query_range_bounded",
         );
 
         assert_unsupported(

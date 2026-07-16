@@ -1,5 +1,8 @@
 use crate::{
-    model::{BoundedList, ConsumeOptions, Message, MetadataBudget, ReadBudget, ResultSet},
+    model::{
+        series::Series, BoundedList, ConsumeOptions, Message, MetadataBudget, ReadBudget,
+        ResultSet, SeriesSet, TimeSeriesReadBudget,
+    },
     Error, Result,
 };
 use serde::Serialize;
@@ -271,6 +274,204 @@ impl ReadLimiter {
             Err(_) if writer.exceeded => Err(CountingError::BudgetExceeded),
             Err(error) => Err(CountingError::Serialization(error)),
         }
+    }
+
+    fn map_counting_error(&self, error: CountingError) -> Error {
+        match error {
+            CountingError::BudgetExceeded => self.byte_budget_error(),
+            CountingError::Serialization(error) => Error::Serialization(error.to_string()),
+        }
+    }
+
+    fn byte_budget_error(&self) -> Error {
+        Error::ReadBudgetExceeded {
+            subject: self.subject.clone(),
+            unit: "bytes",
+            limit: self.budget.max_bytes,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TimeSeriesHeader<'a> {
+    name: &'a str,
+    columns: &'a [String],
+}
+
+/// Applies independent series and cumulative-sample N+1 limits to a time-series
+/// range response while sharing one serialized-byte envelope.
+///
+/// Adapters pass one lazily converted series at a time to
+/// [`Self::retain_series`]. A retained series charges its complete name and
+/// columns before any sample is retained. Samples then share one counter across
+/// all series. The first extra series header or sample row is charged as the
+/// sole truncation probe, after which the caller must stop. [`Self::finish`]
+/// measures the complete [`SeriesSet`] and reserves the bytes consumed by that
+/// non-visible probe, so a byte failure never returns a partial response.
+pub struct TimeSeriesReadLimiter {
+    budget: TimeSeriesReadBudget,
+    subject: String,
+    observed_series: usize,
+    observed_samples: usize,
+    observed_bytes: usize,
+    probe_bytes: usize,
+    truncated: bool,
+}
+
+impl TimeSeriesReadLimiter {
+    pub fn new(budget: TimeSeriesReadBudget, subject: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            budget: budget.validate()?,
+            subject: subject.into(),
+            observed_series: 0,
+            observed_samples: 0,
+            observed_bytes: 0,
+            probe_bytes: 0,
+            truncated: false,
+        })
+    }
+
+    /// Return the maximum number of series headers needed to distinguish an
+    /// exact result from a series-truncated result.
+    pub fn probe_series(&self) -> Result<usize> {
+        checked_probe_limit(self.budget.max_series, "time-series series")
+    }
+
+    /// Return the maximum cumulative number of sample rows needed to
+    /// distinguish an exact result from a sample-truncated result.
+    pub fn probe_samples(&self) -> Result<usize> {
+        checked_probe_limit(self.budget.max_samples, "time-series sample")
+    }
+
+    /// Account and retain one series without eagerly converting samples beyond
+    /// the first truncation probe.
+    ///
+    /// The iterator is fallible so protocol adapters can convert one backend
+    /// sample at a time. `Ok(true)` means the caller may provide another series;
+    /// `Ok(false)` means this call observed the one permitted series or sample
+    /// probe and the caller must stop.
+    pub fn retain_series<I>(
+        &mut self,
+        name: String,
+        columns: Vec<String>,
+        samples: I,
+        retained: &mut Vec<Series>,
+    ) -> Result<bool>
+    where
+        I: IntoIterator<Item = Result<Vec<serde_json::Value>>>,
+    {
+        if self.truncated {
+            return Err(Error::Internal(format!(
+                "{} time-series limiter observed data after its N+1 probe",
+                self.subject
+            )));
+        }
+
+        let header = TimeSeriesHeader {
+            name: &name,
+            columns: &columns,
+        };
+        let header_bytes = self.charge_serialized(&header)?;
+        let retain_series = self.observed_series < self.budget.max_series;
+        self.observed_series += 1;
+        if !retain_series {
+            self.probe_bytes = header_bytes;
+            self.truncated = true;
+            return Ok(false);
+        }
+
+        let mut values = Vec::new();
+        for sample in samples {
+            let sample = sample?;
+            let sample_bytes = self.charge_serialized(&sample)?;
+            let retain_sample = self.observed_samples < self.budget.max_samples;
+            self.observed_samples += 1;
+            if retain_sample {
+                values.push(sample);
+            } else {
+                self.probe_bytes = sample_bytes;
+                self.truncated = true;
+                break;
+            }
+        }
+
+        retained.push(Series {
+            name,
+            columns,
+            values,
+        });
+        Ok(!self.truncated)
+    }
+
+    /// Finalize the complete portable response and include the non-visible
+    /// series-header or sample probe in the same byte budget.
+    pub fn finish(self, series: Vec<Series>) -> Result<SeriesSet> {
+        let expected_series = self.observed_series.min(self.budget.max_series);
+        if series.len() != expected_series {
+            return Err(Error::Internal(format!(
+                "{} time-series limiter retained {} series after observing {}; expected {expected_series}",
+                self.subject,
+                series.len(),
+                self.observed_series
+            )));
+        }
+
+        let retained_samples = series.iter().try_fold(0usize, |total, item| {
+            total.checked_add(item.values.len()).ok_or_else(|| {
+                Error::Internal(format!(
+                    "{} retained time-series sample count overflow",
+                    self.subject
+                ))
+            })
+        })?;
+        let expected_samples = self.observed_samples.min(self.budget.max_samples);
+        if retained_samples != expected_samples {
+            return Err(Error::Internal(format!(
+                "{} time-series limiter retained {retained_samples} samples after observing {}; expected {expected_samples}",
+                self.subject, self.observed_samples
+            )));
+        }
+
+        let response = SeriesSet {
+            series,
+            truncated: self.truncated,
+        };
+        let visible_limit = self
+            .budget
+            .max_bytes
+            .checked_sub(self.probe_bytes)
+            .ok_or_else(|| self.byte_budget_error())?;
+        ReadLimiter::measure_serialized(&response, visible_limit)
+            .map_err(|error| self.map_counting_error(error))?;
+        Ok(response)
+    }
+
+    pub fn observed_series(&self) -> usize {
+        self.observed_series
+    }
+
+    pub fn observed_samples(&self) -> usize {
+        self.observed_samples
+    }
+
+    pub fn observed_bytes(&self) -> usize {
+        self.observed_bytes
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn charge_serialized<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<usize> {
+        let remaining = self
+            .budget
+            .max_bytes
+            .checked_sub(self.observed_bytes)
+            .expect("observed time-series bytes never exceed the validated budget");
+        let written = ReadLimiter::measure_serialized(value, remaining)
+            .map_err(|error| self.map_counting_error(error))?;
+        self.observed_bytes += written;
+        Ok(written)
     }
 
     fn map_counting_error(&self, error: CountingError) -> Error {
@@ -844,6 +1045,233 @@ mod tests {
                 ..
             }) if limit == required - 1
         ));
+    }
+
+    fn sample(timestamp: i64, value: i64) -> Vec<serde_json::Value> {
+        vec![serde_json::json!(timestamp), serde_json::json!(value)]
+    }
+
+    #[test]
+    fn time_series_limiter_distinguishes_exact_series_and_cumulative_samples() {
+        let budget = TimeSeriesReadBudget::new(2, 3, 4096).unwrap();
+        let mut limiter = TimeSeriesReadLimiter::new(budget, "Prometheus range").unwrap();
+        assert_eq!(limiter.probe_series().unwrap(), 3);
+        assert_eq!(limiter.probe_samples().unwrap(), 4);
+
+        let mut retained = Vec::new();
+        assert!(limiter
+            .retain_series(
+                "cpu".to_owned(),
+                vec!["timestamp".to_owned(), "value".to_owned()],
+                vec![Ok(sample(1, 10)), Ok(sample(2, 20))],
+                &mut retained,
+            )
+            .unwrap());
+        assert!(limiter
+            .retain_series(
+                "memory".to_owned(),
+                vec!["timestamp".to_owned(), "value".to_owned()],
+                vec![Ok(sample(3, 30))],
+                &mut retained,
+            )
+            .unwrap());
+        assert_eq!(limiter.observed_series(), 2);
+        assert_eq!(limiter.observed_samples(), 3);
+
+        let result = limiter.finish(retained).unwrap();
+        assert_eq!(result.series.len(), 2);
+        assert_eq!(
+            result
+                .series
+                .iter()
+                .map(|series| series.values.len())
+                .sum::<usize>(),
+            3
+        );
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn time_series_limiter_stops_after_one_sample_or_series_probe() {
+        let mut sample_limiter = TimeSeriesReadLimiter::new(
+            TimeSeriesReadBudget::new(3, 2, 4096).unwrap(),
+            "Prometheus range",
+        )
+        .unwrap();
+        let mut retained = Vec::new();
+        assert!(sample_limiter
+            .retain_series(
+                "cpu".to_owned(),
+                vec!["timestamp".to_owned(), "value".to_owned()],
+                vec![Ok(sample(1, 10))],
+                &mut retained,
+            )
+            .unwrap());
+        assert!(!sample_limiter
+            .retain_series(
+                "memory".to_owned(),
+                vec!["timestamp".to_owned(), "value".to_owned()],
+                vec![Ok(sample(2, 20)), Ok(sample(3, 30)), Ok(sample(4, 40))],
+                &mut retained,
+            )
+            .unwrap());
+        assert_eq!(sample_limiter.observed_series(), 2);
+        assert_eq!(sample_limiter.observed_samples(), 3);
+        assert!(sample_limiter.is_truncated());
+        let sample_limited = sample_limiter.finish(retained).unwrap();
+        assert_eq!(sample_limited.series.len(), 2);
+        assert_eq!(sample_limited.series[1].values, vec![sample(2, 20)]);
+        assert!(sample_limited.truncated);
+
+        let mut series_limiter = TimeSeriesReadLimiter::new(
+            TimeSeriesReadBudget::new(1, 10, 4096).unwrap(),
+            "Prometheus range",
+        )
+        .unwrap();
+        let mut retained = Vec::new();
+        assert!(series_limiter
+            .retain_series(
+                "cpu".to_owned(),
+                vec!["timestamp".to_owned(), "value".to_owned()],
+                vec![Ok(sample(1, 10))],
+                &mut retained,
+            )
+            .unwrap());
+        assert!(!series_limiter
+            .retain_series(
+                "probe".to_owned(),
+                vec!["timestamp".to_owned(), "value".to_owned()],
+                std::iter::once_with(|| -> Result<Vec<serde_json::Value>> {
+                    panic!("series probe must not convert any sample")
+                }),
+                &mut retained,
+            )
+            .unwrap());
+        assert_eq!(series_limiter.observed_series(), 2);
+        assert_eq!(series_limiter.observed_samples(), 1);
+        let series_limited = series_limiter.finish(retained).unwrap();
+        assert_eq!(series_limited.series.len(), 1);
+        assert!(series_limited.truncated);
+    }
+
+    #[test]
+    fn time_series_limiter_charges_complete_envelope_and_probe_bytes() {
+        let columns = vec!["timestamp".to_owned(), "value".to_owned()];
+        let retained_sample = sample(1, 10);
+        let probe_sample = sample(2, 20);
+        let expected = SeriesSet {
+            series: vec![Series {
+                name: "cpu".to_owned(),
+                columns: columns.clone(),
+                values: vec![retained_sample.clone()],
+            }],
+            truncated: true,
+        };
+        let required = serde_json::to_vec(&expected).unwrap().len()
+            + serde_json::to_vec(&probe_sample).unwrap().len();
+
+        let run = |max_bytes| {
+            let budget = TimeSeriesReadBudget::new(1, 1, max_bytes).unwrap();
+            let mut limiter = TimeSeriesReadLimiter::new(budget, "Prometheus range").unwrap();
+            let mut retained = Vec::new();
+            limiter.retain_series(
+                "cpu".to_owned(),
+                columns.clone(),
+                vec![Ok(retained_sample.clone()), Ok(probe_sample.clone())],
+                &mut retained,
+            )?;
+            limiter.finish(retained)
+        };
+
+        let exact = run(required).unwrap();
+        assert_eq!(
+            serde_json::to_value(exact).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+
+        assert!(matches!(
+            run(required - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == required - 1
+        ));
+
+        let complete = SeriesSet {
+            series: vec![Series {
+                name: "cpu".to_owned(),
+                columns: columns.clone(),
+                values: vec![retained_sample.clone()],
+            }],
+            truncated: true,
+        };
+        let probe_name = "memory".to_owned();
+        let probe_columns = columns.clone();
+        let probe_header = TimeSeriesHeader {
+            name: &probe_name,
+            columns: &probe_columns,
+        };
+        let series_required = serde_json::to_vec(&complete).unwrap().len()
+            + serde_json::to_vec(&probe_header).unwrap().len();
+        let run_series_probe = |max_bytes| {
+            let mut limiter = TimeSeriesReadLimiter::new(
+                TimeSeriesReadBudget::new(1, 10, max_bytes).unwrap(),
+                "Prometheus range",
+            )
+            .unwrap();
+            let mut retained = Vec::new();
+            limiter.retain_series(
+                "cpu".to_owned(),
+                columns.clone(),
+                vec![Ok(retained_sample.clone())],
+                &mut retained,
+            )?;
+            limiter.retain_series(
+                probe_name.clone(),
+                probe_columns.clone(),
+                Vec::<Result<Vec<serde_json::Value>>>::new(),
+                &mut retained,
+            )?;
+            limiter.finish(retained)
+        };
+
+        assert_eq!(
+            serde_json::to_value(run_series_probe(series_required).unwrap()).unwrap(),
+            serde_json::to_value(complete).unwrap()
+        );
+        assert!(matches!(
+            run_series_probe(series_required - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == series_required - 1
+        ));
+    }
+
+    #[test]
+    fn time_series_limiter_rejects_oversized_headers_before_retention() {
+        let mut limiter = TimeSeriesReadLimiter::new(
+            TimeSeriesReadBudget::new(1, 1, 32).unwrap(),
+            "Prometheus range",
+        )
+        .unwrap();
+        let mut retained = Vec::new();
+        let error = limiter
+            .retain_series(
+                "oversized-series-name".repeat(8),
+                vec!["timestamp".to_owned(), "value".to_owned()],
+                Vec::<Result<Vec<serde_json::Value>>>::new(),
+                &mut retained,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+        assert!(retained.is_empty());
+        assert_eq!(limiter.observed_series(), 0);
+        assert_eq!(limiter.observed_samples(), 0);
+        assert_eq!(limiter.observed_bytes(), 0);
     }
 
     #[test]

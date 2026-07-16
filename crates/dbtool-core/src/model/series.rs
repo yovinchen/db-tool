@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::bounded::{DEFAULT_READ_BYTES, MAX_READ_BYTES};
+use crate::{Error, Result};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Point {
     pub measurement: String,
@@ -21,6 +24,71 @@ pub struct Series {
     pub name: String,
     pub columns: Vec<String>,
     pub values: Vec<Vec<serde_json::Value>>,
+}
+
+/// Caller-owned structure and byte envelope for one time-series range read.
+///
+/// `max_series` bounds retained series headers, while `max_samples` is shared
+/// across every retained series rather than being reset for each one. Both
+/// dimensions reserve one additional observation to prove truncation.
+/// `max_bytes` covers the complete compact JSON representation of the returned
+/// [`SeriesSet`] plus the one non-retained series-header or sample probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSeriesReadBudget {
+    pub max_series: usize,
+    pub max_samples: usize,
+    pub max_bytes: usize,
+}
+
+impl TimeSeriesReadBudget {
+    pub fn new(max_series: usize, max_samples: usize, max_bytes: usize) -> Result<Self> {
+        let budget = Self {
+            max_series,
+            max_samples,
+            max_bytes,
+        };
+        budget.validate()
+    }
+
+    pub fn with_default_bytes(max_series: usize, max_samples: usize) -> Result<Self> {
+        Self::new(max_series, max_samples, DEFAULT_READ_BYTES)
+    }
+
+    /// Validate deserialized or directly constructed budgets before a backend
+    /// connection is opened.
+    pub fn validate(self) -> Result<Self> {
+        if self.max_series == 0 {
+            return Err(Error::Config(
+                "time-series series budget must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_series.checked_add(1).is_none() {
+            return Err(Error::Config(
+                "time-series series budget is too large to reserve a probe series".to_owned(),
+            ));
+        }
+        if self.max_samples == 0 {
+            return Err(Error::Config(
+                "time-series sample budget must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_samples.checked_add(1).is_none() {
+            return Err(Error::Config(
+                "time-series sample budget is too large to reserve a probe sample".to_owned(),
+            ));
+        }
+        if self.max_bytes == 0 {
+            return Err(Error::Config(
+                "time-series read byte budget must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_bytes > MAX_READ_BYTES {
+            return Err(Error::Config(format!(
+                "time-series read byte budget exceeds the hard {MAX_READ_BYTES}-byte ceiling"
+            )));
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +148,8 @@ impl TimeRange {
 
 #[cfg(test)]
 mod tests {
-    use super::TimeRange;
+    use super::{TimeRange, TimeSeriesReadBudget};
+    use crate::{model::bounded::MAX_READ_BYTES, Error};
 
     #[test]
     fn closed_ranges_require_two_ordered_endpoints() {
@@ -105,5 +174,32 @@ mod tests {
         let range = TimeRange::last_n_minutes(5).unwrap();
         let (start, end) = range.require_closed().unwrap();
         assert_eq!(end - start, 300_000);
+    }
+
+    #[test]
+    fn time_series_read_budget_rejects_invalid_dimensions_and_bytes() {
+        for result in [
+            TimeSeriesReadBudget::new(0, 1, 1024),
+            TimeSeriesReadBudget::new(1, 0, 1024),
+            TimeSeriesReadBudget::new(usize::MAX, 1, 1024),
+            TimeSeriesReadBudget::new(1, usize::MAX, 1024),
+            TimeSeriesReadBudget::new(1, 1, 0),
+            TimeSeriesReadBudget::new(1, 1, MAX_READ_BYTES + 1),
+        ] {
+            assert!(matches!(result, Err(Error::Config(_))));
+        }
+    }
+
+    #[test]
+    fn time_series_read_budget_uses_shared_default_and_round_trips() {
+        let budget = TimeSeriesReadBudget::with_default_bytes(7, 11).unwrap();
+        assert_eq!(budget.max_series, 7);
+        assert_eq!(budget.max_samples, 11);
+        assert_eq!(budget.max_bytes, super::DEFAULT_READ_BYTES);
+        assert_eq!(
+            serde_json::from_value::<TimeSeriesReadBudget>(serde_json::to_value(budget).unwrap())
+                .unwrap(),
+            budget
+        );
     }
 }

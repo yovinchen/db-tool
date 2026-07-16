@@ -96,6 +96,7 @@ capability_operations! {
     TimeSeriesListMeasurementsBounded => "time_series.list_measurements_bounded",
     TimeSeriesWritePoints => "time_series.write_points",
     TimeSeriesQueryRange => "time_series.query_range",
+    TimeSeriesQueryRangeBounded => "time_series.query_range_bounded",
     SearchListIndices => "search.list_indices",
     SearchListIndicesBounded => "search.list_indices_bounded",
     SearchSearch => "search.search",
@@ -148,6 +149,7 @@ impl CapabilityOperation {
         Self::KeyValueRawCommandBounded,
         Self::DocumentFindBudgeted,
         Self::DocumentAggregateBudgeted,
+        Self::TimeSeriesQueryRangeBounded,
     ];
     pub const DB2: &'static [Self] = &[
         Self::Db2ListSequences,
@@ -198,6 +200,10 @@ impl CapabilityOperation {
         Self::TimeSeriesWritePoints,
         Self::TimeSeriesQueryRange,
     ];
+    /// Complete time-series range envelopes are optional because their series,
+    /// cumulative-sample, and byte limits must be enforced by the backend
+    /// adapter rather than inferred from the legacy family flag.
+    pub const TIME_SERIES_BUDGETED_READS: &'static [Self] = &[Self::TimeSeriesQueryRangeBounded];
     pub const SEARCH: &'static [Self] = &[
         Self::SearchListIndices,
         Self::SearchSearch,
@@ -625,6 +631,10 @@ mod tests {
             serde_json::to_value(CapabilityOperation::DocumentAggregateBudgeted).unwrap(),
             serde_json::json!("document.aggregate_budgeted")
         );
+        assert_eq!(
+            serde_json::to_value(CapabilityOperation::TimeSeriesQueryRangeBounded).unwrap(),
+            serde_json::json!("time_series.query_range_bounded")
+        );
         for (operation, stable_name) in [
             (CapabilityOperation::KeyValueExists, "kv.exists"),
             (CapabilityOperation::KeyValueGetBounded, "kv.get_bounded"),
@@ -660,6 +670,15 @@ mod tests {
                 CapabilityOperation::KeyValueRawCommandBounded,
             ]
         );
+        assert_eq!(
+            CapabilityOperation::TIME_SERIES_BUDGETED_READS,
+            [CapabilityOperation::TimeSeriesQueryRangeBounded]
+        );
+        assert!(!CapabilityOperation::TIME_SERIES
+            .contains(&CapabilityOperation::TimeSeriesQueryRangeBounded));
+        assert!(CapabilityOperation::TIME_SERIES_BUDGETED_READS
+            .iter()
+            .all(|operation| CapabilityOperation::BUDGETED_READS.contains(operation)));
         assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
             .iter()
             .all(|operation| CapabilityOperation::BUDGETED_READS.contains(operation)));
@@ -812,6 +831,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::TIME_SERIES_BUDGETED_READS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         for operation in [
