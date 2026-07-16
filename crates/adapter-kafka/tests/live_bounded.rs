@@ -6,7 +6,7 @@ use dbtool_core::{
     error::Error,
     model::{
         ConsumeOptions, DeleteResourceOptions, Message, MessageResource, MessageResourceKind,
-        MetadataBudget, ReadBudget,
+        MetadataBudget, ProduceBudget, ReadBudget,
     },
     port::CapabilityOperation,
 };
@@ -35,6 +35,7 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
         .as_nanos();
     let topic = format!("dbtool_it_pure_bounded_{}_{}", std::process::id(), unique);
     let auxiliary_topic = format!("{topic}_catalog_probe");
+    let rejected_topic = format!("{topic}_produce_rejected");
 
     let fixture = ClientBuilder::new(vec![broker])
         .client_id("dbtool-bounded-live-fixture")
@@ -61,12 +62,31 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
     assert!(connector
         .operations()
         .contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
+    assert!(connector
+        .operations()
+        .contains(&CapabilityOperation::MessageProduceBudgeted));
     assert!(!connector
         .operations()
         .contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
     let admin = connector
         .as_admin()
         .expect("Kafka adapter should expose admin inspection");
+    let producer = connector
+        .as_producer()
+        .expect("Kafka adapter should expose production");
+    let legacy_empty = producer
+        .produce(&rejected_topic, vec![])
+        .await
+        .expect("legacy empty produce should remain a no-op");
+    assert_eq!(legacy_empty.produced, 0);
+    assert!(legacy_empty.placements.is_empty());
+    assert!(producer.produce("", vec![]).await.is_err());
+    assert!(!admin
+        .list_topics()
+        .await
+        .expect("legacy no-op must leave the catalog readable")
+        .iter()
+        .any(|item| item.name == rejected_topic));
     let full_catalog = admin
         .list_topics()
         .await
@@ -124,21 +144,41 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
     assert_eq!(detail.info.partitions, 2);
     assert_eq!(detail.watermarks.len(), 2);
 
-    connector
-        .as_producer()
-        .expect("Kafka adapter should expose production")
-        .produce(
+    let fixture_message = Message {
+        key: Some(b"key".to_vec().into()),
+        payload: b"budgeted-pure-kafka-message".to_vec().into(),
+        headers: HashMap::from([("trace".to_owned(), "pure".to_owned())]),
+        partition: Some(0),
+        offset: None,
+        timestamp: None,
+        cursor: None,
+        metadata: None,
+    };
+    let message_bytes = serde_json::to_vec(&fixture_message).unwrap().len();
+    let batch_bytes = serde_json::to_vec(&vec![fixture_message.clone()])
+        .unwrap()
+        .len();
+    assert!(matches!(
+        producer
+            .produce_budgeted(
+                &rejected_topic,
+                vec![fixture_message.clone()],
+                ProduceBudget::new(1, message_bytes - 1, batch_bytes).unwrap(),
+            )
+            .await,
+        Err(Error::InputBudgetExceeded { unit: "bytes", .. })
+    ));
+    assert!(!admin
+        .list_topics()
+        .await
+        .expect("Kafka topic catalog should remain readable")
+        .iter()
+        .any(|item| item.name == rejected_topic));
+    producer
+        .produce_budgeted(
             &topic,
-            vec![Message {
-                key: Some(b"key".to_vec().into()),
-                payload: b"budgeted-pure-kafka-message".to_vec().into(),
-                headers: HashMap::from([("trace".to_owned(), "pure".to_owned())]),
-                partition: Some(0),
-                offset: None,
-                timestamp: None,
-                cursor: None,
-                metadata: None,
-            }],
+            vec![fixture_message],
+            ProduceBudget::new(1, message_bytes, batch_bytes).unwrap(),
         )
         .await
         .expect("pure Kafka budget fixture should publish");

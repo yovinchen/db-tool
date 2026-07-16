@@ -7,7 +7,7 @@ use dbtool_core::{
     model::{
         BoundedList, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo,
         Message, MessageCursor, MessagePlacement, MessageResource, MetadataBudget,
-        PartitionWatermark, ProduceOutcome, ReadBudget, TopicDetail, TopicInfo,
+        PartitionWatermark, ProduceBudget, ProduceOutcome, ReadBudget, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -30,8 +30,8 @@ use std::{
 
 use super::{
     budgeted_topic_catalog_plan, finish_budgeted_topic_catalog, kafka_messages_before,
-    resolve_consume_position, validate_kafka_consume_options, validate_kafka_delete_request,
-    validate_produce_message,
+    legacy_empty_produce_outcome, map_after_possible_write, resolve_consume_position,
+    validate_kafka_consume_options, validate_kafka_delete_request, validate_kafka_produce_request,
 };
 
 // Kafka's Metadata API does not paginate. Keep the unavoidable protocol frame
@@ -120,6 +120,7 @@ impl Connector for RskafkaAdapter {
 fn pure_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::MessageProduceBudgeted,
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminListTopicsBudgeted,
@@ -134,16 +135,36 @@ fn pure_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
 impl MessageProducer for RskafkaAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
         validate_topic(target)?;
-        if messages.is_empty() {
-            return Ok(ProduceOutcome {
-                produced: 0,
-                placements: vec![],
-            });
+        if let Some(outcome) = legacy_empty_produce_outcome(&messages) {
+            return Ok(outcome);
         }
+        self.produce_with_budget(target, messages, None).await
+    }
+
+    async fn produce_budgeted(
+        &self,
+        target: &str,
+        messages: Vec<Message>,
+        budget: ProduceBudget,
+    ) -> Result<ProduceOutcome> {
+        self.produce_with_budget(target, messages, Some(budget))
+            .await
+    }
+}
+
+impl RskafkaAdapter {
+    async fn produce_with_budget(
+        &self,
+        target: &str,
+        messages: Vec<Message>,
+        budget: Option<ProduceBudget>,
+    ) -> Result<ProduceOutcome> {
+        validate_topic(target)?;
+        validate_kafka_produce_request(&messages, budget)?;
 
         let message_count = messages.len();
         let grouped_records = group_records_by_partition(messages)?;
-        self.ensure_topic(target).await?;
+        let mut possible_write = self.ensure_topic(target).await?;
 
         // rskafka produces through a partition-specific client. Keep batches
         // efficient while restoring placements to the caller's input order.
@@ -155,18 +176,35 @@ impl MessageProducer for RskafkaAdapter {
                 .client
                 .partition_client(target, partition, UnknownTopicHandling::Retry)
                 .await
-                .map_err(|e| Error::Connection(e.to_string()))?;
+                .map_err(|e| {
+                    map_after_possible_write(
+                        possible_write,
+                        "Kafka produce",
+                        Error::Connection(e.to_string()),
+                    )
+                })?;
             let (indices, records): (Vec<_>, Vec<_>) = indexed_records.into_iter().unzip();
+            possible_write = true;
             let offsets = client
                 .produce(records, Compression::NoCompression)
                 .await
-                .map_err(|e| Error::Query(e.to_string()))?;
+                .map_err(|e| {
+                    map_after_possible_write(
+                        possible_write,
+                        "Kafka produce",
+                        Error::Query(e.to_string()),
+                    )
+                })?;
             if offsets.len() != indices.len() {
-                return Err(Error::Internal(format!(
-                    "Kafka produced {} offsets for {} records in partition {partition}",
-                    offsets.len(),
-                    indices.len()
-                )));
+                return Err(map_after_possible_write(
+                    possible_write,
+                    "Kafka produce",
+                    Error::Internal(format!(
+                        "Kafka produced {} offsets for {} records in partition {partition}",
+                        offsets.len(),
+                        indices.len()
+                    )),
+                ));
             }
 
             for (index, offset) in indices.into_iter().zip(offsets) {
@@ -185,7 +223,13 @@ impl MessageProducer for RskafkaAdapter {
         let placements = placements
             .into_iter()
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| Error::Internal("Kafka produce result is missing a placement".into()))?;
+            .ok_or_else(|| {
+                map_after_possible_write(
+                    possible_write,
+                    "Kafka produce",
+                    Error::Internal("Kafka produce result is missing a placement".into()),
+                )
+            })?;
 
         Ok(ProduceOutcome {
             produced: placements.len() as u64,
@@ -493,7 +537,7 @@ impl RskafkaAdapter {
         Ok(detail)
     }
 
-    async fn ensure_topic(&self, name: &str) -> Result<()> {
+    async fn ensure_topic(&self, name: &str) -> Result<bool> {
         if self
             .client
             .list_topics()
@@ -502,15 +546,20 @@ impl RskafkaAdapter {
             .iter()
             .any(|topic| topic.name == name)
         {
-            return Ok(());
+            return Ok(false);
         }
 
-        self.client
+        let controller = self
+            .client
             .controller_client()
-            .map_err(|e| Error::Connection(e.to_string()))?
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        controller
             .create_topic(name, 1, 1, 5_000)
             .await
-            .map_err(|e| Error::Query(e.to_string()))
+            .map(|_| true)
+            .map_err(|e| {
+                map_after_possible_write(true, "Kafka topic creation", Error::Query(e.to_string()))
+            })
     }
 
     async fn topic_infos(&self) -> Result<Vec<TopicInfo>> {
@@ -571,7 +620,6 @@ fn group_records_by_partition(
 ) -> Result<BTreeMap<i32, Vec<(usize, Record)>>> {
     let mut grouped = BTreeMap::<i32, Vec<(usize, Record)>>::new();
     for (index, message) in messages.into_iter().enumerate() {
-        validate_produce_message(&message)?;
         let partition = message.partition.unwrap_or(0);
         let timestamp = kafka_timestamp(message.timestamp)?;
         let record = Record {
@@ -735,6 +783,7 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
         assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
         assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
+        assert!(operations.contains(&CapabilityOperation::MessageProduceBudgeted));
         assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
         assert!(!operations.contains(&CapabilityOperation::MessageConsumeGroup));
         assert!(!operations.contains(&CapabilityOperation::MessageConsumeAck));

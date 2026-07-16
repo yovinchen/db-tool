@@ -6,7 +6,8 @@ use dbtool_core::{
     model::{
         AckMode, BoundedList, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
         DeleteResourceOutcome, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
-        MetadataBudget, PartitionWatermark, ProduceOutcome, ReadBudget, TopicDetail, TopicInfo,
+        MetadataBudget, PartitionWatermark, ProduceBudget, ProduceOutcome, ReadBudget, TopicDetail,
+        TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -33,8 +34,8 @@ use std::{
 
 use super::{
     budgeted_topic_catalog_plan, finish_budgeted_topic_catalog, kafka_messages_before,
-    resolve_consume_position, validate_kafka_consume_options, validate_kafka_delete_request,
-    validate_produce_message,
+    legacy_empty_produce_outcome, map_after_possible_write, resolve_consume_position,
+    validate_kafka_consume_options, validate_kafka_delete_request, validate_kafka_produce_request,
 };
 
 // Kafka metadata has no pagination. librdkafka enforces this receive-frame
@@ -123,6 +124,7 @@ impl Connector for RdkafkaAdapter {
 fn native_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::MessageProduceBudgeted,
         CapabilityOperation::MessageConsumeGroup,
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
@@ -141,16 +143,33 @@ fn native_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
 impl MessageProducer for RdkafkaAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
         validate_topic(target)?;
-        if messages.is_empty() {
-            return Ok(ProduceOutcome {
-                produced: 0,
-                placements: vec![],
-            });
+        if let Some(outcome) = legacy_empty_produce_outcome(&messages) {
+            return Ok(outcome);
         }
+        self.produce_with_budget(target, messages, None).await
+    }
 
-        for message in &messages {
-            validate_native_produce_message(message)?;
-        }
+    async fn produce_budgeted(
+        &self,
+        target: &str,
+        messages: Vec<Message>,
+        budget: ProduceBudget,
+    ) -> Result<ProduceOutcome> {
+        self.produce_with_budget(target, messages, Some(budget))
+            .await
+    }
+}
+
+impl RdkafkaAdapter {
+    async fn produce_with_budget(
+        &self,
+        target: &str,
+        messages: Vec<Message>,
+        budget: Option<ProduceBudget>,
+    ) -> Result<ProduceOutcome> {
+        validate_topic(target)?;
+        validate_kafka_produce_request(&messages, budget)?;
+
         self.ensure_topic(target).await?;
         let mut placements = Vec::with_capacity(messages.len());
         for message in messages {
@@ -172,7 +191,9 @@ impl MessageProducer for RdkafkaAdapter {
                 .producer
                 .send(record, Timeout::After(Duration::from_secs(5)))
                 .await
-                .map_err(|(error, _)| Error::Query(error.to_string()))?;
+                .map_err(|(error, _)| {
+                    map_after_possible_write(true, "Kafka produce", Error::Query(error.to_string()))
+                })?;
             placements.push(MessagePlacement {
                 partition,
                 offset,
@@ -636,19 +657,10 @@ impl RdkafkaAdapter {
             .admin
             .create_topics(&[topic], &AdminOptions::new())
             .await
-            .map_err(kafka_query_error)?;
-        for result in results {
-            match result {
-                Ok(_) => {}
-                Err((_, RDKafkaErrorCode::TopicAlreadyExists)) => {}
-                Err((topic, error)) => {
-                    return Err(Error::Query(format!(
-                        "failed to create Kafka topic {topic}: {error}"
-                    )));
-                }
-            }
-        }
-        Ok(())
+            .map_err(|error| {
+                map_after_possible_write(true, "Kafka topic creation", kafka_query_error(error))
+            })?;
+        require_created_topic(results, name)
     }
 
     fn topic_infos(&self) -> Result<Vec<TopicInfo>> {
@@ -1021,6 +1033,38 @@ fn require_deleted_topic(
     }
 }
 
+fn require_created_topic(
+    mut results: Vec<rdkafka::admin::TopicResult>,
+    expected: &str,
+) -> Result<()> {
+    if results.len() != 1 {
+        return Err(map_after_possible_write(
+            true,
+            "Kafka topic creation",
+            Error::Query(format!(
+                "Kafka returned {} create results for one requested topic",
+                results.len()
+            )),
+        ));
+    }
+    match results.pop().expect("length checked above") {
+        Ok(topic) if topic == expected => Ok(()),
+        Ok(topic) => Err(map_after_possible_write(
+            true,
+            "Kafka topic creation",
+            Error::Query(format!(
+                "Kafka acknowledged creation for topic {topic:?} instead of {expected:?}"
+            )),
+        )),
+        Err((topic, RDKafkaErrorCode::TopicAlreadyExists)) if topic == expected => Ok(()),
+        Err((topic, error)) => Err(map_after_possible_write(
+            true,
+            "Kafka topic creation",
+            Error::Query(format!("failed to create Kafka topic {topic}: {error}")),
+        )),
+    }
+}
+
 fn topic_deletion_not_verified(name: &str) -> Error {
     Error::Query(format!(
         "Kafka acknowledged deletion of topic {name:?}, but its absence was not verified within 5 seconds"
@@ -1037,16 +1081,6 @@ fn validate_topic(topic: &str) -> Result<()> {
         return Err(Error::Query(format!("invalid Kafka topic name: {topic:?}")));
     }
 
-    Ok(())
-}
-
-fn validate_native_produce_message(message: &Message) -> Result<()> {
-    validate_produce_message(message)?;
-    if let Some(key) = message.headers.keys().find(|key| key.contains('\0')) {
-        return Err(Error::Config(format!(
-            "Kafka header name must not contain a NUL byte: {key:?}"
-        )));
-    }
     Ok(())
 }
 
@@ -1123,7 +1157,7 @@ fn kafka_query_error(error: KafkaError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbtool_core::model::MessageResourceKind;
+    use dbtool_core::model::{MessageResourceKind, ProduceBudget};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn message(headers: HashMap<String, String>) -> Message {
@@ -1152,10 +1186,13 @@ mod tests {
 
     #[test]
     fn native_produce_validation_rejects_nul_header_names() {
-        let error = validate_native_produce_message(&message(HashMap::from([(
-            "bad\0header".to_owned(),
-            "value".to_owned(),
-        )])))
+        let error = validate_kafka_produce_request(
+            &[message(HashMap::from([(
+                "bad\0header".to_owned(),
+                "value".to_owned(),
+            )]))],
+            None,
+        )
         .unwrap_err();
 
         assert!(matches!(error, Error::Config(_)));
@@ -1247,6 +1284,7 @@ mod tests {
         });
         assert!(operations.contains(&CapabilityOperation::MessageConsumeGroup));
         assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
+        assert!(operations.contains(&CapabilityOperation::MessageProduceBudgeted));
         assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
         assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
         assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
@@ -1431,6 +1469,33 @@ mod tests {
         assert!(matches!(missing_result, Error::Query(_)));
     }
 
+    #[test]
+    fn native_topic_creation_results_are_indeterminate_after_submission() {
+        require_created_topic(vec![Ok("events".to_owned())], "events").unwrap();
+        require_created_topic(
+            vec![Err((
+                "events".to_owned(),
+                RDKafkaErrorCode::TopicAlreadyExists,
+            ))],
+            "events",
+        )
+        .unwrap();
+
+        for result in [
+            require_created_topic(vec![], "events"),
+            require_created_topic(vec![Ok("other".to_owned())], "events"),
+            require_created_topic(
+                vec![Err(("events".to_owned(), RDKafkaErrorCode::InvalidRequest))],
+                "events",
+            ),
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::OutcomeIndeterminate(_)));
+            assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+            assert!(!error.is_retryable());
+        }
+    }
+
     #[tokio::test]
     async fn live_consumer_lag_reads_a_real_committed_group_offset() {
         if std::env::var("DBTOOL_RUN_KAFKA_NATIVE_LIVE").as_deref() != Ok("1") {
@@ -1444,6 +1509,7 @@ mod tests {
             .expect("clock should be after Unix epoch")
             .as_millis();
         let topic = format!("dbtool_it_native_lag_{}_{}", std::process::id(), unique);
+        let rejected_topic = format!("{topic}_produce_rejected");
         let group = format!("dbtool-it-native-lag-{}-{unique}", std::process::id());
 
         let brokers = brokers_from_dsn(&dsn);
@@ -1462,6 +1528,24 @@ mod tests {
         assert!(created[0].is_ok(), "topic creation failed: {created:?}");
 
         let connector = connect(dsn.clone()).await.expect("Kafka should connect");
+        let producer = connector
+            .as_producer()
+            .expect("native Kafka exposes MessageProducer");
+        let legacy_empty = producer
+            .produce(&rejected_topic, vec![])
+            .await
+            .expect("legacy empty produce should remain a no-op");
+        assert_eq!(legacy_empty.produced, 0);
+        assert!(legacy_empty.placements.is_empty());
+        assert!(producer.produce("", vec![]).await.is_err());
+        assert!(!connector
+            .as_admin()
+            .expect("native Kafka exposes AdminInspect")
+            .list_topics()
+            .await
+            .expect("legacy no-op must leave the catalog readable")
+            .iter()
+            .any(|item| item.name == rejected_topic));
         let messages = ["first", "second"]
             .into_iter()
             .map(|payload| Message {
@@ -1474,11 +1558,40 @@ mod tests {
                 cursor: None,
                 metadata: None,
             })
-            .collect();
-        connector
-            .as_producer()
-            .expect("native Kafka exposes MessageProducer")
-            .produce(&topic, messages)
+            .collect::<Vec<_>>();
+        let max_message_bytes = messages
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len())
+            .max()
+            .unwrap();
+        let batch_bytes = serde_json::to_vec(&messages).unwrap().len();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::MessageProduceBudgeted));
+        assert!(matches!(
+            producer
+                .produce_budgeted(
+                    &rejected_topic,
+                    messages.clone(),
+                    ProduceBudget::new(2, max_message_bytes - 1, batch_bytes).unwrap(),
+                )
+                .await,
+            Err(Error::InputBudgetExceeded { unit: "bytes", .. })
+        ));
+        assert!(!connector
+            .as_admin()
+            .expect("native Kafka exposes AdminInspect")
+            .list_topics()
+            .await
+            .expect("topic catalog should remain readable")
+            .iter()
+            .any(|item| item.name == rejected_topic));
+        producer
+            .produce_budgeted(
+                &topic,
+                messages,
+                ProduceBudget::new(2, max_message_bytes, batch_bytes).unwrap(),
+            )
             .await
             .expect("messages should be produced");
 

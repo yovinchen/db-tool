@@ -3,10 +3,11 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         BoundedList, ConsumeCursor, ConsumeOptions, DeleteResourceOptions, Message,
-        MessageResource, MessageResourceKind, PartitionWatermark, ReadBudget, TopicInfo,
+        MessageResource, MessageResourceKind, PartitionWatermark, ProduceBudget, ProduceOutcome,
+        ReadBudget, TopicInfo,
     },
     port::connector::Connector,
-    service::limiter::ReadLimiter,
+    service::limiter::{MessageWriteLimiter, ReadLimiter},
 };
 use futures::future::BoxFuture;
 
@@ -49,6 +50,42 @@ where
     limiter.finish(retained)
 }
 
+fn validate_kafka_produce_request(
+    messages: &[Message],
+    budget: Option<ProduceBudget>,
+) -> Result<()> {
+    // This proves only dbtool's portable process envelope. A broker may have
+    // a lower topic-level `message.max.bytes`; that remote policy cannot be
+    // discovered atomically during preflight, so a post-send rejection is
+    // deliberately surfaced as OUTCOME_INDETERMINATE by both backends.
+    let budget = budget.unwrap_or_default();
+    MessageWriteLimiter::new(budget, "Kafka produce request")?.validate(messages)?;
+    for message in messages {
+        validate_produce_message(message)?;
+    }
+    Ok(())
+}
+
+fn legacy_empty_produce_outcome(messages: &[Message]) -> Option<ProduceOutcome> {
+    messages.is_empty().then(|| ProduceOutcome {
+        produced: 0,
+        placements: Vec::new(),
+    })
+}
+
+/// Once a create/append request has entered a client, a timeout or delivery
+/// error cannot prove that the broker applied nothing. Keep the original
+/// error only while no remote mutation was attempted.
+fn map_after_possible_write(possible_write: bool, operation: &str, error: Error) -> Error {
+    if !possible_write {
+        return error;
+    }
+    Error::OutcomeIndeterminate(format!(
+        "{operation} may have reached the broker; inspect remote state before retrying ({})",
+        error.code()
+    ))
+}
+
 /// Validate producer-only fields before the adapter creates a topic or sends
 /// any records. Kafka assigns offsets after a successful append, so accepting
 /// a caller-provided offset would silently misrepresent what was persisted.
@@ -69,6 +106,12 @@ fn validate_produce_message(message: &Message) -> Result<()> {
         return Err(Error::Config(
             "Kafka producer messages cannot set consumer cursor or delivery metadata".to_owned(),
         ));
+    }
+
+    if let Some(key) = message.headers.keys().find(|key| key.contains('\0')) {
+        return Err(Error::Config(format!(
+            "Kafka header name must not contain a NUL byte: {key:?}"
+        )));
     }
 
     Ok(())
@@ -190,6 +233,81 @@ mod tests {
         let (limiter, probe_items) =
             budgeted_topic_catalog_plan(ReadBudget::new(max_items, max_bytes)?)?;
         finish_budgeted_topic_catalog(limiter, probe_items, names.iter().map(|name| topic(name)))
+    }
+
+    #[test]
+    fn kafka_produce_preflight_enforces_count_and_exact_bytes() {
+        let one = message(None, None);
+        let encoded = serde_json::to_vec(&one).unwrap().len();
+        let encoded_batch = serde_json::to_vec(&vec![one.clone()]).unwrap().len();
+        let exact = ProduceBudget {
+            max_messages: 1,
+            max_message_bytes: encoded,
+            max_batch_bytes: encoded_batch,
+        };
+        validate_kafka_produce_request(std::slice::from_ref(&one), Some(exact)).unwrap();
+        let legacy_empty = legacy_empty_produce_outcome(&[]).unwrap();
+        assert_eq!(legacy_empty.produced, 0);
+        assert!(legacy_empty.placements.is_empty());
+        assert!(matches!(
+            validate_kafka_produce_request(&[], Some(exact)),
+            Err(Error::Config(message)) if message.contains("at least one")
+        ));
+
+        let too_many = vec![one.clone(), one.clone()];
+        assert!(validate_kafka_produce_request(&too_many, Some(exact)).is_err());
+        assert!(matches!(
+            validate_kafka_produce_request(&vec![one.clone(); 101], None),
+            Err(Error::InputBudgetExceeded {
+                unit: "messages",
+                limit: 100,
+                ..
+            })
+        ));
+        assert!(validate_kafka_produce_request(
+            std::slice::from_ref(&one),
+            Some(ProduceBudget {
+                max_message_bytes: encoded - 1,
+                ..exact
+            })
+        )
+        .is_err());
+        assert!(validate_kafka_produce_request(
+            std::slice::from_ref(&one),
+            Some(ProduceBudget {
+                max_batch_bytes: encoded_batch - 1,
+                ..exact
+            })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn kafka_produce_preflight_rejects_all_fields_before_dispatch() {
+        let mut invalid = message(None, None);
+        invalid.offset = Some(1);
+        assert!(matches!(
+            validate_kafka_produce_request(&[invalid], None),
+            Err(Error::Config(message)) if message.contains("offset")
+        ));
+
+        let mut invalid = message(None, None);
+        invalid.headers.insert("bad\0header".into(), "value".into());
+        assert!(matches!(
+            validate_kafka_produce_request(&[invalid], None),
+            Err(Error::Config(message)) if message.contains("NUL")
+        ));
+    }
+
+    #[test]
+    fn kafka_errors_after_a_possible_write_are_indeterminate() {
+        let before = map_after_possible_write(false, "Kafka produce", Error::Timeout);
+        assert!(matches!(before, Error::Timeout));
+
+        let after = map_after_possible_write(true, "Kafka produce", Error::Timeout);
+        assert!(matches!(after, Error::OutcomeIndeterminate(_)));
+        assert_eq!(after.code(), "OUTCOME_INDETERMINATE");
+        assert!(!after.is_retryable());
     }
 
     #[test]
