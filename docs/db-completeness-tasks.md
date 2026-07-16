@@ -88,6 +88,12 @@ fixture resource:
 The evidence must also record the exact runner, UTC timestamp, image/product
 version, architecture, result, and any unsupported capability boundary.
 
+The cross-family final live inventory is recorded in
+[`final-residue-audit.md`](test-evidence/final-residue-audit.md). It reports
+zero per-run SQL tables, Redis keys, Mongo collections, Search indices,
+Prometheus series, Kafka topics, RabbitMQ queues, and NATS JetStream state; the
+configured Cassandra harness keyspace remains with zero tables.
+
 ## Design-Only, Not Registered
 
 Oracle, etcd, InfluxDB, VictoriaMetrics, Pulsar, MQTT, and RocketMQ still appear

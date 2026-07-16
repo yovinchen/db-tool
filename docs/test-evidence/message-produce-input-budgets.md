@@ -66,6 +66,11 @@ resource names. The IF-T77 tests deleted every topic they created but did not
 delete that historical resource; cleanup evidence is therefore scoped to the
 current test run rather than misstated as a globally empty broker.
 
+The final campaign-wide residue audit later deleted that historical test topic
+through dbtool's public target-bound confirmation path. Redpanda then reported
+zero `dbtool_it_*` topics; see
+[`final-residue-audit.md`](final-residue-audit.md).
+
 One root NATS rerun exposed the documented distinction between Core NATS
 flush and JetStream PubAck: stream depth was transiently zero and became one
 shortly afterward. The live assertion now polls inside a fixed two-second

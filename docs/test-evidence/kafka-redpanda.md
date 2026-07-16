@@ -89,6 +89,12 @@ IF-T77 run and was not one of its resource names. The test correctly avoided
 deleting it; cleanup PASS means all current-run topics were removed, not that
 the shared broker was globally empty.
 
+Final campaign cleanup (UTC 2026-07-16T13:51:26Z): the historical name was
+subsequently treated as an explicitly disposable `dbtool_it_*` resource and
+deleted through `dbtool mq delete --kind kafka-topic` with a target-bound
+confirmation token. A final `rpk topic list` contained no test topic. This does
+not retroactively weaken the earlier test's ownership-scoped cleanup rule.
+
 Kafka topic creation and per-partition append are separate remote mutations.
 After either may have started, create/send/delivery/placement failures are
 non-retryable `OUTCOME_INDETERMINATE`. Broker or topic
@@ -96,8 +102,8 @@ non-retryable `OUTCOME_INDETERMINATE`. Broker or topic
 cannot be atomically frozen during preflight, so a post-submit broker rejection
 is not described as zero-write.
 
-Cleanup: PASS; every topic created by the exact lifecycle was deleted through
-the public API and bounded absence verification succeeded.
+Cleanup: PASS; every topic created by the exact lifecycle and the one historical
+test topic were deleted through the public API; final broker test-topic count 0.
 
 Commits: `e24fb79`, `85c7954`, `acff12b`, `1279cbd`, `300e94b`, `d2c88a2`,
 `de6b79e`
