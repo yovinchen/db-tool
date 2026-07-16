@@ -75,6 +75,7 @@ capability_operations! {
     DocumentListCollections => "document.list_collections",
     DocumentListCollectionsBounded => "document.list_collections_bounded",
     DocumentFind => "document.find",
+    DocumentFindBudgeted => "document.find_budgeted",
     DocumentInsert => "document.insert",
     DocumentUpdate => "document.update",
     DocumentDelete => "document.delete",
@@ -84,6 +85,7 @@ capability_operations! {
     DocumentDeleteMany => "document.delete_many",
     DocumentAggregate => "document.aggregate",
     DocumentAggregateBounded => "document.aggregate_bounded",
+    DocumentAggregateBudgeted => "document.aggregate_budgeted",
     DocumentDropCollection => "document.drop_collection",
     TimeSeriesListMeasurements => "time_series.list_measurements",
     TimeSeriesListMeasurementsBounded => "time_series.list_measurements_bounded",
@@ -130,8 +132,14 @@ impl CapabilityOperation {
         Self::CqlDescribeTable,
     ];
     /// Item-and-byte read envelopes are optional backend-aware contracts.
-    /// Legacy SQL/CQL booleans and row-only bounded methods never imply them.
-    pub const BUDGETED_READS: &'static [Self] = &[Self::SqlQueryBudgeted, Self::CqlQueryBudgeted];
+    /// Legacy family booleans and row/item-only bounded methods never imply
+    /// them.
+    pub const BUDGETED_READS: &'static [Self] = &[
+        Self::SqlQueryBudgeted,
+        Self::CqlQueryBudgeted,
+        Self::DocumentFindBudgeted,
+        Self::DocumentAggregateBudgeted,
+    ];
     pub const DB2: &'static [Self] = &[
         Self::Db2ListSequences,
         Self::Db2ListRoutines,
@@ -553,6 +561,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(CapabilityOperation::CqlQueryBudgeted).unwrap(),
             serde_json::json!("cql.query_budgeted")
+        );
+        assert_eq!(
+            serde_json::to_value(CapabilityOperation::DocumentFindBudgeted).unwrap(),
+            serde_json::json!("document.find_budgeted")
+        );
+        assert_eq!(
+            serde_json::to_value(CapabilityOperation::DocumentAggregateBudgeted).unwrap(),
+            serde_json::json!("document.aggregate_budgeted")
         );
     }
 

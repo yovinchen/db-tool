@@ -243,6 +243,25 @@ pub trait DocumentStore: Connector {
         filter: Value,
         options: FindOptions,
     ) -> Result<Vec<Document>>;
+    /// Find documents within one cumulative item-and-byte read envelope.
+    ///
+    /// Implementations must account each complete native document before
+    /// retention, observe at most N+1 documents, and fail without returning a
+    /// partial collection when either the native or caller-visible byte budget
+    /// is exceeded. This exact operation is optional and never inferred from
+    /// the legacy `document=true` capability.
+    async fn find_budgeted(
+        &self,
+        _collection: &str,
+        _filter: Value,
+        _options: FindOptions,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<Document>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "DocumentStore.find_budgeted",
+        })
+    }
     async fn insert(&self, collection: &str, docs: Vec<Document>) -> Result<InsertOutcome>;
     /// Compatibility bulk-update entry point retained for embedded callers.
     ///
@@ -324,6 +343,22 @@ pub trait DocumentStore: Connector {
         pipeline: Vec<Value>,
         max_items: usize,
     ) -> Result<Vec<Document>>;
+    /// Run an aggregation within a cumulative item-and-byte read envelope.
+    ///
+    /// This exact operation is optional and never delegates to the legacy
+    /// aggregate methods because post-hoc truncation cannot bound a remote
+    /// cursor or a cumulative response.
+    async fn aggregate_budgeted(
+        &self,
+        _collection: &str,
+        _pipeline: Vec<Value>,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<Document>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "DocumentStore.aggregate_budgeted",
+        })
+    }
 
     /// Drop a document collection.
     ///
@@ -643,7 +678,7 @@ mod tests {
             _filter: Value,
             _options: FindOptions,
         ) -> Result<Vec<Document>> {
-            Ok(Vec::new())
+            Ok(self.record_unbounded(Vec::new()))
         }
 
         async fn insert(&self, _collection: &str, _docs: Vec<Document>) -> Result<InsertOutcome> {
@@ -674,7 +709,7 @@ mod tests {
             _collection: &str,
             _pipeline: Vec<Value>,
         ) -> Result<Vec<Document>> {
-            Ok(Vec::new())
+            Ok(self.record_unbounded(Vec::new()))
         }
 
         async fn aggregate_bounded(
@@ -816,6 +851,21 @@ mod tests {
             )
             .await,
             "CqlEngine.query_cql_budgeted",
+        );
+        assert_unsupported(
+            DocumentStore::find_budgeted(
+                &connector,
+                "users",
+                Value::Null,
+                FindOptions::default(),
+                read_budget,
+            )
+            .await,
+            "DocumentStore.find_budgeted",
+        );
+        assert_unsupported(
+            DocumentStore::aggregate_budgeted(&connector, "users", Vec::new(), read_budget).await,
+            "DocumentStore.aggregate_budgeted",
         );
 
         assert_unsupported(
@@ -1065,6 +1115,8 @@ mod tests {
     async fn legacy_document_bulk_methods_keep_their_mapping_without_claiming_optional_modes() {
         let connector = LegacyDocument;
         for operation in [
+            CapabilityOperation::DocumentFindBudgeted,
+            CapabilityOperation::DocumentAggregateBudgeted,
             CapabilityOperation::DocumentUpdateOne,
             CapabilityOperation::DocumentUpdateMany,
             CapabilityOperation::DocumentDeleteOne,

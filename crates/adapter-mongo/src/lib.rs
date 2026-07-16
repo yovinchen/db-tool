@@ -1,12 +1,12 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{BoundedList, Document, FindOptions, InsertOutcome, UpdateOutcome, Value},
+    model::{BoundedList, Document, FindOptions, InsertOutcome, ReadBudget, UpdateOutcome, Value},
     port::{
         capability::DocumentStore,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::ListLimiter,
+    service::{ListLimiter, ReadLimiter},
 };
 use futures::future::BoxFuture;
 use mongodb::{
@@ -14,6 +14,8 @@ use mongodb::{
     Client, Database,
 };
 use std::collections::BTreeMap;
+
+const MONGO_BUDGETED_BATCH_SIZE: u32 = 1;
 
 pub struct MongoAdapter {
     db: Database,
@@ -129,6 +131,44 @@ impl DocumentStore for MongoAdapter {
         Ok(docs)
     }
 
+    async fn find_budgeted(
+        &self,
+        collection: &str,
+        filter: Value,
+        opts: FindOptions,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<Document>> {
+        let limiter = MongoDocumentLimiter::new(budget, "MongoDB find result")?;
+        let probe_items = limiter.probe_items()?;
+        let col = self.db.collection::<mongodb::bson::Document>(collection);
+        let filter = value_to_document(filter)?;
+        let limit = mongo_budgeted_find_limit(opts.limit, budget.max_items, probe_items)?;
+        let skip = opts
+            .skip
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| Error::Config("MongoDB skip exceeds the u64 range".into()))?;
+        let find_opts = mongodb::options::FindOptions::builder()
+            .limit(Some(limit))
+            .batch_size(MONGO_BUDGETED_BATCH_SIZE)
+            .skip(skip)
+            .sort(optional_document(opts.sort)?)
+            .projection(optional_document(opts.projection)?)
+            .build();
+
+        // As with aggregation below, the driver must materialize one legal
+        // server response before this adapter can inspect its raw BSON. A
+        // single-document batch bounds that unavoidable residual to one
+        // MongoDB-legal document inside one legal wire message.
+        let cursor = col
+            .find(filter)
+            .with_options(find_opts)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        collect_budgeted_cursor(cursor, limiter, probe_items).await
+    }
+
     async fn insert(&self, collection: &str, docs: Vec<Document>) -> Result<InsertOutcome> {
         let col = self.db.collection::<mongodb::bson::Document>(collection);
         let bson_docs: Vec<_> = docs
@@ -204,6 +244,35 @@ impl DocumentStore for MongoAdapter {
     ) -> Result<Vec<Document>> {
         self.aggregate_with_limit(collection, pipeline, Some(max_items))
             .await
+    }
+
+    async fn aggregate_budgeted(
+        &self,
+        collection: &str,
+        pipeline: Vec<Value>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<Document>> {
+        let limiter = MongoDocumentLimiter::new(budget, "MongoDB aggregate result")?;
+        let probe_items = limiter.probe_items()?;
+        let col = self.db.collection::<mongodb::bson::Document>(collection);
+        let pipeline = pipeline
+            .into_iter()
+            .map(value_to_document)
+            .collect::<Result<Vec<_>>>()?;
+
+        // The driver necessarily materializes one server response before the
+        // adapter can inspect raw BSON lengths. Keeping the protocol batch at
+        // one document confines that residual to one MongoDB-legal document
+        // (normally at most 16 MiB) inside one legal wire message (normally at
+        // most 48 MiB). Caller budgets are enforced immediately afterwards.
+        let cursor = col
+            .aggregate(pipeline)
+            .with_type::<mongodb::bson::Document>()
+            .batch_size(MONGO_BUDGETED_BATCH_SIZE)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        collect_budgeted_cursor(cursor, limiter, probe_items).await
     }
 
     async fn drop_collection(&self, collection: &str) -> Result<()> {
@@ -290,6 +359,8 @@ fn mongo_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
         CapabilityOperation::DocumentListCollectionsBounded,
+        CapabilityOperation::DocumentFindBudgeted,
+        CapabilityOperation::DocumentAggregateBudgeted,
         CapabilityOperation::DocumentUpdateOne,
         CapabilityOperation::DocumentUpdateMany,
         CapabilityOperation::DocumentDeleteOne,
@@ -297,6 +368,102 @@ fn mongo_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::DocumentDropCollection,
     ]);
     operations
+}
+
+async fn collect_budgeted_cursor(
+    mut cursor: mongodb::Cursor<mongodb::bson::Document>,
+    mut limiter: MongoDocumentLimiter,
+    probe_items: usize,
+) -> Result<BoundedList<Document>> {
+    let mut documents = Vec::with_capacity(limiter.retained_capacity());
+    while limiter.observed_items() < probe_items {
+        if !cursor
+            .advance()
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?
+        {
+            break;
+        }
+
+        // `current()` exposes the exact raw BSON document retained by the
+        // driver, so duplicate fields and native BSON types are charged before
+        // conversion can normalize them into the portable core representation.
+        let raw_bson_bytes = cursor.current().as_bytes().len();
+        limiter.observe_raw_bson(raw_bson_bytes)?;
+        let document = cursor
+            .deserialize_current()
+            .map_err(|error| Error::Serialization(error.to_string()))?;
+        limiter.retain_decoded_document(document, &mut documents)?;
+    }
+    drop(cursor);
+
+    limiter.finish(documents)
+}
+
+struct MongoDocumentLimiter {
+    visible: ReadLimiter,
+    max_items: usize,
+    max_bytes: usize,
+    observed_bson_bytes: usize,
+    subject: String,
+}
+
+impl MongoDocumentLimiter {
+    fn new(budget: ReadBudget, subject: impl Into<String>) -> Result<Self> {
+        let subject = subject.into();
+        Ok(Self {
+            visible: ReadLimiter::new(budget, subject.clone())?,
+            max_items: budget.max_items,
+            max_bytes: budget.max_bytes,
+            observed_bson_bytes: 0,
+            subject,
+        })
+    }
+
+    fn probe_items(&self) -> Result<usize> {
+        self.visible.probe_items()
+    }
+
+    fn retained_capacity(&self) -> usize {
+        self.max_items.min(256)
+    }
+
+    fn observed_items(&self) -> usize {
+        self.visible.observed_items()
+    }
+
+    fn retain_decoded_document(
+        &mut self,
+        document: bson::Document,
+        retained: &mut Vec<Document>,
+    ) -> Result<()> {
+        self.visible
+            .retain_item(bson_document_to_core(document), retained)
+    }
+
+    fn finish(self, documents: Vec<Document>) -> Result<BoundedList<Document>> {
+        self.visible.finish(documents)
+    }
+
+    fn observe_raw_bson(&mut self, bytes: usize) -> Result<()> {
+        let next = self
+            .observed_bson_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| self.byte_budget_error())?;
+        if next > self.max_bytes {
+            return Err(self.byte_budget_error());
+        }
+        self.observed_bson_bytes = next;
+        Ok(())
+    }
+
+    fn byte_budget_error(&self) -> Error {
+        Error::ReadBudgetExceeded {
+            subject: self.subject.clone(),
+            unit: "bytes",
+            limit: self.max_bytes,
+        }
+    }
 }
 
 fn optional_document(value: Option<Value>) -> Result<Option<bson::Document>> {
@@ -315,6 +482,25 @@ fn mongo_limit(limit: Option<usize>) -> Result<Option<i64>> {
                 .map_err(|_| Error::Config("MongoDB find limit exceeds the i64 range".into()))
         })
         .transpose()
+}
+
+fn mongo_budgeted_find_limit(
+    requested_limit: Option<usize>,
+    max_items: usize,
+    probe_items: usize,
+) -> Result<i64> {
+    if requested_limit == Some(0) {
+        return Err(Error::Config(
+            "MongoDB find limit must be greater than zero".into(),
+        ));
+    }
+
+    let fetch_items = match requested_limit {
+        Some(requested) if requested <= max_items => requested,
+        Some(_) | None => probe_items,
+    };
+    i64::try_from(fetch_items)
+        .map_err(|_| Error::Config("MongoDB budgeted find limit exceeds the i64 range".into()))
 }
 
 fn inserted_id_string(id: Bson) -> String {
@@ -484,6 +670,8 @@ mod tests {
 
         for operation in [
             CapabilityOperation::DocumentListCollectionsBounded,
+            CapabilityOperation::DocumentFindBudgeted,
+            CapabilityOperation::DocumentAggregateBudgeted,
             CapabilityOperation::DocumentUpdateOne,
             CapabilityOperation::DocumentUpdateMany,
             CapabilityOperation::DocumentDeleteOne,
@@ -524,6 +712,120 @@ mod tests {
             ));
         }
         assert_eq!(mongo_limit(Some(7)).unwrap(), Some(7));
+        assert_eq!(mongo_budgeted_find_limit(None, 2, 3).unwrap(), 3);
+        assert_eq!(mongo_budgeted_find_limit(Some(5), 2, 3).unwrap(), 3);
+        assert_eq!(mongo_budgeted_find_limit(Some(2), 2, 3).unwrap(), 2);
+        assert_eq!(mongo_budgeted_find_limit(Some(1), 2, 3).unwrap(), 1);
+        assert!(matches!(
+            mongo_budgeted_find_limit(Some(0), 2, 3),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        if usize::BITS > 63 {
+            assert!(matches!(
+                mongo_budgeted_find_limit(None, usize::MAX - 1, usize::MAX),
+                Err(Error::Config(message)) if message.contains("i64 range")
+            ));
+        }
+        assert_eq!(MONGO_BUDGETED_BATCH_SIZE, 1);
+    }
+
+    fn collect_test_documents(
+        budget: ReadBudget,
+        documents: Vec<bson::Document>,
+    ) -> Result<BoundedList<Document>> {
+        let mut limiter = MongoDocumentLimiter::new(budget, "MongoDB test result")?;
+        let probe_items = limiter.probe_items()?;
+        let mut retained = Vec::new();
+        for document in documents.into_iter().take(probe_items) {
+            let raw_bson_bytes = bson::to_vec(&document)
+                .map_err(|error| Error::Serialization(error.to_string()))?
+                .len();
+            limiter.observe_raw_bson(raw_bson_bytes)?;
+            limiter.retain_decoded_document(document, &mut retained)?;
+        }
+        limiter.finish(retained)
+    }
+
+    #[test]
+    fn budgeted_documents_distinguish_exact_n_from_n_plus_one() {
+        let first = bson::doc! { "id": 1, "name": "one" };
+        let second = bson::doc! { "id": 2, "name": "two" };
+        let probe = bson::doc! { "id": 3, "name": "probe" };
+        let budget = ReadBudget::new(2, 4096).unwrap();
+
+        let exact = collect_test_documents(budget, vec![first.clone(), second.clone()]).unwrap();
+        assert_eq!(exact.items.len(), 2);
+        assert!(!exact.truncated);
+
+        let truncated = collect_test_documents(budget, vec![first, second, probe]).unwrap();
+        assert_eq!(truncated.items.len(), 2);
+        assert!(truncated.truncated);
+    }
+
+    #[test]
+    fn budgeted_documents_charge_complete_visible_envelope_and_probe_at_n_and_n_minus_one() {
+        let first = bson::doc! { "id": 1 };
+        let probe = bson::doc! { "id": 2 };
+        let first_core = bson_document_to_core(first.clone());
+        let probe_core = bson_document_to_core(probe.clone());
+        let visible = BoundedList {
+            items: vec![first_core],
+            truncated: true,
+        };
+        let visible_bytes = serde_json::to_vec(&visible).unwrap().len()
+            + serde_json::to_vec(&probe_core).unwrap().len();
+        let bson_bytes = bson::to_vec(&first).unwrap().len() + bson::to_vec(&probe).unwrap().len();
+        assert!(visible_bytes > bson_bytes);
+
+        let exact_budget = ReadBudget::new(1, visible_bytes).unwrap();
+        let exact =
+            collect_test_documents(exact_budget, vec![first.clone(), probe.clone()]).unwrap();
+        assert_eq!(exact.items.len(), 1);
+        assert!(exact.truncated);
+
+        let error = collect_test_documents(
+            ReadBudget::new(1, visible_bytes - 1).unwrap(),
+            vec![first, probe],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == visible_bytes - 1
+        ));
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+    }
+
+    #[test]
+    fn budgeted_documents_fail_closed_on_first_and_cumulative_raw_bson_overflow() {
+        let first = bson::doc! { "payload": "a".repeat(64) };
+        let first_bytes = bson::to_vec(&first).unwrap().len();
+        let first_error = collect_test_documents(
+            ReadBudget::new(1, first_bytes - 1).unwrap(),
+            vec![first.clone()],
+        )
+        .unwrap_err();
+        assert_eq!(first_error.code(), "READ_BUDGET_EXCEEDED");
+
+        let second = bson::doc! { "payload": "b".repeat(64) };
+        let cumulative_bytes = first_bytes + bson::to_vec(&second).unwrap().len();
+        let cumulative_error = collect_test_documents(
+            ReadBudget::new(2, cumulative_bytes - 1).unwrap(),
+            vec![first, second],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cumulative_error,
+            Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == cumulative_bytes - 1
+        ));
+        assert_eq!(cumulative_error.code(), "READ_BUDGET_EXCEEDED");
     }
 
     #[test]
