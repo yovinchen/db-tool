@@ -41,8 +41,10 @@ capability_operations! {
     SqlInsertRowsAtomic => "sql.insert_rows_atomic",
     SqlListSchemas => "sql.list_schemas",
     SqlListSchemasBounded => "sql.list_schemas_bounded",
+    SqlListSchemasBudgeted => "sql.list_schemas_budgeted",
     SqlListTables => "sql.list_tables",
     SqlListTablesBounded => "sql.list_tables_bounded",
+    SqlListTablesBudgeted => "sql.list_tables_budgeted",
     SqlDescribeTable => "sql.describe_table",
     SqlDescribeTableBounded => "sql.describe_table_bounded",
     CqlQuery => "cql.query",
@@ -51,18 +53,24 @@ capability_operations! {
     CqlExecute => "cql.execute",
     CqlListKeyspaces => "cql.list_keyspaces",
     CqlListKeyspacesBounded => "cql.list_keyspaces_bounded",
+    CqlListKeyspacesBudgeted => "cql.list_keyspaces_budgeted",
     CqlListTables => "cql.list_tables",
     CqlListTablesBounded => "cql.list_tables_bounded",
+    CqlListTablesBudgeted => "cql.list_tables_budgeted",
     CqlDescribeTable => "cql.describe_table",
     CqlDescribeTableBounded => "cql.describe_table_bounded",
     Db2ListSequences => "db2.list_sequences",
     Db2ListSequencesBounded => "db2.list_sequences_bounded",
+    Db2ListSequencesBudgeted => "db2.list_sequences_budgeted",
     Db2ListRoutines => "db2.list_routines",
     Db2ListRoutinesBounded => "db2.list_routines_bounded",
+    Db2ListRoutinesBudgeted => "db2.list_routines_budgeted",
     Db2ListTablespaces => "db2.list_tablespaces",
     Db2ListTablespacesBounded => "db2.list_tablespaces_bounded",
+    Db2ListTablespacesBudgeted => "db2.list_tablespaces_budgeted",
     Db2ListForeignKeys => "db2.list_foreign_keys",
     Db2ListForeignKeysBounded => "db2.list_foreign_keys_bounded",
+    Db2ListForeignKeysBudgeted => "db2.list_foreign_keys_budgeted",
     Db2GenerateDdl => "db2.generate_ddl",
     Db2GenerateDdlBounded => "db2.generate_ddl_bounded",
     KeyValueGet => "kv.get",
@@ -79,6 +87,7 @@ capability_operations! {
     KeyValueRawCommandBounded => "kv.raw_command_bounded",
     DocumentListCollections => "document.list_collections",
     DocumentListCollectionsBounded => "document.list_collections_bounded",
+    DocumentListCollectionsBudgeted => "document.list_collections_budgeted",
     DocumentFind => "document.find",
     DocumentFindBudgeted => "document.find_budgeted",
     DocumentInsert => "document.insert",
@@ -94,11 +103,13 @@ capability_operations! {
     DocumentDropCollection => "document.drop_collection",
     TimeSeriesListMeasurements => "time_series.list_measurements",
     TimeSeriesListMeasurementsBounded => "time_series.list_measurements_bounded",
+    TimeSeriesListMeasurementsBudgeted => "time_series.list_measurements_budgeted",
     TimeSeriesWritePoints => "time_series.write_points",
     TimeSeriesQueryRange => "time_series.query_range",
     TimeSeriesQueryRangeBounded => "time_series.query_range_bounded",
     SearchListIndices => "search.list_indices",
     SearchListIndicesBounded => "search.list_indices_bounded",
+    SearchListIndicesBudgeted => "search.list_indices_budgeted",
     SearchSearch => "search.search",
     SearchSearchBudgeted => "search.search_budgeted",
     SearchIndexDocument => "search.index_doc",
@@ -115,6 +126,7 @@ capability_operations! {
     MessageConsumeAck => "message.consume_ack",
     MessageAdminListTopics => "message.admin.list_topics",
     MessageAdminListTopicsBounded => "message.admin.list_topics_bounded",
+    MessageAdminListTopicsBudgeted => "message.admin.list_topics_budgeted",
     MessageAdminTopicDetail => "message.admin.topic_detail",
     MessageAdminTopicDetailBounded => "message.admin.topic_detail_bounded",
     MessageAdminConsumerLag => "message.admin.consumer_lag",
@@ -144,16 +156,28 @@ impl CapabilityOperation {
     /// them.
     pub const BUDGETED_READS: &'static [Self] = &[
         Self::SqlQueryBudgeted,
+        Self::SqlListSchemasBudgeted,
+        Self::SqlListTablesBudgeted,
         Self::CqlQueryBudgeted,
+        Self::CqlListKeyspacesBudgeted,
+        Self::CqlListTablesBudgeted,
+        Self::Db2ListSequencesBudgeted,
+        Self::Db2ListRoutinesBudgeted,
+        Self::Db2ListTablespacesBudgeted,
+        Self::Db2ListForeignKeysBudgeted,
         Self::KeyValueGetBounded,
         Self::KeyValueGetWithExpiryBounded,
         Self::KeyValueScanBounded,
         Self::KeyValueRawCommandBounded,
         Self::DocumentFindBudgeted,
         Self::DocumentAggregateBudgeted,
+        Self::DocumentListCollectionsBudgeted,
         Self::TimeSeriesQueryRangeBounded,
+        Self::TimeSeriesListMeasurementsBudgeted,
         Self::SearchSearchBudgeted,
         Self::SearchGetDocumentBudgeted,
+        Self::SearchListIndicesBudgeted,
+        Self::MessageAdminListTopicsBudgeted,
     ];
     pub const DB2: &'static [Self] = &[
         Self::Db2ListSequences,
@@ -257,6 +281,23 @@ impl CapabilityOperation {
         Self::TimeSeriesListMeasurementsBounded,
         Self::SearchListIndicesBounded,
         Self::MessageAdminListTopicsBounded,
+    ];
+    /// Catalog reads that enforce both N+1 completeness and the caller's
+    /// serialized byte envelope. These exact methods are optional and never
+    /// inferred from legacy family flags or item-only bounded operations.
+    pub const BUDGETED_CATALOGS: &'static [Self] = &[
+        Self::SqlListSchemasBudgeted,
+        Self::SqlListTablesBudgeted,
+        Self::CqlListKeyspacesBudgeted,
+        Self::CqlListTablesBudgeted,
+        Self::Db2ListSequencesBudgeted,
+        Self::Db2ListRoutinesBudgeted,
+        Self::Db2ListTablespacesBudgeted,
+        Self::Db2ListForeignKeysBudgeted,
+        Self::DocumentListCollectionsBudgeted,
+        Self::TimeSeriesListMeasurementsBudgeted,
+        Self::SearchListIndicesBudgeted,
+        Self::MessageAdminListTopicsBudgeted,
     ];
     /// Complete-object metadata methods that enforce both nested-item and byte
     /// budgets. These are optional and never inferred from legacy booleans or
@@ -664,6 +705,54 @@ mod tests {
                 CapabilityOperation::SearchGetDocumentBudgeted,
                 "search.get_doc_budgeted",
             ),
+            (
+                CapabilityOperation::SqlListSchemasBudgeted,
+                "sql.list_schemas_budgeted",
+            ),
+            (
+                CapabilityOperation::SqlListTablesBudgeted,
+                "sql.list_tables_budgeted",
+            ),
+            (
+                CapabilityOperation::CqlListKeyspacesBudgeted,
+                "cql.list_keyspaces_budgeted",
+            ),
+            (
+                CapabilityOperation::CqlListTablesBudgeted,
+                "cql.list_tables_budgeted",
+            ),
+            (
+                CapabilityOperation::Db2ListSequencesBudgeted,
+                "db2.list_sequences_budgeted",
+            ),
+            (
+                CapabilityOperation::Db2ListRoutinesBudgeted,
+                "db2.list_routines_budgeted",
+            ),
+            (
+                CapabilityOperation::Db2ListTablespacesBudgeted,
+                "db2.list_tablespaces_budgeted",
+            ),
+            (
+                CapabilityOperation::Db2ListForeignKeysBudgeted,
+                "db2.list_foreign_keys_budgeted",
+            ),
+            (
+                CapabilityOperation::DocumentListCollectionsBudgeted,
+                "document.list_collections_budgeted",
+            ),
+            (
+                CapabilityOperation::TimeSeriesListMeasurementsBudgeted,
+                "time_series.list_measurements_budgeted",
+            ),
+            (
+                CapabilityOperation::SearchListIndicesBudgeted,
+                "search.list_indices_budgeted",
+            ),
+            (
+                CapabilityOperation::MessageAdminListTopicsBudgeted,
+                "message.admin.list_topics_budgeted",
+            ),
         ] {
             assert_eq!(operation.as_str(), stable_name);
             assert_eq!(
@@ -712,6 +801,13 @@ mod tests {
         assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
             .iter()
             .all(|operation| CapabilityOperation::BUDGETED_READS.contains(operation)));
+        assert_eq!(CapabilityOperation::BUDGETED_CATALOGS.len(), 12);
+        assert!(CapabilityOperation::BUDGETED_CATALOGS
+            .iter()
+            .all(|operation| CapabilityOperation::BUDGETED_READS.contains(operation)));
+        assert!(CapabilityOperation::BUDGETED_CATALOGS
+            .iter()
+            .all(|operation| !CapabilityOperation::BOUNDED_CATALOGS.contains(operation)));
         assert_eq!(
             CapabilityOperation::KEY_VALUE_EXISTENCE,
             [CapabilityOperation::KeyValueExists]
@@ -852,6 +948,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BOUNDED_CATALOGS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::BUDGETED_CATALOGS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BOUNDED_NESTED_METADATA

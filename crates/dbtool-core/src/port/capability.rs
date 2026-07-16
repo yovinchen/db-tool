@@ -90,6 +90,17 @@ pub trait SqlEngine: Connector {
             needed: "SqlEngine.list_schemas_bounded",
         })
     }
+    /// Return schemas within one caller-owned item-and-byte envelope.
+    ///
+    /// Implementations must charge every complete name before retention and
+    /// the final [`BoundedList`] envelope, including its sole N+1 probe. This
+    /// optional method is authorized only by `sql.list_schemas_budgeted`.
+    async fn list_schemas_budgeted(&self, _budget: ReadBudget) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SqlEngine.list_schemas_budgeted",
+        })
+    }
     /// Return the complete table/view catalog for `schema`.
     ///
     /// Every returned [`TableInfo`] should carry its effective schema when the
@@ -108,6 +119,17 @@ pub trait SqlEngine: Connector {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
             needed: "SqlEngine.list_tables_bounded",
+        })
+    }
+    /// Return complete table identities inside a caller item-and-byte budget.
+    async fn list_tables_budgeted(
+        &self,
+        _schema: Option<&str>,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SqlEngine.list_tables_budgeted",
         })
     }
     async fn describe_table(&self, table: &str) -> Result<TableSchema>;
@@ -155,6 +177,12 @@ pub trait CqlEngine: Connector {
             needed: "CqlEngine.list_keyspaces_bounded",
         })
     }
+    async fn list_keyspaces_budgeted(&self, _budget: ReadBudget) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "CqlEngine.list_keyspaces_budgeted",
+        })
+    }
     async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>>;
     async fn list_cql_tables_bounded(
         &self,
@@ -164,6 +192,16 @@ pub trait CqlEngine: Connector {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
             needed: "CqlEngine.list_cql_tables_bounded",
+        })
+    }
+    async fn list_cql_tables_budgeted(
+        &self,
+        _keyspace: Option<&str>,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "CqlEngine.list_cql_tables_budgeted",
         })
     }
     async fn describe_cql_table(&self, table: &str) -> Result<TableSchema>;
@@ -306,6 +344,12 @@ pub trait DocumentStore: Connector {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
             needed: "DocumentStore.list_collections_bounded",
+        })
+    }
+    async fn list_collections_budgeted(&self, _budget: ReadBudget) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "DocumentStore.list_collections_budgeted",
         })
     }
     async fn find(
@@ -454,6 +498,12 @@ pub trait TimeSeriesStore: Connector {
             needed: "TimeSeriesStore.list_measurements_bounded",
         })
     }
+    async fn list_measurements_budgeted(&self, _budget: ReadBudget) -> Result<BoundedList<String>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "TimeSeriesStore.list_measurements_budgeted",
+        })
+    }
     async fn write_points(&self, points: Vec<Point>) -> Result<()>;
     async fn query_range(&self, query: &str, range: TimeRange) -> Result<SeriesSet>;
 
@@ -486,6 +536,15 @@ pub trait SearchEngine: Connector {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
             needed: "SearchEngine.list_indices_bounded",
+        })
+    }
+    async fn list_indices_budgeted(
+        &self,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<crate::model::IndexInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SearchEngine.list_indices_budgeted",
         })
     }
     async fn search(&self, index: &str, query: Value, options: SearchOptions)
@@ -570,6 +629,12 @@ pub trait AdminInspect: Connector {
             needed: "AdminInspect.list_topics_bounded",
         })
     }
+    async fn list_topics_budgeted(&self, _budget: ReadBudget) -> Result<BoundedList<TopicInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "AdminInspect.list_topics_budgeted",
+        })
+    }
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail>;
     /// Return complete topic config/watermarks within caller budgets.
     async fn topic_detail_bounded(
@@ -628,6 +693,16 @@ pub trait Db2Engine: Connector {
             needed: "Db2Engine.list_sequences_bounded",
         })
     }
+    async fn list_sequences_budgeted(
+        &self,
+        _schema: Option<&str>,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<SequenceInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.list_sequences_budgeted",
+        })
+    }
     /// List stored procedures and user-defined functions in a schema.
     async fn list_routines(&self, schema: Option<&str>) -> Result<Vec<RoutineInfo>>;
     async fn list_routines_bounded(
@@ -638,6 +713,16 @@ pub trait Db2Engine: Connector {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
             needed: "Db2Engine.list_routines_bounded",
+        })
+    }
+    async fn list_routines_budgeted(
+        &self,
+        _schema: Option<&str>,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<RoutineInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.list_routines_budgeted",
         })
     }
     /// List all tablespaces visible in the current database.
@@ -651,6 +736,15 @@ pub trait Db2Engine: Connector {
             needed: "Db2Engine.list_tablespaces_bounded",
         })
     }
+    async fn list_tablespaces_budgeted(
+        &self,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<TablespaceInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.list_tablespaces_budgeted",
+        })
+    }
     /// List foreign-key constraints for a table (schema.table or bare table name).
     async fn list_foreign_keys(&self, table: &str) -> Result<Vec<ForeignKeyInfo>>;
     async fn list_foreign_keys_bounded(
@@ -661,6 +755,16 @@ pub trait Db2Engine: Connector {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
             needed: "Db2Engine.list_foreign_keys_bounded",
+        })
+    }
+    async fn list_foreign_keys_budgeted(
+        &self,
+        _table: &str,
+        _budget: ReadBudget,
+    ) -> Result<BoundedList<ForeignKeyInfo>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "Db2Engine.list_foreign_keys_budgeted",
         })
     }
     /// Generate a CREATE TABLE DDL statement from the Db2 catalog.
@@ -1121,6 +1225,54 @@ mod tests {
             "Db2Engine.list_foreign_keys_bounded",
         );
         assert_unsupported(
+            SqlEngine::list_schemas_budgeted(&connector, read_budget).await,
+            "SqlEngine.list_schemas_budgeted",
+        );
+        assert_unsupported(
+            SqlEngine::list_tables_budgeted(&connector, Some("public"), read_budget).await,
+            "SqlEngine.list_tables_budgeted",
+        );
+        assert_unsupported(
+            CqlEngine::list_keyspaces_budgeted(&connector, read_budget).await,
+            "CqlEngine.list_keyspaces_budgeted",
+        );
+        assert_unsupported(
+            CqlEngine::list_cql_tables_budgeted(&connector, Some("app"), read_budget).await,
+            "CqlEngine.list_cql_tables_budgeted",
+        );
+        assert_unsupported(
+            DocumentStore::list_collections_budgeted(&connector, read_budget).await,
+            "DocumentStore.list_collections_budgeted",
+        );
+        assert_unsupported(
+            SearchEngine::list_indices_budgeted(&connector, read_budget).await,
+            "SearchEngine.list_indices_budgeted",
+        );
+        assert_unsupported(
+            TimeSeriesStore::list_measurements_budgeted(&connector, read_budget).await,
+            "TimeSeriesStore.list_measurements_budgeted",
+        );
+        assert_unsupported(
+            AdminInspect::list_topics_budgeted(&connector, read_budget).await,
+            "AdminInspect.list_topics_budgeted",
+        );
+        assert_unsupported(
+            Db2Engine::list_sequences_budgeted(&connector, None, read_budget).await,
+            "Db2Engine.list_sequences_budgeted",
+        );
+        assert_unsupported(
+            Db2Engine::list_routines_budgeted(&connector, None, read_budget).await,
+            "Db2Engine.list_routines_budgeted",
+        );
+        assert_unsupported(
+            Db2Engine::list_tablespaces_budgeted(&connector, read_budget).await,
+            "Db2Engine.list_tablespaces_budgeted",
+        );
+        assert_unsupported(
+            Db2Engine::list_foreign_keys_budgeted(&connector, "app.orders", read_budget).await,
+            "Db2Engine.list_foreign_keys_budgeted",
+        );
+        assert_unsupported(
             SqlEngine::describe_table_bounded(&connector, "app.orders", metadata_budget).await,
             "SqlEngine.describe_table_bounded",
         );
@@ -1143,6 +1295,9 @@ mod tests {
 
         assert_eq!(connector.unbounded_calls.load(Ordering::SeqCst), 0);
         assert!(CapabilityOperation::BOUNDED_CATALOGS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::BUDGETED_CATALOGS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BOUNDED_NESTED_METADATA
