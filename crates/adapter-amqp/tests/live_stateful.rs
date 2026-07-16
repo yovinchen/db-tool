@@ -45,6 +45,8 @@ fn produce_message(payload: &'static [u8]) -> Message {
 }
 
 #[tokio::test]
+// This assertion intentionally locks the retained 0.1.x empty-batch no-op.
+#[allow(deprecated)]
 async fn budgeted_amqp_produce_rejects_before_queue_creation_then_round_trips() {
     let Some(dsn) = integration_dsn() else {
         return;
@@ -270,7 +272,7 @@ async fn failed_batch_conversion_requeues_every_delivery_before_ack() {
         .as_producer()
         .expect("AMQP adapter should expose a producer");
     producer
-        .produce(
+        .produce_budgeted(
             &queue,
             vec![Message {
                 key: None,
@@ -282,6 +284,7 @@ async fn failed_batch_conversion_requeues_every_delivery_before_ack() {
                 cursor: None,
                 metadata: None,
             }],
+            ProduceBudget::default(),
         )
         .await
         .expect("valid fixture message should publish");
@@ -432,7 +435,7 @@ async fn consume_byte_budget_failure_requeues_before_batch_ack() {
     connector
         .as_producer()
         .expect("AMQP adapter should expose a producer")
-        .produce(
+        .produce_budgeted(
             &queue,
             vec![Message {
                 key: None,
@@ -444,6 +447,7 @@ async fn consume_byte_budget_failure_requeues_before_batch_ack() {
                 cursor: None,
                 metadata: None,
             }],
+            ProduceBudget::default(),
         )
         .await
         .expect("budget fixture should publish");

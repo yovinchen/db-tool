@@ -335,28 +335,7 @@ impl AdminInspect for AmqpAdapter {
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
-        validate_queue(name)?;
-        let channel = self.channel().await?;
-        let queue = declare_queue(&channel, name, true).await?;
-        let mut config = HashMap::new();
-        config.insert(
-            "message_count".to_owned(),
-            queue.message_count().to_string(),
-        );
-        config.insert(
-            "consumer_count".to_owned(),
-            queue.consumer_count().to_string(),
-        );
-
-        Ok(TopicDetail {
-            info: TopicInfo {
-                name: queue.name().as_str().to_owned(),
-                partitions: 1,
-                replicas: 1,
-            },
-            config,
-            watermarks: vec![],
-        })
+        self.queue_detail_complete(name).await
     }
 
     async fn topic_detail_bounded(
@@ -367,7 +346,7 @@ impl AdminInspect for AmqpAdapter {
         // A passive queue declaration has a protocol-fixed reply shape: the
         // queue name plus two counters. It is therefore safe to materialize
         // before applying the caller's complete-object budget.
-        let detail = self.topic_detail(name).await?;
+        let detail = self.queue_detail_complete(name).await?;
         enforce_topic_detail_budget(detail, budget, "AMQP queue detail")
     }
 
@@ -422,6 +401,31 @@ impl AmqpAdapter {
             .create_channel()
             .await
             .map_err(|e| Error::Connection(e.to_string()))
+    }
+
+    async fn queue_detail_complete(&self, name: &str) -> Result<TopicDetail> {
+        validate_queue(name)?;
+        let channel = self.channel().await?;
+        let queue = declare_queue(&channel, name, true).await?;
+        let mut config = HashMap::new();
+        config.insert(
+            "message_count".to_owned(),
+            queue.message_count().to_string(),
+        );
+        config.insert(
+            "consumer_count".to_owned(),
+            queue.consumer_count().to_string(),
+        );
+
+        Ok(TopicDetail {
+            info: TopicInfo {
+                name: queue.name().as_str().to_owned(),
+                partitions: 1,
+                replicas: 1,
+            },
+            config,
+            watermarks: vec![],
+        })
     }
 }
 

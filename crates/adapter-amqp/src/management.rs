@@ -32,6 +32,14 @@ pub struct RabbitManagementAdapter {
     kind: ConnectorKind,
 }
 
+impl RabbitManagementAdapter {
+    async fn queue_detail_complete(&self, name: &str) -> Result<TopicDetail> {
+        validate_queue(name)?;
+        let queue = self.client.get_json(&self.client.queue_path(name)).await?;
+        queue_detail(&queue)
+    }
+}
+
 pub fn management_factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
         let client = RabbitManagementClient::from_dsn(&dsn)?;
@@ -109,9 +117,7 @@ impl AdminInspect for RabbitManagementAdapter {
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
-        validate_queue(name)?;
-        let queue = self.client.get_json(&self.client.queue_path(name)).await?;
-        queue_detail(&queue)
+        self.queue_detail_complete(name).await
     }
 
     async fn topic_detail_bounded(
@@ -122,7 +128,7 @@ impl AdminInspect for RabbitManagementAdapter {
         // RabbitManagementClient rejects the HTTP response above its hard
         // transport ceiling before JSON decoding. The limiter below then
         // proves that the complete portable object fits the caller budget.
-        let detail = self.topic_detail(name).await?;
+        let detail = self.queue_detail_complete(name).await?;
         enforce_topic_detail_budget(detail, budget, "RabbitMQ queue detail")
     }
 

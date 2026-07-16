@@ -138,6 +138,219 @@ impl CassandraAdapter {
         })
     }
 
+    async fn query_complete(&self, cql: &str, params: &[Value]) -> Result<ResultSet> {
+        reject_dynamic_params(params)?;
+        let rows = self
+            .session
+            .query_unpaged(cql, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?
+            .into_rows_result()
+            .map_err(|e| Error::Query(e.to_string()))?;
+        rows_to_result_set(rows)
+    }
+
+    async fn query_rows_bounded(
+        &self,
+        cql: &str,
+        params: &[Value],
+        max_rows: usize,
+    ) -> Result<ResultSet> {
+        let limiter = ResultLimiter::new(max_rows);
+        let probe_rows = limiter.probe_rows()?;
+        reject_dynamic_params(params)?;
+
+        // Keep every driver's raw page bounded as well as the collected core
+        // rows. A smaller page remains accurate because the stream stops after
+        // the single truncation probe row is observed.
+        let page_size = i32::try_from(probe_rows.min(256))
+            .map_err(|_| Error::Internal("bounded CQL page size overflow".to_owned()))?;
+        let statement = Statement::new(cql).with_page_size(page_size);
+        let pager = self
+            .session
+            .query_iter(statement, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut rows_stream = pager
+            .rows_stream::<Row>()
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        let columns = {
+            let specs = rows_stream.column_specs();
+            specs
+                .iter()
+                .map(|spec| ColumnMeta {
+                    name: spec.name().to_owned(),
+                    type_name: cql_type_name(spec.typ()),
+                    nullable: true,
+                    primary_key: false,
+                    default_value: None,
+                })
+                .collect()
+        };
+
+        let mut output_rows = Vec::new();
+        while output_rows.len() < probe_rows {
+            let Some(row) = rows_stream.next().await else {
+                break;
+            };
+            let row = row.map_err(|e| Error::Query(e.to_string()))?;
+            output_rows.push(cql_row_values(row));
+        }
+        drop(rows_stream);
+
+        Ok(limiter.apply(ResultSet {
+            columns,
+            rows: output_rows,
+            truncated: false,
+        }))
+    }
+
+    async fn execute_mutation_budgeted(
+        &self,
+        cql: &str,
+        params: &[Value],
+        budget: InputBudget,
+    ) -> Result<ExecOutcome> {
+        preflight_cassandra_sql_execute(cql, params, budget)?;
+        self.send_cql_mutation(cql).await
+    }
+
+    async fn execute_cql_mutation_budgeted(
+        &self,
+        cql: &str,
+        budget: InputBudget,
+    ) -> Result<ExecOutcome> {
+        preflight_cql_execute(cql, budget)?;
+        self.send_cql_mutation(cql).await
+    }
+
+    async fn list_schemas_complete(&self) -> Result<Vec<String>> {
+        let result = self
+            .query_complete("SELECT keyspace_name FROM system_schema.keyspaces", &[])
+            .await?;
+        let mut schemas: Vec<_> = result
+            .rows
+            .into_iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Text(value)) => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        schemas.sort();
+        Ok(schemas)
+    }
+
+    async fn list_schemas_rows_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
+        self.query_catalog_bounded(
+            "SELECT keyspace_name FROM system_schema.keyspaces",
+            max_items,
+            |row| {
+                row.first()
+                    .and_then(value_text)
+                    .map(str::to_owned)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        Error::Serialization(
+                            "Cassandra catalog keyspace_name is not text".to_owned(),
+                        )
+                    })
+            },
+        )
+        .await
+    }
+
+    async fn list_tables_complete(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
+        let result = if let Some(keyspace) = optional_keyspace(schema)? {
+            self.query_complete(
+                &format!(
+                    "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name = '{}'",
+                    keyspace
+                ),
+                &[],
+            )
+            .await?
+        } else if let Some(keyspace) = &self.keyspace {
+            self.query_complete(
+                &format!(
+                    "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name = '{}'",
+                    validate_identifier(keyspace, "keyspace")?
+                ),
+                &[],
+            )
+            .await?
+        } else {
+            self.query_complete(
+                "SELECT keyspace_name, table_name FROM system_schema.tables",
+                &[],
+            )
+            .await?
+        };
+
+        let mut tables = Vec::new();
+        for row in result.rows {
+            let Some(keyspace) = row.first().and_then(value_text) else {
+                continue;
+            };
+            if schema.is_none() && self.keyspace.is_none() && is_system_keyspace(keyspace) {
+                continue;
+            }
+            let Some(name) = row.get(1).and_then(value_text) else {
+                continue;
+            };
+            tables.push(TableInfo {
+                schema: Some(keyspace.to_owned()),
+                name: name.to_owned(),
+                kind: TableKind::Table,
+            });
+        }
+        tables.sort_by(|left, right| {
+            left.schema
+                .cmp(&right.schema)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(tables)
+    }
+
+    async fn list_tables_rows_bounded(
+        &self,
+        schema: Option<&str>,
+        max_items: usize,
+    ) -> Result<BoundedList<TableInfo>> {
+        let selected_keyspace = optional_keyspace(schema)?
+            .map(str::to_owned)
+            .or_else(|| self.keyspace.clone());
+        let cql = match selected_keyspace.as_deref() {
+            Some(keyspace) => format!(
+                "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name = '{}'",
+                validate_identifier(keyspace, "keyspace")?
+            ),
+            None => "SELECT keyspace_name, table_name FROM system_schema.tables".to_owned(),
+        };
+
+        self.query_catalog_bounded(&cql, max_items, |row| {
+            let Some(keyspace) = row.first().and_then(value_text) else {
+                return Err(Error::Serialization(
+                    "Cassandra catalog keyspace_name is not text".to_owned(),
+                ));
+            };
+            if selected_keyspace.is_none() && is_system_keyspace(keyspace) {
+                return Ok(None);
+            }
+            let Some(name) = row.get(1).and_then(value_text) else {
+                return Err(Error::Serialization(
+                    "Cassandra catalog table_name is not text".to_owned(),
+                ));
+            };
+            Ok(Some(TableInfo {
+                schema: Some(keyspace.to_owned()),
+                name: name.to_owned(),
+                kind: TableKind::Table,
+            }))
+        })
+        .await
+    }
+
     async fn query_catalog_bounded<T, F>(
         &self,
         cql: &str,
@@ -369,15 +582,7 @@ fn budgeted_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize, i32)
 #[async_trait::async_trait]
 impl SqlEngine for CassandraAdapter {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
-        reject_dynamic_params(params)?;
-        let rows = self
-            .session
-            .query_unpaged(sql, &[])
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?
-            .into_rows_result()
-            .map_err(|e| Error::Query(e.to_string()))?;
-        rows_to_result_set(rows)
+        self.query_complete(sql, params).await
     }
 
     async fn query_bounded(
@@ -386,54 +591,7 @@ impl SqlEngine for CassandraAdapter {
         params: &[Value],
         max_rows: usize,
     ) -> Result<ResultSet> {
-        let limiter = ResultLimiter::new(max_rows);
-        let probe_rows = limiter.probe_rows()?;
-        reject_dynamic_params(params)?;
-
-        // Keep every driver's raw page bounded as well as the collected core
-        // rows. A smaller page remains accurate because the stream stops after
-        // the single truncation probe row is observed.
-        let page_size = i32::try_from(probe_rows.min(256))
-            .map_err(|_| Error::Internal("bounded CQL page size overflow".to_owned()))?;
-        let statement = Statement::new(sql).with_page_size(page_size);
-        let pager = self
-            .session
-            .query_iter(statement, &[])
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-        let mut rows_stream = pager
-            .rows_stream::<Row>()
-            .map_err(|e| Error::Query(e.to_string()))?;
-
-        let columns = {
-            let specs = rows_stream.column_specs();
-            specs
-                .iter()
-                .map(|spec| ColumnMeta {
-                    name: spec.name().to_owned(),
-                    type_name: cql_type_name(spec.typ()),
-                    nullable: true,
-                    primary_key: false,
-                    default_value: None,
-                })
-                .collect()
-        };
-
-        let mut output_rows = Vec::new();
-        while output_rows.len() < probe_rows {
-            let Some(row) = rows_stream.next().await else {
-                break;
-            };
-            let row = row.map_err(|e| Error::Query(e.to_string()))?;
-            output_rows.push(cql_row_values(row));
-        }
-        drop(rows_stream);
-
-        Ok(limiter.apply(ResultSet {
-            columns,
-            rows: output_rows,
-            truncated: false,
-        }))
+        self.query_rows_bounded(sql, params, max_rows).await
     }
 
     async fn query_budgeted(
@@ -490,7 +648,7 @@ impl SqlEngine for CassandraAdapter {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
-        self.execute_budgeted(sql, params, InputBudget::default())
+        self.execute_mutation_budgeted(sql, params, InputBudget::default())
             .await
     }
 
@@ -500,43 +658,15 @@ impl SqlEngine for CassandraAdapter {
         params: &[Value],
         budget: InputBudget,
     ) -> Result<ExecOutcome> {
-        preflight_cassandra_sql_execute(sql, params, budget)?;
-        self.send_cql_mutation(sql).await
+        self.execute_mutation_budgeted(sql, params, budget).await
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
-        let result = self
-            .query("SELECT keyspace_name FROM system_schema.keyspaces", &[])
-            .await?;
-        let mut schemas: Vec<_> = result
-            .rows
-            .into_iter()
-            .filter_map(|row| match row.first() {
-                Some(Value::Text(value)) => Some(value.clone()),
-                _ => None,
-            })
-            .collect();
-        schemas.sort();
-        Ok(schemas)
+        self.list_schemas_complete().await
     }
 
     async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
-        self.query_catalog_bounded(
-            "SELECT keyspace_name FROM system_schema.keyspaces",
-            max_items,
-            |row| {
-                row.first()
-                    .and_then(value_text)
-                    .map(str::to_owned)
-                    .map(Some)
-                    .ok_or_else(|| {
-                        Error::Serialization(
-                            "Cassandra catalog keyspace_name is not text".to_owned(),
-                        )
-                    })
-            },
-        )
-        .await
+        self.list_schemas_rows_bounded(max_items).await
     }
 
     async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
@@ -561,55 +691,7 @@ impl SqlEngine for CassandraAdapter {
     }
 
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
-        let result = if let Some(keyspace) = optional_keyspace(schema)? {
-            self.query(
-                &format!(
-                    "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name = '{}'",
-                    keyspace
-                ),
-                &[],
-            )
-            .await?
-        } else if let Some(keyspace) = &self.keyspace {
-            self.query(
-                &format!(
-                    "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name = '{}'",
-                    validate_identifier(keyspace, "keyspace")?
-                ),
-                &[],
-            )
-            .await?
-        } else {
-            self.query(
-                "SELECT keyspace_name, table_name FROM system_schema.tables",
-                &[],
-            )
-            .await?
-        };
-
-        let mut tables = Vec::new();
-        for row in result.rows {
-            let Some(keyspace) = row.first().and_then(value_text) else {
-                continue;
-            };
-            if schema.is_none() && self.keyspace.is_none() && is_system_keyspace(keyspace) {
-                continue;
-            }
-            let Some(name) = row.get(1).and_then(value_text) else {
-                continue;
-            };
-            tables.push(TableInfo {
-                schema: Some(keyspace.to_owned()),
-                name: name.to_owned(),
-                kind: TableKind::Table,
-            });
-        }
-        tables.sort_by(|left, right| {
-            left.schema
-                .cmp(&right.schema)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        Ok(tables)
+        self.list_tables_complete(schema).await
     }
 
     async fn list_tables_bounded(
@@ -617,38 +699,7 @@ impl SqlEngine for CassandraAdapter {
         schema: Option<&str>,
         max_items: usize,
     ) -> Result<BoundedList<TableInfo>> {
-        let selected_keyspace = optional_keyspace(schema)?
-            .map(str::to_owned)
-            .or_else(|| self.keyspace.clone());
-        let sql = match selected_keyspace.as_deref() {
-            Some(keyspace) => format!(
-                "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name = '{}'",
-                validate_identifier(keyspace, "keyspace")?
-            ),
-            None => "SELECT keyspace_name, table_name FROM system_schema.tables".to_owned(),
-        };
-
-        self.query_catalog_bounded(&sql, max_items, |row| {
-            let Some(keyspace) = row.first().and_then(value_text) else {
-                return Err(Error::Serialization(
-                    "Cassandra catalog keyspace_name is not text".to_owned(),
-                ));
-            };
-            if selected_keyspace.is_none() && is_system_keyspace(keyspace) {
-                return Ok(None);
-            }
-            let Some(name) = row.get(1).and_then(value_text) else {
-                return Err(Error::Serialization(
-                    "Cassandra catalog table_name is not text".to_owned(),
-                ));
-            };
-            Ok(Some(TableInfo {
-                schema: Some(keyspace.to_owned()),
-                name: name.to_owned(),
-                kind: TableKind::Table,
-            }))
-        })
-        .await
+        self.list_tables_rows_bounded(schema, max_items).await
     }
 
     async fn list_tables_budgeted(
@@ -718,11 +769,11 @@ impl SqlEngine for CassandraAdapter {
 #[async_trait::async_trait]
 impl CqlEngine for CassandraAdapter {
     async fn query_cql(&self, cql: &str) -> Result<ResultSet> {
-        <Self as SqlEngine>::query(self, cql, &[]).await
+        self.query_complete(cql, &[]).await
     }
 
     async fn query_cql_bounded(&self, cql: &str, max_rows: usize) -> Result<ResultSet> {
-        <Self as SqlEngine>::query_bounded(self, cql, &[], max_rows).await
+        self.query_rows_bounded(cql, &[], max_rows).await
     }
 
     async fn query_cql_budgeted(&self, cql: &str, budget: ReadBudget) -> Result<ResultSet> {
@@ -730,20 +781,20 @@ impl CqlEngine for CassandraAdapter {
     }
 
     async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome> {
-        self.execute_cql_budgeted(cql, InputBudget::default()).await
+        self.execute_cql_mutation_budgeted(cql, InputBudget::default())
+            .await
     }
 
     async fn execute_cql_budgeted(&self, cql: &str, budget: InputBudget) -> Result<ExecOutcome> {
-        preflight_cql_execute(cql, budget)?;
-        self.send_cql_mutation(cql).await
+        self.execute_cql_mutation_budgeted(cql, budget).await
     }
 
     async fn list_keyspaces(&self) -> Result<Vec<String>> {
-        <Self as SqlEngine>::list_schemas(self).await
+        self.list_schemas_complete().await
     }
 
     async fn list_keyspaces_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
-        <Self as SqlEngine>::list_schemas_bounded(self, max_items).await
+        self.list_schemas_rows_bounded(max_items).await
     }
 
     async fn list_keyspaces_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
@@ -751,7 +802,7 @@ impl CqlEngine for CassandraAdapter {
     }
 
     async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>> {
-        <Self as SqlEngine>::list_tables(self, keyspace).await
+        self.list_tables_complete(keyspace).await
     }
 
     async fn list_cql_tables_bounded(
@@ -759,7 +810,7 @@ impl CqlEngine for CassandraAdapter {
         keyspace: Option<&str>,
         max_items: usize,
     ) -> Result<BoundedList<TableInfo>> {
-        <Self as SqlEngine>::list_tables_bounded(self, keyspace, max_items).await
+        self.list_tables_rows_bounded(keyspace, max_items).await
     }
 
     async fn list_cql_tables_budgeted(
@@ -771,7 +822,11 @@ impl CqlEngine for CassandraAdapter {
     }
 
     async fn describe_cql_table(&self, table: &str) -> Result<TableSchema> {
-        <Self as SqlEngine>::describe_table(self, table).await
+        self.describe_table_complete(
+            table,
+            MetadataBudget::new(LEGACY_SCHEMA_MAX_ITEMS, DEFAULT_METADATA_BYTES)?,
+        )
+        .await
     }
 
     async fn describe_cql_table_bounded(
@@ -1397,7 +1452,11 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
-            assert!(!cql.list_keyspaces().await?.contains(&rejected));
+            assert!(!cql
+                .list_keyspaces_budgeted(ReadBudget::with_default_bytes(1_000)?)
+                .await?
+                .items
+                .contains(&rejected));
 
             cql.execute_cql_budgeted(
                 &format!(
@@ -1428,13 +1487,19 @@ mod tests {
             )
             .await?;
             let readback = cql
-                .query_cql(&format!("SELECT id, note FROM {table} WHERE id = 1"))
+                .query_cql_budgeted(
+                    &format!("SELECT id, note FROM {table} WHERE id = 1"),
+                    ReadBudget::with_default_bytes(2)?,
+                )
                 .await?;
             assert_eq!(readback.rows.len(), 1);
             assert_eq!(readback.rows[0][0], Value::Int(1));
             assert_eq!(readback.rows[0][1], Value::Text("updated".into()));
             let sql_readback = cql
-                .query_cql(&format!("SELECT id, note FROM {table} WHERE id = 2"))
+                .query_cql_budgeted(
+                    &format!("SELECT id, note FROM {table} WHERE id = 2"),
+                    ReadBudget::with_default_bytes(2)?,
+                )
                 .await?;
             assert_eq!(sql_readback.rows.len(), 1);
             assert_eq!(sql_readback.rows[0][0], Value::Int(2));
@@ -1449,7 +1514,10 @@ mod tests {
             )
             .await?;
             assert!(cql
-                .query_cql(&format!("SELECT id FROM {table} WHERE id = 1"))
+                .query_cql_budgeted(
+                    &format!("SELECT id FROM {table} WHERE id = 1"),
+                    ReadBudget::with_default_bytes(2)?,
+                )
                 .await?
                 .rows
                 .is_empty());
@@ -1474,7 +1542,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!cql.list_keyspaces().await.unwrap().contains(&keyspace));
+        assert!(!cql
+            .list_keyspaces_budgeted(ReadBudget::with_default_bytes(1_000).unwrap())
+            .await
+            .unwrap()
+            .items
+            .contains(&keyspace));
         exercise.unwrap();
         connector.close().await.unwrap();
     }

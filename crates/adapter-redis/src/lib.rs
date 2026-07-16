@@ -1253,7 +1253,10 @@ impl AdminInspect for RedisAdapter {
                 needed: CapabilityOperation::MessageAdminConsumerLag.as_str(),
             });
         }
-        let streams = self.list_topics().await?;
+        // Preserve the 0.1.x complete-result contract without routing through
+        // the deprecated public catalog method. The exact sibling below owns
+        // its separate work and response envelopes.
+        let streams = self.scan_stream_topics(None).await?;
         let mut results = Vec::new();
 
         for stream in streams {
@@ -4131,34 +4134,56 @@ mod tests {
 
         let connector = factory(dsn).await.unwrap();
         let kv = connector.as_kv().unwrap();
-        assert_eq!(kv.get_with_expiry(&persistent_key).await.unwrap(), None);
+        assert_eq!(
+            kv.get_with_expiry_bounded(
+                &persistent_key,
+                ReadBudget::with_default_bytes(1).unwrap(),
+            )
+            .await
+            .unwrap(),
+            None
+        );
 
         assert_eq!(
-            kv.restore_with_expiry(
+            kv.restore_with_expiry_budgeted(
                 &persistent_key,
                 &[0, 0xff, b'Z'],
                 KeyExpiry::Persistent,
                 false,
+                InputBudget::default(),
             )
             .await
             .unwrap(),
             KeyValueRestoreOutcome::Stored
         );
         assert_eq!(
-            kv.get_with_expiry(&persistent_key).await.unwrap(),
+            kv.get_with_expiry_bounded(
+                &persistent_key,
+                ReadBudget::with_default_bytes(1).unwrap(),
+            )
+            .await
+            .unwrap(),
             Some(KeyValueSnapshot {
                 value: bytes::Bytes::from_static(&[0, 0xff, b'Z']),
                 expiry: KeyExpiry::Persistent,
             })
         );
         assert_eq!(
-            kv.restore_with_expiry(&persistent_key, b"replacement", KeyExpiry::Persistent, true,)
-                .await
-                .unwrap(),
+            kv.restore_with_expiry_budgeted(
+                &persistent_key,
+                b"replacement",
+                KeyExpiry::Persistent,
+                true,
+                InputBudget::default(),
+            )
+            .await
+            .unwrap(),
             KeyValueRestoreOutcome::ConditionNotMet
         );
         assert_eq!(
-            kv.get(&persistent_key).await.unwrap(),
+            kv.get_bounded(&persistent_key, ReadBudget::with_default_bytes(1).unwrap(),)
+                .await
+                .unwrap(),
             Some(bytes::Bytes::from_static(&[0, 0xff, b'Z']))
         );
 
@@ -4169,17 +4194,22 @@ mod tests {
             .checked_add(60_000)
             .unwrap();
         assert_eq!(
-            kv.restore_with_expiry(
+            kv.restore_with_expiry_budgeted(
                 &expiring_key,
                 b"",
                 KeyExpiry::ExpiresAtUnixMs(deadline),
                 false,
+                InputBudget::default(),
             )
             .await
             .unwrap(),
             KeyValueRestoreOutcome::Stored
         );
-        let expiring = kv.get_with_expiry(&expiring_key).await.unwrap().unwrap();
+        let expiring = kv
+            .get_with_expiry_bounded(&expiring_key, ReadBudget::with_default_bytes(1).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(expiring.value.is_empty());
         let KeyExpiry::ExpiresAtUnixMs(observed_deadline) = expiring.expiry else {
             panic!("expiring restore became persistent")
@@ -4187,33 +4217,50 @@ mod tests {
         assert!(observed_deadline <= deadline);
         assert!(observed_deadline >= deadline - 1_000);
 
-        kv.set(&past_key, b"original", SetOptions::default())
-            .await
-            .unwrap();
+        kv.set_budgeted(
+            &past_key,
+            b"original",
+            SetOptions::default(),
+            InputBudget::default(),
+        )
+        .await
+        .unwrap();
         let (seconds, micros): (i64, i64) =
             redis::cmd("TIME").query_async(&mut direct).await.unwrap();
         let now = checked_redis_time_ms(seconds, micros).unwrap();
         assert_eq!(
-            kv.restore_with_expiry(
+            kv.restore_with_expiry_budgeted(
                 &past_key,
                 b"must-not-be-written",
                 KeyExpiry::ExpiresAtUnixMs(now),
                 true,
+                InputBudget::default(),
             )
             .await
             .unwrap(),
             KeyValueRestoreOutcome::Expired
         );
         assert_eq!(
-            kv.get(&past_key).await.unwrap(),
+            kv.get_bounded(&past_key, ReadBudget::with_default_bytes(1).unwrap())
+                .await
+                .unwrap(),
             Some(bytes::Bytes::from_static(b"original"))
         );
 
-        assert_eq!(kv.delete(&keys).await.unwrap(), 3);
         assert_eq!(
-            kv.scan(&format!("dbtool_it_lifetime_{suffix}:*"), 10)
+            kv.delete_budgeted(&keys, InputBudget::default())
                 .await
                 .unwrap(),
+            3
+        );
+        assert_eq!(
+            kv.scan_bounded(
+                &format!("dbtool_it_lifetime_{suffix}:*"),
+                ReadBudget::with_default_bytes(10).unwrap(),
+            )
+            .await
+            .unwrap()
+            .items,
             Vec::<String>::new()
         );
     }
@@ -4415,7 +4462,11 @@ mod tests {
             vec!["RPOP".to_owned(), list.clone()],
             vec!["SPOP".to_owned(), set.clone()],
         ] {
-            assert!(kv.raw_command(&args).await.is_err(), "{args:?}");
+            // 0.1.x compatibility: the legacy escape hatch must continue to
+            // reject mutation commands whose return value cannot be modeled.
+            #[allow(deprecated)]
+            let result = kv.raw_command(&args).await;
+            assert!(result.is_err(), "{args:?}");
         }
         let guarded_value: Vec<u8> = redis::cmd("GET")
             .arg(&guarded)
@@ -4523,7 +4574,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(kv.get(&set_key).await.unwrap().unwrap().as_ref(), value);
+        assert_eq!(
+            kv.get_bounded(&set_key, ReadBudget::with_default_bytes(1).unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            value
+        );
 
         let expiry = KeyExpiry::Persistent;
         let restore_value = b"restored".as_slice();
@@ -4568,7 +4626,11 @@ mod tests {
             KeyValueRestoreOutcome::ConditionNotMet
         );
         assert_eq!(
-            kv.get(&restore_key).await.unwrap().unwrap().as_ref(),
+            kv.get_bounded(&restore_key, ReadBudget::with_default_bytes(1).unwrap(),)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             restore_value
         );
 
@@ -4635,7 +4697,11 @@ mod tests {
             Value::Text(status) if status == "OK"
         ));
         assert_eq!(
-            kv.get(&raw_key).await.unwrap().unwrap().as_ref(),
+            kv.get_bounded(&raw_key, ReadBudget::with_default_bytes(1).unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
             b"raw-value"
         );
 
@@ -4665,7 +4731,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
         assert_eq!(
-            kv.get(&raw_response_key).await.unwrap().unwrap().as_ref(),
+            kv.get_bounded(
+                &raw_response_key,
+                ReadBudget::with_default_bytes(1).unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
             b"written-before-response-budget"
         );
 
@@ -4682,9 +4755,13 @@ mod tests {
         .await
         .unwrap();
         assert!(kv
-            .scan(&format!("{prefix}:*"), cleanup.len() + 1)
+            .scan_bounded(
+                &format!("{prefix}:*"),
+                ReadBudget::with_default_bytes(cleanup.len() + 1).unwrap(),
+            )
             .await
             .unwrap()
+            .items
             .is_empty());
         connector.close().await.unwrap();
     }
@@ -4728,7 +4805,11 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            producer.produce(&stream, fixtures).await.unwrap().produced,
+            producer
+                .produce_budgeted(&stream, fixtures, ProduceBudget::default())
+                .await
+                .unwrap()
+                .produced,
             3
         );
         redis::cmd("XGROUP")
@@ -4781,7 +4862,10 @@ mod tests {
             })
         ));
         if lag_supported {
-            let initial_lag = admin.consumer_lag(&group).await.unwrap();
+            let initial_lag = admin
+                .consumer_lag_bounded(&group, MetadataBudget::with_default_bytes(10_000).unwrap())
+                .await
+                .unwrap();
             assert_eq!(initial_lag.len(), 1);
             assert_eq!(
                 (
@@ -4805,9 +4889,14 @@ mod tests {
             );
         } else {
             assert!(matches!(
-                admin.consumer_lag(&group).await,
+                admin
+                    .consumer_lag_bounded(
+                        &group,
+                        MetadataBudget::with_default_bytes(10_000).unwrap(),
+                    )
+                    .await,
                 Err(Error::UnsupportedCapability { needed, .. })
-                    if needed == CapabilityOperation::MessageAdminConsumerLag.as_str()
+                    if needed == CapabilityOperation::MessageAdminConsumerLagBounded.as_str()
             ));
         }
 
@@ -4869,7 +4958,10 @@ mod tests {
         assert_eq!(message_ids(&replayed), first_ids);
 
         if lag_supported {
-            let lag = admin.consumer_lag(&group).await.unwrap();
+            let lag = admin
+                .consumer_lag_bounded(&group, MetadataBudget::with_default_bytes(10_000).unwrap())
+                .await
+                .unwrap();
             assert_eq!(lag.len(), 1);
             assert_eq!((lag[0].latest, lag[0].committed, lag[0].lag), (3, 0, 3));
         }
@@ -4883,7 +4975,10 @@ mod tests {
             .unwrap();
         assert_eq!(message_ids(&acknowledged), first_ids);
         if lag_supported {
-            let lag = admin.consumer_lag(&group).await.unwrap();
+            let lag = admin
+                .consumer_lag_bounded(&group, MetadataBudget::with_default_bytes(10_000).unwrap())
+                .await
+                .unwrap();
             assert_eq!((lag[0].latest, lag[0].committed, lag[0].lag), (3, 2, 1));
         }
 
@@ -4897,7 +4992,10 @@ mod tests {
         assert_eq!(final_message.len(), 1);
         assert_eq!(final_message[0].payload.as_ref(), b"three");
         if lag_supported {
-            let lag = admin.consumer_lag(&group).await.unwrap();
+            let lag = admin
+                .consumer_lag_bounded(&group, MetadataBudget::with_default_bytes(10_000).unwrap())
+                .await
+                .unwrap();
             assert_eq!((lag[0].latest, lag[0].committed, lag[0].lag), (3, 3, 0));
         }
 
@@ -4965,7 +5063,10 @@ mod tests {
             "failed conversion must not XACK the entry"
         );
         if lag_supported {
-            let lag = admin.consumer_lag(&group).await.unwrap();
+            let lag = admin
+                .consumer_lag_bounded(&group, MetadataBudget::with_default_bytes(10_000).unwrap())
+                .await
+                .unwrap();
             assert_eq!((lag[0].latest, lag[0].committed, lag[0].lag), (5, 4, 1));
         }
 
@@ -5018,13 +5119,15 @@ mod tests {
             .operations()
             .contains(&CapabilityOperation::MessageProduceBudgeted));
         let producer = connector.as_producer().unwrap();
-        let legacy_empty = producer
-            .produce(&rejected_stream, vec![])
-            .await
-            .expect("legacy empty produce should remain a no-op");
+        // 0.1.x compatibility: empty legacy batches remain validated no-ops.
+        #[allow(deprecated)]
+        let legacy_empty = producer.produce(&rejected_stream, vec![]).await;
+        let legacy_empty = legacy_empty.expect("legacy empty produce should remain a no-op");
         assert_eq!(legacy_empty.produced, 0);
         assert!(legacy_empty.placements.is_empty());
-        assert!(producer.produce("stream:", vec![]).await.is_err());
+        #[allow(deprecated)]
+        let invalid_legacy_empty = producer.produce("stream:", vec![]).await;
+        assert!(invalid_legacy_empty.is_err());
         let legacy_empty_type: String = redis::cmd("TYPE")
             .arg(&rejected_stream)
             .query_async(&mut direct)
@@ -5245,7 +5348,10 @@ mod tests {
         let result = connector
             .as_kv()
             .unwrap()
-            .scan(&format!("{prefix}*"), 10)
+            .scan_bounded(
+                &format!("{prefix}*"),
+                ReadBudget::with_default_bytes(10).unwrap(),
+            )
             .await;
 
         let deleted = redis::cmd("DEL")
