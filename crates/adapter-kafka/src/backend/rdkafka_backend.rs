@@ -32,8 +32,8 @@ use std::{
 };
 
 use super::{
-    kafka_messages_before, resolve_consume_position, validate_kafka_delete_request,
-    validate_kafka_consume_options, validate_produce_message,
+    kafka_messages_before, resolve_consume_position, validate_kafka_consume_options,
+    validate_kafka_delete_request, validate_produce_message,
 };
 
 // Kafka metadata has no pagination. librdkafka enforces this receive-frame

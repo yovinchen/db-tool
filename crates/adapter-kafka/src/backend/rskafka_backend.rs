@@ -29,8 +29,8 @@ use std::{
 };
 
 use super::{
-    kafka_messages_before, resolve_consume_position, validate_kafka_delete_request,
-    validate_kafka_consume_options, validate_produce_message,
+    kafka_messages_before, resolve_consume_position, validate_kafka_consume_options,
+    validate_kafka_delete_request, validate_produce_message,
 };
 
 // Kafka's Metadata API does not paginate. Keep the unavoidable protocol frame
