@@ -9,14 +9,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ResultSet, TableInfo,
-        TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ReadBudget, ResultSet,
+        TableInfo, TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
     },
     port::{
         capability::{CqlEngine, SqlEngine},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter, ResultLimiter},
+    service::limiter::{ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, StreamExt};
 use scylla::{
@@ -275,6 +275,8 @@ impl CassandraAdapter {
 fn cassandra_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::SqlQueryBudgeted,
+        CapabilityOperation::CqlQueryBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListTablesBounded,
         CapabilityOperation::CqlListKeyspacesBounded,
@@ -366,6 +368,59 @@ impl SqlEngine for CassandraAdapter {
             rows: output_rows,
             truncated: false,
         }))
+    }
+
+    async fn query_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: ReadBudget,
+    ) -> Result<ResultSet> {
+        let mut limiter = ReadLimiter::new(budget, "Cassandra query result")?;
+        let probe_rows = limiter.probe_items()?;
+        reject_dynamic_params(params)?;
+
+        // A page size of one is the smallest protocol boundary Scylla exposes.
+        // It prevents a page of several rows from being decoded ahead of the
+        // caller envelope. The driver must still decode one complete frame and
+        // convert one complete recursive row before its serialized core size is
+        // known; an oversized single row therefore remains the residual bound.
+        let statement = Statement::new(sql).with_page_size(budgeted_query_page_size());
+        let pager = self
+            .session
+            .query_iter(statement, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut rows_stream = pager
+            .rows_stream::<Row>()
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        let columns = {
+            let specs = rows_stream.column_specs();
+            specs
+                .iter()
+                .map(|spec| ColumnMeta {
+                    name: spec.name().to_owned(),
+                    type_name: cql_type_name(spec.typ()),
+                    nullable: true,
+                    primary_key: false,
+                    default_value: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        limiter.observe_header(&columns)?;
+
+        let mut output_rows = Vec::with_capacity(budget.max_items.min(256));
+        while limiter.observed_items() < probe_rows {
+            let Some(row) = rows_stream.next().await else {
+                break;
+            };
+            let row = row.map_err(|e| Error::Query(e.to_string()))?;
+            limiter.retain_item(cql_row_values(row), &mut output_rows)?;
+        }
+        drop(rows_stream);
+
+        finish_budgeted_result(limiter, columns, output_rows)
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
@@ -532,6 +587,10 @@ impl CqlEngine for CassandraAdapter {
 
     async fn query_cql_bounded(&self, cql: &str, max_rows: usize) -> Result<ResultSet> {
         <Self as SqlEngine>::query_bounded(self, cql, &[], max_rows).await
+    }
+
+    async fn query_cql_budgeted(&self, cql: &str, budget: ReadBudget) -> Result<ResultSet> {
+        <Self as SqlEngine>::query_budgeted(self, cql, &[], budget).await
     }
 
     async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome> {
@@ -787,6 +846,22 @@ fn rows_to_result_set(rows: QueryRowsResult) -> Result<ResultSet> {
     })
 }
 
+fn finish_budgeted_result(
+    limiter: ReadLimiter,
+    columns: Vec<ColumnMeta>,
+    rows: Vec<Vec<Value>>,
+) -> Result<ResultSet> {
+    limiter.finish_with(rows, |rows, truncated| ResultSet {
+        columns,
+        rows,
+        truncated,
+    })
+}
+
+fn budgeted_query_page_size() -> i32 {
+    1
+}
+
 fn cql_row_values(row: Row) -> Vec<Value> {
     row.columns
         .into_iter()
@@ -1008,6 +1083,8 @@ mod tests {
             ..Default::default()
         });
         for operation in [
+            CapabilityOperation::SqlQueryBudgeted,
+            CapabilityOperation::CqlQueryBudgeted,
             CapabilityOperation::SqlListSchemasBounded,
             CapabilityOperation::SqlListTablesBounded,
             CapabilityOperation::CqlListKeyspacesBounded,
@@ -1027,6 +1104,9 @@ mod tests {
         assert_eq!((probe_items, page_size), (3, 3));
         let (_, probe_items, page_size) = bounded_catalog_plan(1_000).unwrap();
         assert_eq!((probe_items, page_size), (1_001, 256));
+        let statement = Statement::new("SELECT now() FROM system.local")
+            .with_page_size(budgeted_query_page_size());
+        assert_eq!(statement.get_page_size(), 1);
     }
 
     #[test]
@@ -1089,6 +1169,60 @@ mod tests {
             cql_value_to_value(CqlValue::List(vec![CqlValue::Boolean(true)])),
             Value::Array(vec![Value::Bool(true)])
         );
+    }
+
+    #[test]
+    fn budgeted_result_retains_n_probes_n_plus_one_and_rejects_large_units() {
+        let columns = vec![ColumnMeta {
+            name: "payload".to_owned(),
+            type_name: "text".to_owned(),
+            nullable: true,
+            primary_key: false,
+            default_value: None,
+        }];
+        let mut exact =
+            ReadLimiter::new(ReadBudget::new(2, 4096).unwrap(), "Cassandra query result").unwrap();
+        exact.observe_header(&columns).unwrap();
+        let mut exact_rows = Vec::new();
+        for value in ["one", "two"] {
+            exact
+                .retain_item(vec![Value::Text(value.to_owned())], &mut exact_rows)
+                .unwrap();
+        }
+        let exact = finish_budgeted_result(exact, columns.clone(), exact_rows).unwrap();
+        assert_eq!(exact.rows.len(), 2);
+        assert!(!exact.truncated);
+
+        let mut limiter =
+            ReadLimiter::new(ReadBudget::new(2, 4096).unwrap(), "Cassandra query result").unwrap();
+        assert_eq!(limiter.probe_items().unwrap(), 3);
+        limiter.observe_header(&columns).unwrap();
+        let mut rows = Vec::new();
+        for value in ["one", "two", "probe"] {
+            limiter
+                .retain_item(vec![Value::Text(value.to_owned())], &mut rows)
+                .unwrap();
+        }
+        let result = finish_budgeted_result(limiter, columns.clone(), rows).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.truncated);
+
+        let mut header_probe =
+            ReadLimiter::new(ReadBudget::new(1, 4096).unwrap(), "header probe").unwrap();
+        header_probe.observe_header(&columns).unwrap();
+        let header_bytes = header_probe.observed_bytes();
+        let mut limiter = ReadLimiter::new(
+            ReadBudget::new(1, header_bytes + 16).unwrap(),
+            "Cassandra query result",
+        )
+        .unwrap();
+        limiter.observe_header(&columns).unwrap();
+        let mut rows = Vec::new();
+        let oversized = cql_value_to_value(CqlValue::List(vec![CqlValue::Text("x".repeat(1024))]));
+        let error = limiter.retain_item(vec![oversized], &mut rows).unwrap_err();
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+        assert!(rows.is_empty());
+        assert_eq!(limiter.observed_items(), 0);
     }
 
     #[test]
