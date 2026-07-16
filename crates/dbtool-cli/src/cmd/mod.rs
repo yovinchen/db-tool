@@ -13,7 +13,8 @@ pub mod ts;
 
 use dbtool_core::service::{formatter::Format, ThrottleConfig};
 use dbtool_core::{
-    config::{ConnectionConfig, LimitsConfig},
+    config::{file::CONNECTION_CONFIG_MAX_NAME_BYTES, ConnectionConfig, LimitsConfig},
+    dsn::Dsn,
     error::Error,
     model::{MetadataBudget, ReadBudget, MAX_READ_BYTES},
     service::ConnectionResolver,
@@ -75,10 +76,16 @@ impl Context {
             return Err(Error::WriteNotAllowed);
         }
 
+        if self.dsn.is_some() {
+            return Ok(());
+        }
         let Some(name) = self.conn.as_deref() else {
             return Ok(());
         };
-        if self.dsn.is_some() || std::env::var_os(ConnectionResolver::env_key(name)).is_some() {
+        if validate_connection_reference(name)? == ConnectionReferenceKind::RawDsn {
+            return Ok(());
+        }
+        if std::env::var_os(ConnectionResolver::env_key(name)).is_some() {
             return Ok(());
         }
 
@@ -98,9 +105,16 @@ impl Context {
     /// Resolve the connection name/DSN from this context.
     pub fn resolve_dsn(&self) -> dbtool_core::Result<String> {
         if let Some(raw) = &self.dsn {
-            return Ok(raw.clone());
+            // Dsn::parse checks the hard raw-size ceiling before cloning and
+            // also bounds every environment-expansion pass. Returning its
+            // owned raw value prevents oversized CLI input from reaching the
+            // registry/connect path.
+            return Dsn::parse(raw).map(|dsn| dsn.raw);
         }
         if let Some(name) = &self.conn {
+            if validate_connection_reference(name)? == ConnectionReferenceKind::RawDsn {
+                return Dsn::parse(name).map(|dsn| dsn.raw);
+            }
             let config = ConnectionConfig::load(&ConnectionConfig::default_path())?;
             return ConnectionResolver::new(config)
                 .resolve(name)
@@ -110,6 +124,14 @@ impl Context {
     }
 
     pub fn throttle_config(&self) -> dbtool_core::Result<ThrottleConfig> {
+        let connection_kind = if self.dsn.is_none() {
+            self.conn
+                .as_deref()
+                .map(validate_connection_reference)
+                .transpose()?
+        } else {
+            None
+        };
         let config = ConnectionConfig::load(&ConnectionConfig::default_path())?;
 
         if self.dsn.is_some() {
@@ -119,13 +141,14 @@ impl Context {
             return Ok(throttle);
         }
 
-        let connection = self.conn.as_deref().and_then(|name| {
-            if std::env::var_os(ConnectionResolver::env_key(name)).is_some() {
-                None
-            } else {
+        let connection = match (connection_kind, self.conn.as_deref()) {
+            (Some(ConnectionReferenceKind::Name), Some(name))
+                if std::env::var_os(ConnectionResolver::env_key(name)).is_none() =>
+            {
                 Some(name)
             }
-        });
+            _ => None,
+        };
 
         let mut throttle = config.throttle_config_for(connection)?;
         self.throttle_overrides
@@ -135,7 +158,12 @@ impl Context {
 
     pub fn safety_target(&self, resolved_dsn: &str) -> String {
         if let Some(name) = &self.conn {
-            return format!("conn:{name}");
+            if matches!(
+                validate_connection_reference(name),
+                Ok(ConnectionReferenceKind::Name)
+            ) {
+                return format!("conn:{name}");
+            }
         }
 
         dbtool_core::dsn::Dsn::parse(resolved_dsn)
@@ -156,4 +184,40 @@ impl Context {
     pub fn render_error(&self, err: &Error) -> String {
         dbtool_core::service::Formatter::error(err)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectionReferenceKind {
+    Name,
+    RawDsn,
+}
+
+fn validate_connection_reference(value: &str) -> dbtool_core::Result<ConnectionReferenceKind> {
+    if has_uri_scheme(value) {
+        Dsn::parse(value)?;
+        return Ok(ConnectionReferenceKind::RawDsn);
+    }
+
+    if value.is_empty()
+        || value.len() > CONNECTION_CONFIG_MAX_NAME_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(Error::Config(
+            "connection name is outside the supported field limit".into(),
+        ));
+    }
+    Ok(ConnectionReferenceKind::Name)
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let Some((scheme, _)) = value.split_once(':') else {
+        return false;
+    };
+    let mut characters = scheme.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
 }

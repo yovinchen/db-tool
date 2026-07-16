@@ -1,4 +1,8 @@
-use crate::{config::file::ConnectionConfig, dsn::Dsn, Error, Result};
+use crate::{
+    config::file::{ConnectionConfig, CONNECTION_CONFIG_MAX_NAME_BYTES},
+    dsn::{Dsn, MAX_DSN_BYTES},
+    Error, Result,
+};
 
 /// Resolves a connection name or raw DSN into a `Dsn`, following priority order:
 /// `--dsn` literal > env `DBTOOL_CONN_<NAME>` > `connections.toml` named entry.
@@ -22,9 +26,26 @@ impl ConnectionResolver {
             return Dsn::parse(name_or_dsn);
         }
 
+        if name_or_dsn.is_empty()
+            || name_or_dsn.len() > CONNECTION_CONFIG_MAX_NAME_BYTES
+            || name_or_dsn.chars().any(char::is_control)
+        {
+            return Err(Error::Config(
+                "connection name is outside the supported field limit".into(),
+            ));
+        }
+
         // 2. Check env var DBTOOL_CONN_<UPPER_NAME>.
         let env_key = Self::env_key(name_or_dsn);
-        if let Ok(dsn_str) = std::env::var(&env_key) {
+        if let Some(raw_dsn) = std::env::var_os(&env_key) {
+            if raw_dsn.len() > MAX_DSN_BYTES {
+                return Err(Error::Dsn(format!(
+                    "environment connection DSN exceeds the {MAX_DSN_BYTES}-byte size limit"
+                )));
+            }
+            let dsn_str = raw_dsn.into_string().map_err(|_| {
+                Error::Dsn("environment connection DSN must contain valid UTF-8".into())
+            })?;
             return Dsn::parse(&dsn_str);
         }
 
@@ -93,5 +114,20 @@ dsn = "sqlite::memory:"
                 .scheme,
             "sqlite"
         );
+    }
+
+    #[test]
+    fn environment_dsns_are_bounded_before_parsing_without_echoing_values() {
+        let name = "if-t79-oversized-env";
+        let key = ConnectionResolver::env_key(name);
+        let marker = "RESOLVER_ENV_SECRET_MARKER";
+        std::env::set_var(&key, format!("{marker}{}", "x".repeat(MAX_DSN_BYTES)));
+
+        let error = ConnectionResolver::new(ConnectionConfig::default())
+            .resolve(name)
+            .unwrap_err();
+        assert_eq!(error.code(), "INVALID_DSN");
+        assert!(!error.to_string().contains(marker));
+        std::env::remove_var(key);
     }
 }

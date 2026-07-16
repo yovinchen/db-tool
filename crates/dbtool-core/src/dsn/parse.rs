@@ -2,6 +2,10 @@ use crate::{Error, Result};
 use std::{collections::HashMap, fmt};
 use url::Url;
 
+/// Hard ceiling for raw and environment-expanded DSNs. Keeping this boundary
+/// at the parser prevents callers from bypassing config or CLI-specific caps.
+pub const MAX_DSN_BYTES: usize = 16 * 1024;
+
 /// Parsed DSN with ownership — passed by value into Factory to satisfy 'static.
 #[derive(Clone)]
 pub struct Dsn {
@@ -34,6 +38,7 @@ impl fmt::Debug for Dsn {
 
 impl Dsn {
     pub fn parse(s: &str) -> Result<Self> {
+        ensure_dsn_size(s)?;
         let expanded = expand_env(s)?;
         let url = Url::parse(&expanded).map_err(|e| Error::Dsn(format!("invalid URL: {e}")))?;
 
@@ -101,7 +106,7 @@ fn expand_env(s: &str) -> Result<String> {
             ));
         }
 
-        let (next, replaced_known) = expand_env_once(&current);
+        let (next, replaced_known) = expand_env_once(&current)?;
         if !replaced_known {
             return Ok(current);
         }
@@ -118,31 +123,63 @@ fn expand_env(s: &str) -> Result<String> {
     )))
 }
 
-fn expand_env_once(input: &str) -> (String, bool) {
+fn expand_env_once(input: &str) -> Result<(String, bool)> {
     let mut output = String::with_capacity(input.len());
     let mut cursor = 0;
     let mut replaced_known = false;
 
     while let Some(relative_start) = input[cursor..].find("${") {
         let start = cursor + relative_start;
-        output.push_str(&input[cursor..start]);
+        push_dsn_fragment(&mut output, &input[cursor..start])?;
         let Some(relative_end) = input[start + 2..].find('}') else {
-            output.push_str(&input[start..]);
-            return (output, replaced_known);
+            push_dsn_fragment(&mut output, &input[start..])?;
+            return Ok((output, replaced_known));
         };
         let end = start + 2 + relative_end;
         let variable = &input[start + 2..end];
-        match std::env::var(variable) {
-            Ok(value) => {
-                output.push_str(&value);
-                replaced_known = true;
+        match std::env::var_os(variable) {
+            Some(value) if value.len() > MAX_DSN_BYTES.saturating_sub(output.len()) => {
+                return Err(dsn_size_error());
             }
-            Err(_) => output.push_str(&input[start..=end]),
+            Some(value) => match value.into_string() {
+                Ok(value) => {
+                    push_dsn_fragment(&mut output, &value)?;
+                    replaced_known = true;
+                }
+                Err(_) => push_dsn_fragment(&mut output, &input[start..=end])?,
+            },
+            None => push_dsn_fragment(&mut output, &input[start..=end])?,
         }
         cursor = end + 1;
     }
-    output.push_str(&input[cursor..]);
-    (output, replaced_known)
+    push_dsn_fragment(&mut output, &input[cursor..])?;
+    Ok((output, replaced_known))
+}
+
+fn push_dsn_fragment(output: &mut String, fragment: &str) -> Result<()> {
+    let next_len = output
+        .len()
+        .checked_add(fragment.len())
+        .ok_or_else(dsn_size_error)?;
+    if next_len > MAX_DSN_BYTES {
+        return Err(dsn_size_error());
+    }
+    output.push_str(fragment);
+    Ok(())
+}
+
+fn ensure_dsn_size(value: &str) -> Result<()> {
+    if value.len() > MAX_DSN_BYTES {
+        Err(dsn_size_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn dsn_size_error() -> Error {
+    Error::Dsn(format!(
+        "DSN exceeds the {MAX_DSN_BYTES}-byte expanded size limit"
+    ))
 }
 
 fn percent_decode(input: &str) -> Result<String> {
@@ -250,6 +287,31 @@ mod tests {
 
         assert_eq!(error.code(), "INVALID_DSN");
         assert!(error.to_string().contains("cyclic"));
+    }
+
+    #[test]
+    fn raw_and_expanded_dsns_enforce_the_same_hard_byte_limit() {
+        let prefix = "postgres://localhost/";
+        let exact = format!("{prefix}{}", "x".repeat(MAX_DSN_BYTES - prefix.len()));
+        assert_eq!(exact.len(), MAX_DSN_BYTES);
+        assert!(Dsn::parse(&exact).is_ok());
+
+        let oversized = format!("{exact}x");
+        let error = Dsn::parse(&oversized).unwrap_err();
+        assert!(error.to_string().contains("expanded size limit"));
+        assert!(!error.to_string().contains(&oversized));
+
+        let variable = "DBTOOL_PARSE_BOUNDED_EXPANSION";
+        let template = format!("{prefix}${{{variable}}}");
+        std::env::set_var(variable, "y".repeat(MAX_DSN_BYTES - prefix.len()));
+        assert_eq!(Dsn::parse(&template).unwrap().raw.len(), MAX_DSN_BYTES);
+
+        let marker = "EXPANSION_SECRET_MARKER";
+        std::env::set_var(variable, format!("{marker}{}", "z".repeat(MAX_DSN_BYTES)));
+        let error = Dsn::parse(&template).unwrap_err();
+        assert!(error.to_string().contains("expanded size limit"));
+        assert!(!error.to_string().contains(marker));
+        std::env::remove_var(variable);
     }
 
     #[test]
