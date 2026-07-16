@@ -6,13 +6,13 @@ use dbtool_core::{
         AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
         DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message, MessageCursor,
         MessageMetadata, MessageResource, MessageResourceKind, MetadataBudget, PartitionWatermark,
-        ProduceOutcome, TopicDetail, TopicInfo, MAX_METADATA_BYTES,
+        ProduceOutcome, ReadBudget, TopicDetail, TopicInfo, MAX_METADATA_BYTES,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter},
+    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter, ReadLimiter},
 };
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
@@ -203,6 +203,35 @@ impl AdminInspect for NatsAdapter {
 
         topics.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(limiter.finish(topics))
+    }
+
+    async fn list_topics_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<TopicInfo>> {
+        let (mut limiter, probe_items) = nats_budgeted_topic_catalog_plan(budget)?;
+        // Only JetStream streams are enumerable. Core NATS subjects have no
+        // portable discovery protocol and are intentionally never synthesized
+        // into this admin catalog.
+        let mut streams = self.jetstream().streams();
+        let mut topics = Vec::with_capacity(budget.max_items.min(256));
+        let mut names = HashSet::new();
+        while limiter.observed_items() < probe_items {
+            let Some(info) = streams
+                .try_next()
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?
+            else {
+                break;
+            };
+            let topic = nats_topic_info(&info);
+            if !names.insert(topic.name.clone()) {
+                return Err(Error::Serialization(format!(
+                    "NATS JetStream paginated catalog repeated stream {:?}",
+                    topic.name
+                )));
+            }
+            limiter.retain_item(topic, &mut topics)?;
+        }
+        topics.sort_by(|left, right| left.name.cmp(&right.name));
+        limiter.finish(topics)
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -898,6 +927,7 @@ fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
+        CapabilityOperation::MessageAdminListTopicsBudgeted,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminConsumerLag,
@@ -905,6 +935,12 @@ fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
+}
+
+fn nats_budgeted_topic_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize)> {
+    let limiter = ReadLimiter::new(budget, "NATS JetStream catalog response")?;
+    let probe_items = limiter.probe_items()?;
+    Ok((limiter, probe_items))
 }
 
 struct NatsStreamNamesPage {
@@ -1624,6 +1660,7 @@ mod tests {
             CapabilityOperation::MessageConsumeAck,
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminListTopicsBounded,
+            CapabilityOperation::MessageAdminListTopicsBudgeted,
             CapabilityOperation::MessageAdminTopicDetail,
             CapabilityOperation::MessageAdminTopicDetailBounded,
             CapabilityOperation::MessageAdminConsumerLag,
@@ -1632,6 +1669,92 @@ mod tests {
         ] {
             assert!(operations.contains(&operation));
         }
+    }
+
+    fn nats_topic(name: &str) -> TopicInfo {
+        TopicInfo {
+            name: name.to_owned(),
+            partitions: 1,
+            replicas: 1,
+        }
+    }
+
+    fn finish_nats_topic_fixture(
+        names: &[&str],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Result<BoundedList<TopicInfo>> {
+        let (mut limiter, probe_items) =
+            nats_budgeted_topic_catalog_plan(ReadBudget::new(max_items, max_bytes)?)?;
+        let mut retained = Vec::new();
+        for topic in names.iter().take(probe_items).map(|name| nats_topic(name)) {
+            limiter.retain_item(topic, &mut retained)?;
+        }
+        retained.sort_by(|left, right| left.name.cmp(&right.name));
+        limiter.finish(retained)
+    }
+
+    #[test]
+    fn nats_budgeted_jetstream_catalog_rejects_invalid_budgets_before_requests() {
+        for budget in [
+            ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            },
+            ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            },
+        ] {
+            assert!(matches!(
+                nats_budgeted_topic_catalog_plan(budget),
+                Err(Error::Config(_))
+            ));
+        }
+        let (_, probe_items) =
+            nats_budgeted_topic_catalog_plan(ReadBudget::new(2, 1024).unwrap()).unwrap();
+        assert_eq!(probe_items, 3);
+    }
+
+    #[test]
+    fn nats_budgeted_jetstream_catalog_covers_item_and_byte_boundaries() {
+        let exact = finish_nats_topic_fixture(&["STREAM_B", "STREAM_A"], 2, 4096).unwrap();
+        assert!(!exact.truncated);
+        assert_eq!(
+            exact
+                .items
+                .iter()
+                .map(|topic| topic.name.as_str())
+                .collect::<Vec<_>>(),
+            ["STREAM_A", "STREAM_B"]
+        );
+
+        let probed =
+            finish_nats_topic_fixture(&["STREAM_B", "STREAM_A", "STREAM_C", "IGNORED"], 2, 4096)
+                .unwrap();
+        assert!(probed.truncated);
+        assert_eq!(probed.items.len(), 2);
+
+        let expected = BoundedList::complete(vec![nats_topic("STREAM_A"), nats_topic("STREAM_B")]);
+        let exact_bytes = serde_json::to_vec(&expected).unwrap().len();
+        assert!(finish_nats_topic_fixture(&["STREAM_A", "STREAM_B"], 2, exact_bytes).is_ok());
+        assert!(matches!(
+            finish_nats_topic_fixture(&["STREAM_A", "STREAM_B"], 2, exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn nats_admin_catalog_is_jetstream_only_not_core_subject_discovery() {
+        let topic = nats_topic("EVENTS");
+        assert_eq!(topic.partitions, 1);
+        assert_eq!(topic.replicas, 1);
+        assert!(validate_subject("events.created").is_ok());
+        assert!(validate_jetstream_name("stream", "events.created").is_err());
     }
 
     #[test]

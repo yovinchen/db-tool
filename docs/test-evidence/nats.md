@@ -41,6 +41,29 @@ Post-cleanup `/jsz?streams=true` reported `streams=0`, `consumers=0`,
 `messages=0`, and `bytes=0`. JetStream durable semantics are not attributed to
 Core NATS queue groups.
 
+## IF-T74 JetStream scalar-byte envelope refresh
+
+Run at (UTC): 2026-07-16T03:24:39Z
+
+The NATS adapter now advertises and implements exact
+`message.admin.list_topics_budgeted` for JetStream streams. `ReadBudget` and
+the N+1 probe are validated before requesting the stream iterator; each
+complete `TopicInfo` is charged before retention and the complete
+`BoundedList` plus probe is validated before return. The iterator stops as soon
+as the probe is observed instead of draining the remaining catalog pages.
+
+NATS 2.10 Docker validation created two isolated streams, passed item N/N+1 and
+exact byte N/N-1 boundaries, removed both, and confirmed
+`streams=consumers=messages=0`. Core NATS subjects remain ephemeral routing
+names and are never enumerated. A Core-only server may therefore return a
+JetStream-unavailable runtime error for this admin method; connect-time
+capability probing was intentionally not added, avoiding changed connection
+latency and authentication semantics.
+
+Verification: adapter-nats 17 unit + 2 integration PASS; strict all-target
+Clippy, rustfmt and diff check PASS; NATS JetStream live exact catalog and zero
+state cleanup PASS.
+
 Cleanup: PASS
 
 Compatibility gaps: NATS 2.10.29 standalone was tested. Stateful TLS,

@@ -5,8 +5,9 @@ use dbtool_core::{
     error::Error,
     model::{
         AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, MessageCursor,
-        MessageResource, MessageResourceKind, MetadataBudget,
+        MessageResource, MessageResourceKind, MetadataBudget, ReadBudget,
     },
+    port::CapabilityOperation,
 };
 use futures::TryStreamExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -177,6 +178,25 @@ async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_suppor
     let admin = connector
         .as_admin()
         .expect("NATS adapter should expose admin");
+    assert!(connector
+        .operations()
+        .contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
+    let catalog = admin
+        .list_topics_budgeted(ReadBudget::with_default_bytes(1).unwrap())
+        .await
+        .expect("two fixture JetStreams should provide an N+1 probe");
+    assert!(catalog.truncated);
+    assert_eq!(catalog.items.len(), 1);
+    assert!(matches!(
+        admin
+            .list_topics_budgeted(ReadBudget::new(1, 1).unwrap())
+            .await,
+        Err(Error::ReadBudgetExceeded {
+            unit: "bytes",
+            limit: 1,
+            ..
+        })
+    ));
     let detail = admin
         .topic_detail_bounded(
             &stream_name,
