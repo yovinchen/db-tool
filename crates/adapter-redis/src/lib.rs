@@ -3,10 +3,10 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
-        DeleteResourceOptions, DeleteResourceOutcome, KeyExpiry, KeyValueRestoreOutcome,
-        KeyValueSnapshot, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
-        MessageResourceKind, MetadataBudget, PartitionWatermark, ProduceBudget, ProduceOutcome,
-        ReadBudget, TopicDetail, TopicInfo, Value,
+        DeleteResourceOptions, DeleteResourceOutcome, InputBudget, KeyExpiry,
+        KeyValueRestoreOutcome, KeyValueSnapshot, LagInfo, Message, MessageCursor,
+        MessagePlacement, MessageResource, MessageResourceKind, MetadataBudget, PartitionWatermark,
+        ProduceBudget, ProduceOutcome, ReadBudget, TopicDetail, TopicInfo, Value,
     },
     port::{
         capability::{
@@ -15,7 +15,8 @@ use dbtool_core::{
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
     service::limiter::{
-        ListLimiter, MessageReadLimiter, MessageWriteLimiter, MetadataLimiter, ReadLimiter,
+        InputLimiter, ListLimiter, MessageReadLimiter, MessageWriteLimiter, MetadataLimiter,
+        ReadLimiter,
     },
 };
 use futures::{future::BoxFuture, StreamExt};
@@ -570,16 +571,37 @@ impl KeyValueStore for RedisAdapter {
     }
 
     async fn set(&self, key: &str, value: &[u8], options: SetOptions) -> Result<()> {
+        self.set_budgeted(key, value, options, InputBudget::default())
+            .await
+    }
+
+    async fn set_budgeted(
+        &self,
+        key: &str,
+        value: &[u8],
+        options: SetOptions,
+        budget: InputBudget,
+    ) -> Result<()> {
+        validate_redis_set_input(key, value, &options, budget)?;
         let mut c = self.conn.lock().await;
         let nx = options.nx;
         let response: Option<String> = redis_set_command(key, value, options)
             .query_async(&mut *c)
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
+            .map_err(|error| {
+                map_redis_after_possible_write(true, "Redis SET", Error::Query(error.to_string()))
+            })?;
 
         if nx && response.is_none() {
             return Err(Error::Query(
                 "SET NX condition not met because the key already exists".to_owned(),
+            ));
+        }
+        if response.as_deref() != Some("OK") {
+            return Err(map_redis_after_possible_write(
+                true,
+                "Redis SET",
+                Error::Serialization("Redis SET returned an unexpected status".into()),
             ));
         }
 
@@ -593,6 +615,19 @@ impl KeyValueStore for RedisAdapter {
         expiry: KeyExpiry,
         nx: bool,
     ) -> Result<KeyValueRestoreOutcome> {
+        self.restore_with_expiry_budgeted(key, value, expiry, nx, InputBudget::default())
+            .await
+    }
+
+    async fn restore_with_expiry_budgeted(
+        &self,
+        key: &str,
+        value: &[u8],
+        expiry: KeyExpiry,
+        nx: bool,
+        budget: InputBudget,
+    ) -> Result<KeyValueRestoreOutcome> {
+        validate_redis_restore_input(key, value, expiry, nx, budget)?;
         validate_restore_expiry(expiry)?;
         let (mode, deadline) = match expiry {
             KeyExpiry::Persistent => ("persistent", String::new()),
@@ -609,15 +644,33 @@ impl KeyValueStore for RedisAdapter {
             .arg(if nx { "1" } else { "0" })
             .query_async(&mut *c)
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
+            .map_err(|error| {
+                map_redis_after_possible_write(
+                    true,
+                    "Redis lifetime restore",
+                    Error::Query(error.to_string()),
+                )
+            })?;
         decode_restore_with_expiry_status(status)
+            .map_err(|error| map_redis_after_possible_write(true, "Redis lifetime restore", error))
     }
 
     async fn delete(&self, keys: &[String]) -> Result<u64> {
+        if !keys.is_empty() {
+            return self.delete_budgeted(keys, InputBudget::default()).await;
+        }
         let mut c = self.conn.lock().await;
         c.del::<_, u64>(keys)
             .await
             .map_err(|e| Error::Query(e.to_string()))
+    }
+
+    async fn delete_budgeted(&self, keys: &[String], budget: InputBudget) -> Result<u64> {
+        validate_redis_delete_input(keys, budget)?;
+        let mut c = self.conn.lock().await;
+        c.del::<_, u64>(keys).await.map_err(|error| {
+            map_redis_after_possible_write(true, "Redis DEL", Error::Query(error.to_string()))
+        })
     }
 
     async fn scan(&self, pattern: &str, limit: usize) -> Result<Vec<String>> {
@@ -731,6 +784,15 @@ impl KeyValueStore for RedisAdapter {
 
     async fn raw_command(&self, args: &[String]) -> Result<Value> {
         validate_raw_command(args)?;
+        if is_allowed_raw_mutation(args)? {
+            return self
+                .raw_command_io_budgeted(
+                    args,
+                    InputBudget::default(),
+                    ReadBudget::new(RAW_ADAPTER_ITEM_LIMIT, RAW_MAX_REQUEST_BYTES)?,
+                )
+                .await;
+        }
         let mut cmd = redis::cmd(args[0].as_str());
         for arg in &args[1..] {
             cmd.arg(arg.as_str());
@@ -799,6 +861,36 @@ impl KeyValueStore for RedisAdapter {
         let value = redis_value_to_core(response)?;
         validate_bounded_raw_core_response(args, &value, budget.max_items)?;
         limiter.finish_single(value)
+    }
+
+    async fn raw_command_io_budgeted(
+        &self,
+        args: &[String],
+        input_budget: InputBudget,
+        response_budget: ReadBudget,
+    ) -> Result<Value> {
+        validate_redis_raw_mutation_input(args, input_budget)?;
+        let limiter = ReadLimiter::new(response_budget, "Redis raw mutation response")?;
+        let mut command = redis::cmd(args[0].as_str());
+        for arg in &args[1..] {
+            command.arg(arg.as_str());
+        }
+        let mut c = self.conn.lock().await;
+        let response: redis::Value = command.query_async(&mut *c).await.map_err(|error| {
+            map_redis_after_possible_write(
+                true,
+                "Redis raw mutation",
+                Error::Query(error.to_string()),
+            )
+        })?;
+        let result = (|| {
+            validate_raw_response_budget(&response)?;
+            let value = redis_value_to_core(response)?;
+            limiter.finish_single(value)
+        })();
+        result.map_err(|error| {
+            map_redis_after_possible_write(true, "Redis raw mutation response", error)
+        })
     }
 }
 
@@ -1025,6 +1117,60 @@ fn redis_set_command(key: &str, value: &[u8], options: SetOptions) -> redis::Cmd
         command.arg("NX");
     }
     command
+}
+
+fn validate_redis_set_input(
+    key: &str,
+    value: &[u8],
+    options: &SetOptions,
+    budget: InputBudget,
+) -> Result<()> {
+    validate_redis_bulk_string("SET key", key.len())?;
+    validate_redis_bulk_string("SET value", value.len())?;
+    InputLimiter::new(budget, "Redis SET request")?.validate_request(&(key, value, options))
+}
+
+fn validate_redis_restore_input(
+    key: &str,
+    value: &[u8],
+    expiry: KeyExpiry,
+    nx: bool,
+    budget: InputBudget,
+) -> Result<()> {
+    validate_redis_bulk_string("restore key", key.len())?;
+    validate_redis_bulk_string("restore value", value.len())?;
+    InputLimiter::new(budget, "Redis lifetime restore request")?
+        .validate_request(&(key, value, expiry, nx))
+}
+
+fn validate_redis_delete_input(keys: &[String], budget: InputBudget) -> Result<()> {
+    for key in keys {
+        validate_redis_bulk_string("DEL key", key.len())?;
+    }
+    InputLimiter::new(budget, "Redis DEL request")?.validate_batch(keys)
+}
+
+fn validate_redis_raw_mutation_input(args: &[String], budget: InputBudget) -> Result<()> {
+    InputLimiter::new(budget, "Redis raw mutation request")?.validate_batch(args)?;
+    validate_raw_command(args)?;
+    if !is_allowed_raw_mutation(args)? {
+        return Err(Error::Config(
+            "Redis raw io-budgeted operation requires an allowlisted mutation command".into(),
+        ));
+    }
+    for arg in args {
+        validate_redis_bulk_string("raw command argument", arg.len())?;
+    }
+    Ok(())
+}
+
+fn validate_redis_bulk_string(subject: &str, bytes: usize) -> Result<()> {
+    if bytes > REDIS_BULK_STRING_MAX_BYTES {
+        return Err(Error::Config(format!(
+            "{subject} exceeds the Redis {REDIS_BULK_STRING_MAX_BYTES}-byte bulk-string limit"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -1931,6 +2077,45 @@ fn validate_bounded_raw_command(args: &[String]) -> Result<()> {
     }
 }
 
+fn is_allowed_raw_mutation(args: &[String]) -> Result<bool> {
+    let command = normalized_raw_command(args)?;
+    Ok(matches!(
+        command.as_str(),
+        "SET"
+            | "DEL"
+            | "UNLINK"
+            | "INCR"
+            | "DECR"
+            | "PERSIST"
+            | "APPEND"
+            | "INCRBY"
+            | "INCRBYFLOAT"
+            | "DECRBY"
+            | "EXPIRE"
+            | "PEXPIRE"
+            | "EXPIREAT"
+            | "PEXPIREAT"
+            | "RENAME"
+            | "RENAMENX"
+            | "HSET"
+            | "HDEL"
+            | "SADD"
+            | "SREM"
+            | "LPUSH"
+            | "RPUSH"
+            | "LPUSHX"
+            | "RPUSHX"
+            | "ZREM"
+            | "XDEL"
+            | "HINCRBY"
+            | "HINCRBYFLOAT"
+            | "LSET"
+            | "ZINCRBY"
+            | "LTRIM"
+            | "ZADD"
+    ))
+}
+
 fn bounded_raw_script_keys(args: &[String]) -> Result<Vec<&str>> {
     let command = normalized_raw_command(args)?;
     match command.as_str() {
@@ -2622,9 +2807,13 @@ fn redis_operations(
         CapabilityOperation::KeyValueGetBounded,
         CapabilityOperation::KeyValueGetWithExpiry,
         CapabilityOperation::KeyValueGetWithExpiryBounded,
+        CapabilityOperation::KeyValueSetBudgeted,
         CapabilityOperation::KeyValueRestoreWithExpiry,
+        CapabilityOperation::KeyValueRestoreWithExpiryBudgeted,
+        CapabilityOperation::KeyValueDeleteBudgeted,
         CapabilityOperation::KeyValueScanBounded,
         CapabilityOperation::KeyValueRawCommandBounded,
+        CapabilityOperation::KeyValueRawCommandIoBudgeted,
         CapabilityOperation::MessageProduceBudgeted,
         CapabilityOperation::MessageConsumeGroup,
         CapabilityOperation::MessageConsumeAck,
@@ -3452,6 +3641,112 @@ mod tests {
     }
 
     #[test]
+    fn kv_mutation_preflight_counts_complete_requests_exactly() {
+        let key = "user:1";
+        let value = b"alice".as_slice();
+        let options = SetOptions {
+            ttl_secs: Some(30),
+            nx: true,
+        };
+        let set_bytes = serde_json::to_vec(&(key, value, &options)).unwrap().len();
+        let set_exact = InputBudget::new(1, set_bytes, set_bytes).unwrap();
+        assert!(validate_redis_set_input(key, value, &options, set_exact).is_ok());
+        assert!(matches!(
+            validate_redis_set_input(
+                key,
+                value,
+                &options,
+                InputBudget::new(1, set_bytes - 1, set_bytes).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == set_bytes - 1
+        ));
+
+        let expiry = KeyExpiry::ExpiresAtUnixMs(1_710_000_000_123);
+        let restore_bytes = serde_json::to_vec(&(key, value, expiry, true))
+            .unwrap()
+            .len();
+        let restore_exact = InputBudget::new(1, restore_bytes, restore_bytes).unwrap();
+        assert!(validate_redis_restore_input(key, value, expiry, true, restore_exact).is_ok());
+        assert!(matches!(
+            validate_redis_restore_input(
+                key,
+                value,
+                expiry,
+                true,
+                InputBudget::new(1, restore_bytes, restore_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == restore_bytes - 1
+        ));
+
+        let keys = ["one".to_owned(), "two".to_owned()];
+        let delete_item_bytes = keys
+            .iter()
+            .map(|key| serde_json::to_vec(key).unwrap().len())
+            .max()
+            .unwrap();
+        let delete_batch_bytes = serde_json::to_vec(&keys).unwrap().len();
+        assert!(validate_redis_delete_input(
+            &keys,
+            InputBudget::new(2, delete_item_bytes, delete_batch_bytes).unwrap(),
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_redis_delete_input(
+                &keys,
+                InputBudget::new(1, delete_item_bytes, delete_batch_bytes).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_redis_delete_input(&[], InputBudget::default()),
+            Err(Error::Config(message)) if message.contains("at least one")
+        ));
+
+        let args = ["SET", "raw:key", "value"].map(str::to_owned);
+        let raw_item_bytes = args
+            .iter()
+            .map(|arg| serde_json::to_vec(arg).unwrap().len())
+            .max()
+            .unwrap();
+        let raw_batch_bytes = serde_json::to_vec(&args).unwrap().len();
+        assert!(validate_redis_raw_mutation_input(
+            &args,
+            InputBudget::new(args.len(), raw_item_bytes, raw_batch_bytes).unwrap(),
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_redis_raw_mutation_input(
+                &args,
+                InputBudget::new(args.len(), raw_item_bytes, raw_batch_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == raw_batch_bytes - 1
+        ));
+        assert!(matches!(
+            validate_redis_raw_mutation_input(
+                &["GET".to_owned(), "raw:key".to_owned()],
+                InputBudget::default(),
+            ),
+            Err(Error::Config(message)) if message.contains("requires an allowlisted mutation")
+        ));
+    }
+
+    #[test]
     fn lifetime_read_script_orders_time_before_pttl_and_decodes_exact_values() {
         let get_position = GET_WITH_EXPIRY_SCRIPT.find("'GET'").unwrap();
         let time_position = GET_WITH_EXPIRY_SCRIPT.find("'TIME'").unwrap();
@@ -4153,6 +4448,244 @@ mod tests {
                 .unwrap(),
             cleanup.len() as u64
         );
+        connector.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redis_live_budgeted_kv_mutations_reject_before_write_and_round_trip() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("dbtool_it_input_{suffix}");
+        let set_key = format!("{prefix}:set");
+        let restore_key = format!("{prefix}:restore");
+        let delete_one = format!("{prefix}:delete:one");
+        let delete_two = format!("{prefix}:delete:two");
+        let raw_key = format!("{prefix}:raw");
+        let raw_response_key = format!("{prefix}:raw-response");
+        let cleanup = vec![
+            set_key.clone(),
+            restore_key.clone(),
+            delete_one.clone(),
+            delete_two.clone(),
+            raw_key.clone(),
+            raw_response_key.clone(),
+        ];
+
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let client = Client::open(dsn.raw_with_scheme("redis").unwrap()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&cleanup)
+            .query_async::<u64>(&mut direct)
+            .await
+            .unwrap();
+
+        let connector = factory(dsn).await.unwrap();
+        for operation in [
+            CapabilityOperation::KeyValueSetBudgeted,
+            CapabilityOperation::KeyValueRestoreWithExpiryBudgeted,
+            CapabilityOperation::KeyValueDeleteBudgeted,
+            CapabilityOperation::KeyValueRawCommandIoBudgeted,
+        ] {
+            assert!(connector.operations().contains(&operation));
+        }
+        let kv = connector.as_kv().unwrap();
+
+        let value = [0, 0xff, b'Z'];
+        let options = SetOptions {
+            ttl_secs: Some(60),
+            nx: false,
+        };
+        let set_bytes = serde_json::to_vec(&(set_key.as_str(), value.as_slice(), &options))
+            .unwrap()
+            .len();
+        let error = kv
+            .set_budgeted(
+                &set_key,
+                &value,
+                options.clone(),
+                InputBudget::new(1, set_bytes - 1, set_bytes).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+        assert!(!kv.exists(&set_key).await.unwrap());
+        kv.set_budgeted(
+            &set_key,
+            &value,
+            options,
+            InputBudget::new(1, set_bytes, set_bytes).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kv.get(&set_key).await.unwrap().unwrap().as_ref(), value);
+
+        let expiry = KeyExpiry::Persistent;
+        let restore_value = b"restored".as_slice();
+        let restore_bytes =
+            serde_json::to_vec(&(restore_key.as_str(), restore_value, expiry, false))
+                .unwrap()
+                .len();
+        let error = kv
+            .restore_with_expiry_budgeted(
+                &restore_key,
+                restore_value,
+                expiry,
+                false,
+                InputBudget::new(1, restore_bytes, restore_bytes - 1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+        assert!(!kv.exists(&restore_key).await.unwrap());
+        assert_eq!(
+            kv.restore_with_expiry_budgeted(
+                &restore_key,
+                restore_value,
+                expiry,
+                false,
+                InputBudget::new(1, restore_bytes, restore_bytes).unwrap(),
+            )
+            .await
+            .unwrap(),
+            KeyValueRestoreOutcome::Stored
+        );
+        assert_eq!(
+            kv.restore_with_expiry_budgeted(
+                &restore_key,
+                b"replacement",
+                expiry,
+                true,
+                InputBudget::default(),
+            )
+            .await
+            .unwrap(),
+            KeyValueRestoreOutcome::ConditionNotMet
+        );
+        assert_eq!(
+            kv.get(&restore_key).await.unwrap().unwrap().as_ref(),
+            restore_value
+        );
+
+        for key in [&delete_one, &delete_two] {
+            redis::cmd("SET")
+                .arg(key)
+                .arg("delete-me")
+                .query_async::<()>(&mut direct)
+                .await
+                .unwrap();
+        }
+        let delete_keys = [delete_one.clone(), delete_two.clone()];
+        let delete_item_bytes = delete_keys
+            .iter()
+            .map(|key| serde_json::to_vec(key).unwrap().len())
+            .max()
+            .unwrap();
+        let delete_batch_bytes = serde_json::to_vec(&delete_keys).unwrap().len();
+        let error = kv
+            .delete_budgeted(
+                &delete_keys,
+                InputBudget::new(1, delete_item_bytes, delete_batch_bytes).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+        assert!(kv.exists(&delete_one).await.unwrap());
+        assert!(kv.exists(&delete_two).await.unwrap());
+        assert_eq!(
+            kv.delete_budgeted(
+                &delete_keys,
+                InputBudget::new(2, delete_item_bytes, delete_batch_bytes).unwrap(),
+            )
+            .await
+            .unwrap(),
+            2
+        );
+
+        let raw_args = ["SET".to_owned(), raw_key.clone(), "raw-value".to_owned()];
+        let raw_item_bytes = raw_args
+            .iter()
+            .map(|arg| serde_json::to_vec(arg).unwrap().len())
+            .max()
+            .unwrap();
+        let raw_batch_bytes = serde_json::to_vec(&raw_args).unwrap().len();
+        let error = kv
+            .raw_command_io_budgeted(
+                &raw_args,
+                InputBudget::new(raw_args.len(), raw_item_bytes, raw_batch_bytes - 1).unwrap(),
+                ReadBudget::new(1, 4096).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+        assert!(!kv.exists(&raw_key).await.unwrap());
+        assert!(matches!(
+            kv.raw_command_io_budgeted(
+                &raw_args,
+                InputBudget::new(raw_args.len(), raw_item_bytes, raw_batch_bytes).unwrap(),
+                ReadBudget::new(1, 4096).unwrap(),
+            )
+            .await
+            .unwrap(),
+            Value::Text(status) if status == "OK"
+        ));
+        assert_eq!(
+            kv.get(&raw_key).await.unwrap().unwrap().as_ref(),
+            b"raw-value"
+        );
+
+        let raw_response_args = [
+            "SET".to_owned(),
+            raw_response_key.clone(),
+            "written-before-response-budget".to_owned(),
+        ];
+        let raw_response_item_bytes = raw_response_args
+            .iter()
+            .map(|arg| serde_json::to_vec(arg).unwrap().len())
+            .max()
+            .unwrap();
+        let raw_response_batch_bytes = serde_json::to_vec(&raw_response_args).unwrap().len();
+        let error = kv
+            .raw_command_io_budgeted(
+                &raw_response_args,
+                InputBudget::new(
+                    raw_response_args.len(),
+                    raw_response_item_bytes,
+                    raw_response_batch_bytes,
+                )
+                .unwrap(),
+                ReadBudget::new(1, 1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+        assert_eq!(
+            kv.get(&raw_response_key).await.unwrap().unwrap().as_ref(),
+            b"written-before-response-budget"
+        );
+
+        let cleanup_item_bytes = cleanup
+            .iter()
+            .map(|key| serde_json::to_vec(key).unwrap().len())
+            .max()
+            .unwrap();
+        let cleanup_batch_bytes = serde_json::to_vec(&cleanup).unwrap().len();
+        kv.delete_budgeted(
+            &cleanup,
+            InputBudget::new(cleanup.len(), cleanup_item_bytes, cleanup_batch_bytes).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(kv
+            .scan(&format!("{prefix}:*"), cleanup.len() + 1)
+            .await
+            .unwrap()
+            .is_empty());
         connector.close().await.unwrap();
     }
 
@@ -5411,9 +5944,13 @@ mod tests {
             CapabilityOperation::KeyValueGetBounded,
             CapabilityOperation::KeyValueGetWithExpiry,
             CapabilityOperation::KeyValueGetWithExpiryBounded,
+            CapabilityOperation::KeyValueSetBudgeted,
             CapabilityOperation::KeyValueRestoreWithExpiry,
+            CapabilityOperation::KeyValueRestoreWithExpiryBudgeted,
+            CapabilityOperation::KeyValueDeleteBudgeted,
             CapabilityOperation::KeyValueScanBounded,
             CapabilityOperation::KeyValueRawCommandBounded,
+            CapabilityOperation::KeyValueRawCommandIoBudgeted,
             CapabilityOperation::MessageProduceBudgeted,
             CapabilityOperation::MessageConsumeGroup,
             CapabilityOperation::MessageConsumeAck,
