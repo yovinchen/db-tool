@@ -2,14 +2,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ResultSet, TableInfo,
-        TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ReadBudget, ResultSet,
+        TableInfo, TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
     },
     port::{
         capability::SqlEngine,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter, ResultLimiter},
+    service::limiter::{ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, TryStreamExt};
 use tiberius::{AuthMethod, Client, Column, ColumnData, Config, EncryptionLevel, QueryItem, Row};
@@ -225,6 +225,74 @@ impl SqlEngine for SqlServerAdapter {
         }))
     }
 
+    async fn query_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: ReadBudget,
+    ) -> Result<ResultSet> {
+        let mut limiter = ReadLimiter::new(budget, "SQL Server query result")?;
+        let probe_rows = limiter.probe_items()?;
+        reject_dynamic_params(params)?;
+
+        // Tiberius exposes rows as a token stream but has no configurable
+        // decoded-row byte ceiling. A disposable connection ensures that we
+        // observe at most N+1 rows and drop unread response state immediately.
+        // One oversized row or metadata token is necessarily decoded by the
+        // driver before the recursive core byte accounting can reject it.
+        let mut client = connect_client(&self.dsn).await?;
+        let mut stream = client
+            .query(sql, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        let mut columns = Vec::new();
+        let mut header_observed = false;
+        let mut rows = Vec::with_capacity(budget.max_items.min(256));
+        while limiter.observed_items() < probe_rows {
+            let Some(item) = stream
+                .try_next()
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?
+            else {
+                break;
+            };
+
+            match item {
+                QueryItem::Metadata(metadata) if metadata.result_index() == 0 => {
+                    if header_observed {
+                        return Err(Error::Serialization(
+                            "SQL Server query emitted duplicate first-result metadata".to_owned(),
+                        ));
+                    }
+                    columns = metadata.columns().iter().map(column_meta).collect();
+                    limiter.observe_header(&columns)?;
+                    header_observed = true;
+                }
+                QueryItem::Metadata(_) => break,
+                QueryItem::Row(row) if row.result_index() == 0 => {
+                    if !header_observed {
+                        columns = row.columns().iter().map(column_meta).collect();
+                        limiter.observe_header(&columns)?;
+                        header_observed = true;
+                    }
+                    limiter.retain_item(row_values(row), &mut rows)?;
+                }
+                QueryItem::Row(_) => break,
+            }
+        }
+        if !header_observed {
+            limiter.observe_header(&columns)?;
+        }
+        drop(stream);
+        client
+            .close()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+
+        finish_budgeted_result(limiter, columns, rows)
+    }
+
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
         reject_dynamic_params(params)?;
         let mut guard = self.client.lock().await;
@@ -431,6 +499,18 @@ fn rows_to_result_set(rows: Vec<Row>) -> Result<ResultSet> {
     })
 }
 
+fn finish_budgeted_result(
+    limiter: ReadLimiter,
+    columns: Vec<ColumnMeta>,
+    rows: Vec<Vec<Value>>,
+) -> Result<ResultSet> {
+    limiter.finish_with(rows, |rows, truncated| ResultSet {
+        columns,
+        rows,
+        truncated,
+    })
+}
+
 fn column_meta(column: &Column) -> ColumnMeta {
     ColumnMeta {
         name: column.name().to_owned(),
@@ -477,6 +557,7 @@ fn column_data_value(value: ColumnData<'static>) -> Value {
 fn sqlserver_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListTablesBounded,
         CapabilityOperation::SqlDescribeTableBounded,
@@ -726,6 +807,7 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::SqlListSchemasBounded));
         assert!(operations.contains(&CapabilityOperation::SqlListTablesBounded));
         assert!(operations.contains(&CapabilityOperation::SqlDescribeTableBounded));
+        assert!(operations.contains(&CapabilityOperation::SqlQueryBudgeted));
         assert!(matches!(sqlserver_catalog_limit(0), Err(Error::Config(_))));
         assert!(matches!(
             sqlserver_catalog_limit(usize::MAX),
@@ -825,5 +907,59 @@ mod tests {
             Value::Text("hello".to_owned())
         );
         assert_eq!(column_data_value(ColumnData::I32(None)), Value::Null);
+    }
+
+    #[test]
+    fn budgeted_result_retains_n_probes_n_plus_one_and_rejects_large_units() {
+        let columns = vec![ColumnMeta {
+            name: "payload".to_owned(),
+            type_name: "nvarchar".to_owned(),
+            nullable: true,
+            primary_key: false,
+            default_value: None,
+        }];
+        let mut exact =
+            ReadLimiter::new(ReadBudget::new(2, 4096).unwrap(), "SQL Server query result").unwrap();
+        exact.observe_header(&columns).unwrap();
+        let mut exact_rows = Vec::new();
+        for value in ["one", "two"] {
+            exact
+                .retain_item(vec![Value::Text(value.to_owned())], &mut exact_rows)
+                .unwrap();
+        }
+        let exact = finish_budgeted_result(exact, columns.clone(), exact_rows).unwrap();
+        assert_eq!(exact.rows.len(), 2);
+        assert!(!exact.truncated);
+
+        let mut limiter =
+            ReadLimiter::new(ReadBudget::new(2, 4096).unwrap(), "SQL Server query result").unwrap();
+        assert_eq!(limiter.probe_items().unwrap(), 3);
+        limiter.observe_header(&columns).unwrap();
+        let mut rows = Vec::new();
+        for value in ["one", "two", "probe"] {
+            limiter
+                .retain_item(vec![Value::Text(value.to_owned())], &mut rows)
+                .unwrap();
+        }
+        let result = finish_budgeted_result(limiter, columns.clone(), rows).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.truncated);
+
+        let mut header_probe =
+            ReadLimiter::new(ReadBudget::new(1, 4096).unwrap(), "header probe").unwrap();
+        header_probe.observe_header(&columns).unwrap();
+        let header_bytes = header_probe.observed_bytes();
+        let mut limiter = ReadLimiter::new(
+            ReadBudget::new(1, header_bytes + 16).unwrap(),
+            "SQL Server query result",
+        )
+        .unwrap();
+        limiter.observe_header(&columns).unwrap();
+        let mut rows = Vec::new();
+        let oversized = column_data_value(ColumnData::String(Some("x".repeat(1024).into())));
+        let error = limiter.retain_item(vec![oversized], &mut rows).unwrap_err();
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+        assert!(rows.is_empty());
+        assert_eq!(limiter.observed_items(), 0);
     }
 }
