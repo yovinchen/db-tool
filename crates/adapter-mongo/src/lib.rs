@@ -97,6 +97,28 @@ impl DocumentStore for MongoAdapter {
         Ok(limiter.finish(names))
     }
 
+    async fn list_collections_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        use futures::StreamExt;
+
+        let (mut limiter, probe_items, batch_size) = mongo_budgeted_catalog_plan(budget)?;
+        let mut cursor = self
+            .db
+            .list_collections()
+            .batch_size(batch_size)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let mut names = Vec::with_capacity(budget.max_items.min(256));
+        while limiter.observed_items() < probe_items {
+            let Some(specification) = cursor.next().await else {
+                break;
+            };
+            let name = specification.map_err(|e| Error::Query(e.to_string()))?.name;
+            limiter.retain_item(name, &mut names)?;
+        }
+        drop(cursor);
+        limiter.finish(names)
+    }
+
     async fn find(
         &self,
         collection: &str,
@@ -359,6 +381,7 @@ fn mongo_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
         CapabilityOperation::DocumentListCollectionsBounded,
+        CapabilityOperation::DocumentListCollectionsBudgeted,
         CapabilityOperation::DocumentFindBudgeted,
         CapabilityOperation::DocumentAggregateBudgeted,
         CapabilityOperation::DocumentUpdateOne,
@@ -501,6 +524,15 @@ fn mongo_budgeted_find_limit(
     };
     i64::try_from(fetch_items)
         .map_err(|_| Error::Config("MongoDB budgeted find limit exceeds the i64 range".into()))
+}
+
+fn mongo_budgeted_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize, u32)> {
+    let limiter = ReadLimiter::new(budget, "MongoDB collection catalog response")?;
+    let probe_items = limiter.probe_items()?;
+    let batch_size = u32::try_from(probe_items).map_err(|_| {
+        Error::Config("MongoDB collection catalog item budget exceeds the u32 range".into())
+    })?;
+    Ok((limiter, probe_items, batch_size))
 }
 
 fn inserted_id_string(id: Bson) -> String {
@@ -670,6 +702,7 @@ mod tests {
 
         for operation in [
             CapabilityOperation::DocumentListCollectionsBounded,
+            CapabilityOperation::DocumentListCollectionsBudgeted,
             CapabilityOperation::DocumentFindBudgeted,
             CapabilityOperation::DocumentAggregateBudgeted,
             CapabilityOperation::DocumentUpdateOne,
@@ -838,6 +871,136 @@ mod tests {
             ListLimiter::new(usize::MAX).probe_items(),
             Err(Error::Config(message)) if message.contains("too large")
         ));
+        assert!(matches!(
+            mongo_budgeted_catalog_plan(ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            mongo_budgeted_catalog_plan(ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        let (_, probe_items, batch_size) =
+            mongo_budgeted_catalog_plan(ReadBudget::new(2, 1024).unwrap()).unwrap();
+        assert_eq!((probe_items, batch_size), (3, 3));
+    }
+
+    #[test]
+    fn collection_catalog_budget_counts_items_probe_and_complete_envelope() {
+        let visible = BoundedList {
+            items: vec!["alpha".to_owned(), "beta".to_owned()],
+            truncated: true,
+        };
+        let probe = "gamma".to_owned();
+        let exact_bytes =
+            serde_json::to_vec(&visible).unwrap().len() + serde_json::to_vec(&probe).unwrap().len();
+        let finish = |max_bytes: usize| -> Result<BoundedList<String>> {
+            let (mut limiter, probe_items, batch_size) =
+                mongo_budgeted_catalog_plan(ReadBudget::new(2, max_bytes)?)?;
+            assert_eq!((probe_items, batch_size), (3, 3));
+            let mut retained = Vec::new();
+            for item in ["alpha", "beta", "gamma"] {
+                limiter.retain_item(item.to_owned(), &mut retained)?;
+            }
+            limiter.finish(retained)
+        };
+
+        assert_eq!(finish(exact_bytes).unwrap(), visible);
+        assert!(matches!(
+            finish(exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
+
+        let complete = BoundedList::complete(vec!["alpha".to_owned(), "beta".to_owned()]);
+        let complete_bytes = serde_json::to_vec(&complete).unwrap().len();
+        let (mut limiter, _, _) =
+            mongo_budgeted_catalog_plan(ReadBudget::new(2, complete_bytes).unwrap()).unwrap();
+        let mut retained = Vec::new();
+        for item in ["alpha", "beta"] {
+            limiter.retain_item(item.to_owned(), &mut retained).unwrap();
+        }
+        assert_eq!(limiter.finish(retained).unwrap(), complete);
+    }
+
+    #[tokio::test]
+    async fn mongo_live_budgeted_collection_catalog_is_exact_and_cleans_up() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MONGO_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let collections = [
+            format!("dbt_budget_{suffix}_alpha"),
+            format!("dbt_budget_{suffix}_beta"),
+            format!("dbt_budget_{suffix}_gamma"),
+        ];
+        let connector = factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::DocumentListCollectionsBudgeted));
+        let store = connector.as_document().unwrap();
+
+        let exercise = async {
+            for (index, collection) in collections.iter().enumerate() {
+                let mut document = Document::new();
+                document.insert("_id".to_owned(), Value::Int(index as i64));
+                store.insert(collection, vec![document]).await?;
+            }
+
+            let all = store.list_collections().await?;
+            let total = all.len();
+            let expected = BoundedList::complete(all);
+            let complete_bytes = serde_json::to_vec(&expected)
+                .map_err(|error| Error::Serialization(error.to_string()))?
+                .len();
+            let exact = store
+                .list_collections_budgeted(ReadBudget::new(total, complete_bytes)?)
+                .await?;
+            let short = store
+                .list_collections_budgeted(ReadBudget::new(total, complete_bytes - 1)?)
+                .await;
+            let probed = store
+                .list_collections_budgeted(ReadBudget::new(
+                    total - 1,
+                    dbtool_core::model::DEFAULT_READ_BYTES,
+                )?)
+                .await?;
+            Ok::<_, Error>((exact, short, probed, total, complete_bytes))
+        }
+        .await;
+
+        for collection in &collections {
+            let _ = store.drop_collection(collection).await;
+        }
+        let remaining = store.list_collections().await.unwrap();
+        assert!(collections
+            .iter()
+            .all(|collection| !remaining.contains(collection)));
+
+        let (exact, short, probed, total, complete_bytes) = exercise.unwrap();
+        assert_eq!(exact.items.len(), total);
+        assert!(!exact.truncated);
+        assert!(matches!(
+            short,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == complete_bytes - 1
+        ));
+        assert_eq!(probed.items.len(), total - 1);
+        assert!(probed.truncated);
     }
 
     #[test]

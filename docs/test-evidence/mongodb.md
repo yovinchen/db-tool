@@ -31,6 +31,27 @@ cardinality, target/content/operation-bound bulk confirmation, target-bound
 collection drop, complete three-document fixture readback, and public
 export/import all passed.
 
+## IF-T74 collection scalar-byte envelope refresh
+
+Run at (UTC): 2026-07-16T03:19:08Z
+
+`DocumentStore.list_collections_budgeted` and the exact
+`document.list_collections_budgeted` operation are now implemented and advertised.
+The adapter validates `ReadBudget` before opening a cursor, requests MongoDB
+`listCollections` with `batchSize=N+1`, accounts every complete collection name
+before retention, and accounts the complete `BoundedList` envelope plus the
+truncation probe. Unit boundaries cover item N/N+1, exact byte N/N-1, zero and
+probe-overflow budgets.
+
+MongoDB 7 Docker validation created three isolated collections and passed the
+complete item/byte boundary plus N+1 truncation checks. All three collections
+were dropped and the test prefix was absent on final catalog read. The MongoDB
+driver necessarily decodes one `CollectionSpecification` before dbtool extracts
+and charges its name; `batchSize=N+1` bounds that protocol cursor batch.
+
+Verification: `cargo test -p adapter-mongo` 15/15 PASS; strict all-target Clippy,
+rustfmt and diff check PASS; Docker live exact catalog 1/1 PASS.
+
 Cleanup: PASS
 
 Lifecycle boundary: `DocumentStore.drop_collection` is now public. Connectors
