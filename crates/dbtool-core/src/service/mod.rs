@@ -10,7 +10,7 @@ pub use atomic_file::write_file_atomically;
 pub use formatter::{Format, Formatter};
 pub use limiter::{
     ListLimiter, MessageReadLimiter, MetadataLimiter, ReadLimiter, ResultLimiter,
-    TimeSeriesReadLimiter,
+    SearchReadLimiter, TimeSeriesReadLimiter,
 };
 pub use manager::ConnectionManager;
 pub use resolver::ConnectionResolver;

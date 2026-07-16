@@ -100,9 +100,11 @@ capability_operations! {
     SearchListIndices => "search.list_indices",
     SearchListIndicesBounded => "search.list_indices_bounded",
     SearchSearch => "search.search",
+    SearchSearchBudgeted => "search.search_budgeted",
     SearchIndexDocument => "search.index_doc",
     SearchPutDocument => "search.put_doc",
     SearchGetDocument => "search.get_doc",
+    SearchGetDocumentBudgeted => "search.get_doc_budgeted",
     SearchUpdateDocument => "search.update_doc",
     SearchDeleteDocument => "search.delete_doc",
     SearchDeleteIndex => "search.delete_index",
@@ -150,6 +152,8 @@ impl CapabilityOperation {
         Self::DocumentFindBudgeted,
         Self::DocumentAggregateBudgeted,
         Self::TimeSeriesQueryRangeBounded,
+        Self::SearchSearchBudgeted,
+        Self::SearchGetDocumentBudgeted,
     ];
     pub const DB2: &'static [Self] = &[
         Self::Db2ListSequences,
@@ -214,6 +218,11 @@ impl CapabilityOperation {
         Self::SearchDeleteDocument,
         Self::SearchDeleteIndex,
     ];
+    /// Complete search-result envelopes are optional backend-aware contracts.
+    /// The legacy search family and its unbounded methods never authorize
+    /// these exact operations.
+    pub const SEARCH_BUDGETED_READS: &'static [Self] =
+        &[Self::SearchSearchBudgeted, Self::SearchGetDocumentBudgeted];
     pub const MESSAGE_PRODUCER: &'static [Self] = &[Self::MessageProduce];
     pub const MESSAGE_CONSUMER: &'static [Self] = &[Self::MessageConsume];
     /// Stateful identity and acknowledgement operations are optional and must
@@ -647,6 +656,14 @@ mod tests {
                 CapabilityOperation::KeyValueRawCommandBounded,
                 "kv.raw_command_bounded",
             ),
+            (
+                CapabilityOperation::SearchSearchBudgeted,
+                "search.search_budgeted",
+            ),
+            (
+                CapabilityOperation::SearchGetDocumentBudgeted,
+                "search.get_doc_budgeted",
+            ),
         ] {
             assert_eq!(operation.as_str(), stable_name);
             assert_eq!(
@@ -674,9 +691,22 @@ mod tests {
             CapabilityOperation::TIME_SERIES_BUDGETED_READS,
             [CapabilityOperation::TimeSeriesQueryRangeBounded]
         );
+        assert_eq!(
+            CapabilityOperation::SEARCH_BUDGETED_READS,
+            [
+                CapabilityOperation::SearchSearchBudgeted,
+                CapabilityOperation::SearchGetDocumentBudgeted,
+            ]
+        );
         assert!(!CapabilityOperation::TIME_SERIES
             .contains(&CapabilityOperation::TimeSeriesQueryRangeBounded));
+        assert!(CapabilityOperation::SEARCH_BUDGETED_READS
+            .iter()
+            .all(|operation| !CapabilityOperation::SEARCH.contains(operation)));
         assert!(CapabilityOperation::TIME_SERIES_BUDGETED_READS
+            .iter()
+            .all(|operation| CapabilityOperation::BUDGETED_READS.contains(operation)));
+        assert!(CapabilityOperation::SEARCH_BUDGETED_READS
             .iter()
             .all(|operation| CapabilityOperation::BUDGETED_READS.contains(operation)));
         assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
@@ -834,6 +864,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::TIME_SERIES_BUDGETED_READS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::SEARCH_BUDGETED_READS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         for operation in [

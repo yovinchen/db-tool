@@ -1,11 +1,12 @@
 use crate::{
     model::{
         series::Series, BoundedList, ConsumeOptions, Message, MetadataBudget, ReadBudget,
-        ResultSet, SeriesSet, TimeSeriesReadBudget,
+        ResultSet, SearchDocument, SearchHits, SeriesSet, TimeSeriesReadBudget,
     },
     Error, Result,
 };
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use std::io::Write;
 
 fn checked_probe_limit(limit: usize, subject: &str) -> Result<usize> {
@@ -288,6 +289,100 @@ impl ReadLimiter {
             subject: self.subject.clone(),
             unit: "bytes",
             limit: self.budget.max_bytes,
+        }
+    }
+}
+
+/// Enforces a fail-closed item-and-byte envelope for search reads.
+///
+/// Search results have no portable truncation marker, so observing more than
+/// `budget.max_items` hits is an error rather than a partial success. Each hit
+/// is charged before retention. [`Self::finish`] then charges the complete
+/// [`SearchHits`] value so `_source`, aggregations, hit-container metadata, and
+/// backend-specific top-level fields all share the caller's byte budget.
+pub struct SearchReadLimiter {
+    hits: ReadLimiter,
+    subject: String,
+    max_items: usize,
+}
+
+impl SearchReadLimiter {
+    pub fn new(budget: ReadBudget, subject: impl Into<String>) -> Result<Self> {
+        let subject = subject.into();
+        Ok(Self {
+            hits: ReadLimiter::new(budget, subject.clone())?,
+            subject,
+            max_items: budget.max_items,
+        })
+    }
+
+    /// Return the maximum number of hits the backend may return.
+    ///
+    /// Unlike collection reads with a portable `truncated` field, search reads
+    /// must not request an N+1 probe because they cannot return that probe as a
+    /// successful partial result.
+    pub fn max_items(&self) -> usize {
+        self.max_items
+    }
+
+    /// Charge and retain one complete raw hit.
+    ///
+    /// An extra hit fails immediately with `READ_BUDGET_EXCEEDED`; the retained
+    /// prefix must never be returned as a successful search result.
+    pub fn retain_hit(&mut self, hit: JsonValue, retained: &mut Vec<JsonValue>) -> Result<()> {
+        if !self.hits.observe_item(&hit)? {
+            return Err(self.item_budget_error());
+        }
+        retained.push(hit);
+        Ok(())
+    }
+
+    /// Enforce the envelope on an already decoded portable search response.
+    ///
+    /// This convenience path is intended for adapters whose transport has
+    /// already bounded the HTTP body before JSON parsing. Any retained prefix
+    /// is dropped if a later hit or the final response envelope exceeds the
+    /// caller's budget.
+    pub fn apply(mut self, mut response: SearchHits) -> Result<SearchHits> {
+        let source_hits = std::mem::take(&mut response.hits);
+        let mut retained = Vec::with_capacity(source_hits.len().min(self.max_items));
+        for hit in source_hits {
+            self.retain_hit(hit, &mut retained)?;
+        }
+        response.hits = retained;
+        self.finish(response)
+    }
+
+    /// Validate the complete response after all retained hits were observed.
+    pub fn finish(self, mut response: SearchHits) -> Result<SearchHits> {
+        if self.hits.is_truncated() {
+            return Err(self.item_budget_error());
+        }
+        let retained = std::mem::take(&mut response.hits);
+        self.hits.finish_with(retained, |hits, truncated| {
+            debug_assert!(!truncated, "search reads fail instead of truncating hits");
+            response.hits = hits;
+            response
+        })
+    }
+
+    /// Validate one optional get-by-id response as a complete scalar.
+    ///
+    /// A present document consumes one item. A missing document consumes zero
+    /// items, while the serialized `None` envelope still consumes bytes.
+    pub fn finish_optional_document(
+        budget: ReadBudget,
+        subject: impl Into<String>,
+        document: Option<SearchDocument>,
+    ) -> Result<Option<SearchDocument>> {
+        ReadLimiter::new(budget, subject)?.finish_optional(document)
+    }
+
+    fn item_budget_error(&self) -> Error {
+        Error::ReadBudgetExceeded {
+            subject: self.subject.clone(),
+            unit: "items",
+            limit: self.max_items,
         }
     }
 }
@@ -1044,6 +1139,226 @@ mod tests {
                 limit,
                 ..
             }) if limit == required - 1
+        ));
+    }
+
+    fn complete_search_hits() -> SearchHits {
+        SearchHits {
+            total: 2,
+            total_relation: "eq".to_owned(),
+            hits: vec![
+                serde_json::json!({
+                    "_index": "users",
+                    "_id": "user-1",
+                    "_score": 1.0,
+                    "_source": {"name": "Alice", "roles": ["admin", "reader"]}
+                }),
+                serde_json::json!({
+                    "_index": "users",
+                    "_id": "user-2",
+                    "_score": 0.5,
+                    "_source": {"name": "Bob", "roles": ["reader"]}
+                }),
+            ],
+            took_ms: 7,
+            timed_out: false,
+            aggregations: Some(serde_json::json!({
+                "roles": {"buckets": [{"key": "reader", "doc_count": 2}]}
+            })),
+            hits_metadata: serde_json::Map::from_iter([(
+                "max_score".to_owned(),
+                serde_json::json!(1.0),
+            )]),
+            extra: serde_json::Map::from_iter([(
+                "_shards".to_owned(),
+                serde_json::json!({"total": 1, "successful": 1, "failed": 0}),
+            )]),
+        }
+    }
+
+    #[test]
+    fn search_limiter_fails_closed_instead_of_returning_a_hit_prefix() {
+        let mut response = complete_search_hits();
+        let source_hits = std::mem::take(&mut response.hits);
+        let mut limiter =
+            SearchReadLimiter::new(ReadBudget::new(1, 4096).unwrap(), "search response").unwrap();
+        assert_eq!(limiter.max_items(), 1);
+
+        let mut retained = Vec::new();
+        limiter
+            .retain_hit(source_hits[0].clone(), &mut retained)
+            .unwrap();
+        let error = limiter
+            .retain_hit(source_hits[1].clone(), &mut retained)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ReadBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            }
+        ));
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+        assert_eq!(retained, vec![source_hits[0].clone()]);
+
+        response.hits = retained;
+        assert!(matches!(
+            limiter.finish(response),
+            Err(Error::ReadBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            SearchReadLimiter::new(ReadBudget::new(1, 4096).unwrap(), "decoded search response",)
+                .unwrap()
+                .apply(complete_search_hits()),
+            Err(Error::ReadBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn search_limiter_charges_the_complete_hits_envelope_at_n_and_n_minus_one_bytes() {
+        let expected = complete_search_hits();
+        let required = serde_json::to_vec(&expected).unwrap().len();
+        let run = |max_bytes| {
+            SearchReadLimiter::new(ReadBudget::new(2, max_bytes)?, "search response")?
+                .apply(expected.clone())
+        };
+
+        assert_eq!(run(required).unwrap(), expected);
+        let error = run(required - 1).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == required - 1
+        ));
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+    }
+
+    #[test]
+    fn search_limiter_charges_an_aggregation_only_response() {
+        let response = SearchHits {
+            total: 0,
+            total_relation: "eq".to_owned(),
+            hits: Vec::new(),
+            took_ms: 3,
+            timed_out: false,
+            aggregations: Some(serde_json::json!({
+                "status": {
+                    "buckets": [
+                        {"key": "active", "doc_count": 17},
+                        {"key": "disabled", "doc_count": 2}
+                    ]
+                }
+            })),
+            hits_metadata: serde_json::Map::new(),
+            extra: serde_json::Map::new(),
+        };
+        let required = serde_json::to_vec(&response).unwrap().len();
+
+        assert_eq!(
+            SearchReadLimiter::new(
+                ReadBudget::new(1, required).unwrap(),
+                "aggregation-only search",
+            )
+            .unwrap()
+            .apply(response.clone())
+            .unwrap(),
+            response
+        );
+        assert!(matches!(
+            SearchReadLimiter::new(
+                ReadBudget::new(1, required - 1).unwrap(),
+                "aggregation-only search",
+            )
+            .unwrap()
+            .apply(response),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == required - 1
+        ));
+    }
+
+    #[test]
+    fn search_limiter_charges_present_and_absent_get_documents_completely() {
+        let document = SearchDocument {
+            index: "users".to_owned(),
+            id: "user-1".to_owned(),
+            found: true,
+            version: Some(4),
+            seq_no: Some(9),
+            primary_term: Some(2),
+            source: Some(serde_json::json!({
+                "name": "Alice",
+                "profile": {"bio": "complete source", "tags": ["one", "two"]}
+            })),
+            extra: serde_json::Map::from_iter([(
+                "_routing".to_owned(),
+                serde_json::json!("tenant-a"),
+            )]),
+        };
+        let present_bytes = serde_json::to_vec(&Some(document.clone())).unwrap().len();
+
+        assert_eq!(
+            SearchReadLimiter::finish_optional_document(
+                ReadBudget::new(1, present_bytes).unwrap(),
+                "search get document",
+                Some(document.clone()),
+            )
+            .unwrap(),
+            Some(document.clone())
+        );
+        let error = SearchReadLimiter::finish_optional_document(
+            ReadBudget::new(1, present_bytes - 1).unwrap(),
+            "search get document",
+            Some(document),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == present_bytes - 1
+        ));
+        assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+
+        let absent_bytes = serde_json::to_vec(&Option::<SearchDocument>::None)
+            .unwrap()
+            .len();
+        assert_eq!(
+            SearchReadLimiter::finish_optional_document(
+                ReadBudget::new(1, absent_bytes).unwrap(),
+                "search get miss",
+                None,
+            )
+            .unwrap(),
+            None
+        );
+        assert!(matches!(
+            SearchReadLimiter::finish_optional_document(
+                ReadBudget::new(1, absent_bytes - 1).unwrap(),
+                "search get miss",
+                None,
+            ),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == absent_bytes - 1
         ));
     }
 

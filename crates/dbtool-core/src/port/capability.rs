@@ -490,12 +490,51 @@ pub trait SearchEngine: Connector {
     }
     async fn search(&self, index: &str, query: Value, options: SearchOptions)
         -> Result<SearchHits>;
+    /// Search within a caller-owned hit-count and serialized-byte envelope.
+    ///
+    /// `budget.max_items` limits the number of returned hits. Implementations
+    /// must account every complete hit before retaining it and then validate
+    /// the complete [`SearchHits`] response, including aggregations, hit
+    /// metadata, and backend-specific extra fields. Exceeding either limit
+    /// fails without returning a partial response. This optional contract must
+    /// be advertised as `search.search_budgeted`; neither the legacy
+    /// `search=true` family nor [`Self::search`] authorizes it.
+    async fn search_budgeted(
+        &self,
+        _index: &str,
+        _query: Value,
+        _options: SearchOptions,
+        _budget: ReadBudget,
+    ) -> Result<SearchHits> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SearchEngine.search_budgeted",
+        })
+    }
     /// Create a document using a backend-generated identifier.
     async fn index_doc(&self, index: &str, doc: Value) -> Result<SearchWriteOutcome>;
     /// Create or replace a document using a caller-controlled stable identifier.
     async fn put_doc(&self, index: &str, id: &str, doc: Value) -> Result<SearchWriteOutcome>;
     /// Get one document by stable identifier. A backend HTTP 404 maps to `None`.
     async fn get_doc(&self, index: &str, id: &str) -> Result<Option<SearchDocument>>;
+    /// Get one document within a caller-owned serialized-byte envelope.
+    ///
+    /// A present document consumes one item and is charged in full, including
+    /// `_source` and backend-specific extra fields. A missing document consumes
+    /// no item but the complete serialized `None` response is still charged.
+    /// This optional contract must be advertised as
+    /// `search.get_doc_budgeted`; legacy search capabilities never imply it.
+    async fn get_doc_budgeted(
+        &self,
+        _index: &str,
+        _id: &str,
+        _budget: ReadBudget,
+    ) -> Result<Option<SearchDocument>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "SearchEngine.get_doc_budgeted",
+        })
+    }
     /// Partially update one document by stable identifier.
     async fn update_doc(&self, index: &str, id: &str, patch: Value) -> Result<SearchWriteOutcome>;
     /// Delete one document by stable identifier.
@@ -1017,6 +1056,21 @@ mod tests {
             .await,
             "TimeSeriesStore.query_range_bounded",
         );
+        assert_unsupported(
+            SearchEngine::search_budgeted(
+                &connector,
+                "users",
+                Value::Null,
+                SearchOptions::default(),
+                read_budget,
+            )
+            .await,
+            "SearchEngine.search_budgeted",
+        );
+        assert_unsupported(
+            SearchEngine::get_doc_budgeted(&connector, "users", "user-1", read_budget).await,
+            "SearchEngine.get_doc_budgeted",
+        );
 
         assert_unsupported(
             SqlEngine::list_schemas_bounded(&connector, 10).await,
@@ -1098,6 +1152,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::SEARCH_BUDGETED_READS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::KEY_VALUE_EXISTENCE
