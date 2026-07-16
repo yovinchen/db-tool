@@ -552,6 +552,10 @@ dbtool --dsn "$PROMETHEUS_DSN" ts query 'rate(http_requests_total[5m])' \
 # 精确闭区间；单位为 Unix epoch 毫秒，两个端点必须同时提供
 dbtool --dsn "$PROMETHEUS_DSN" ts query 'up' \
   --start-ms 1710000000000 --end-ms 1710000060000
+
+# 三维读取预算：最多 20 个 series、5000 个累计 sample、8 MiB 完整响应
+dbtool --dsn "$PROMETHEUS_DSN" --limit 5000 --max-bytes 8388608 \
+  ts query 'up' --last-minutes 30 --max-series 20
 ```
 
 规范如下：
@@ -559,13 +563,18 @@ dbtool --dsn "$PROMETHEUS_DSN" ts query 'up' \
 - `--last-minutes` 必须大于零，且不能与显式端点混用；
 - `--start-ms` 与 `--end-ms` 必须成对出现，`start <= end`；
 - 全局 `--limit` 对所有 series 的样本总数生效，不是每个 series 各用一次；
-- TS 查询的样本预算为 `1..=1,000,000`，零值、超上限和时间运算溢出在连接前返回
-  `CONFIG_ERROR`；
+- `--max-series` 独立限制 series 数；未写时沿用全局 `--limit`，不会隐式放大查询；
+- 全局 `--max-bytes` 覆盖返回 `SeriesSet` 的 series name、columns、label/sample JSON、完整外层结构及唯一 N+1 probe；超限返回
+  `READ_BUDGET_EXCEEDED`，不返回一份字节不完整的响应；
+- TS 查询的 series/sample 预算均为 `1..=1,000,000`，字节预算还受 core 全局硬上限约束；零值、超上限和时间运算溢出在解析 DSN/建立连接前返回 `CONFIG_ERROR`；
+- CLI/TUI 只调用 `time_series.query_range_bounded`；仅声明粗粒度 `time_series=true` 或旧 `query_range` 的第三方 adapter 会得到
+  `UNSUPPORTED_CAPABILITY`，不回退到无界读取；
+- Prometheus HTTP response 另有独立 16 MiB transport ceiling；该上限在 JSON 解析前防止无界 body，caller `--max-bytes` 则在 portable 结构级精确计费，两者不互相伪装；
 - 成功响应保持 `data.series`、`data.truncated` 与 `meta.truncated`，显式范围不会改变
   JSON 契约。
 
 CLI mock 服务测试会核对发给 Prometheus 的秒级 `start/end`；Prometheus 2.55.1 Docker
-实测会写入两个带标签和精确时间戳的样本，再用相对窗口和显式 epoch-ms 窗口逐值读回。
+实测会写入两个带标签和精确时间戳的样本，再用相对窗口和显式 epoch-ms 窗口逐值读回；另外分别验证 series 截断、sample 截断和小字节预算失败。当前 registry 的公共 `TimeSeriesStore` 实现只有 Prometheus；TimescaleDB 走 SQL 协议，InfluxDB/VictoriaMetrics/QuestDB 尚未注册，因此不将它们写成本接口的实测 PASS。Prometheus 不提供通用 series delete API；测试以唯一 metric namespace 和一次性 Docker volume/retention 完成隔离与清理。
 
 ## Messaging / Kafka 字段范式
 

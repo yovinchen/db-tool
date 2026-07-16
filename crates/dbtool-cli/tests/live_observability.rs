@@ -593,6 +593,11 @@ fn prometheus_live_measurements_and_query() {
     let caps = stdout_json(dbtool(&["--dsn", &dsn, "caps"]));
     assert_eq!(caps["kind"], "prometheus");
     assert_eq!(caps["data"]["time_series"], true);
+    assert!(caps["data"]["operations"]
+        .as_array()
+        .is_some_and(|operations| operations
+            .iter()
+            .any(|operation| operation == "time_series.query_range_bounded")));
 
     let blocked = stderr_json(dbtool(&[
         "--dsn",
@@ -747,6 +752,41 @@ fn prometheus_live_measurements_and_query() {
     assert_eq!(limited["data"]["truncated"], true);
     assert_eq!(limited["meta"]["truncated"], true);
     assert_prometheus_samples(&limited, &metric, first_timestamp, second_timestamp, true);
+
+    let series_limited = stdout_json_retry(
+        &[
+            "--dsn",
+            &dsn,
+            "--limit",
+            "100",
+            "ts",
+            "query",
+            &metric,
+            "--last-minutes",
+            "1",
+            "--max-series",
+            "1",
+        ],
+        |value| value["data"]["truncated"] == true,
+    );
+    assert_eq!(
+        series_limited["data"]["series"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(series_limited["meta"]["truncated"], true);
+
+    let byte_limited = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--max-bytes",
+        "1",
+        "ts",
+        "query",
+        &metric,
+        "--last-minutes",
+        "1",
+    ]));
+    assert_eq!(byte_limited["error"]["code"], "READ_BUDGET_EXCEEDED");
 
     // TimeSeriesStore intentionally exposes no public delete operation. The
     // unique metric and disposable Prometheus volume bound test data cleanup.

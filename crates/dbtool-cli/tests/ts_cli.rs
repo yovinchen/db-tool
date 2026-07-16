@@ -103,9 +103,11 @@ fn query_help_documents_range_modes_units_and_sample_budget() {
     assert!(help.contains("--last-minutes <MINUTES>"));
     assert!(help.contains("--start-ms <EPOCH_MILLIS>"));
     assert!(help.contains("--end-ms <EPOCH_MILLIS>"));
+    assert!(help.contains("--max-series <COUNT>"));
     assert!(help.contains("Unix epoch milliseconds"));
     assert!(help.contains("60 minutes by default"));
-    assert!(help.contains("1 and 1,000,000 samples"));
+    assert!(help.contains("1 and 1,000,000 cumulative samples"));
+    assert!(help.contains("complete portable response"));
 }
 
 #[test]
@@ -216,5 +218,29 @@ fn invalid_range_and_limit_values_fail_before_connecting() {
             "up",
         ],
         "must not exceed 1000000",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "ts",
+            "query",
+            "up",
+            "--max-series",
+            "0",
+        ],
+        "--max-series must be greater than zero",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "--max-bytes",
+            "0",
+            "ts",
+            "query",
+            "up",
+        ],
+        "global --max-bytes must be greater than zero",
     );
 }

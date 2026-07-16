@@ -24,8 +24,13 @@ without that flag could not substantiate remote-write support. Query limiting
 uses one sample budget across all returned series rather than once per series.
 The CLI accepts either `--last-minutes` (default 60) or both `--start-ms` and
 `--end-ms`; mixing modes, omitting one endpoint, reversing bounds, zero limits,
-and limits above 1,000,000 are rejected before a backend connection.
+and limits above 1,000,000 are rejected before a backend connection. IF-T73
+also requires exact `time_series.query_range_bounded` negotiation. `--max-series`,
+global `--limit` (cumulative samples), and global `--max-bytes` independently
+bound the complete portable result; Docker CLI revalidation passed a one-series
+truncation and a one-byte `READ_BUDGET_EXCEEDED` failure without weakening the
+independent 16 MiB HTTP transport ceiling.
 
 Cleanup: PASS by disposable Docker teardown; public series deletion is N/A
 
-Commits: `7a6bbdd`, `932655d`, `b9dd9fd`, IF-T48 TS current campaign
+Commits: `7a6bbdd`, `932655d`, `b9dd9fd`, `167f89f`, `73b8180`, IF-T73 caller/docs commit

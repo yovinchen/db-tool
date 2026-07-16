@@ -2,7 +2,7 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::{Point, SeriesSet, TimeRange},
+    model::{Point, TimeRange, TimeSeriesReadBudget},
     port::CapabilityOperation,
     service::ListLimiter,
     Result,
@@ -10,6 +10,7 @@ use dbtool_core::{
 use std::collections::HashMap;
 
 const DEFAULT_LAST_MINUTES: i64 = 60;
+const MAX_QUERY_SERIES: usize = 1_000_000;
 const MAX_QUERY_SAMPLES: usize = 1_000_000;
 
 #[derive(Args)]
@@ -28,7 +29,7 @@ pub enum TsAction {
     Measurements,
     /// Run a bounded range query.
     #[command(
-        long_about = "Run a PromQL range query. Select either a relative window with --last-minutes (60 minutes by default) or an inclusive explicit range with both --start-ms and --end-ms in Unix epoch milliseconds. Explicit bounds cannot be combined with --last-minutes. The global --limit must be between 1 and 1,000,000 samples and is applied across all returned series."
+        long_about = "Run a PromQL range query. Select either a relative window with --last-minutes (60 minutes by default) or an inclusive explicit range with both --start-ms and --end-ms in Unix epoch milliseconds. Explicit bounds cannot be combined with --last-minutes. The global --limit must be between 1 and 1,000,000 cumulative samples. --max-series independently bounds returned series and defaults to the global limit. The global --max-bytes bounds the complete portable response."
     )]
     Query {
         /// PromQL expression to evaluate over the requested range.
@@ -42,6 +43,9 @@ pub enum TsAction {
         /// Inclusive range end as Unix epoch milliseconds; requires --start-ms.
         #[arg(long, value_name = "EPOCH_MILLIS")]
         end_ms: Option<i64>,
+        /// Maximum returned series; defaults to the global sample limit.
+        #[arg(long, value_name = "COUNT")]
+        max_series: Option<usize>,
     },
     /// Write one sample through Prometheus remote write.
     Write {
@@ -65,15 +69,23 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
     if matches!(cmd.action, TsAction::Write { .. }) {
         ensure_write_allowed(ctx)?;
     }
-    let query_range = match &cmd.action {
+    let query_request = match &cmd.action {
         TsAction::Query {
             last_minutes,
             start_ms,
             end_ms,
+            max_series,
             ..
         } => {
-            validate_query_limit(ctx.limit)?;
-            Some(resolve_query_range(*last_minutes, *start_ms, *end_ms)?)
+            let budget = time_series_query_budget(
+                ctx.limit,
+                max_series.unwrap_or(ctx.limit),
+                ctx.max_bytes,
+            )?;
+            Some((
+                resolve_query_range(*last_minutes, *start_ms, *end_ms)?,
+                budget,
+            ))
         }
         TsAction::Measurements => {
             ListLimiter::new(ctx.limit).probe_items()?;
@@ -112,11 +124,12 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
             last_minutes: _,
             start_ms: _,
             end_ms: _,
+            max_series: _,
         } => {
-            let range = query_range.ok_or_else(|| {
-                Error::Internal("validated time-series query range is missing".into())
+            let (range, budget) = query_request.ok_or_else(|| {
+                Error::Internal("validated time-series query request is missing".into())
             })?;
-            let result = limit_series_set(ts.query_range(&query, range).await?, ctx.limit);
+            let result = ts.query_range_bounded(&query, range, budget).await?;
             let truncated = result.truncated;
             ctx.render_success(&kind, result, start.elapsed().as_millis() as u64, truncated)
         }
@@ -151,8 +164,8 @@ fn time_series_operation_for_action(action: &TsAction) -> (CapabilityOperation, 
             "TimeSeriesStore.list_measurements_bounded",
         ),
         TsAction::Query { .. } => (
-            CapabilityOperation::TimeSeriesQueryRange,
-            "TimeSeriesStore.query_range",
+            CapabilityOperation::TimeSeriesQueryRangeBounded,
+            "TimeSeriesStore.query_range_bounded",
         ),
         TsAction::Write { .. } => (
             CapabilityOperation::TimeSeriesWritePoints,
@@ -210,6 +223,25 @@ fn validate_query_limit(limit: usize) -> Result<()> {
     Ok(())
 }
 
+fn time_series_query_budget(
+    max_samples: usize,
+    max_series: usize,
+    max_bytes: usize,
+) -> Result<TimeSeriesReadBudget> {
+    validate_query_limit(max_samples)?;
+    if max_series == 0 {
+        return Err(Error::Config(
+            "time-series query --max-series must be greater than zero".into(),
+        ));
+    }
+    if max_series > MAX_QUERY_SERIES {
+        return Err(Error::Config(format!(
+            "time-series query --max-series must not exceed {MAX_QUERY_SERIES} series"
+        )));
+    }
+    TimeSeriesReadBudget::new(max_series, max_samples, max_bytes)
+}
+
 fn resolve_query_range(
     last_minutes: Option<i64>,
     start_ms: Option<i64>,
@@ -247,37 +279,6 @@ fn resolve_query_range(
     }
 }
 
-/// Apply the CLI row budget across all samples in all returned series.
-///
-/// Prometheus range queries return one row vector per series, so limiting every
-/// series independently would allow high-cardinality queries to multiply the
-/// configured limit. Empty trailing series are removed only when truncation is
-/// required, keeping the returned shape bounded along with the sample count.
-fn limit_series_set(mut result: SeriesSet, limit: usize) -> SeriesSet {
-    let total_samples = result.series.iter().fold(0usize, |total, series| {
-        total.saturating_add(series.values.len())
-    });
-
-    if total_samples <= limit {
-        return result;
-    }
-
-    let mut remaining = limit;
-    for series in &mut result.series {
-        if remaining == 0 {
-            series.values.clear();
-            continue;
-        }
-        if series.values.len() > remaining {
-            series.values.truncate(remaining);
-        }
-        remaining -= series.values.len();
-    }
-    result.series.retain(|series| !series.values.is_empty());
-    result.truncated = true;
-    result
-}
-
 fn parse_tags(tags: &[String]) -> Result<HashMap<String, String>> {
     let mut parsed = HashMap::new();
     for tag in tags {
@@ -302,9 +303,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbtool_core::model::series::Series;
     use dbtool_core::service::formatter::Format;
-    use serde_json::json;
 
     fn test_context(allow_write: bool) -> Context {
         Context {
@@ -330,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn coarse_time_series_capability_does_not_authorize_bounded_measurement_listing() {
+    fn coarse_time_series_capability_does_not_authorize_bounded_reads() {
         assert!(matches!(
             require_time_series_operation(
                 CapabilityOperation::TIME_SERIES,
@@ -342,6 +341,32 @@ mod tests {
                 if kind == "legacy-time-series"
                     && needed == "TimeSeriesStore.list_measurements_bounded"
         ));
+        assert!(matches!(
+            require_time_series_operation(
+                CapabilityOperation::TIME_SERIES,
+                CapabilityOperation::TimeSeriesQueryRangeBounded,
+                "legacy-time-series",
+                "TimeSeriesStore.query_range_bounded",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-time-series"
+                    && needed == "TimeSeriesStore.query_range_bounded"
+        ));
+
+        let query = TsAction::Query {
+            query: "up".to_owned(),
+            last_minutes: None,
+            start_ms: None,
+            end_ms: None,
+            max_series: Some(3),
+        };
+        assert_eq!(
+            time_series_operation_for_action(&query),
+            (
+                CapabilityOperation::TimeSeriesQueryRangeBounded,
+                "TimeSeriesStore.query_range_bounded"
+            )
+        );
     }
 
     #[tokio::test]
@@ -438,54 +463,18 @@ mod tests {
             validate_query_limit(MAX_QUERY_SAMPLES + 1),
             Err(Error::Config(message)) if message.contains("must not exceed")
         ));
-    }
 
-    #[test]
-    fn limits_samples_across_all_series_and_marks_truncation() {
-        let result = SeriesSet {
-            series: vec![series("first", &[1, 2]), series("second", &[3, 4])],
-            truncated: false,
-        };
-
-        let limited = limit_series_set(result, 3);
-
-        assert_eq!(limited.series.len(), 2);
-        assert_eq!(limited.series[0].values.len(), 2);
-        assert_eq!(limited.series[1].values, vec![vec![json!(3)]]);
-        assert!(limited.truncated);
-    }
-
-    #[test]
-    fn preserves_backend_truncation_without_over_limit() {
-        let result = SeriesSet {
-            series: vec![series("only", &[1, 2])],
-            truncated: true,
-        };
-
-        let limited = limit_series_set(result, 2);
-
-        assert_eq!(limited.series[0].values.len(), 2);
-        assert!(limited.truncated);
-    }
-
-    #[test]
-    fn zero_limit_returns_no_samples_and_marks_truncation() {
-        let result = SeriesSet {
-            series: vec![series("only", &[1])],
-            truncated: false,
-        };
-
-        let limited = limit_series_set(result, 0);
-
-        assert!(limited.series.is_empty());
-        assert!(limited.truncated);
-    }
-
-    fn series(name: &str, values: &[i64]) -> Series {
-        Series {
-            name: name.to_owned(),
-            columns: vec!["value".to_owned()],
-            values: values.iter().map(|value| vec![json!(value)]).collect(),
-        }
+        let budget = time_series_query_budget(5, 2, 4096).unwrap();
+        assert_eq!(budget.max_samples, 5);
+        assert_eq!(budget.max_series, 2);
+        assert_eq!(budget.max_bytes, 4096);
+        assert!(matches!(
+            time_series_query_budget(1, 0, 4096),
+            Err(Error::Config(message)) if message.contains("--max-series")
+        ));
+        assert!(matches!(
+            time_series_query_budget(1, MAX_QUERY_SERIES + 1, 4096),
+            Err(Error::Config(message)) if message.contains("must not exceed")
+        ));
     }
 }

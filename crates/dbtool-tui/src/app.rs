@@ -8,7 +8,10 @@ use dbtool_core::{
     config::{env::discover_env_connections, ConnectionConfig},
     dsn::Dsn,
     error::Error,
-    model::{BoundedList, FindOptions, MetadataBudget, Point, ReadBudget, TimeRange, Value},
+    model::{
+        BoundedList, FindOptions, MetadataBudget, Point, ReadBudget, TimeRange,
+        TimeSeriesReadBudget, Value,
+    },
     port::{CapabilityOperation, CapabilityReport},
     registry::Registry,
     service::{
@@ -633,8 +636,8 @@ async fn run_ts_command(
         )
     } else {
         (
-            CapabilityOperation::TimeSeriesQueryRange,
-            "TimeSeriesStore.query_range",
+            CapabilityOperation::TimeSeriesQueryRangeBounded,
+            "TimeSeriesStore.query_range_bounded",
         )
     };
     require_operation(connector, operation, needed)?;
@@ -654,8 +657,12 @@ async fn run_ts_command(
         .map(str::trim)
         .ok_or_else(|| Error::Config("ts command must be measurements, query <expr>, or write <measurement> <value> [field=<name>] [tag=value...]".into()))?;
     render_json(
-        ts.query_range(query, TimeRange::last_n_minutes(60)?)
-            .await?,
+        ts.query_range_bounded(
+            query,
+            TimeRange::last_n_minutes(60)?,
+            TimeSeriesReadBudget::with_default_bytes(limit, limit)?,
+        )
+        .await?,
     )
 }
 
@@ -710,6 +717,9 @@ fn validate_bounded_catalog_limit(command: &str, limit: usize) -> Result<()> {
     }
     if matches!(parts.as_slice(), ["schema", _]) {
         MetadataBudget::with_default_bytes(limit)?;
+    }
+    if matches!(parts.as_slice(), ["ts", "query", ..]) {
+        TimeSeriesReadBudget::with_default_bytes(limit, limit)?;
     }
     let is_sql_read = parts.first() == Some(&"sql") && parts.get(1) != Some(&"exec");
     if is_sql_read
@@ -1176,6 +1186,12 @@ readonli = true
                 CapabilityOperation::TimeSeriesListMeasurementsBounded,
                 "legacy-time-series",
                 "TimeSeriesStore.list_measurements_bounded",
+            ),
+            (
+                CapabilityOperation::TIME_SERIES,
+                CapabilityOperation::TimeSeriesQueryRangeBounded,
+                "legacy-time-series",
+                "TimeSeriesStore.query_range_bounded",
             ),
         ] {
             assert!(matches!(
