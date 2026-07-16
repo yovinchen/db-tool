@@ -15,8 +15,8 @@ pub use bounded::{
 };
 pub use document::{Document, FindOptions, InsertOutcome, UpdateOutcome};
 pub use input::{
-    InputBudget, DEFAULT_INPUT_BATCH_BYTES, DEFAULT_INPUT_ITEMS, DEFAULT_INPUT_ITEM_BYTES,
-    MAX_INPUT_BYTES, MAX_INPUT_ITEMS,
+    InputBudget, SqlExecuteInput, DEFAULT_INPUT_BATCH_BYTES, DEFAULT_INPUT_ITEMS,
+    DEFAULT_INPUT_ITEM_BYTES, MAX_INPUT_BYTES, MAX_INPUT_ITEMS,
 };
 pub use kv::{KeyExpiry, KeyValueRestoreOutcome, KeyValueSnapshot};
 pub use message::{

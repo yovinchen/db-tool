@@ -9,8 +9,8 @@ use dbtool_core::{
     dsn::Dsn,
     error::Error,
     model::{
-        BoundedList, FindOptions, InputBudget, MetadataBudget, Point, ReadBudget, TimeRange,
-        TimeSeriesReadBudget, Value,
+        BoundedList, FindOptions, InputBudget, MetadataBudget, Point, ReadBudget, SqlExecuteInput,
+        TimeRange, TimeSeriesReadBudget, Value,
     },
     port::{capability::SetOptions, CapabilityOperation, CapabilityReport},
     registry::Registry,
@@ -82,12 +82,6 @@ enum PreparedMutation {
     TimeSeriesWritePoints {
         points: Vec<Point>,
     },
-}
-
-#[derive(serde::Serialize)]
-struct SqlExecuteInput<'a> {
-    sql: &'a str,
-    params: &'a [Value],
 }
 
 impl App {
@@ -344,11 +338,7 @@ fn prepare_tui_mutation(
 fn prepare_sql_execute(sql: &str) -> Result<PreparedMutation> {
     let params: &[Value] = &[];
     let limiter = InputLimiter::new(InputBudget::default(), "TUI SQL execute input")?;
-    // SQLx adapters use a named request object, while SQL Server, Db2, and
-    // Cassandra use a compact tuple envelope. Validate both before opening a
-    // connection so the shared TUI budget is sufficient for every SQL backend.
     limiter.validate_request(&SqlExecuteInput { sql, params })?;
-    limiter.validate_request(&("sql", sql, "params", params))?;
     Ok(PreparedMutation::SqlExecute {
         sql: sql.to_owned(),
     })

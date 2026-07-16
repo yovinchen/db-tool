@@ -10,8 +10,8 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         BoundedList, ColumnMeta, ExecOutcome, IndexInfo, InputBudget, MetadataBudget, ReadBudget,
-        ResultSet, TableInfo, TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
-        MAX_INPUT_BYTES,
+        ResultSet, SqlExecuteInput, TableInfo, TableKind, TableSchema, Value,
+        DEFAULT_METADATA_BYTES, MAX_INPUT_BYTES,
     },
     port::{
         capability::{CqlEngine, SqlEngine},
@@ -1216,7 +1216,7 @@ fn preflight_cql_execute(cql: &str, budget: InputBudget) -> Result<()> {
 }
 
 fn preflight_cassandra_sql_execute(sql: &str, params: &[Value], budget: InputBudget) -> Result<()> {
-    let request = ("cql", sql, "params", params);
+    let request = SqlExecuteInput { sql, params };
     let limiter = InputLimiter::new(budget, "Cassandra SQL-compatible execute input")?;
     if params.is_empty() {
         limiter.validate_request(&request)?;

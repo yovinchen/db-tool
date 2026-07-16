@@ -3,8 +3,9 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         BoundedList, ColumnMeta, ExecOutcome, ForeignKeyInfo, IndexInfo, InputBudget,
-        MetadataBudget, ReadBudget, ResultSet, RoutineInfo, RoutineKind, SequenceInfo, TableInfo,
-        TableKind, TableSchema, TablespaceInfo, Value, DEFAULT_METADATA_BYTES,
+        MetadataBudget, ReadBudget, ResultSet, RoutineInfo, RoutineKind, SequenceInfo,
+        SqlExecuteInput, TableInfo, TableKind, TableSchema, TablespaceInfo, Value,
+        DEFAULT_METADATA_BYTES,
     },
     port::{
         capability::{Db2Engine, SqlEngine},
@@ -2282,7 +2283,7 @@ fn reject_params(params: &[Value]) -> Result<()> {
 }
 
 fn preflight_db2_execute(sql: &str, params: &[Value], budget: InputBudget) -> Result<()> {
-    let request = ("sql", sql, "params", params);
+    let request = SqlExecuteInput { sql, params };
     let limiter = InputLimiter::new(budget, "Db2 execute input")?;
     if params.is_empty() {
         limiter.validate_request(&request)?;

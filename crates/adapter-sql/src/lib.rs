@@ -11,7 +11,10 @@ pub use sqlite::sqlite_factory;
 use chrono::{DateTime, Utc};
 use dbtool_core::{
     error::{Error, Result},
-    model::{ColumnMeta, IndexInfo, InputBudget, ReadBudget, ResultSet, Value, MAX_INPUT_BYTES},
+    model::{
+        ColumnMeta, IndexInfo, InputBudget, ReadBudget, ResultSet, SqlExecuteInput, Value,
+        MAX_INPUT_BYTES,
+    },
     service::limiter::{InputLimiter, ListLimiter, MetadataLimiter, ReadLimiter},
 };
 use serde::Serialize;
@@ -29,12 +32,6 @@ pub(crate) struct SqlMutationLimits {
     pub(crate) max_statement_bytes: usize,
     pub(crate) max_parameters: usize,
     pub(crate) max_identifier_bytes: usize,
-}
-
-#[derive(Serialize)]
-struct SqlExecuteInput<'a> {
-    sql: &'a str,
-    params: &'a [Value],
 }
 
 #[derive(Serialize)]

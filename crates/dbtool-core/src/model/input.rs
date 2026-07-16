@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{model::Value, Error, Result};
 
 /// Absolute number of items accepted by one portable mutation request.
 pub const MAX_INPUT_ITEMS: usize = 100_000;
@@ -16,6 +16,18 @@ pub const DEFAULT_INPUT_ITEM_BYTES: usize = 8 * 1024 * 1024;
 
 /// Finite default byte ceiling for one complete mutation request or batch.
 pub const DEFAULT_INPUT_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// Canonical portable input envelope for one SQL execute request.
+///
+/// Every first-party SQL adapter and caller serializes this same structure
+/// before connection or dispatch. Keeping the field names and shape in core
+/// prevents byte-boundary drift between SQLx, SQL Server, Db2, Cassandra's SQL
+/// compatibility surface, CLI, TUI, and embedded integrations.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SqlExecuteInput<'a> {
+    pub sql: &'a str,
+    pub params: &'a [Value],
+}
 
 /// Caller-owned item-and-byte envelope for a portable mutation input.
 ///

@@ -3,8 +3,8 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         BoundedList, ColumnMeta, ExecOutcome, IndexInfo, InputBudget, MetadataBudget, ReadBudget,
-        ResultSet, TableInfo, TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
-        MAX_INPUT_BYTES,
+        ResultSet, SqlExecuteInput, TableInfo, TableKind, TableSchema, Value,
+        DEFAULT_METADATA_BYTES, MAX_INPUT_BYTES,
     },
     port::{
         capability::SqlEngine,
@@ -870,7 +870,7 @@ fn reject_dynamic_params(params: &[Value]) -> Result<()> {
 }
 
 fn preflight_sqlserver_execute(sql: &str, params: &[Value], budget: InputBudget) -> Result<()> {
-    let request = ("sql", sql, "params", params);
+    let request = SqlExecuteInput { sql, params };
     let limiter = InputLimiter::new(budget, "SQL Server execute input")?;
     if params.is_empty() {
         limiter.validate_request(&request)?;

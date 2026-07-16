@@ -2,9 +2,12 @@ use std::{sync::Arc, time::Duration};
 
 use dbtool_core::{
     error::Error,
-    model::{ReadBudget, Value},
+    model::{InputBudget, ReadBudget, SqlExecuteInput, Value},
     port::CapabilityOperation,
-    service::{safety::StatementKind, ConnectionManager, FlowControl, SafetyGuard, ThrottleConfig},
+    service::{
+        safety::StatementKind, ConnectionManager, FlowControl, InputLimiter, SafetyGuard,
+        ThrottleConfig,
+    },
 };
 use dbtool_registry::build_registry;
 
@@ -12,6 +15,13 @@ use dbtool_registry::build_registry;
 async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior() {
     let registry = Arc::new(build_registry());
     let manager = ConnectionManager::new(Arc::clone(&registry));
+    let input_budget = InputBudget::default();
+    let params: &[Value] = &[];
+    let create_sql = "create table embedded_values (id integer primary key, note text not null)";
+    let insert_sql = "insert into embedded_values (id, note) values (1, 'library path')";
+
+    preflight_sql_execute(create_sql, params, input_budget).unwrap();
+    preflight_sql_execute(insert_sql, params, input_budget).unwrap();
 
     let conn = manager.get_or_connect("sqlite::memory:").await.unwrap();
     let conn_again = manager.get_or_connect("sqlite::memory:").await.unwrap();
@@ -19,7 +29,7 @@ async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior()
     assert!(conn.capabilities().sql);
     let operations = conn.operations();
     for operation in [
-        CapabilityOperation::SqlExecute,
+        CapabilityOperation::SqlExecuteBudgeted,
         CapabilityOperation::SqlQueryBudgeted,
     ] {
         assert!(
@@ -38,7 +48,6 @@ async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior()
     ));
 
     let target = "embedded:sqlite::memory:";
-    let create_sql = "create table embedded_values (id integer primary key, note text not null)";
     let confirm = match SafetyGuard::check_with_target(create_sql, target, true, None) {
         Err(Error::ConfirmRequired {
             confirm_token,
@@ -56,23 +65,17 @@ async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior()
     );
 
     let sql = conn.as_sql().expect("sqlite connector should expose SQL");
-    sql.execute(create_sql, &[]).await.unwrap();
+    sql.execute_budgeted(create_sql, params, input_budget)
+        .await
+        .unwrap();
 
     assert_eq!(
-        SafetyGuard::check(
-            "insert into embedded_values (id, note) values (1, 'ok')",
-            true,
-            None
-        )
-        .unwrap(),
+        SafetyGuard::check(insert_sql, true, None).unwrap(),
         StatementKind::Write
     );
-    sql.execute(
-        "insert into embedded_values (id, note) values (1, 'library path')",
-        &[],
-    )
-    .await
-    .unwrap();
+    sql.execute_budgeted(insert_sql, params, input_budget)
+        .await
+        .unwrap();
 
     let flow = FlowControl::new(ThrottleConfig {
         max_concurrency: 1,
@@ -95,4 +98,20 @@ async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior()
     assert!(!rows.truncated);
     assert_eq!(rows.rows[0][0], Value::Int(1));
     assert_eq!(rows.rows[0][1], Value::Text("library path".to_owned()));
+}
+
+fn preflight_sql_execute(
+    sql: &str,
+    params: &[Value],
+    budget: InputBudget,
+) -> dbtool_core::Result<()> {
+    let request = SqlExecuteInput { sql, params };
+    let limiter = InputLimiter::new(budget, "embedded SQL execute input")?;
+    if params.is_empty() {
+        limiter.validate_request(&request)?;
+    } else {
+        limiter.validate_items_with_request(params, &request)?;
+    }
+
+    Ok(())
 }
