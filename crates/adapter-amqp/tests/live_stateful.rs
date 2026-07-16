@@ -1,7 +1,9 @@
-use adapter_amqp::factory;
+use adapter_amqp::{factory, management_factory};
 use dbtool_core::{
     dsn::Dsn,
-    model::{AckMode, ConsumeOptions, Message},
+    error::Error,
+    model::{AckMode, ConsumeOptions, Message, MetadataBudget},
+    port::CapabilityOperation,
 };
 use lapin::{
     options::{
@@ -27,6 +29,90 @@ fn unique_queue() -> String {
         .expect("system clock should be after Unix epoch")
         .as_nanos();
     format!("dbtool_it_amqp_atomic_ack_{}_{}", std::process::id(), nanos)
+}
+
+#[tokio::test]
+async fn rabbit_management_detail_has_transport_and_complete_object_bounds() {
+    let Some(amqp_dsn) = integration_dsn() else {
+        return;
+    };
+    let management_dsn = std::env::var("DBTOOL_IT_RABBITMQ_MANAGEMENT_DSN")
+        .expect("RabbitMQ management DSN should be configured");
+    let queue = unique_queue();
+    let fixture = Connection::connect(&amqp_dsn, ConnectionProperties::default())
+        .await
+        .expect("fixture connection should open");
+    let channel = fixture
+        .create_channel()
+        .await
+        .expect("fixture channel should open");
+    channel
+        .queue_declare(
+            &queue,
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("fixture queue should be declared");
+
+    let connector = management_factory(
+        Dsn::parse(&management_dsn).expect("RabbitMQ management DSN should parse"),
+    )
+    .await
+    .expect("RabbitMQ management adapter should connect");
+    assert!(connector
+        .operations()
+        .contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
+    let admin = connector
+        .as_admin()
+        .expect("management adapter should expose admin inspection");
+    // RabbitMQ's management statistics are populated asynchronously after an
+    // AMQP declaration. Retry only that documented transient shape; every
+    // other adapter error remains an immediate failure.
+    let mut detail = None;
+    for _ in 0..50 {
+        match admin
+            .topic_detail_bounded(
+                &queue,
+                MetadataBudget::with_default_bytes(100).expect("budget should be valid"),
+            )
+            .await
+        {
+            Ok(value) => {
+                detail = Some(value);
+                break;
+            }
+            Err(Error::Serialization(message)) if message.contains("messages_ready") => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("management queue detail failed: {error}"),
+        }
+    }
+    let detail = detail.expect("RabbitMQ management statistics should become available");
+    assert_eq!(detail.info.name, queue);
+    assert_eq!(detail.watermarks.len(), 1);
+    assert!(matches!(
+        admin
+            .topic_detail_bounded(
+                &queue,
+                MetadataBudget::with_default_bytes(1).expect("budget should be valid"),
+            )
+            .await,
+        Err(Error::MetadataBudgetExceeded {
+            unit: "items",
+            limit: 1,
+            ..
+        })
+    ));
+
+    channel
+        .queue_delete(&queue, QueueDeleteOptions::default())
+        .await
+        .expect("fixture queue should delete cleanly");
+    fixture
+        .close(200, "fixture complete")
+        .await
+        .expect("fixture connection should close");
 }
 
 #[tokio::test]
@@ -57,6 +143,28 @@ async fn failed_batch_conversion_requeues_every_delivery_before_ack() {
         )
         .await
         .expect("valid fixture message should publish");
+
+    let admin = connector
+        .as_admin()
+        .expect("AMQP adapter should expose queue detail");
+    let detail = admin
+        .topic_detail_bounded(
+            &queue,
+            MetadataBudget::with_default_bytes(2).expect("exact queue budget should be valid"),
+        )
+        .await
+        .expect("fixed-shape passive queue detail should fit two config entries");
+    assert_eq!(detail.info.name, queue);
+    assert!(matches!(
+        admin
+            .topic_detail_bounded(&queue, MetadataBudget::with_default_bytes(1).unwrap(),)
+            .await,
+        Err(Error::MetadataBudgetExceeded {
+            unit: "items",
+            limit: 1,
+            ..
+        })
+    ));
 
     let fixture = Connection::connect(&dsn, ConnectionProperties::default())
         .await

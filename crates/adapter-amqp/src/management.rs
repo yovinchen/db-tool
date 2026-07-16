@@ -1,10 +1,10 @@
-use crate::validate_queue;
+use crate::{enforce_topic_detail_budget, validate_queue};
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
         BoundedList, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, MessageResource,
-        MessageResourceKind, PartitionWatermark, TopicDetail, TopicInfo,
+        MessageResourceKind, MetadataBudget, PartitionWatermark, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate},
@@ -101,6 +101,18 @@ impl AdminInspect for RabbitManagementAdapter {
         validate_queue(name)?;
         let queue = self.client.get_json(&self.client.queue_path(name)).await?;
         queue_detail(&queue)
+    }
+
+    async fn topic_detail_bounded(
+        &self,
+        name: &str,
+        budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        // RabbitManagementClient rejects the HTTP response above its hard
+        // transport ceiling before JSON decoding. The limiter below then
+        // proves that the complete portable object fits the caller budget.
+        let detail = self.topic_detail(name).await?;
+        enforce_topic_detail_budget(detail, budget, "RabbitMQ queue detail")
     }
 
     async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
@@ -341,6 +353,7 @@ fn rabbit_management_operations(capabilities: Capabilities) -> Vec<CapabilityOpe
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
@@ -703,6 +716,35 @@ fn percent_decode(input: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    async fn read_tcp_fixture(payload: Vec<u8>) -> Result<Vec<u8>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("fixture listener should have an address");
+        let writer = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("fixture connection should arrive");
+            stream
+                .write_all(&payload)
+                .await
+                .expect("fixture payload should be written");
+            stream
+                .shutdown()
+                .await
+                .expect("fixture stream should shut down");
+        });
+        let mut reader = TcpStream::connect(address)
+            .await
+            .expect("fixture reader should connect");
+        let result = read_bounded_response(&mut reader).await;
+        writer.await.expect("fixture writer should finish");
+        result
+    }
+
     // Captured from the RabbitMQ 3.13 management endpoint used by the Docker
     // integration suite after publishing one message to a classic queue.
     const RABBITMQ_QUEUE_DETAIL_FIXTURE: &str = r#"{
@@ -743,6 +785,47 @@ mod tests {
         "type": "classic",
         "vhost": "dbtool_it"
     }"#;
+
+    #[tokio::test]
+    async fn raw_http_reader_accepts_exactly_one_mib_and_rejects_the_probe_byte() {
+        let exact = vec![b'x'; MAX_HTTP_RESPONSE_BYTES];
+        assert_eq!(
+            read_tcp_fixture(exact.clone()).await.unwrap().len(),
+            MAX_HTTP_RESPONSE_BYTES
+        );
+        let error = read_tcp_fixture(vec![b'x'; MAX_HTTP_RESPONSE_BYTES + 1])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Connection(message)
+                if message.contains("exceeds")
+                    && message.contains(&MAX_HTTP_RESPONSE_BYTES.to_string())
+        ));
+    }
+
+    #[test]
+    fn chunked_decoder_accepts_exactly_one_mib_and_rejects_the_probe_byte() {
+        let encoded = |size: usize| {
+            let mut response = format!("{size:X}\r\n").into_bytes();
+            response.extend(std::iter::repeat_n(b'x', size));
+            response.extend_from_slice(b"\r\n0\r\n\r\n");
+            response
+        };
+
+        assert_eq!(
+            decode_chunked_body(&encoded(MAX_HTTP_RESPONSE_BYTES))
+                .unwrap()
+                .len(),
+            MAX_HTTP_RESPONSE_BYTES
+        );
+        assert!(matches!(
+            decode_chunked_body(&encoded(MAX_HTTP_RESPONSE_BYTES + 1)),
+            Err(Error::Connection(message))
+                if message.contains("decoded body exceeds")
+                    && message.contains(&MAX_HTTP_RESPONSE_BYTES.to_string())
+        ));
+    }
 
     #[test]
     fn management_dsn_extracts_vhost_and_auth() {
@@ -863,6 +946,7 @@ mod tests {
                 CapabilityOperation::MessageAdminListTopics,
                 CapabilityOperation::MessageAdminListTopicsBounded,
                 CapabilityOperation::MessageAdminTopicDetail,
+                CapabilityOperation::MessageAdminTopicDetailBounded,
                 CapabilityOperation::MessageAdminDelete,
             ]
         );

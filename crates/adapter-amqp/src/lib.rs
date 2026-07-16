@@ -3,13 +3,14 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, DeleteResourceOutcome,
-        LagInfo, Message, MessageMetadata, MessageResource, MessageResourceKind, ProduceOutcome,
-        TopicDetail, TopicInfo,
+        LagInfo, Message, MessageMetadata, MessageResource, MessageResourceKind, MetadataBudget,
+        ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
+    service::limiter::MetadataLimiter,
 };
 use futures::future::BoxFuture;
 use lapin::{
@@ -331,6 +332,18 @@ impl AdminInspect for AmqpAdapter {
         })
     }
 
+    async fn topic_detail_bounded(
+        &self,
+        name: &str,
+        budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        // A passive queue declaration has a protocol-fixed reply shape: the
+        // queue name plus two counters. It is therefore safe to materialize
+        // before applying the caller's complete-object budget.
+        let detail = self.topic_detail(name).await?;
+        enforce_topic_detail_budget(detail, budget, "AMQP queue detail")
+    }
+
     async fn consumer_lag(&self, _group: &str) -> Result<Vec<LagInfo>> {
         Err(Error::UnsupportedCapability {
             kind: self.kind.0.clone(),
@@ -390,9 +403,26 @@ fn direct_amqp_operations(capabilities: Capabilities) -> Vec<CapabilityOperation
     operations.extend([
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
+}
+
+pub(crate) fn enforce_topic_detail_budget(
+    detail: TopicDetail,
+    budget: MetadataBudget,
+    subject: &str,
+) -> Result<TopicDetail> {
+    let mut limiter = MetadataLimiter::new(budget, subject)?;
+    for item in &detail.config {
+        limiter.observe(&item)?;
+    }
+    for watermark in &detail.watermarks {
+        limiter.observe(watermark)?;
+    }
+    limiter.ensure_complete(&detail)?;
+    Ok(detail)
 }
 
 fn validate_amqp_delete_request(resource: &MessageResource) -> Result<()> {
@@ -799,6 +829,7 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::MessageConsume));
         assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
         assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetail));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
         assert!(operations.contains(&CapabilityOperation::MessageAdminDelete));
         assert!(!operations.contains(&CapabilityOperation::MessageAdminListTopics));
         assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
