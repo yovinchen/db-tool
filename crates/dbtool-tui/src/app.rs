@@ -9,14 +9,14 @@ use dbtool_core::{
     dsn::Dsn,
     error::Error,
     model::{
-        BoundedList, FindOptions, MetadataBudget, Point, ReadBudget, TimeRange,
+        BoundedList, FindOptions, InputBudget, MetadataBudget, Point, ReadBudget, TimeRange,
         TimeSeriesReadBudget, Value,
     },
-    port::{CapabilityOperation, CapabilityReport},
+    port::{capability::SetOptions, CapabilityOperation, CapabilityReport},
     registry::Registry,
     service::{
         safety::{SafetyGuard, StatementKind},
-        ConnectionManager,
+        ConnectionManager, InputLimiter,
     },
     Result,
 };
@@ -61,6 +61,33 @@ pub struct App {
     _manager: Arc<ConnectionManager>,
     state: AppState,
     startup_error: Option<String>,
+}
+
+enum PreparedMutation {
+    SqlExecute {
+        sql: String,
+    },
+    KeyValueSet {
+        key: String,
+        value: Vec<u8>,
+        options: SetOptions,
+    },
+    KeyValueDelete {
+        keys: Vec<String>,
+    },
+    SearchIndexDocument {
+        index: String,
+        document: Value,
+    },
+    TimeSeriesWritePoints {
+        points: Vec<Point>,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct SqlExecuteInput<'a> {
+    sql: &'a str,
+    params: &'a [Value],
 }
 
 impl App {
@@ -255,6 +282,208 @@ fn load_connection_items_from(path: &std::path::Path) -> Result<Vec<ConnectionIt
     Ok(connections)
 }
 
+fn prepare_tui_mutation(
+    connection: &ConnectionItem,
+    command: &str,
+    confirmed_write: bool,
+) -> Result<Option<PreparedMutation>> {
+    let command = command.trim();
+    if let Some(sql) = sql_statement_from_command(command) {
+        let kind = authorize_sql_statement(connection, sql, confirmed_write)?;
+        let explicit_execute = command == "exec"
+            || command.starts_with("exec ")
+            || command == "sql exec"
+            || command.starts_with("sql exec ");
+        if explicit_execute || kind != StatementKind::Read {
+            return prepare_sql_execute(sql).map(Some);
+        }
+        return Ok(None);
+    }
+
+    if command == "kv set" || command.starts_with("kv set ") {
+        let rest = command.strip_prefix("kv set").unwrap_or_default().trim();
+        let mut parts = rest.split_whitespace();
+        let key = parts
+            .next()
+            .ok_or_else(|| Error::Config("kv set requires a key".into()))?
+            .to_owned();
+        let value = parts.collect::<Vec<_>>().join(" ").into_bytes();
+        return prepare_key_value_set(key, value, SetOptions::default()).map(Some);
+    }
+
+    if command == "kv del" || command.starts_with("kv del ") {
+        let keys = command
+            .strip_prefix("kv del")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        return prepare_key_value_delete(keys).map(Some);
+    }
+
+    if command == "search index" || command.starts_with("search index ") {
+        let rest = command
+            .strip_prefix("search index")
+            .unwrap_or_default()
+            .trim();
+        let (index, document) = rest
+            .split_once(' ')
+            .ok_or_else(|| Error::Config("search index requires index and JSON doc".into()))?;
+        return prepare_search_index(index.to_owned(), parse_json_value(document.trim())?)
+            .map(Some);
+    }
+
+    if command == "ts write" || command.starts_with("ts write ") {
+        let raw = command.strip_prefix("ts write").unwrap_or_default().trim();
+        return prepare_time_series_write(vec![parse_tui_ts_point(raw)?]).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn prepare_sql_execute(sql: &str) -> Result<PreparedMutation> {
+    let params: &[Value] = &[];
+    let limiter = InputLimiter::new(InputBudget::default(), "TUI SQL execute input")?;
+    // SQLx adapters use a named request object, while SQL Server, Db2, and
+    // Cassandra use a compact tuple envelope. Validate both before opening a
+    // connection so the shared TUI budget is sufficient for every SQL backend.
+    limiter.validate_request(&SqlExecuteInput { sql, params })?;
+    limiter.validate_request(&("sql", sql, "params", params))?;
+    Ok(PreparedMutation::SqlExecute {
+        sql: sql.to_owned(),
+    })
+}
+
+fn prepare_key_value_set(
+    key: String,
+    value: Vec<u8>,
+    options: SetOptions,
+) -> Result<PreparedMutation> {
+    InputLimiter::new(InputBudget::default(), "TUI key-value set input")?.validate_request(&(
+        &key,
+        value.as_slice(),
+        &options,
+    ))?;
+    Ok(PreparedMutation::KeyValueSet {
+        key,
+        value,
+        options,
+    })
+}
+
+fn prepare_key_value_delete(keys: Vec<String>) -> Result<PreparedMutation> {
+    if keys.is_empty() {
+        return Err(Error::Config("kv del requires at least one key".into()));
+    }
+    InputLimiter::new(InputBudget::default(), "TUI key-value delete input")?
+        .validate_batch(&keys)?;
+    Ok(PreparedMutation::KeyValueDelete { keys })
+}
+
+fn prepare_search_index(index: String, document: Value) -> Result<PreparedMutation> {
+    let body = document.to_plain_json()?;
+    if !body.is_object() {
+        return Err(Error::Config(
+            "search index document body must be a JSON object".to_owned(),
+        ));
+    }
+    InputLimiter::new(InputBudget::default(), "TUI search index input")?
+        .validate_request(&serde_json::json!({ "index": &index, "document": &body }))?;
+    Ok(PreparedMutation::SearchIndexDocument { index, document })
+}
+
+fn prepare_time_series_write(points: Vec<Point>) -> Result<PreparedMutation> {
+    InputLimiter::new(InputBudget::default(), "TUI time-series write input")?
+        .validate_batch(&points)?;
+    Ok(PreparedMutation::TimeSeriesWritePoints { points })
+}
+
+async fn execute_prepared_mutation(
+    connector: &dyn dbtool_core::port::Connector,
+    mutation: PreparedMutation,
+) -> Result<String> {
+    match mutation {
+        PreparedMutation::SqlExecute { sql } => {
+            require_operation(
+                connector,
+                CapabilityOperation::SqlExecuteBudgeted,
+                "SqlEngine.execute_budgeted",
+            )?;
+            let engine = connector
+                .as_sql()
+                .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
+            render_json(
+                engine
+                    .execute_budgeted(&sql, &[], InputBudget::default())
+                    .await?,
+            )
+        }
+        PreparedMutation::KeyValueSet {
+            key,
+            value,
+            options,
+        } => {
+            require_operation(
+                connector,
+                CapabilityOperation::KeyValueSetBudgeted,
+                "KeyValueStore.set_budgeted",
+            )?;
+            let store = connector
+                .as_kv()
+                .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
+            store
+                .set_budgeted(&key, &value, options, InputBudget::default())
+                .await?;
+            render_json(serde_json::json!({ "ok": true }))
+        }
+        PreparedMutation::KeyValueDelete { keys } => {
+            require_operation(
+                connector,
+                CapabilityOperation::KeyValueDeleteBudgeted,
+                "KeyValueStore.delete_budgeted",
+            )?;
+            let store = connector
+                .as_kv()
+                .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
+            render_json(serde_json::json!({
+                "deleted": store.delete_budgeted(&keys, InputBudget::default()).await?
+            }))
+        }
+        PreparedMutation::SearchIndexDocument { index, document } => {
+            require_operation(
+                connector,
+                CapabilityOperation::SearchIndexDocumentBudgeted,
+                "SearchEngine.index_doc_budgeted",
+            )?;
+            let engine = connector
+                .as_search()
+                .ok_or_else(|| unsupported(connector, "SearchEngine"))?;
+            engine
+                .index_doc_budgeted(&index, document, InputBudget::default())
+                .await?;
+            render_json(serde_json::json!({ "indexed": true }))
+        }
+        PreparedMutation::TimeSeriesWritePoints { points } => {
+            require_operation(
+                connector,
+                CapabilityOperation::TimeSeriesWritePointsBudgeted,
+                "TimeSeriesStore.write_points_budgeted",
+            )?;
+            let store = connector
+                .as_timeseries()
+                .ok_or_else(|| unsupported(connector, "TimeSeriesStore"))?;
+            let written_points = points.len();
+            store
+                .write_points_budgeted(points, InputBudget::default())
+                .await?;
+            render_json(serde_json::json!({
+                "written_points": written_points,
+                "written_samples": written_points
+            }))
+        }
+    }
+}
+
 async fn execute_tui_command(
     manager: &ConnectionManager,
     connection: &ConnectionItem,
@@ -264,8 +493,12 @@ async fn execute_tui_command(
 ) -> Result<String> {
     authorize_tui_command(connection, command, confirmed_write)?;
     validate_bounded_catalog_limit(command, limit)?;
+    let mutation = prepare_tui_mutation(connection, command, confirmed_write)?;
     let conn = manager.get_or_connect(&connection.dsn).await?;
     let connector = conn.as_ref().as_ref();
+    if let Some(mutation) = mutation {
+        return execute_prepared_mutation(connector, mutation).await;
+    }
     let mut parts = command.split_whitespace();
     let head = parts
         .next()
@@ -402,7 +635,10 @@ async fn run_sql_query(
     limit: usize,
     confirmed_write: bool,
 ) -> Result<String> {
-    authorize_sql_statement(connection, sql_text, confirmed_write)?;
+    let kind = authorize_sql_statement(connection, sql_text, confirmed_write)?;
+    if kind != StatementKind::Read {
+        return execute_prepared_mutation(connector, prepare_sql_execute(sql_text)?).await;
+    }
     require_operation(
         connector,
         CapabilityOperation::SqlQueryBudgeted,
@@ -424,15 +660,7 @@ async fn run_sql_exec(
     confirmed_write: bool,
 ) -> Result<String> {
     authorize_sql_statement(connection, sql_text, confirmed_write)?;
-    require_operation(
-        connector,
-        CapabilityOperation::SqlExecute,
-        "SqlEngine.execute",
-    )?;
-    let sql = connector
-        .as_sql()
-        .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
-    render_json(sql.execute(sql_text, &[]).await?)
+    execute_prepared_mutation(connector, prepare_sql_execute(sql_text)?).await
 }
 
 async fn run_kv_command(
@@ -476,40 +704,20 @@ async fn run_kv_command(
             )
         }
         Some("set") => {
-            require_operation(
-                connector,
-                CapabilityOperation::KeyValueSet,
-                "KeyValueStore.set",
-            )?;
-            let kv = connector
-                .as_kv()
-                .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
             let key = parts
                 .next()
-                .ok_or_else(|| Error::Config("kv set requires a key".into()))?;
-            let value = parts.collect::<Vec<_>>().join(" ");
-            kv.set(
-                key,
-                value.as_bytes(),
-                dbtool_core::port::capability::SetOptions::default(),
+                .ok_or_else(|| Error::Config("kv set requires a key".into()))?
+                .to_owned();
+            let value = parts.collect::<Vec<_>>().join(" ").into_bytes();
+            execute_prepared_mutation(
+                connector,
+                prepare_key_value_set(key, value, SetOptions::default())?,
             )
-            .await?;
-            render_json(serde_json::json!({ "ok": true }))
+            .await
         }
         Some("del") => {
-            require_operation(
-                connector,
-                CapabilityOperation::KeyValueDelete,
-                "KeyValueStore.delete",
-            )?;
-            let kv = connector
-                .as_kv()
-                .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
             let keys = parts.map(str::to_owned).collect::<Vec<_>>();
-            if keys.is_empty() {
-                return Err(Error::Config("kv del requires at least one key".into()));
-            }
-            render_json(serde_json::json!({ "deleted": kv.delete(&keys).await? }))
+            execute_prepared_mutation(connector, prepare_key_value_delete(keys)?).await
         }
         _ => Err(Error::Config(
             "kv command must be get, scan, set, or del".into(),
@@ -588,30 +796,24 @@ async fn run_search_command(
                 .await?,
         );
     }
-    let (operation, needed) = if command.strip_prefix("index ").is_some() {
-        (
-            CapabilityOperation::SearchIndexDocument,
-            "SearchEngine.index_doc",
-        )
-    } else {
-        (
-            CapabilityOperation::SearchSearchBudgeted,
-            "SearchEngine.search_budgeted",
-        )
-    };
-    require_operation(connector, operation, needed)?;
-    let search = connector
-        .as_search()
-        .ok_or_else(|| unsupported(connector, "SearchEngine"))?;
     if let Some(rest) = command.strip_prefix("index ").map(str::trim) {
         let (index, doc) = rest
             .split_once(' ')
             .ok_or_else(|| Error::Config("search index requires index and JSON doc".into()))?;
-        search
-            .index_doc(index, parse_json_value(doc.trim())?)
-            .await?;
-        return render_json(serde_json::json!({ "indexed": true }));
+        return execute_prepared_mutation(
+            connector,
+            prepare_search_index(index.to_owned(), parse_json_value(doc.trim())?)?,
+        )
+        .await;
     }
+    require_operation(
+        connector,
+        CapabilityOperation::SearchSearchBudgeted,
+        "SearchEngine.search_budgeted",
+    )?;
+    let search = connector
+        .as_search()
+        .ok_or_else(|| unsupported(connector, "SearchEngine"))?;
     let (index, query) = command
         .split_once(' ')
         .ok_or_else(|| Error::Config("search requires index and JSON query".into()))?;
@@ -649,29 +851,18 @@ async fn run_ts_command(
                 .await?,
         );
     }
-    let (operation, needed) = if command.strip_prefix("write ").is_some() {
-        (
-            CapabilityOperation::TimeSeriesWritePoints,
-            "TimeSeriesStore.write_points",
-        )
-    } else {
-        (
-            CapabilityOperation::TimeSeriesQueryRangeBounded,
-            "TimeSeriesStore.query_range_bounded",
-        )
-    };
-    require_operation(connector, operation, needed)?;
+    if let Some(rest) = command.strip_prefix("write ").map(str::trim) {
+        let point = parse_tui_ts_point(rest)?;
+        return execute_prepared_mutation(connector, prepare_time_series_write(vec![point])?).await;
+    }
+    require_operation(
+        connector,
+        CapabilityOperation::TimeSeriesQueryRangeBounded,
+        "TimeSeriesStore.query_range_bounded",
+    )?;
     let ts = connector
         .as_timeseries()
         .ok_or_else(|| unsupported(connector, "TimeSeriesStore"))?;
-    if let Some(rest) = command.strip_prefix("write ").map(str::trim) {
-        let point = parse_tui_ts_point(rest)?;
-        ts.write_points(vec![point]).await?;
-        return render_json(serde_json::json!({
-            "written_points": 1,
-            "written_samples": 1
-        }));
-    }
     let query = command
         .strip_prefix("query ")
         .map(str::trim)
@@ -931,9 +1122,316 @@ fn format_error(err: &Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use crossterm::event::{KeyEvent, KeyModifiers};
+    use dbtool_core::{
+        model::{
+            ExecOutcome, IndexInfo, ResultSet, SearchDeleteIndexOutcome, SearchDocument,
+            SearchHits, SearchWriteOutcome, SeriesSet, TableInfo, TableSchema,
+        },
+        port::{
+            Capabilities, Connector, ConnectorKind, KeyValueStore, SearchEngine, SqlEngine,
+            TimeSeriesStore,
+        },
+    };
     use dbtool_registry::build_registry;
     use std::sync::Mutex;
+
+    struct MutationProbe {
+        advertise_exact: bool,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl MutationProbe {
+        fn new(advertise_exact: bool) -> Self {
+            Self {
+                advertise_exact,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, operation: &'static str) {
+            self.calls.lock().unwrap().push(operation);
+        }
+
+        fn recorded(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Connector for MutationProbe {
+        fn kind(&self) -> ConnectorKind {
+            ConnectorKind("tui-mutation-probe".to_owned())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                sql: true,
+                key_value: true,
+                time_series: true,
+                search: true,
+                ..Default::default()
+            }
+        }
+
+        fn operations(&self) -> Vec<CapabilityOperation> {
+            let mut operations = self.capabilities().operations();
+            if self.advertise_exact {
+                operations.extend([
+                    CapabilityOperation::SqlExecuteBudgeted,
+                    CapabilityOperation::KeyValueSetBudgeted,
+                    CapabilityOperation::KeyValueDeleteBudgeted,
+                    CapabilityOperation::SearchIndexDocumentBudgeted,
+                    CapabilityOperation::TimeSeriesWritePointsBudgeted,
+                ]);
+            }
+            operations
+        }
+
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        fn as_sql(&self) -> Option<&dyn SqlEngine> {
+            Some(self)
+        }
+
+        fn as_kv(&self) -> Option<&dyn KeyValueStore> {
+            Some(self)
+        }
+
+        fn as_timeseries(&self) -> Option<&dyn TimeSeriesStore> {
+            Some(self)
+        }
+
+        fn as_search(&self) -> Option<&dyn SearchEngine> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl SqlEngine for MutationProbe {
+        async fn query(&self, _sql: &str, _params: &[Value]) -> Result<ResultSet> {
+            unreachable!("mutation probe does not execute SQL reads")
+        }
+
+        async fn query_bounded(
+            &self,
+            _sql: &str,
+            _params: &[Value],
+            _max_rows: usize,
+        ) -> Result<ResultSet> {
+            unreachable!("mutation probe does not execute SQL reads")
+        }
+
+        async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<ExecOutcome> {
+            self.record("sql.execute");
+            Ok(ExecOutcome {
+                rows_affected: 1,
+                last_insert_id: None,
+            })
+        }
+
+        async fn execute_budgeted(
+            &self,
+            sql: &str,
+            _params: &[Value],
+            budget: InputBudget,
+        ) -> Result<ExecOutcome> {
+            assert_eq!(budget, InputBudget::default());
+            self.record("sql.execute_budgeted");
+            if sql == "indeterminate" {
+                return Err(Error::OutcomeIndeterminate(
+                    "probe cannot prove the remote write outcome".to_owned(),
+                ));
+            }
+            Ok(ExecOutcome {
+                rows_affected: 1,
+                last_insert_id: None,
+            })
+        }
+
+        async fn list_schemas(&self) -> Result<Vec<String>> {
+            unreachable!("mutation probe does not inspect SQL catalogs")
+        }
+
+        async fn list_tables(&self, _schema: Option<&str>) -> Result<Vec<TableInfo>> {
+            unreachable!("mutation probe does not inspect SQL catalogs")
+        }
+
+        async fn describe_table(&self, _table: &str) -> Result<TableSchema> {
+            unreachable!("mutation probe does not inspect SQL catalogs")
+        }
+    }
+
+    #[async_trait]
+    impl KeyValueStore for MutationProbe {
+        async fn get(&self, _key: &str) -> Result<Option<bytes::Bytes>> {
+            unreachable!("mutation probe does not execute key-value reads")
+        }
+
+        async fn set(&self, _key: &str, _value: &[u8], _options: SetOptions) -> Result<()> {
+            self.record("kv.set");
+            Ok(())
+        }
+
+        async fn set_budgeted(
+            &self,
+            _key: &str,
+            _value: &[u8],
+            _options: SetOptions,
+            budget: InputBudget,
+        ) -> Result<()> {
+            assert_eq!(budget, InputBudget::default());
+            self.record("kv.set_budgeted");
+            Ok(())
+        }
+
+        async fn delete(&self, _keys: &[String]) -> Result<u64> {
+            self.record("kv.delete");
+            Ok(1)
+        }
+
+        async fn delete_budgeted(&self, _keys: &[String], budget: InputBudget) -> Result<u64> {
+            assert_eq!(budget, InputBudget::default());
+            self.record("kv.delete_budgeted");
+            Ok(1)
+        }
+
+        async fn scan(&self, _pattern: &str, _limit: usize) -> Result<Vec<String>> {
+            unreachable!("mutation probe does not execute key-value reads")
+        }
+
+        async fn raw_command(&self, _args: &[String]) -> Result<Value> {
+            unreachable!("mutation probe does not execute raw commands")
+        }
+    }
+
+    #[async_trait]
+    impl SearchEngine for MutationProbe {
+        async fn list_indices(&self) -> Result<Vec<IndexInfo>> {
+            unreachable!("mutation probe does not inspect search indices")
+        }
+
+        async fn search(
+            &self,
+            _index: &str,
+            _query: Value,
+            _options: dbtool_core::port::capability::SearchOptions,
+        ) -> Result<SearchHits> {
+            unreachable!("mutation probe does not execute search reads")
+        }
+
+        async fn index_doc(&self, index: &str, _doc: Value) -> Result<SearchWriteOutcome> {
+            self.record("search.index_doc");
+            Ok(search_write_outcome(index))
+        }
+
+        async fn index_doc_budgeted(
+            &self,
+            index: &str,
+            _doc: Value,
+            budget: InputBudget,
+        ) -> Result<SearchWriteOutcome> {
+            assert_eq!(budget, InputBudget::default());
+            self.record("search.index_doc_budgeted");
+            Ok(search_write_outcome(index))
+        }
+
+        async fn put_doc(
+            &self,
+            _index: &str,
+            _id: &str,
+            _doc: Value,
+        ) -> Result<SearchWriteOutcome> {
+            unreachable!("mutation probe does not execute search put")
+        }
+
+        async fn get_doc(&self, _index: &str, _id: &str) -> Result<Option<SearchDocument>> {
+            unreachable!("mutation probe does not execute search reads")
+        }
+
+        async fn update_doc(
+            &self,
+            _index: &str,
+            _id: &str,
+            _patch: Value,
+        ) -> Result<SearchWriteOutcome> {
+            unreachable!("mutation probe does not execute search updates")
+        }
+
+        async fn delete_doc(&self, _index: &str, _id: &str) -> Result<SearchWriteOutcome> {
+            unreachable!("mutation probe does not execute search deletes")
+        }
+
+        async fn delete_index(&self, _index: &str) -> Result<SearchDeleteIndexOutcome> {
+            unreachable!("mutation probe does not delete search indices")
+        }
+    }
+
+    #[async_trait]
+    impl TimeSeriesStore for MutationProbe {
+        async fn list_measurements(&self) -> Result<Vec<String>> {
+            unreachable!("mutation probe does not inspect measurements")
+        }
+
+        async fn write_points(&self, _points: Vec<Point>) -> Result<()> {
+            self.record("time_series.write_points");
+            Ok(())
+        }
+
+        async fn write_points_budgeted(
+            &self,
+            _points: Vec<Point>,
+            budget: InputBudget,
+        ) -> Result<()> {
+            assert_eq!(budget, InputBudget::default());
+            self.record("time_series.write_points_budgeted");
+            Ok(())
+        }
+
+        async fn query_range(&self, _query: &str, _range: TimeRange) -> Result<SeriesSet> {
+            unreachable!("mutation probe does not execute time-series reads")
+        }
+    }
+
+    fn search_write_outcome(index: &str) -> SearchWriteOutcome {
+        SearchWriteOutcome {
+            index: index.to_owned(),
+            id: "generated".to_owned(),
+            result: "created".to_owned(),
+            version: Some(1),
+            seq_no: None,
+            primary_term: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn mutation_samples() -> Vec<PreparedMutation> {
+        vec![
+            prepare_sql_execute("insert into events values (1)").unwrap(),
+            prepare_key_value_set("key".to_owned(), b"value".to_vec(), SetOptions::default())
+                .unwrap(),
+            prepare_key_value_delete(vec!["key".to_owned()]).unwrap(),
+            prepare_search_index(
+                "events".to_owned(),
+                Value::Json(serde_json::json!({ "id": 1 })),
+            )
+            .unwrap(),
+            prepare_time_series_write(vec![Point {
+                measurement: "requests_total".to_owned(),
+                tags: HashMap::new(),
+                fields: HashMap::from([("value".to_owned(), 1.0)]),
+                timestamp: 1,
+            }])
+            .unwrap(),
+        ]
+    }
 
     #[test]
     fn detects_write_commands() {
@@ -1147,7 +1645,9 @@ readonli = true
                 "sql.describe_table",
                 "sql.describe_table_bounded",
                 "sql.execute",
+                "sql.execute_budgeted",
                 "sql.insert_rows_atomic",
+                "sql.insert_rows_atomic_budgeted",
                 "sql.list_schemas",
                 "sql.list_schemas_bounded",
                 "sql.list_schemas_budgeted",
@@ -1288,6 +1788,88 @@ readonli = true
                     if actual_kind == kind && actual_needed == needed
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn mutation_dispatch_negotiates_and_invokes_only_exact_methods() {
+        let connector = MutationProbe::new(true);
+
+        for mutation in mutation_samples() {
+            execute_prepared_mutation(&connector, mutation)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            connector.recorded(),
+            [
+                "sql.execute_budgeted",
+                "kv.set_budgeted",
+                "kv.delete_budgeted",
+                "search.index_doc_budgeted",
+                "time_series.write_points_budgeted",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_only_mutation_declarations_are_rejected_without_dispatch() {
+        let connector = MutationProbe::new(false);
+
+        for mutation in mutation_samples() {
+            assert!(matches!(
+                execute_prepared_mutation(&connector, mutation).await,
+                Err(Error::UnsupportedCapability { kind, .. })
+                    if kind == "tui-mutation-probe"
+            ));
+        }
+
+        assert!(connector.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn indeterminate_mutation_errors_are_returned_without_retry() {
+        let connector = MutationProbe::new(true);
+
+        let error =
+            execute_prepared_mutation(&connector, prepare_sql_execute("indeterminate").unwrap())
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+        assert_eq!(connector.recorded(), ["sql.execute_budgeted"]);
+    }
+
+    #[tokio::test]
+    async fn mutation_input_budget_is_rejected_before_tui_connection() {
+        let registry = Arc::new(build_registry());
+        let manager = ConnectionManager::new(registry);
+        let connection = ConnectionItem {
+            name: "unreachable".to_owned(),
+            dsn: "mongodb://127.0.0.1:1/dbtool".to_owned(),
+            readonly: false,
+        };
+        let keys = (0..=InputBudget::default().max_items)
+            .map(|index| format!("key-{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let command = format!("kv del {keys}");
+
+        assert!(matches!(
+            execute_tui_command(&manager, &connection, &command, 100, true).await,
+            Err(Error::InputBudgetExceeded { unit: "items", .. })
+        ));
+        assert!(matches!(
+            execute_tui_command(
+                &manager,
+                &connection,
+                "search index events []",
+                100,
+                true,
+            )
+            .await,
+            Err(Error::Config(message)) if message.contains("JSON object")
+        ));
     }
 
     #[tokio::test]
