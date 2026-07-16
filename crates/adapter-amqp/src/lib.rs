@@ -844,6 +844,8 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
         assert!(operations.contains(&CapabilityOperation::MessageAdminDelete));
         assert!(!operations.contains(&CapabilityOperation::MessageAdminListTopics));
+        assert!(!operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
+        assert!(!operations.contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
         assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
     }
 

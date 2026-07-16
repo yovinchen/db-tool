@@ -36,6 +36,27 @@ mutations. RabbitMQ 0.9.1 provides no ACK-of-ACK, and the CLI can still fail
 after ACK but before observable formatted output, so no exactly-once or strict
 end-to-end at-least-once output guarantee is claimed.
 
+## IF-T74 queue scalar-byte envelope refresh
+
+Run at (UTC): 2026-07-16T03:24:39Z
+
+The `rabbitmq+http://` management adapter now advertises and implements exact
+`message.admin.list_topics_budgeted`. It validates `ReadBudget` before HTTP,
+retains stable server pagination, converts only the remaining N+1 queue
+objects, accounts every complete `TopicInfo`, then validates the complete
+`BoundedList` plus probe. The independent 1 MiB per-page transport ceiling
+remains in force.
+
+RabbitMQ 3.13 Docker validation declared two isolated queues, proved N+1
+truncation and a one-byte budget failure, deleted both through AMQP, and
+confirmed the management queue list was empty. Direct AMQP 0.9.1 continues to
+advertise neither item-bounded nor byte-budgeted global queue listing because
+that protocol has no portable discovery operation.
+
+Verification: adapter-amqp 24 unit + 3 integration PASS; strict all-target
+Clippy, rustfmt and diff check PASS; RabbitMQ management live catalog and empty
+cleanup PASS.
+
 Focused reproduction:
 
 ```text

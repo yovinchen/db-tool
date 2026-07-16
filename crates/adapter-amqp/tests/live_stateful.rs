@@ -2,7 +2,7 @@ use adapter_amqp::{factory, management_factory};
 use dbtool_core::{
     dsn::Dsn,
     error::Error,
-    model::{AckMode, ConsumeOptions, Message, MetadataBudget},
+    model::{AckMode, ConsumeOptions, Message, MetadataBudget, ReadBudget},
     port::CapabilityOperation,
 };
 use lapin::{
@@ -39,6 +39,7 @@ async fn rabbit_management_detail_has_transport_and_complete_object_bounds() {
     let management_dsn = std::env::var("DBTOOL_IT_RABBITMQ_MANAGEMENT_DSN")
         .expect("RabbitMQ management DSN should be configured");
     let queue = unique_queue();
+    let auxiliary_queue = format!("{queue}_catalog_probe");
     let fixture = Connection::connect(&amqp_dsn, ConnectionProperties::default())
         .await
         .expect("fixture connection should open");
@@ -54,6 +55,14 @@ async fn rabbit_management_detail_has_transport_and_complete_object_bounds() {
         )
         .await
         .expect("fixture queue should be declared");
+    channel
+        .queue_declare(
+            &auxiliary_queue,
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("catalog probe queue should be declared");
 
     let connector = management_factory(
         Dsn::parse(&management_dsn).expect("RabbitMQ management DSN should parse"),
@@ -63,9 +72,28 @@ async fn rabbit_management_detail_has_transport_and_complete_object_bounds() {
     assert!(connector
         .operations()
         .contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
+    assert!(connector
+        .operations()
+        .contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
     let admin = connector
         .as_admin()
         .expect("management adapter should expose admin inspection");
+    let truncated = admin
+        .list_topics_budgeted(ReadBudget::with_default_bytes(1).unwrap())
+        .await
+        .expect("two fixture queues should provide an N+1 probe");
+    assert!(truncated.truncated);
+    assert_eq!(truncated.items.len(), 1);
+    assert!(matches!(
+        admin
+            .list_topics_budgeted(ReadBudget::new(1, 1).unwrap())
+            .await,
+        Err(Error::ReadBudgetExceeded {
+            unit: "bytes",
+            limit: 1,
+            ..
+        })
+    ));
     // RabbitMQ's management statistics are populated asynchronously after an
     // AMQP declaration. Retry only that documented transient shape; every
     // other adapter error remains an immediate failure.
@@ -105,6 +133,10 @@ async fn rabbit_management_detail_has_transport_and_complete_object_bounds() {
         })
     ));
 
+    channel
+        .queue_delete(&auxiliary_queue, QueueDeleteOptions::default())
+        .await
+        .expect("catalog probe queue should delete cleanly");
     channel
         .queue_delete(&queue, QueueDeleteOptions::default())
         .await

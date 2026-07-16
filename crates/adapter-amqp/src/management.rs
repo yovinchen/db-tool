@@ -4,13 +4,14 @@ use dbtool_core::{
     error::{Error, Result},
     model::{
         BoundedList, DeleteResourceOptions, DeleteResourceOutcome, LagInfo, MessageResource,
-        MessageResourceKind, MetadataBudget, PartitionWatermark, TopicDetail, TopicInfo,
+        MessageResourceKind, MetadataBudget, PartitionWatermark, ReadBudget, TopicDetail,
+        TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ListLimiter,
+    service::limiter::{ListLimiter, ReadLimiter},
 };
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -95,6 +96,16 @@ impl AdminInspect for RabbitManagementAdapter {
         let probe_items = limiter.probe_items()?;
         let topics = self.client.list_queues_bounded(probe_items).await?;
         Ok(limiter.finish(topics))
+    }
+
+    async fn list_topics_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<TopicInfo>> {
+        let (mut limiter, probe_items) = rabbit_budgeted_catalog_plan(budget)?;
+        let mut topics = Vec::with_capacity(budget.max_items.min(RABBIT_QUEUE_PAGE_SIZE));
+        self.client
+            .visit_queues_bounded(probe_items, |topic| limiter.retain_item(topic, &mut topics))
+            .await?;
+        topics.sort_by(|left, right| left.name.cmp(&right.name));
+        limiter.finish(topics)
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -241,18 +252,33 @@ impl RabbitManagementClient {
     }
 
     async fn list_queues_bounded(&self, probe_items: usize) -> Result<Vec<TopicInfo>> {
+        let mut topics = Vec::with_capacity(probe_items.min(RABBIT_QUEUE_PAGE_SIZE));
+        self.visit_queues_bounded(probe_items, |topic| {
+            topics.push(topic);
+            Ok(())
+        })
+        .await?;
+        topics.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(topics)
+    }
+
+    async fn visit_queues_bounded<F>(&self, probe_items: usize, mut visit: F) -> Result<()>
+    where
+        F: FnMut(TopicInfo) -> Result<()>,
+    {
         let mut page = 1_usize;
-        let mut topics = Vec::new();
+        let mut observed = 0_usize;
         let mut names = HashSet::new();
         // Page numbers are offsets in units of page_size. Keep the requested
         // size fixed across the traversal; shrinking the final request would
         // move page 2 backwards and could duplicate or skip queues.
         let page_size = rabbit_queue_page_size(probe_items);
 
-        while topics.len() < probe_items {
+        while observed < probe_items {
             let path = self.queues_page_path(page, page_size);
             let response = self.get_json(&path).await?;
-            let parsed = parse_queue_page(&response, page, page_size)?;
+            let remaining = probe_items - observed;
+            let parsed = parse_queue_page(&response, page, page_size, remaining)?;
 
             for topic in parsed.items {
                 if !names.insert(topic.name.clone()) {
@@ -261,13 +287,14 @@ impl RabbitManagementClient {
                         topic.name
                     )));
                 }
-                topics.push(topic);
-                if topics.len() == probe_items {
+                visit(topic)?;
+                observed += 1;
+                if observed == probe_items {
                     break;
                 }
             }
 
-            if topics.len() == probe_items || page >= parsed.page_count {
+            if observed == probe_items || page >= parsed.page_count {
                 break;
             }
             if parsed.returned == 0 {
@@ -279,9 +306,7 @@ impl RabbitManagementClient {
                 Error::Serialization("RabbitMQ queue page number overflow".into())
             })?;
         }
-
-        topics.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(topics)
+        Ok(())
     }
 
     async fn delete_queue(&self, queue: &str, options: DeleteResourceOptions) -> Result<()> {
@@ -352,6 +377,7 @@ fn rabbit_management_operations(capabilities: Capabilities) -> Vec<CapabilityOpe
     operations.extend([
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
+        CapabilityOperation::MessageAdminListTopicsBudgeted,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminDelete,
@@ -369,10 +395,17 @@ fn rabbit_queue_page_size(probe_items: usize) -> usize {
     probe_items.min(RABBIT_QUEUE_PAGE_SIZE)
 }
 
+fn rabbit_budgeted_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize)> {
+    let limiter = ReadLimiter::new(budget, "RabbitMQ queue catalog response")?;
+    let probe_items = limiter.probe_items()?;
+    Ok((limiter, probe_items))
+}
+
 fn parse_queue_page(
     value: &Value,
     expected_page: usize,
     requested_page_size: usize,
+    topic_limit: usize,
 ) -> Result<QueuePage> {
     let page = json_usize_required(value, "page")?;
     let page_size = json_usize_required(value, "page_size")?;
@@ -412,12 +445,14 @@ fn parse_queue_page(
         )));
     }
 
+    let returned = items.len();
     let topics = items
         .iter()
+        .take(topic_limit)
         .map(queue_topic_info)
         .collect::<Result<Vec<_>>>()?;
     Ok(QueuePage {
-        returned: topics.len(),
+        returned,
         items: topics,
         page_count,
     })
@@ -945,12 +980,89 @@ mod tests {
             vec![
                 CapabilityOperation::MessageAdminListTopics,
                 CapabilityOperation::MessageAdminListTopicsBounded,
+                CapabilityOperation::MessageAdminListTopicsBudgeted,
                 CapabilityOperation::MessageAdminTopicDetail,
                 CapabilityOperation::MessageAdminTopicDetailBounded,
                 CapabilityOperation::MessageAdminDelete,
             ]
         );
         assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
+    }
+
+    fn queue_topic(name: &str) -> TopicInfo {
+        TopicInfo {
+            name: name.to_owned(),
+            partitions: 1,
+            replicas: 1,
+        }
+    }
+
+    fn finish_queue_fixture(
+        names: &[&str],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Result<BoundedList<TopicInfo>> {
+        let (mut limiter, probe_items) =
+            rabbit_budgeted_catalog_plan(ReadBudget::new(max_items, max_bytes)?)?;
+        let mut retained = Vec::new();
+        for topic in names.iter().take(probe_items).map(|name| queue_topic(name)) {
+            limiter.retain_item(topic, &mut retained)?;
+        }
+        retained.sort_by(|left, right| left.name.cmp(&right.name));
+        limiter.finish(retained)
+    }
+
+    #[test]
+    fn rabbit_budgeted_queue_catalog_rejects_invalid_budgets_before_http() {
+        for budget in [
+            ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            },
+            ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            },
+        ] {
+            assert!(matches!(
+                rabbit_budgeted_catalog_plan(budget),
+                Err(Error::Config(_))
+            ));
+        }
+        let (_, probe_items) =
+            rabbit_budgeted_catalog_plan(ReadBudget::new(2, 1024).unwrap()).unwrap();
+        assert_eq!(probe_items, 3);
+    }
+
+    #[test]
+    fn rabbit_budgeted_queue_catalog_covers_item_and_byte_boundaries() {
+        let exact = finish_queue_fixture(&["jobs-b", "jobs-a"], 2, 4096).unwrap();
+        assert!(!exact.truncated);
+        assert_eq!(
+            exact
+                .items
+                .iter()
+                .map(|topic| topic.name.as_str())
+                .collect::<Vec<_>>(),
+            ["jobs-a", "jobs-b"]
+        );
+
+        let probed =
+            finish_queue_fixture(&["jobs-b", "jobs-a", "jobs-c", "ignored"], 2, 4096).unwrap();
+        assert!(probed.truncated);
+        assert_eq!(probed.items.len(), 2);
+
+        let expected = BoundedList::complete(vec![queue_topic("jobs-a"), queue_topic("jobs-b")]);
+        let exact_bytes = serde_json::to_vec(&expected).unwrap().len();
+        assert!(finish_queue_fixture(&["jobs-a", "jobs-b"], 2, exact_bytes).is_ok());
+        assert!(matches!(
+            finish_queue_fixture(&["jobs-a", "jobs-b"], 2, exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
     }
 
     #[test]
@@ -964,18 +1076,22 @@ mod tests {
                 {"name": "jobs-b"}
             ]
         });
-        let parsed = parse_queue_page(&page, 1, 2).unwrap();
+        let parsed = parse_queue_page(&page, 1, 2, 2).unwrap();
         assert_eq!(parsed.page_count, 2);
         assert_eq!(parsed.returned, 2);
         assert_eq!(parsed.items[0].name, "jobs-a");
         assert_eq!(parsed.items[1].name, "jobs-b");
+        let capped = parse_queue_page(&page, 1, 2, 1).unwrap();
+        assert_eq!(capped.returned, 2);
+        assert_eq!(capped.items.len(), 1);
+        assert_eq!(capped.items[0].name, "jobs-a");
 
         assert!(matches!(
-            parse_queue_page(&page, 2, 2),
+            parse_queue_page(&page, 2, 2, 2),
             Err(Error::Serialization(message)) if message.contains("page 1") && message.contains("page 2")
         ));
         assert!(matches!(
-            parse_queue_page(&page, 1, 1),
+            parse_queue_page(&page, 1, 1, 1),
             Err(Error::Serialization(message)) if message.contains("page_size")
         ));
 
@@ -986,7 +1102,7 @@ mod tests {
             "items": [{"name": "jobs-a"}]
         });
         assert!(matches!(
-            parse_queue_page(&short_non_final, 1, 2),
+            parse_queue_page(&short_non_final, 1, 2, 2),
             Err(Error::Serialization(message)) if message.contains("short non-final page")
         ));
     }
