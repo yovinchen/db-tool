@@ -2,9 +2,9 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::{decode_canonical_base64, Value},
+    model::{decode_canonical_base64, ReadBudget, Value},
     port::{capability::SetOptions, CapabilityOperation},
-    service::{ResultLimiter, SafetyGuard},
+    service::{ReadLimiter, SafetyGuard},
     Result,
 };
 
@@ -77,6 +77,18 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
         KvAction::Raw { args } => Some(classify_raw_command(args, ctx.limit)?),
         _ => None,
     };
+    let read_budget = match (&cmd.action, raw_plan.as_ref()) {
+        (KvAction::Get { .. }, _) => Some(ReadBudget::new(1, ctx.max_bytes)?),
+        (KvAction::Scan { .. }, _)
+        | (
+            KvAction::Raw { .. },
+            Some(RawCommandPlan {
+                access: RawCommandAccess::ReadOnly,
+                ..
+            }),
+        ) => Some(ctx.read_budget()?),
+        _ => None,
+    };
 
     match &cmd.action {
         KvAction::Set { .. } | KvAction::Del { .. } => ensure_write_allowed(ctx)?,
@@ -109,7 +121,7 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
     let kind = conn.kind().0.clone();
-    let (operation, needed) = kv_operation_for_action(&cmd.action);
+    let (operation, needed) = kv_operation_for_action(&cmd.action, raw_plan.as_ref());
     require_kv_operation(&operations, operation, &kind, needed)?;
     let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
         kind: kind.clone(),
@@ -121,7 +133,12 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
 
     Ok(match cmd.action {
         KvAction::Get { key } => {
-            let value = kv.get(&key).await?;
+            let value = kv
+                .get_bounded(
+                    &key,
+                    read_budget.expect("GET actions construct a read budget"),
+                )
+                .await?;
             let (value, value_bytes, encoding) = match value {
                 Some(bytes) => {
                     let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
@@ -130,17 +147,17 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
                 }
                 None => (None, None, None),
             };
-            ctx.render_success(
-                &kind,
+            let data = enforce_kv_output_budget(
                 serde_json::json!({
                     "key": key,
                     "value": value,
                     "value_bytes": value_bytes,
                     "encoding": encoding,
                 }),
-                elapsed(),
-                false,
-            )
+                ctx.max_bytes,
+                "KV get CLI output",
+            )?;
+            ctx.render_success(&kind, data, elapsed(), false)
         }
         KvAction::Set {
             key,
@@ -157,9 +174,14 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             ctx.render_success(&kind, serde_json::json!({"ok": true}), elapsed(), false)
         }
         KvAction::Scan { pattern } => {
-            let probe_limit = ResultLimiter::new(ctx.limit).probe_rows()?;
-            let keys = kv.scan(&pattern, probe_limit).await?;
-            let (keys, truncated) = limit_scan_keys(keys, ctx.limit);
+            let result = kv
+                .scan_bounded(
+                    &pattern,
+                    read_budget.expect("SCAN actions construct a read budget"),
+                )
+                .await?;
+            let truncated = result.truncated;
+            let keys = enforce_kv_output_budget(result.items, ctx.max_bytes, "KV scan CLI output")?;
             ctx.render_success(&kind, keys, elapsed(), truncated)
         }
         KvAction::Del { keys } => {
@@ -167,23 +189,55 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             ctx.render_success(&kind, serde_json::json!({"deleted": n}), elapsed(), false)
         }
         KvAction::Raw { args } => {
-            let val = kv.raw_command(&args).await?;
+            let mutation = raw_plan.as_ref().is_some_and(RawCommandPlan::is_mutation);
+            let val = if mutation {
+                kv.raw_command(&args).await?
+            } else {
+                let value = kv
+                    .raw_command_bounded(
+                        &args,
+                        read_budget.expect("raw read actions construct a read budget"),
+                    )
+                    .await?;
+                enforce_kv_output_budget(value, ctx.max_bytes, "KV raw CLI output")?
+            };
             ctx.render_success(&kind, val, elapsed(), false)
         }
     })
 }
 
-fn kv_operation_for_action(action: &KvAction) -> (CapabilityOperation, &'static str) {
+fn kv_operation_for_action(
+    action: &KvAction,
+    raw_plan: Option<&RawCommandPlan>,
+) -> (CapabilityOperation, &'static str) {
     match action {
-        KvAction::Get { .. } => (CapabilityOperation::KeyValueGet, "KeyValueStore.get"),
+        KvAction::Get { .. } => (
+            CapabilityOperation::KeyValueGetBounded,
+            "KeyValueStore.get_bounded",
+        ),
         KvAction::Set { .. } => (CapabilityOperation::KeyValueSet, "KeyValueStore.set"),
-        KvAction::Scan { .. } => (CapabilityOperation::KeyValueScan, "KeyValueStore.scan"),
+        KvAction::Scan { .. } => (
+            CapabilityOperation::KeyValueScanBounded,
+            "KeyValueStore.scan_bounded",
+        ),
         KvAction::Del { .. } => (CapabilityOperation::KeyValueDelete, "KeyValueStore.delete"),
-        KvAction::Raw { .. } => (
+        KvAction::Raw { .. } if raw_plan.is_some_and(RawCommandPlan::is_mutation) => (
             CapabilityOperation::KeyValueRawCommand,
             "KeyValueStore.raw_command",
         ),
+        KvAction::Raw { .. } => (
+            CapabilityOperation::KeyValueRawCommandBounded,
+            "KeyValueStore.raw_command_bounded",
+        ),
     }
+}
+
+fn enforce_kv_output_budget<T: serde::Serialize>(
+    value: T,
+    max_bytes: usize,
+    subject: &'static str,
+) -> Result<T> {
+    ReadLimiter::new(ReadBudget::new(1, max_bytes)?, subject)?.finish_single(value)
 }
 
 fn require_kv_operation(
@@ -328,12 +382,22 @@ fn classify_raw_command(args: &[String], limit: usize) -> Result<RawCommandPlan>
             check_item_budget(&command, count, limit)
         }
 
-        "SET" => expect_min_arity(args, 3, &command),
+        "SET" => {
+            expect_min_arity(args, 3, &command)?;
+            if args[3..]
+                .iter()
+                .any(|argument| argument.eq_ignore_ascii_case("GET"))
+            {
+                return Err(value_returning_raw_mutation_error(&command));
+            }
+            Ok(())
+        }
         "DEL" | "UNLINK" => {
             expect_min_arity(args, 2, &command)?;
             check_item_budget(&command, args.len() - 1, limit)
         }
-        "INCR" | "DECR" | "PERSIST" | "GETDEL" => expect_arity(args, &[2], &command),
+        "INCR" | "DECR" | "PERSIST" => expect_arity(args, &[2], &command),
+        "GETDEL" => return Err(value_returning_raw_mutation_error(&command)),
         "APPEND" | "INCRBY" | "INCRBYFLOAT" | "DECRBY" => expect_arity(args, &[3], &command),
         "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
             expect_arity(args, &[3, 4], &command)?;
@@ -368,14 +432,7 @@ fn classify_raw_command(args: &[String], limit: usize) -> Result<RawCommandPlan>
             expect_arity(args, &[4], &command)?;
             check_index_range_budget(args, 2, 3, &command, limit)
         }
-        "LPOP" | "RPOP" | "SPOP" => {
-            expect_arity(args, &[2, 3], &command)?;
-            if args.len() == 3 {
-                let count = parse_positive_usize_arg(args, 2, &command)?;
-                check_item_budget(&command, count, limit)?;
-            }
-            Ok(())
-        }
+        "LPOP" | "RPOP" | "SPOP" => return Err(value_returning_raw_mutation_error(&command)),
         "ZADD" => validate_simple_zadd(args, &command, limit),
         _ => {
             return Err(Error::Config(format!(
@@ -389,6 +446,12 @@ fn classify_raw_command(args: &[String], limit: usize) -> Result<RawCommandPlan>
     } else {
         Ok(RawCommandPlan::readonly(command))
     }
+}
+
+fn value_returning_raw_mutation_error(command: &str) -> Error {
+    Error::Config(format!(
+        "kv raw {command} is rejected because its value response cannot be budgeted after mutation; use a dedicated atomic API"
+    ))
 }
 
 fn normalized_raw_command(args: &[String]) -> Result<String> {
@@ -645,12 +708,6 @@ fn validate_simple_zadd(args: &[String], command: &str, limit: usize) -> Result<
     check_item_budget(command, (args.len() - 2) / 2, limit)
 }
 
-fn limit_scan_keys(mut keys: Vec<String>, limit: usize) -> (Vec<String>, bool) {
-    let truncated = keys.len() > limit;
-    keys.truncate(limit);
-    (keys, truncated)
-}
-
 fn ensure_write_allowed(ctx: &Context) -> Result<()> {
     ctx.ensure_write_allowed()
 }
@@ -704,23 +761,36 @@ mod tests {
         let action = KvAction::Raw {
             args: strings(&["GET", "key"]),
         };
+        let read_plan = classify_raw_command(&strings(&["GET", "key"]), 2).unwrap();
         assert_eq!(
-            kv_operation_for_action(&action),
+            kv_operation_for_action(&action, Some(&read_plan)),
+            (
+                CapabilityOperation::KeyValueRawCommandBounded,
+                "KeyValueStore.raw_command_bounded"
+            )
+        );
+        assert!(matches!(
+            require_kv_operation(
+                &[CapabilityOperation::KeyValueRawCommand],
+                CapabilityOperation::KeyValueRawCommandBounded,
+                "partial-kv",
+                "KeyValueStore.raw_command_bounded",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "partial-kv" && needed == "KeyValueStore.raw_command_bounded"
+        ));
+
+        let mutation = KvAction::Raw {
+            args: strings(&["SET", "key", "value"]),
+        };
+        let mutation_plan = classify_raw_command(&strings(&["SET", "key", "value"]), 2).unwrap();
+        assert_eq!(
+            kv_operation_for_action(&mutation, Some(&mutation_plan)),
             (
                 CapabilityOperation::KeyValueRawCommand,
                 "KeyValueStore.raw_command"
             )
         );
-        assert!(matches!(
-            require_kv_operation(
-                &[CapabilityOperation::KeyValueGet],
-                CapabilityOperation::KeyValueRawCommand,
-                "partial-kv",
-                "KeyValueStore.raw_command",
-            ),
-            Err(Error::UnsupportedCapability { kind, needed })
-                if kind == "partial-kv" && needed == "KeyValueStore.raw_command"
-        ));
     }
 
     #[tokio::test]
@@ -774,6 +844,18 @@ mod tests {
             classify_raw_command(&strings(&["TOTALLY_UNKNOWN"]), 2),
             Err(Error::Config(_))
         ));
+        for args in [
+            strings(&["GETDEL", "key"]),
+            strings(&["LPOP", "list"]),
+            strings(&["RPOP", "list", "2"]),
+            strings(&["SPOP", "set"]),
+            strings(&["SET", "key", "value", "GET"]),
+        ] {
+            assert!(matches!(
+                classify_raw_command(&args, 2),
+                Err(Error::Config(message)) if message.contains("cannot be budgeted after mutation")
+            ));
+        }
     }
 
     #[test]
@@ -820,23 +902,23 @@ mod tests {
     }
 
     #[test]
-    fn scan_truncation_requires_a_probe_key() {
-        let (exact, exact_truncated) = limit_scan_keys(vec!["one".to_owned(), "two".to_owned()], 2);
-        assert_eq!(exact, ["one", "two"]);
-        assert!(!exact_truncated);
-
-        let (limited, limited_truncated) = limit_scan_keys(
-            vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
-            2,
+    fn caller_visible_kv_output_has_an_exact_byte_boundary() {
+        let output = serde_json::json!({
+            "key": "binary",
+            "value": null,
+            "value_bytes": Value::Bytes(vec![0, 255]),
+            "encoding": "binary",
+        });
+        let exact = serde_json::to_vec(&output).unwrap().len();
+        assert_eq!(
+            enforce_kv_output_budget(output.clone(), exact, "KV CLI test").unwrap(),
+            output
         );
-        assert_eq!(limited, ["one", "two"]);
-        assert!(limited_truncated);
-    }
-
-    #[test]
-    fn scan_probe_limit_rejects_zero_and_overflow() {
-        assert!(ResultLimiter::new(0).probe_rows().is_err());
-        assert!(ResultLimiter::new(usize::MAX).probe_rows().is_err());
-        assert_eq!(ResultLimiter::new(2).probe_rows().unwrap(), 3);
+        assert!(matches!(
+            enforce_kv_output_budget(output, exact - 1, "KV CLI test"),
+            Err(Error::ReadBudgetExceeded { unit: "bytes", .. })
+        ));
+        assert!(ReadBudget::new(0, dbtool_core::model::DEFAULT_READ_BYTES).is_err());
+        assert!(ReadBudget::new(usize::MAX, dbtool_core::model::DEFAULT_READ_BYTES).is_err());
     }
 }

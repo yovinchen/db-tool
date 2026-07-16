@@ -436,8 +436,8 @@ async fn run_kv_command(
         Some("get") => {
             require_operation(
                 connector,
-                CapabilityOperation::KeyValueGet,
-                "KeyValueStore.get",
+                CapabilityOperation::KeyValueGetBounded,
+                "KeyValueStore.get_bounded",
             )?;
             let kv = connector
                 .as_kv()
@@ -446,7 +446,7 @@ async fn run_kv_command(
                 .next()
                 .ok_or_else(|| Error::Config("kv get requires a key".into()))?;
             let value = kv
-                .get(key)
+                .get_bounded(key, ReadBudget::with_default_bytes(1)?)
                 .await?
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
             render_json(serde_json::json!({ "key": key, "value": value }))
@@ -454,14 +454,17 @@ async fn run_kv_command(
         Some("scan") => {
             require_operation(
                 connector,
-                CapabilityOperation::KeyValueScan,
-                "KeyValueStore.scan",
+                CapabilityOperation::KeyValueScanBounded,
+                "KeyValueStore.scan_bounded",
             )?;
             let kv = connector
                 .as_kv()
                 .ok_or_else(|| unsupported(connector, "KeyValueStore"))?;
             let pattern = parts.next().unwrap_or("*");
-            render_json(kv.scan(pattern, limit).await?)
+            render_bounded_list(
+                kv.scan_bounded(pattern, ReadBudget::with_default_bytes(limit)?)
+                    .await?,
+            )
         }
         Some("set") => {
             require_operation(
@@ -709,7 +712,12 @@ fn validate_bounded_catalog_limit(command: &str, limit: usize) -> Result<()> {
         MetadataBudget::with_default_bytes(limit)?;
     }
     let is_sql_read = parts.first() == Some(&"sql") && parts.get(1) != Some(&"exec");
-    if is_sql_read || matches!(parts.as_slice(), ["doc", "find", ..]) {
+    if is_sql_read
+        || matches!(
+            parts.as_slice(),
+            ["doc", "find", ..] | ["kv", "get", _] | ["kv", "scan", ..]
+        )
+    {
         ReadBudget::with_default_bytes(limit)?;
     }
     Ok(())
@@ -1131,8 +1139,20 @@ readonli = true
     }
 
     #[test]
-    fn document_search_and_time_series_catalogs_require_explicit_bounded_operations() {
+    fn kv_document_search_and_time_series_reads_require_explicit_bounded_operations() {
         for (operations, operation, kind, needed) in [
+            (
+                CapabilityOperation::KEY_VALUE,
+                CapabilityOperation::KeyValueGetBounded,
+                "legacy-kv",
+                "KeyValueStore.get_bounded",
+            ),
+            (
+                CapabilityOperation::KEY_VALUE,
+                CapabilityOperation::KeyValueScanBounded,
+                "legacy-kv",
+                "KeyValueStore.scan_bounded",
+            ),
             (
                 CapabilityOperation::DOCUMENT,
                 CapabilityOperation::DocumentListCollectionsBounded,

@@ -98,6 +98,135 @@ fn base64_input_errors_are_config_errors_before_connection() {
 }
 
 #[test]
+fn value_returning_raw_mutations_are_rejected_before_connection() {
+    let dsn = "redis://127.0.0.1:1/0";
+    for args in [
+        vec!["GETDEL", "key"],
+        vec!["LPOP", "list"],
+        vec!["RPOP", "list", "2"],
+        vec!["SPOP", "set"],
+        vec!["SET", "key", "value", "GET"],
+    ] {
+        let mut command = vec!["--dsn", dsn, "--allow-write", "kv", "raw"];
+        command.extend(args);
+        let error = stderr_json(dbtool(&command));
+        assert_eq!(error["error"]["code"], "CONFIG_ERROR", "{error}");
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot be budgeted after mutation")));
+    }
+}
+
+#[test]
+fn redis_compatible_live_bounded_read_envelopes_and_cleanup() {
+    if env::var("DBTOOL_RUN_INTEGRATION").as_deref() != Ok("1") {
+        return;
+    }
+
+    for (dsn_variable, expected_kind) in [
+        ("DBTOOL_IT_REDIS_DSN", "redis"),
+        ("DBTOOL_IT_VALKEY_DSN", "valkey"),
+        ("DBTOOL_IT_KEYDB_DSN", "keydb"),
+        ("DBTOOL_IT_DRAGONFLY_DSN", "dragonfly"),
+    ] {
+        let Ok(dsn) = env::var(dsn_variable) else {
+            continue;
+        };
+        let prefix = unique_name(&format!("dbtool_it_kv_envelope_{expected_kind}"));
+        let first = format!("{prefix}:first");
+        let second = format!("{prefix}:second");
+
+        for (key, value) in [(&first, "first-value"), (&second, "second-value")] {
+            stdout_json(dbtool(&[
+                "--dsn",
+                &dsn,
+                "--allow-write",
+                "kv",
+                "set",
+                key,
+                value,
+            ]));
+        }
+
+        let caps = stdout_json(dbtool(&["--dsn", &dsn, "caps"]));
+        assert_eq!(caps["kind"], expected_kind);
+        let operations = caps["data"]["operations"]
+            .as_array()
+            .expect("operations should be an array");
+        for operation in [
+            "kv.exists",
+            "kv.get_bounded",
+            "kv.get_with_expiry_bounded",
+            "kv.scan_bounded",
+            "kv.raw_command_bounded",
+        ] {
+            assert!(
+                operations.iter().any(|actual| actual == operation),
+                "{expected_kind} did not advertise {operation}: {caps}"
+            );
+        }
+
+        let exact = stdout_json(dbtool(&["--dsn", &dsn, "kv", "get", &first]));
+        assert_eq!(exact["data"]["value"], "first-value");
+
+        let oversized = stderr_json(dbtool(&[
+            "--dsn",
+            &dsn,
+            "--max-bytes",
+            "1",
+            "kv",
+            "get",
+            &first,
+        ]));
+        assert_eq!(oversized["error"]["code"], "READ_BUDGET_EXCEEDED");
+
+        let scan = stdout_json(dbtool(&[
+            "--dsn",
+            &dsn,
+            "--limit",
+            "1",
+            "kv",
+            "scan",
+            &format!("{prefix}:*"),
+        ]));
+        assert_eq!(scan["meta"]["truncated"], true, "{scan}");
+        assert_eq!(scan["data"].as_array().map(Vec::len), Some(1));
+
+        let raw = stdout_json(dbtool(&[
+            "--dsn", &dsn, "--limit", "2", "kv", "raw", "MGET", &first, &second,
+        ]));
+        let decoded = serde_json::from_value::<CoreValue>(raw["data"].clone()).unwrap();
+        assert_eq!(
+            decoded,
+            CoreValue::Array(vec![
+                CoreValue::Text("first-value".to_owned()),
+                CoreValue::Text("second-value".to_owned()),
+            ])
+        );
+
+        let deleted = stdout_json(dbtool(&[
+            "--dsn",
+            &dsn,
+            "--allow-write",
+            "kv",
+            "del",
+            &first,
+            &second,
+        ]));
+        assert_eq!(deleted["data"]["deleted"], 2);
+        let cleanup = stdout_json(dbtool(&[
+            "--dsn",
+            &dsn,
+            "kv",
+            "scan",
+            &format!("{prefix}:*"),
+        ]));
+        assert_eq!(cleanup["data"], serde_json::json!([]));
+        assert_eq!(cleanup["meta"]["truncated"], false);
+    }
+}
+
+#[test]
 fn redis_live_binary_values_and_raw_policy_are_exact() {
     if env::var("DBTOOL_RUN_INTEGRATION").as_deref() != Ok("1") {
         return;

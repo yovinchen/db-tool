@@ -502,9 +502,11 @@ fn redis_artifact_v3_preserves_lifetimes_skips_expired_and_binds_replacement() {
     let complete_path = temp_path("redis-complete");
     let partial_path = temp_path("redis-partial");
     let mutated_path = temp_path("redis-mutated-expiry");
+    let budget_path = temp_path("redis-budget-preserves-target");
     let complete_arg = complete_path.to_string_lossy().to_string();
     let partial_arg = partial_path.to_string_lossy().to_string();
     let mutated_arg = mutated_path.to_string_lossy().to_string();
+    let budget_arg = budget_path.to_string_lossy().to_string();
 
     stdout_json(dbtool(&[
         "--dsn",
@@ -557,6 +559,27 @@ fn redis_artifact_v3_preserves_lifetimes_skips_expired_and_binds_replacement() {
         "--ttl",
         "30",
     ]));
+
+    fs::write(&budget_path, b"existing artifact must survive").unwrap();
+    let budget_error = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--limit",
+        "5",
+        "--max-bytes",
+        "128",
+        "export",
+        "kv",
+        "--pattern",
+        &pattern,
+        "--out",
+        &budget_arg,
+    ]));
+    assert_eq!(budget_error["error"]["code"], "READ_BUDGET_EXCEEDED");
+    assert_eq!(
+        fs::read(&budget_path).unwrap(),
+        b"existing artifact must survive"
+    );
 
     let partial = stdout_json(dbtool(&[
         "--dsn",
@@ -719,9 +742,22 @@ fn redis_artifact_v3_preserves_lifetimes_skips_expired_and_binds_replacement() {
         .as_str()
         .is_some_and(|message| message.contains("already exists or changed after preflight")));
 
+    let large_old_value = "x".repeat(4096);
+    stdout_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--allow-write",
+        "kv",
+        "set",
+        &target_persistent,
+        &large_old_value,
+    ]));
+
     let confirm_required = stderr_json(dbtool(&[
         "--dsn",
         &dsn,
+        "--max-bytes",
+        "64",
         "--allow-write",
         "import",
         "kv",
@@ -850,6 +886,7 @@ fn redis_artifact_v3_preserves_lifetimes_skips_expired_and_binds_replacement() {
     fs::remove_file(complete_path).unwrap();
     fs::remove_file(partial_path).unwrap();
     fs::remove_file(mutated_path).unwrap();
+    fs::remove_file(budget_path).unwrap();
 }
 
 #[test]

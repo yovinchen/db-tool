@@ -7,7 +7,7 @@ use dbtool_core::{
     },
     port::CapabilityOperation,
     service::{
-        limiter::ResultLimiter,
+        limiter::{ReadLimiter, ResultLimiter},
         safety::{SafetyGuard, StatementKind},
         write_file_atomically,
     },
@@ -222,14 +222,7 @@ enum PreparedImport {
 }
 
 pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
-    let read_budget = match &cmd.action {
-        ExportAction::Sql { .. } | ExportAction::Doc { .. } => Some(ctx.read_budget()?),
-        ExportAction::Kv { .. } => None,
-    };
-    let kv_probe_limit = match &cmd.action {
-        ExportAction::Kv { .. } => Some(ResultLimiter::new(ctx.limit).probe_rows()?),
-        ExportAction::Sql { .. } | ExportAction::Doc { .. } => None,
-    };
+    let read_budget = ctx.read_budget()?;
     if let ExportAction::Sql { query, .. } = &cmd.action {
         ensure_readonly_export_query(query)?;
     }
@@ -252,13 +245,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 kind: kind.clone(),
                 needed: "SqlEngine",
             })?;
-            let result = sql
-                .query_budgeted(
-                    &query,
-                    &[],
-                    read_budget.expect("SQL export constructs a read budget"),
-                )
-                .await?;
+            let result = sql.query_budgeted(&query, &[], read_budget).await?;
             let count = result.rows.len();
             let truncated = result.truncated;
             write_artifact_with_limit(&out, sql_rows_artifact(result), ctx.max_bytes)?;
@@ -275,8 +262,8 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
         }
         ExportAction::Kv { pattern, out } => {
             for operation in [
-                CapabilityOperation::KeyValueScan,
-                CapabilityOperation::KeyValueGetWithExpiry,
+                CapabilityOperation::KeyValueScanBounded,
+                CapabilityOperation::KeyValueGetWithExpiryBounded,
             ] {
                 require_transfer_operation(&operations, operation, &kind)?;
             }
@@ -284,26 +271,35 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 kind: kind.clone(),
                 needed: "KeyValueStore",
             })?;
-            let mut keys = kv
-                .scan(
-                    &pattern,
-                    kv_probe_limit.expect("KV export constructs a probe limit"),
-                )
-                .await?;
+            let scan = kv.scan_bounded(&pattern, read_budget).await?;
+            let keys = scan.items;
             ensure_unique_strings(&keys, "key returned by the source scan")?;
-            let truncated = keys.len() > ctx.limit;
-            keys.truncate(ctx.limit);
+            let truncated = scan.truncated;
             let selected_items = usize_to_u64(keys.len(), "selected key count")?;
             let mut entries = Vec::with_capacity(keys.len());
+            let mut entry_limiter = ReadLimiter::new(read_budget, "KV export entries")?;
             for key in keys {
-                if let Some(snapshot) = kv.get_with_expiry(&key).await? {
-                    entries.push(KvEntry {
-                        key,
-                        value: Value::Bytes(snapshot.value.to_vec()),
-                        expiry: snapshot.expiry,
-                    });
+                if let Some(snapshot) = kv
+                    .get_with_expiry_bounded(&key, ReadBudget::new(1, ctx.max_bytes)?)
+                    .await?
+                {
+                    entry_limiter.retain_item(
+                        KvEntry {
+                            key,
+                            value: Value::Bytes(snapshot.value.to_vec()),
+                            expiry: snapshot.expiry,
+                        },
+                        &mut entries,
+                    )?;
                 }
             }
+            let entries = entry_limiter.finish_with(entries, |entries, entry_truncated| {
+                debug_assert!(
+                    !entry_truncated,
+                    "KV export entries never observe a separate probe item"
+                );
+                entries
+            })?;
             let count = entries.len();
             let exported_items = usize_to_u64(count, "exported key count")?;
             let source_changed = exported_items != selected_items;
@@ -315,7 +311,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 source_changed,
             );
             let complete = integrity.complete;
-            write_artifact(
+            write_artifact_with_limit(
                 &out,
                 TransferArtifact::KvPairs {
                     version: KV_TRANSFER_VERSION,
@@ -328,6 +324,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                     integrity,
                     entries,
                 },
+                ctx.max_bytes,
             )?;
             ctx.render_success(
                 &kind,
@@ -366,12 +363,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 ..Default::default()
             };
             let result = docs
-                .find_budgeted(
-                    &collection,
-                    filter.clone(),
-                    options,
-                    read_budget.expect("document export constructs a read budget"),
-                )
+                .find_budgeted(&collection, filter.clone(), options, read_budget)
                 .await?;
             let documents = result.items;
             let truncated = result.truncated;
@@ -473,7 +465,11 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
                 &kind,
             )?;
             if replace_existing {
-                require_transfer_operation(&operations, CapabilityOperation::KeyValueGet, &kind)?;
+                require_transfer_operation(
+                    &operations,
+                    CapabilityOperation::KeyValueExists,
+                    &kind,
+                )?;
             }
             let kv = conn.as_kv().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
@@ -482,7 +478,7 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             let mut existing = BTreeSet::new();
             if replace_existing {
                 for entry in &entries {
-                    if kv.get(&entry.key).await?.is_some() {
+                    if kv.exists(&entry.key).await? {
                         existing.insert(entry.key.clone());
                     }
                 }
@@ -946,6 +942,7 @@ fn parse_json_value(raw: &str) -> Result<Value> {
         .map_err(|e| Error::Serialization(e.to_string()))
 }
 
+#[cfg(test)]
 fn write_artifact(path: &Path, artifact: TransferArtifact) -> Result<()> {
     let bytes = serialize_artifact_bounded(&artifact, MAX_TRANSFER_ARTIFACT_BYTES)?;
     publish_artifact(path, &bytes)
@@ -994,6 +991,7 @@ impl Write for BoundedVecWriter {
     }
 }
 
+#[cfg(test)]
 fn serialize_artifact_bounded(artifact: &TransferArtifact, max_bytes: usize) -> Result<Vec<u8>> {
     let mut writer = BoundedVecWriter {
         bytes: Vec::new(),
@@ -1425,6 +1423,15 @@ mod tests {
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "partial-document" && needed == "document.insert"
         ));
+        assert!(matches!(
+            require_transfer_operation(
+                &[CapabilityOperation::KeyValueGet],
+                CapabilityOperation::KeyValueExists,
+                "legacy-kv",
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-kv" && needed == "kv.exists"
+        ));
 
         assert!(document_import_operations(&[]).is_empty());
         assert_eq!(
@@ -1444,7 +1451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn row_and_document_export_budgets_fail_before_connection_resolution() {
+    async fn export_read_budgets_fail_before_connection_resolution() {
         for action in [
             ExportAction::Sql {
                 query: "select 1".to_owned(),
@@ -1454,6 +1461,10 @@ mod tests {
                 collection: "users".to_owned(),
                 filter: "{}".to_owned(),
                 out: PathBuf::from("unused-doc.json"),
+            },
+            ExportAction::Kv {
+                pattern: "users:*".to_owned(),
+                out: PathBuf::from("unused-kv.json"),
             },
         ] {
             let mut ctx = test_context(false);

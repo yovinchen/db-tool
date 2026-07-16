@@ -135,10 +135,11 @@ the stated dbtool objective.
 Top-level catalog item bounds and exact method negotiation are complete. The
 read-envelope audit is tracked as IF-T67 through IF-T75 in
 `docs/interface-completion-tasks.zh-CN.md`. Nested schema/topic metadata,
-recursive SQL/CQL result bytes, multi-document accumulation, and message batch
-bytes before ACK are complete. Cross-platform artifact replacement is implemented
-but still awaits current-SHA Windows CI evidence. KV reads, structured time-series
-budgets, catalog scalar bytes, and the legacy unbounded API lifecycle remain open.
+recursive SQL/CQL result bytes, multi-document accumulation, message batch bytes
+before ACK, and Redis-compatible KV read envelopes are complete. Cross-platform
+artifact replacement is implemented but still awaits current-SHA Windows CI
+evidence. Structured time-series budgets, catalog scalar bytes, and the legacy
+unbounded API lifecycle remain open.
 A bounded top-level name or row count is not evidence that nested values are
 bounded. IF-T51 remains open until the final all-feature compile, test, and
 packaging pass.
@@ -169,3 +170,4 @@ cannot mask another:
 - `docs/test-evidence/db2-catalog-bounded.md`
 - `docs/test-evidence/bounded-document-search-timeseries.md`
 - `docs/test-evidence/messaging-bounded-catalogs.md`
+- `docs/test-evidence/kv-read-envelopes.md`
