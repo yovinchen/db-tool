@@ -2528,7 +2528,10 @@ mod tests {
                 )));
             }
             if adapter
-                .list_indices_bounded(10_000)
+                .list_indices_budgeted(ReadBudget::new(
+                    10_000,
+                    MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES,
+                )?)
                 .await?
                 .items
                 .iter()
@@ -2614,7 +2617,14 @@ mod tests {
                 .await
                 .expect_err("N-1 delete must fail before sending");
             if rejected_delete.code() != "INPUT_BUDGET_EXCEEDED"
-                || adapter.get_doc(&index, &generated.id).await?.is_none()
+                || adapter
+                    .get_doc_budgeted(
+                        &index,
+                        &generated.id,
+                        ReadBudget::new(1, MAX_HTTP_RESPONSE_BODY_BYTES)?,
+                    )
+                    .await?
+                    .is_none()
             {
                 return Err(Error::Internal(format!(
                     "{product} N-1 document delete changed remote state: {rejected_delete}"
@@ -2632,17 +2642,32 @@ mod tests {
                     "unexpected {product} document delete outcome: {deleted:?}"
                 )));
             }
-            if adapter.get_doc(&index, &generated.id).await?.is_some() {
+            if adapter
+                .get_doc_budgeted(
+                    &index,
+                    &generated.id,
+                    ReadBudget::new(1, MAX_HTTP_RESPONSE_BODY_BYTES)?,
+                )
+                .await?
+                .is_some()
+            {
                 return Err(Error::Internal(format!(
                     "{product} generated document survived exact delete"
                 )));
             }
 
+            let peer_document = json!({"product": product, "purpose": "catalog probe"});
+            let peer_input = json!({
+                "index": &catalog_peer,
+                "id": "catalog-probe",
+                "document": &peer_document,
+            });
             let peer_outcome = adapter
-                .put_doc(
+                .put_doc_budgeted(
                     &catalog_peer,
                     "catalog-probe",
-                    Value::Json(json!({"product": product, "purpose": "catalog probe"})),
+                    Value::Json(peer_document),
+                    exact_budget(&peer_input),
                 )
                 .await?;
             if peer_outcome.result != "created" {
@@ -2895,7 +2920,10 @@ mod tests {
                 .expect_err("N-1 index delete must fail before sending");
             if rejected_delete.code() != "INPUT_BUDGET_EXCEEDED"
                 || !adapter
-                    .list_indices_bounded(10_000)
+                    .list_indices_budgeted(ReadBudget::new(
+                        10_000,
+                        MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES,
+                    )?)
                     .await?
                     .items
                     .iter()
@@ -2921,7 +2949,12 @@ mod tests {
             .await;
         let absence = async {
             for _ in 0..40 {
-                let indices = adapter.list_indices_bounded(10_000).await?;
+                let indices = adapter
+                    .list_indices_budgeted(ReadBudget::new(
+                        10_000,
+                        MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES,
+                    )?)
+                    .await?;
                 if indices
                     .items
                     .iter()

@@ -1607,6 +1607,8 @@ mod tests {
             .unwrap();
         let batch_bytes = serde_json::to_vec(&points).unwrap().len();
         let range = TimeRange::closed(timestamp, timestamp + 1_000).unwrap();
+        let read_budget =
+            TimeSeriesReadBudget::new(10_000, 10_000, MAX_HTTP_RESPONSE_BODY_BYTES).unwrap();
 
         let exercise = async {
             let error = adapter
@@ -1627,7 +1629,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
             assert!(adapter
-                .query_range(&metric, range.clone())
+                .query_range_bounded(&metric, range.clone(), read_budget)
                 .await?
                 .series
                 .is_empty());
@@ -1640,7 +1642,9 @@ mod tests {
                 .await?;
             let mut observed = None;
             for _ in 0..40 {
-                let result = adapter.query_range(&metric, range.clone()).await?;
+                let result = adapter
+                    .query_range_bounded(&metric, range.clone(), read_budget)
+                    .await?;
                 if result.series.len() == points.len()
                     && result.series.iter().all(|series| !series.values.is_empty())
                 {
@@ -1674,7 +1678,7 @@ mod tests {
         let mut cleaned = false;
         for _ in 0..40 {
             if adapter
-                .query_range(&metric, range.clone())
+                .query_range_bounded(&metric, range.clone(), read_budget)
                 .await
                 .unwrap()
                 .series
@@ -1719,7 +1723,7 @@ mod tests {
         let now_millis = i64::try_from(now).unwrap();
         let timestamp = now_millis.div_euclid(1000) * 1000 - 8_000;
         let metric = format!("dbtool_it_ts_budget_{}_{}", std::process::id(), now);
-        let points = ["one", "two", "three"]
+        let points: Vec<_> = ["one", "two", "three"]
             .into_iter()
             .enumerate()
             .map(|(index, slot)| Point {
@@ -1729,7 +1733,10 @@ mod tests {
                 timestamp,
             })
             .collect();
-        adapter.write_points(points).await.unwrap();
+        adapter
+            .write_points_budgeted(points, InputBudget::default())
+            .await
+            .unwrap();
 
         let range = TimeRange::closed(timestamp, timestamp + 1_000).unwrap();
         let complete_budget = TimeSeriesReadBudget::new(3, 100, 1024 * 1024).unwrap();
@@ -1763,7 +1770,14 @@ mod tests {
         });
         assert!(!complete.truncated);
 
-        let all_measurements = adapter.list_measurements().await.unwrap();
+        let all_measurements = adapter
+            .list_measurements_budgeted(
+                ReadBudget::new(10_000, MAX_HTTP_RESPONSE_BODY_BYTES).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!all_measurements.truncated);
+        let all_measurements = all_measurements.items;
         assert!(all_measurements.contains(&metric));
         let measurement_count = all_measurements.len();
         let expected_measurements = BoundedList::complete(all_measurements);

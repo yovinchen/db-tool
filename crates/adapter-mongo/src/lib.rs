@@ -1287,6 +1287,39 @@ mod tests {
         ])
     }
 
+    async fn complete_collection_catalog(store: &dyn DocumentStore) -> Result<Vec<String>> {
+        let result = store
+            .list_collections_budgeted(ReadBudget::with_default_bytes(10_000)?)
+            .await?;
+        if result.truncated {
+            return Err(Error::Internal(
+                "MongoDB test collection catalog exceeded its exact read envelope".into(),
+            ));
+        }
+        Ok(result.items)
+    }
+
+    async fn complete_find(
+        store: &dyn DocumentStore,
+        collection: &str,
+        filter: Value,
+    ) -> Result<Vec<Document>> {
+        let result = store
+            .find_budgeted(
+                collection,
+                filter,
+                FindOptions::default(),
+                ReadBudget::with_default_bytes(10_000)?,
+            )
+            .await?;
+        if result.truncated {
+            return Err(Error::Internal(format!(
+                "MongoDB test read for {collection} exceeded its exact read envelope"
+            )));
+        }
+        Ok(result.items)
+    }
+
     #[test]
     fn mongo_mutation_preflight_counts_complete_targets_items_and_requests() {
         let collection = "input_budget_docs";
@@ -1770,10 +1803,12 @@ mod tests {
             for (index, collection) in collections.iter().enumerate() {
                 let mut document = Document::new();
                 document.insert("_id".to_owned(), Value::Int(index as i64));
-                store.insert(collection, vec![document]).await?;
+                store
+                    .insert_budgeted(collection, vec![document], InputBudget::default())
+                    .await?;
             }
 
-            let all = store.list_collections().await?;
+            let all = complete_collection_catalog(store).await?;
             let total = all.len();
             let expected = BoundedList::complete(all);
             let complete_bytes = serde_json::to_vec(&expected)
@@ -1796,9 +1831,11 @@ mod tests {
         .await;
 
         for collection in &collections {
-            let _ = store.drop_collection(collection).await;
+            let _ = store
+                .drop_collection_budgeted(collection, InputBudget::default())
+                .await;
         }
-        let remaining = store.list_collections().await.unwrap();
+        let remaining = complete_collection_catalog(store).await.unwrap();
         assert!(collections
             .iter()
             .all(|collection| !remaining.contains(collection)));
@@ -1870,7 +1907,9 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
-            assert!(!store.list_collections().await?.contains(&collection));
+            assert!(!complete_collection_catalog(store)
+                .await?
+                .contains(&collection));
 
             let inserted = store
                 .insert_budgeted(
@@ -1911,7 +1950,9 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
-            assert!(!store.list_collections().await?.contains(&aggregate_target));
+            assert!(!complete_collection_catalog(store)
+                .await?
+                .contains(&aggregate_target));
 
             let error = store
                 .aggregate_budgeted(
@@ -1922,7 +1963,9 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "CONFIG_ERROR");
-            assert!(!store.list_collections().await?.contains(&aggregate_target));
+            assert!(!complete_collection_catalog(store)
+                .await?
+                .contains(&aggregate_target));
 
             let aggregate_response = store
                 .aggregate_write_budgeted(
@@ -1935,8 +1978,7 @@ mod tests {
             assert!(aggregate_response.items.is_empty());
             assert!(!aggregate_response.truncated);
             assert_eq!(
-                store
-                    .find(&aggregate_target, Value::Null, FindOptions::default())
+                complete_find(store, &aggregate_target, Value::Null)
                     .await?
                     .len(),
                 3
@@ -1974,8 +2016,7 @@ mod tests {
             assert!(merge_response.items.is_empty());
             assert!(!merge_response.truncated);
             assert_eq!(
-                store
-                    .find(&aggregate_target, Value::Null, FindOptions::default())
+                complete_find(store, &aggregate_target, Value::Null)
                     .await?
                     .len(),
                 3
@@ -1992,7 +2033,9 @@ mod tests {
                     InputBudget::new(1, aggregate_drop_bytes, aggregate_drop_bytes)?,
                 )
                 .await?;
-            assert!(!store.list_collections().await?.contains(&aggregate_target));
+            assert!(!complete_collection_catalog(store)
+                .await?
+                .contains(&aggregate_target));
 
             let one_filter = Value::Json(serde_json::json!({"_id": 1}));
             let one_update = Value::Json(serde_json::json!({"state": "updated-one"}));
@@ -2014,9 +2057,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
-            let unchanged = store
-                .find(&collection, one_filter.clone(), FindOptions::default())
-                .await?;
+            let unchanged = complete_find(store, &collection, one_filter.clone()).await?;
             assert_eq!(unchanged[0]["state"], Value::Text("created".into()));
 
             let updated = store
@@ -2060,8 +2101,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
             assert_eq!(
-                store
-                    .find(&collection, delete_filter.clone(), FindOptions::default())
+                complete_find(store, &collection, delete_filter.clone())
                     .await?
                     .len(),
                 1
@@ -2078,8 +2118,7 @@ mod tests {
                     .await?,
                 2
             );
-            assert!(store
-                .find(&collection, Value::Null, FindOptions::default())
+            assert!(complete_find(store, &collection, Value::Null)
                 .await?
                 .is_empty());
 
@@ -2096,22 +2135,29 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
-            assert!(store.list_collections().await?.contains(&collection));
+            assert!(complete_collection_catalog(store)
+                .await?
+                .contains(&collection));
             store
                 .drop_collection_budgeted(&collection, InputBudget::new(1, drop_bytes, drop_bytes)?)
                 .await?;
-            assert!(!store.list_collections().await?.contains(&collection));
+            assert!(!complete_collection_catalog(store)
+                .await?
+                .contains(&collection));
             Ok::<(), Error>(())
         }
         .await;
 
-        let remaining = store.list_collections().await.unwrap();
+        let remaining = complete_collection_catalog(store).await.unwrap();
         for candidate in [&collection, &aggregate_target] {
             if remaining.contains(candidate) {
-                store.drop_collection(candidate).await.unwrap();
+                store
+                    .drop_collection_budgeted(candidate, InputBudget::default())
+                    .await
+                    .unwrap();
             }
         }
-        let remaining = store.list_collections().await.unwrap();
+        let remaining = complete_collection_catalog(store).await.unwrap();
         assert!(!remaining.contains(&collection));
         assert!(!remaining.contains(&aggregate_target));
         exercise.unwrap();
