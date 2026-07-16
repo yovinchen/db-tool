@@ -19,7 +19,7 @@ use sqlx::query::Query;
 use sqlx::{types::Json, Column, Encode, PgPool, Postgres, Row, Type};
 
 use crate::{
-    bounded_catalog_limit, bounded_metadata_limit, group_index_rows,
+    bounded_catalog_limit, bounded_metadata_limit, budgeted_catalog_limit, group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, postgres_value},
@@ -37,7 +37,9 @@ fn postgres_operations() -> Vec<CapabilityOperation> {
         CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::SqlInsertRowsAtomic,
         CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::SqlListTablesBudgeted,
         CapabilityOperation::SqlDescribeTableBounded,
     ]);
     operations
@@ -437,6 +439,26 @@ impl SqlEngine for PostgresAdapter {
         Ok(limiter.finish(schemas))
     }
 
+    async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        let (mut limiter, sql_limit) = budgeted_catalog_limit(budget, "PostgreSQL")?;
+        let rows = sqlx::query(
+            "SELECT schema_name FROM information_schema.schemata \
+             ORDER BY schema_name LIMIT $1",
+        )
+        .bind(sql_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+        let mut schemas = Vec::with_capacity(rows.len().min(budget.max_items));
+        for row in rows {
+            let schema = row
+                .try_get::<String, _>(0)
+                .map_err(|error| Error::Query(error.to_string()))?;
+            limiter.retain_item(schema, &mut schemas)?;
+        }
+        limiter.finish(schemas)
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let s = validate_optional_schema(schema)?.unwrap_or("public");
         if self.kind.0 == "redshift" {
@@ -515,6 +537,54 @@ impl SqlEngine for PostgresAdapter {
                 .collect::<Result<Vec<_>>>()?
         };
         Ok(limiter.finish(tables))
+    }
+
+    async fn list_tables_budgeted(
+        &self,
+        schema: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (mut limiter, sql_limit) = budgeted_catalog_limit(budget, "PostgreSQL")?;
+        let schema = validate_optional_schema(schema)?.unwrap_or("public");
+        let observed = if self.kind.0 == "redshift" {
+            redshift_list_tables_bounded(&self.pool, schema, sql_limit).await?
+        } else {
+            let rows = sqlx::query(
+                "SELECT n.nspname, c.relname, c.relkind::text \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                 ORDER BY c.relname LIMIT $2",
+            )
+            .bind(schema)
+            .bind(sql_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+            rows.iter()
+                .map(|row| {
+                    let schema = row
+                        .try_get::<String, _>(0)
+                        .map_err(|error| Error::Query(error.to_string()))?;
+                    let name = row
+                        .try_get::<String, _>(1)
+                        .map_err(|error| Error::Query(error.to_string()))?;
+                    let relkind = row
+                        .try_get::<String, _>(2)
+                        .map_err(|error| Error::Query(error.to_string()))?;
+                    Ok(TableInfo {
+                        schema: Some(schema),
+                        name,
+                        kind: postgres_table_kind(&relkind)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut tables = Vec::with_capacity(observed.len().min(budget.max_items));
+        for table in observed {
+            limiter.retain_item(table, &mut tables)?;
+        }
+        limiter.finish(tables)
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -1009,8 +1079,10 @@ mod tests {
     }
 
     #[test]
-    fn postgres_and_redshift_advertise_budgeted_query_and_bounded_table_description() {
+    fn postgres_and_redshift_advertise_budgeted_reads_and_bounded_table_description() {
         assert!(postgres_operations().contains(&CapabilityOperation::SqlQueryBudgeted));
+        assert!(postgres_operations().contains(&CapabilityOperation::SqlListSchemasBudgeted));
+        assert!(postgres_operations().contains(&CapabilityOperation::SqlListTablesBudgeted));
         assert!(postgres_operations().contains(&CapabilityOperation::SqlDescribeTableBounded));
     }
 
@@ -1151,6 +1223,12 @@ mod tests {
         assert!(connector
             .operations()
             .contains(&CapabilityOperation::SqlListTablesBounded));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListSchemasBudgeted));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListTablesBudgeted));
         let sql = connector.as_sql().unwrap();
         sql.execute(&format!("CREATE SCHEMA {schema}"), &[])
             .await
@@ -1172,6 +1250,53 @@ mod tests {
                 [format!("{schema}.alpha"), format!("{schema}.beta")]
             );
             assert!(limited.truncated);
+
+            let probe = TableInfo {
+                schema: Some(schema.clone()),
+                name: "gamma".to_owned(),
+                kind: TableKind::Table,
+            };
+            let table_bytes = serde_json::to_vec(&limited).unwrap().len()
+                + serde_json::to_vec(&probe).unwrap().len();
+            let budgeted = sql
+                .list_tables_budgeted(Some(&schema), ReadBudget::new(2, table_bytes)?)
+                .await?;
+            assert_eq!(
+                serde_json::to_value(&budgeted).unwrap(),
+                serde_json::to_value(&limited).unwrap()
+            );
+            assert!(matches!(
+                sql.list_tables_budgeted(
+                    Some(&schema),
+                    ReadBudget::new(2, table_bytes - 1)?
+                )
+                .await,
+                Err(Error::ReadBudgetExceeded {
+                    unit: "bytes",
+                    limit,
+                    ..
+                }) if limit == table_bytes - 1
+            ));
+
+            let all_schemas = sql.list_schemas().await?;
+            let expected_schemas = BoundedList::complete(all_schemas);
+            let schema_bytes = serde_json::to_vec(&expected_schemas).unwrap().len();
+            let budgeted_schemas = sql
+                .list_schemas_budgeted(ReadBudget::new(expected_schemas.items.len(), schema_bytes)?)
+                .await?;
+            assert_eq!(budgeted_schemas, expected_schemas);
+            assert!(matches!(
+                sql.list_schemas_budgeted(ReadBudget::new(
+                    budgeted_schemas.items.len(),
+                    schema_bytes - 1,
+                )?)
+                .await,
+                Err(Error::ReadBudgetExceeded {
+                    unit: "bytes",
+                    limit,
+                    ..
+                }) if limit == schema_bytes - 1
+            ));
 
             sql.execute(&format!("DROP TABLE {schema}.gamma"), &[])
                 .await?;
