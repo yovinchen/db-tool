@@ -468,8 +468,13 @@ artifact 只能诊断，不能导入。已成功读取后 key 的正常过期不
 `SET [NX]`。因此不会重新开始旧 PTTL，也不会短暂复活已经过期的 key。跨 Redis 实例迁移
 绝对时间要求源/目标服务器时钟基本同步；时钟偏差属于部署边界，不能通过客户端重置 TTL
 掩盖。
-artifact 先以 Unix `0600` 权限写同目录临时文件并 `sync`，再通过 rename 发布并同步
-父目录，避免进程中断留下看似完整的目标文件；单个 artifact 的读写上限固定为 256 MiB。
+artifact 先以 Unix `0600` 权限写同目录独占临时文件并同步文件内容，再通过统一原子发布
+primitive 替换目标。Unix 使用同目录 rename 并在成功后同步父目录；Windows 使用
+`MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`，因此已有普通文件可被替换且返回前请求
+write-through。替换前的写入、同步或发布失败会删除临时文件并保留旧目标；Unix rename 已经
+成功后若父目录同步失败，函数会返回错误，但新目标已经发布，不能声称旧目标仍在。单个
+artifact 的导入读写硬上限固定为 256 MiB；SQL/Document bounded export 还受调用方
+`--max-bytes` 限制。
 导入还会把全局 `--limit` 作为项目总预算，在解析 DSN 前拒绝更多 rows/keys/documents；
 超限时必须有意识地提高 `--limit` 或拆分资源。
 旧 KV v1/v2、缺失或伪造 expiry、Document v1/v2、计数不一致、未知 codec、标记矛盾以及任何

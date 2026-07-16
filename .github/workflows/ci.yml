@@ -183,6 +183,14 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
+      - name: Windows atomic file replacement tests
+        if: runner.os == 'Windows'
+        run: cargo test -p dbtool-core --lib service::atomic_file::tests
+
+      - name: Windows transfer artifact replacement test
+        if: runner.os == 'Windows'
+        run: cargo test -p dbtool-cli --bin dbtool cmd::transfer::tests::artifact_publish_replaces_existing_target_and_leaves_no_temp_file -- --exact
+
   build-matrix:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -230,6 +238,25 @@ jobs:
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --release --target ${{ matrix.target }} -p dbtool-cli
+
+  windows-portable-pr:
+    name: Windows portable PR gate (${{ matrix.target }})
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build portable Windows release
+        run: cargo build --release --target ${{ matrix.target }} -p dbtool-cli --no-default-features --features portable
 
   integration-services:
     name: Live services integration
