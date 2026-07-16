@@ -12,3 +12,6 @@ dbtool-core = { path = "../dbtool-core" }
 async-trait = { workspace = true }
 futures     = { workspace = true }
 scylla      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -26,6 +26,7 @@ dependencies = [
  "dbtool-core",
  "futures",
  "scylla",
+ "tokio",
 ]
 
 [[package]]

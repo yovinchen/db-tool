@@ -9,14 +9,15 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ReadBudget, ResultSet,
-        TableInfo, TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, InputBudget, MetadataBudget, ReadBudget,
+        ResultSet, TableInfo, TableKind, TableSchema, Value, DEFAULT_METADATA_BYTES,
+        MAX_INPUT_BYTES,
     },
     port::{
         capability::{CqlEngine, SqlEngine},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
+    service::limiter::{InputLimiter, ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
 };
 use futures::{future::BoxFuture, StreamExt};
 use scylla::{
@@ -38,6 +39,7 @@ pub struct CassandraAdapter {
 }
 
 const LEGACY_SCHEMA_MAX_ITEMS: usize = 100_000;
+const CASSANDRA_MAX_CQL_BYTES: usize = MAX_INPUT_BYTES;
 
 pub fn factory(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     Box::pin(async move {
@@ -120,6 +122,22 @@ impl Connector for CassandraAdapter {
 }
 
 impl CassandraAdapter {
+    async fn send_cql_mutation(&self, cql: &str) -> Result<ExecOutcome> {
+        self.session
+            .query_unpaged(cql, &[])
+            .await
+            .map_err(|error| {
+                Error::OutcomeIndeterminate(format!(
+                    "Cassandra CQL mutation may have reached the backend: {error}; inspect database state before retrying"
+                ))
+            })?;
+
+        Ok(ExecOutcome {
+            rows_affected: 0,
+            last_insert_id: None,
+        })
+    }
+
     async fn query_catalog_bounded<T, F>(
         &self,
         cql: &str,
@@ -311,6 +329,7 @@ fn cassandra_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> 
     operations.extend([
         CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::CqlQueryBudgeted,
+        CapabilityOperation::CqlExecuteBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
@@ -470,16 +489,8 @@ impl SqlEngine for CassandraAdapter {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
-        reject_dynamic_params(params)?;
-        self.session
-            .query_unpaged(sql, &[])
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-
-        Ok(ExecOutcome {
-            rows_affected: 0,
-            last_insert_id: None,
-        })
+        preflight_cassandra_sql_execute(sql, params, InputBudget::default())?;
+        self.send_cql_mutation(sql).await
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
@@ -708,7 +719,12 @@ impl CqlEngine for CassandraAdapter {
     }
 
     async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome> {
-        <Self as SqlEngine>::execute(self, cql, &[]).await
+        self.execute_cql_budgeted(cql, InputBudget::default()).await
+    }
+
+    async fn execute_cql_budgeted(&self, cql: &str, budget: InputBudget) -> Result<ExecOutcome> {
+        preflight_cql_execute(cql, budget)?;
+        self.send_cql_mutation(cql).await
     }
 
     async fn list_keyspaces(&self) -> Result<Vec<String>> {
@@ -1168,6 +1184,38 @@ fn reject_dynamic_params(params: &[Value]) -> Result<()> {
     }
 }
 
+fn validate_cql_statement(cql: &str) -> Result<()> {
+    if cql.as_bytes().contains(&0) {
+        return Err(Error::Query(
+            "Cassandra CQL statement contains a NUL byte".to_owned(),
+        ));
+    }
+    if cql.len() > CASSANDRA_MAX_CQL_BYTES {
+        return Err(Error::Query(format!(
+            "Cassandra CQL statement exceeds the fixed {CASSANDRA_MAX_CQL_BYTES}-byte ceiling"
+        )));
+    }
+    Ok(())
+}
+
+fn preflight_cql_execute(cql: &str, budget: InputBudget) -> Result<()> {
+    let request = ("cql", cql);
+    InputLimiter::new(budget, "Cassandra CQL execute input")?.validate_request(&request)?;
+    validate_cql_statement(cql)
+}
+
+fn preflight_cassandra_sql_execute(sql: &str, params: &[Value], budget: InputBudget) -> Result<()> {
+    let request = ("cql", sql, "params", params);
+    let limiter = InputLimiter::new(budget, "Cassandra SQL-compatible execute input")?;
+    if params.is_empty() {
+        limiter.validate_request(&request)?;
+    } else {
+        limiter.validate_items_with_request(params, &request)?;
+    }
+    validate_cql_statement(sql)?;
+    reject_dynamic_params(params)
+}
+
 fn value_text(value: &Value) -> Option<&str> {
     match value {
         Value::Text(value) => Some(value),
@@ -1211,6 +1259,7 @@ mod tests {
         for operation in [
             CapabilityOperation::SqlQueryBudgeted,
             CapabilityOperation::CqlQueryBudgeted,
+            CapabilityOperation::CqlExecuteBudgeted,
             CapabilityOperation::SqlListSchemasBounded,
             CapabilityOperation::SqlListSchemasBudgeted,
             CapabilityOperation::SqlListTablesBounded,
@@ -1254,6 +1303,143 @@ mod tests {
         let statement = Statement::new("SELECT now() FROM system.local")
             .with_page_size(budgeted_query_page_size());
         assert_eq!(statement.get_page_size(), 1);
+    }
+
+    #[test]
+    fn cql_execute_budget_preflight_is_exact_and_sql_alias_counts_late_params() {
+        let cql = "delete from ks.jobs where id = 1";
+        let scalar_bytes = (1..=1024)
+            .find(|bytes| {
+                preflight_cql_execute(cql, InputBudget::new(1, *bytes, *bytes).unwrap()).is_ok()
+            })
+            .expect("small CQL scalar request must fit");
+        preflight_cql_execute(
+            cql,
+            InputBudget::new(1, scalar_bytes, scalar_bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            preflight_cql_execute(
+                cql,
+                InputBudget::new(1, scalar_bytes, scalar_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded { .. })
+        ));
+
+        let params = [Value::Int(1), Value::Text("late".into())];
+        assert!(matches!(
+            preflight_cassandra_sql_execute(
+                "update ks.jobs set note = ? where id = ?",
+                &params,
+                InputBudget {
+                    max_items: 1,
+                    ..InputBudget::default()
+                },
+            ),
+            Err(Error::InputBudgetExceeded { unit: "items", .. })
+        ));
+        assert!(matches!(
+            preflight_cassandra_sql_execute(
+                "update ks.jobs set note = ? where id = ?",
+                &params,
+                InputBudget::default(),
+            ),
+            Err(Error::Query(_))
+        ));
+        assert!(matches!(
+            preflight_cql_execute("x\0y", InputBudget::default()),
+            Err(Error::Query(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cassandra_live_budgeted_cql_rejects_before_write_and_cleans_keyspace() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_CASSANDRA_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let keyspace = format!("dbtool_it_input_{suffix}");
+        let rejected = format!("{keyspace}_rejected");
+        let table = format!("{keyspace}.items");
+        let connector = factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::CqlExecuteBudgeted));
+        let cql = connector.as_cql().unwrap();
+
+        let exercise = async {
+            let error = cql
+                .execute_cql_budgeted(
+                    &format!(
+                        "CREATE KEYSPACE {rejected} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+                    ),
+                    InputBudget::new(1, 1, 1)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+            assert!(!cql.list_keyspaces().await?.contains(&rejected));
+
+            cql.execute_cql_budgeted(
+                &format!(
+                    "CREATE KEYSPACE {keyspace} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+                ),
+                InputBudget::default(),
+            )
+            .await?;
+            cql.execute_cql_budgeted(
+                &format!("CREATE TABLE {table} (id int PRIMARY KEY, note text)"),
+                InputBudget::default(),
+            )
+            .await?;
+            cql.execute_cql_budgeted(
+                &format!("INSERT INTO {table} (id, note) VALUES (1, 'created')"),
+                InputBudget::default(),
+            )
+            .await?;
+            cql.execute_cql_budgeted(
+                &format!("UPDATE {table} SET note = 'updated' WHERE id = 1"),
+                InputBudget::default(),
+            )
+            .await?;
+            let readback = cql
+                .query_cql(&format!("SELECT id, note FROM {table} WHERE id = 1"))
+                .await?;
+            assert_eq!(readback.rows.len(), 1);
+            assert_eq!(readback.rows[0][0], Value::Int(1));
+            assert_eq!(readback.rows[0][1], Value::Text("updated".into()));
+
+            cql.execute_cql_budgeted(
+                &format!("DELETE FROM {table} WHERE id = 1"),
+                InputBudget::default(),
+            )
+            .await?;
+            assert!(cql
+                .query_cql(&format!("SELECT id FROM {table} WHERE id = 1"))
+                .await?
+                .rows
+                .is_empty());
+            cql.execute_cql_budgeted(
+                &format!("DROP TABLE {table}"),
+                InputBudget::default(),
+            )
+            .await?;
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        cql.execute_cql_budgeted(
+            &format!("DROP KEYSPACE IF EXISTS {keyspace}"),
+            InputBudget::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!cql.list_keyspaces().await.unwrap().contains(&keyspace));
+        exercise.unwrap();
+        connector.close().await.unwrap();
     }
 
     #[test]
