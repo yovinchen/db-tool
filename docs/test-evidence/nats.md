@@ -64,8 +64,39 @@ Verification: adapter-nats 17 unit + 2 integration PASS; strict all-target
 Clippy, rustfmt and diff check PASS; NATS JetStream live exact catalog and zero
 state cleanup PASS.
 
+## IF-T77 producer input envelope refresh
+
+Run date: 2026-07-16
+
+NATS now advertises exact `message.produce_budgeted`. It prebuilds the complete
+batch and validates portable Message/batch N/N-1, subject grammar, header
+support, exact HPUB wire body, and the server-advertised `INFO.max_payload`
+before the first Core NATS publish. A later invalid message cannot follow an
+already-dispatched valid one.
+
+NATS Docker 3/3 passed: an oversized request left a precreated JetStream at
+zero retained messages; the exact budget retained one Core NATS publish and a
+raw JetStream read reproduced its payload; the isolated stream was deleted and
+final server state reported `streams=consumers=messages=bytes=0`. Adapter
+verification was 20 tests plus strict Clippy.
+
+A root rerun observed stream depth `0` immediately after Core NATS flush and
+`1` shortly afterward, which is valid because flush is not a JetStream PubAck.
+The live assertion now polls within a fixed two-second deadline. The failed-run
+stream was deleted through the public CLI with a target-bound confirmation
+token; the rerun passed 3/3 and `/jsz` ended with zero resources and bytes.
+
+Core NATS flush is not a per-message JetStream publish ACK. Publish/flush
+failure after dispatch is therefore non-retryable `OUTCOME_INDETERMINATE` and
+requires subscriber/stream inspection. `INFO` also does not expose every
+custom server policy, including a separately lowered maximum control line, so
+the portable exact budget is not a guarantee that every server will accept the
+message.
+
 Cleanup: PASS
 
 Compatibility gaps: NATS 2.10.29 standalone was tested. Stateful TLS,
 clustered/leaf-node behavior, ACL-denied strict creation, a concurrent creator
 race, and a fault injected between verified ACKs were not rerun in this slice.
+
+IF-T77 commits: `317829e`, `9c0a273`

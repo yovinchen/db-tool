@@ -57,6 +57,30 @@ Verification: adapter-amqp 24 unit + 3 integration PASS; strict all-target
 Clippy, rustfmt and diff check PASS; RabbitMQ management live catalog and empty
 cleanup PASS.
 
+## IF-T77 producer input envelope refresh
+
+Run date: 2026-07-16
+
+AMQP now advertises exact `message.produce_budgeted`. Before creating a channel
+or declaring a queue, it validates the complete `ProduceBudget`, every portable
+Message, the complete Vec envelope, the queue name, prebuilt BasicProperties/
+field tables, and fixed-width header constraints for the entire batch. Body
+segmentation remains lapin's responsibility. Offline tests passed
+the exact per-message/batch N boundary and rejected N-1, N+1 messages, and a
+valid first item followed by an invalid item before declaration.
+
+RabbitMQ Docker 4/4 passed: an oversized request left the passive-probed queue
+absent; the exact budget declared the queue and published one payload; direct
+`basic.get` read back the exact bytes and ACKed them; deletion succeeded and
+the final management queue inventory was empty. Adapter verification was 27
+tests plus strict Clippy.
+
+Queue declaration is itself a remote mutation, so declaration, publish, or
+publisher-confirm failures after that boundary return non-retryable
+`OUTCOME_INDETERMINATE`. AMQP 0.9.1 has no confirm-of-confirm. A broker policy
+may also impose a payload/frame ceiling below dbtool's portable 16 MiB limit;
+that remote rejection cannot be claimed as a preflight zero-write result.
+
 Focused reproduction:
 
 ```text
@@ -72,4 +96,5 @@ DBTOOL_IT_AMQP_DSN=amqp://... \
 
 Cleanup: PASS; focused management API final queue list was `[]`
 
-Commits: `e24fb79`, `acff12b`, `1279cbd`, `d2c88a2`, IF-T47, IF-T59
+Commits: `e24fb79`, `acff12b`, `1279cbd`, `d2c88a2`, `9a813d8`, `d580664`,
+`d69f866`, IF-T47, IF-T59

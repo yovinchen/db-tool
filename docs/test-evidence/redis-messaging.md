@@ -82,8 +82,35 @@ is not overstated as four new product runs.
 Verification: adapter-redis 47 tests PASS; strict all-target Clippy, rustfmt and
 diff check PASS; Redis 7 live exact catalog and zero-key cleanup PASS.
 
+## IF-T77 producer input envelope refresh
+
+Run date: 2026-07-16
+
+Redis now advertises exact `message.produce_budgeted`. Before the first
+XADD/PUBLISH, Streams and Pub/Sub validate the target, portable
+non-empty/count/per-message/batch N/N-1 envelope, and every protocol field.
+Streams preserve payload, key, string headers and partition 0 while rejecting
+producer offset/timestamp/cursor/metadata; Pub/Sub accepts payload only. Redis'
+512 MiB bulk-string bound remains above dbtool's stricter portable 16 MiB hard
+ceiling.
+
+Redis 7 exact live validation passed 1/1: the one-byte-short request returned
+`INPUT_BUDGET_EXCEEDED`, the rejected name remained `TYPE none`, the exact
+request produced one Stream entry, and bounded consume reproduced payload,
+key, header and native Stream ID. Both accepted/rejected names were deleted and
+the final `dbtool_it_produce_*` scan was empty.
+
+The initial live attempt expected only the caller header and failed when the
+adapter correctly added lossless `redis_stream_id`. The assertion was fixed,
+the failed-run Stream was removed, and the rerun passed; the final empty scan
+proves the cleanup. Redis Pub/Sub remains ephemeral, so a persistent catalog
+cannot prove that no subscriber received a publish. Any failure after the
+first XADD/PUBLISH is non-retryable `OUTCOME_INDETERMINATE` because an earlier
+message may already have reached Redis.
+
 Cleanup: PASS; all `dbtool_it_stream_group_*` and
 `dbtool_it_redis_stream_*` scans were empty on Redis, Valkey, KeyDB, and
 Dragonfly after the matrix.
 
-Commits: `e24fb79`, `acff12b`, `1279cbd`, `d2c88a2`, `b3b6e34`, IF-T48
+Commits: `e24fb79`, `acff12b`, `1279cbd`, `d2c88a2`, `b3b6e34`, `7540ff3`,
+IF-T48

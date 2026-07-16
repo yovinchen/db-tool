@@ -65,7 +65,39 @@ Verification: Kafka pure 18 unit + 1 integration PASS; native 26 unit PASS;
 strict Clippy for both feature sets, rustfmt and diff check PASS; Redpanda live
 exact catalog and cleanup PASS.
 
+## IF-T77 producer input envelope refresh
+
+Run date: 2026-07-16
+
+Both pure `rskafka` and native `librdkafka` advertise exact
+`message.produce_budgeted`. They validate non-empty/count, every complete
+Message, complete batch bytes, topic, headers, partition/timestamp and the
+broker-owned offset rule before topic creation or the first record send.
+Offline preflight passed exact N and rejected per-message/batch N-1, N+1
+messages, NUL headers, and caller-supplied offsets.
+
+The pure Redpanda `live_bounded` test passed 1/1: a one-byte-short request did
+not create its target topic, an exact request produced and consumed the exact
+partition-0 payload, and the topic plus auxiliary catalog topic were deleted.
+The native exact live test passed 1/1: a two-message one-byte-short request did
+not create its target topic, the exact batch produced successfully, committed
+offset/high-watermark lag proved the expected partition contents, and every
+topic created by that run was deleted.
+
+One old topic, `dbtool_it_kafka_topic_16721_1784144037118`, existed before this
+IF-T77 run and was not one of its resource names. The test correctly avoided
+deleting it; cleanup PASS means all current-run topics were removed, not that
+the shared broker was globally empty.
+
+Kafka topic creation and per-partition append are separate remote mutations.
+After either may have started, create/send/delivery/placement failures are
+non-retryable `OUTCOME_INDETERMINATE`. Broker or topic
+`message.max.bytes` can be lower than dbtool's portable 16 MiB ceiling and
+cannot be atomically frozen during preflight, so a post-submit broker rejection
+is not described as zero-write.
+
 Cleanup: PASS; every topic created by the exact lifecycle was deleted through
 the public API and bounded absence verification succeeded.
 
-Commits: `e24fb79`, `85c7954`, `acff12b`, `1279cbd`, `300e94b`, `d2c88a2`
+Commits: `e24fb79`, `85c7954`, `acff12b`, `1279cbd`, `300e94b`, `d2c88a2`,
+`de6b79e`
