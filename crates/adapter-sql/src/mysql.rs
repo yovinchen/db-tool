@@ -17,7 +17,7 @@ use sqlx::query::Query;
 use sqlx::{types::Json, Column, MySql, MySqlPool, Row};
 
 use crate::{
-    bounded_catalog_limit, bounded_metadata_limit, group_index_rows,
+    bounded_catalog_limit, bounded_metadata_limit, budgeted_catalog_limit, group_index_rows,
     identifier::{parse_table_ref, validate_optional_schema, TableRef},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, mysql_value},
@@ -35,7 +35,9 @@ fn mysql_operations() -> Vec<CapabilityOperation> {
         CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::SqlInsertRowsAtomic,
         CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::SqlListTablesBudgeted,
         CapabilityOperation::SqlDescribeTableBounded,
     ]);
     operations
@@ -461,6 +463,23 @@ impl SqlEngine for MySqlAdapter {
         Ok(limiter.finish(schemas))
     }
 
+    async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        let (mut limiter, sql_limit) = budgeted_catalog_limit(budget, "MySQL")?;
+        let rows = sqlx::query(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
+             ORDER BY SCHEMA_NAME LIMIT ?",
+        )
+        .bind(sql_limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| Error::Query(error.to_string()))?;
+        let mut schemas = Vec::with_capacity(rows.len().min(budget.max_items));
+        for row in rows {
+            limiter.retain_item(mysql_text(&row, 0)?, &mut schemas)?;
+        }
+        limiter.finish(schemas)
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let schema = validate_optional_schema(schema)?;
         let rows = if let Some(schema) = schema {
@@ -549,6 +568,56 @@ impl SqlEngine for MySqlAdapter {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(limiter.finish(tables))
+    }
+
+    async fn list_tables_budgeted(
+        &self,
+        schema: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (mut limiter, sql_limit) = budgeted_catalog_limit(budget, "MySQL")?;
+        let schema = validate_optional_schema(schema)?;
+        let rows = if let Some(schema) = schema {
+            sqlx::query(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+                 FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME LIMIT ?",
+            )
+            .bind(schema)
+            .bind(sql_limit)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+                 FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME LIMIT ?",
+            )
+            .bind(sql_limit)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|error| Error::Query(error.to_string()))?;
+
+        let mut tables = Vec::with_capacity(rows.len().min(budget.max_items));
+        for row in rows {
+            let effective_schema = mysql_text(&row, 0)?;
+            let name = mysql_text(&row, 1)?;
+            let table_type = mysql_text(&row, 2)?;
+            limiter.retain_item(
+                TableInfo {
+                    schema: Some(effective_schema),
+                    name,
+                    kind: if table_type.contains("VIEW") {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                },
+                &mut tables,
+            )?;
+        }
+        limiter.finish(tables)
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -810,8 +879,10 @@ mod tests {
     }
 
     #[test]
-    fn mysql_family_advertises_bounded_query_and_table_description() {
+    fn mysql_family_advertises_budgeted_reads_and_bounded_table_description() {
         assert!(mysql_operations().contains(&CapabilityOperation::SqlQueryBudgeted));
+        assert!(mysql_operations().contains(&CapabilityOperation::SqlListSchemasBudgeted));
+        assert!(mysql_operations().contains(&CapabilityOperation::SqlListTablesBudgeted));
         assert!(mysql_operations().contains(&CapabilityOperation::SqlDescribeTableBounded));
     }
 
@@ -923,6 +994,12 @@ mod tests {
         assert!(connector
             .operations()
             .contains(&CapabilityOperation::SqlListTablesBounded));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListSchemasBudgeted));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlListTablesBudgeted));
         let sql = connector.as_sql().unwrap();
         let existing_count = sql.list_tables(None).await.unwrap().len();
         for table in &tables {
@@ -945,10 +1022,97 @@ mod tests {
                 .as_deref()
                 .is_some_and(|schema| !schema.is_empty())));
 
+            let all_tables = sql.list_tables(None).await?;
+            let probe = all_tables
+                .get(total - 1)
+                .cloned()
+                .ok_or_else(|| Error::Query("MySQL table probe item was not listed".into()))?;
+            let table_bytes = serde_json::to_vec(&limited).unwrap().len()
+                + serde_json::to_vec(&probe).unwrap().len();
+            let budgeted = sql
+                .list_tables_budgeted(None, ReadBudget::new(total - 1, table_bytes)?)
+                .await?;
+            assert_eq!(
+                serde_json::to_value(&budgeted).unwrap(),
+                serde_json::to_value(&limited).unwrap()
+            );
+            assert!(matches!(
+                sql.list_tables_budgeted(
+                    None,
+                    ReadBudget::new(total - 1, table_bytes - 1)?
+                )
+                .await,
+                Err(Error::ReadBudgetExceeded {
+                    unit: "bytes",
+                    limit,
+                    ..
+                }) if limit == table_bytes - 1
+            ));
+
+            let complete = BoundedList::complete(all_tables);
+            let complete_bytes = serde_json::to_vec(&complete).unwrap().len();
+            let budgeted_complete = sql
+                .list_tables_budgeted(None, ReadBudget::new(total, complete_bytes)?)
+                .await?;
+            assert_eq!(
+                serde_json::to_value(&budgeted_complete).unwrap(),
+                serde_json::to_value(&complete).unwrap()
+            );
+
             let all_schemas = sql.list_schemas().await?;
             let exact_schemas = sql.list_schemas_bounded(all_schemas.len()).await?;
             assert_eq!(exact_schemas.items, all_schemas);
             assert!(!exact_schemas.truncated);
+
+            let schema_limit = all_schemas
+                .len()
+                .checked_sub(1)
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| {
+                    Error::Query("MySQL did not expose enough schemas for an N+1 probe".into())
+                })?;
+            let limited_schemas = sql.list_schemas_bounded(schema_limit).await?;
+            assert_eq!(limited_schemas.items.len(), schema_limit);
+            assert!(limited_schemas.truncated);
+            let schema_probe = all_schemas
+                .get(schema_limit)
+                .ok_or_else(|| Error::Query("MySQL schema probe item was not listed".into()))?;
+            let limited_schema_bytes = serde_json::to_vec(&limited_schemas).unwrap().len()
+                + serde_json::to_vec(schema_probe).unwrap().len();
+            let budgeted_limited_schemas = sql
+                .list_schemas_budgeted(ReadBudget::new(schema_limit, limited_schema_bytes)?)
+                .await?;
+            assert_eq!(budgeted_limited_schemas, limited_schemas);
+            assert!(matches!(
+                sql.list_schemas_budgeted(ReadBudget::new(
+                    schema_limit,
+                    limited_schema_bytes - 1,
+                )?)
+                .await,
+                Err(Error::ReadBudgetExceeded {
+                    unit: "bytes",
+                    limit,
+                    ..
+                }) if limit == limited_schema_bytes - 1
+            ));
+
+            let schema_bytes = serde_json::to_vec(&exact_schemas).unwrap().len();
+            let budgeted_schemas = sql
+                .list_schemas_budgeted(ReadBudget::new(all_schemas.len(), schema_bytes)?)
+                .await?;
+            assert_eq!(budgeted_schemas, exact_schemas);
+            assert!(matches!(
+                sql.list_schemas_budgeted(ReadBudget::new(
+                    all_schemas.len(),
+                    schema_bytes - 1,
+                )?)
+                .await,
+                Err(Error::ReadBudgetExceeded {
+                    unit: "bytes",
+                    limit,
+                    ..
+                }) if limit == schema_bytes - 1
+            ));
             Ok::<_, Error>(())
         }
         .await;
