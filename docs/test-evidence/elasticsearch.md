@@ -22,6 +22,26 @@ This is product-native plain HTTP compatibility evidence, not an HTTPS claim.
 The registered `elasticsearch+https://` transport has service-free mapping
 coverage, but no product-native Elasticsearch security/TLS profile was run.
 
+## IF-T74 index scalar-byte envelope refresh
+
+Run at (UTC): 2026-07-16T03:19:08Z
+
+The shared Search adapter now advertises and implements exact
+`search.list_indices_budgeted` negotiation. It validates item/byte budgets
+before HTTP dispatch, accounts complete `IndexInfo` values plus the returned
+envelope and N+1 probe, and rejects exact byte N-1 while accepting N.
+Elasticsearch 8.15.5 Docker validation created two isolated indices, passed
+the item and byte boundaries, deleted both, and confirmed `_cat/indices` was
+`[]` afterward.
+
+Elasticsearch CAT indices shares the OpenSearch transport limitation: there is
+no reliable cross-version page-size/cursor contract. Raw JSON is capped at
+`min(caller max_bytes, 1 MiB)` before parsing, and only N+1 portable objects are
+constructed and observed. Product-native HTTPS remains outside this run.
+
+Verification: shared adapter-search 37/37 PASS; strict all-target Clippy,
+rustfmt and diff check PASS; Elasticsearch live exact catalog 1/1 PASS.
+
 Cleanup: PASS through public document delete and target-bound delete-index before container teardown
 
 Commits: `2e93c35`, `932655d`, `b9dd9fd`, `dbe1f32`, `ce19cb4`, IF-T76 caller/docs commit

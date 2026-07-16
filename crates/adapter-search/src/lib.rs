@@ -9,7 +9,7 @@ use dbtool_core::{
         },
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::{ListLimiter, SearchReadLimiter},
+    service::{ListLimiter, ReadLimiter, SearchReadLimiter},
 };
 use futures::future::BoxFuture;
 use rustls::{ClientConfig, RootCertStore};
@@ -98,6 +98,25 @@ impl SearchEngine for SearchAdapter {
             )
             .await?;
         indices_from_response_bounded(&response, limiter, probe_items)
+    }
+
+    async fn list_indices_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<IndexInfo>> {
+        let (limiter, probe_items) = budgeted_index_catalog_plan(budget)?;
+        let response = self
+            .client
+            .request_json_response_with_limit(
+                "GET",
+                "/_cat/indices?format=json&h=index&s=index",
+                None,
+                ResponseBodyLimit::read_budget_with_cap(
+                    budget.max_bytes,
+                    MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES,
+                    "search index catalog transport",
+                ),
+            )
+            .await?
+            .into_success()?;
+        indices_from_response_budgeted(&response, limiter, probe_items)
     }
 
     async fn search(
@@ -281,8 +300,16 @@ impl ResponseBodyLimit {
     }
 
     fn read_budget(caller_limit: usize, subject: &'static str) -> Self {
-        let max_bytes = caller_limit.min(MAX_HTTP_RESPONSE_BODY_BYTES);
-        let overflow = if caller_limit <= MAX_HTTP_RESPONSE_BODY_BYTES {
+        Self::read_budget_with_cap(caller_limit, MAX_HTTP_RESPONSE_BODY_BYTES, subject)
+    }
+
+    fn read_budget_with_cap(
+        caller_limit: usize,
+        transport_cap: usize,
+        subject: &'static str,
+    ) -> Self {
+        let max_bytes = caller_limit.min(transport_cap);
+        let overflow = if caller_limit <= transport_cap {
             ResponseBodyOverflow::ReadBudget {
                 subject,
                 caller_limit,
@@ -779,6 +806,41 @@ fn indices_from_response_bounded(
     Ok(limiter.finish(bounded))
 }
 
+fn budgeted_index_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize)> {
+    let limiter = ReadLimiter::new(budget, "search index catalog response")?;
+    let probe_items = limiter.probe_items()?;
+    Ok((limiter, probe_items))
+}
+
+fn indices_from_response_budgeted(
+    response: &JsonValue,
+    mut limiter: ReadLimiter,
+    probe_items: usize,
+) -> Result<BoundedList<IndexInfo>> {
+    let indices = response
+        .as_array()
+        .ok_or_else(|| Error::Serialization("search index list response is not an array".into()))?;
+    let mut bounded = Vec::with_capacity(probe_items.saturating_sub(1).min(256));
+    for entry in indices.iter().take(probe_items) {
+        let name = entry
+            .get("index")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| Error::Serialization("search index entry is missing index name".into()))?
+            .to_owned();
+        limiter.retain_item(
+            IndexInfo {
+                name,
+                columns: vec![],
+                unique: false,
+                primary: false,
+            },
+            &mut bounded,
+        )?;
+    }
+    bounded.sort_by(|a, b| a.name.cmp(&b.name));
+    limiter.finish(bounded)
+}
+
 fn search_body(query: Value, options: &SearchOptions) -> Result<JsonValue> {
     let query = core_value_to_json(query)?;
     let mut body = if looks_like_search_body(&query) {
@@ -1032,6 +1094,7 @@ fn parse_http_json_with_limit(
 fn search_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.push(CapabilityOperation::SearchListIndicesBounded);
+    operations.push(CapabilityOperation::SearchListIndicesBudgeted);
     operations.extend_from_slice(CapabilityOperation::SEARCH_BUDGETED_READS);
     operations
 }
@@ -1584,6 +1647,92 @@ mod tests {
     }
 
     #[test]
+    fn budgeted_index_catalog_rejects_invalid_envelopes_before_access() {
+        assert!(matches!(
+            budgeted_index_catalog_plan(ReadBudget {
+                max_items: 0,
+                max_bytes: 1024,
+            }),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+        assert!(matches!(
+            budgeted_index_catalog_plan(ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1024,
+            }),
+            Err(Error::Config(message)) if message.contains("probe item")
+        ));
+        assert!(matches!(
+            budgeted_index_catalog_plan(ReadBudget {
+                max_items: 1,
+                max_bytes: 0,
+            }),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+    }
+
+    #[test]
+    fn budgeted_index_catalog_is_exact_for_items_and_complete_bytes() {
+        fn apply(response: &JsonValue, budget: ReadBudget) -> Result<BoundedList<IndexInfo>> {
+            let (limiter, probe_items) = budgeted_index_catalog_plan(budget)?;
+            indices_from_response_budgeted(response, limiter, probe_items)
+        }
+
+        let two = json!([{ "index": "audit" }, { "index": "orders" }]);
+        let expected = BoundedList {
+            items: vec![
+                IndexInfo {
+                    name: "audit".to_owned(),
+                    columns: vec![],
+                    unique: false,
+                    primary: false,
+                },
+                IndexInfo {
+                    name: "orders".to_owned(),
+                    columns: vec![],
+                    unique: false,
+                    primary: false,
+                },
+            ],
+            truncated: false,
+        };
+        let required = serde_json::to_vec(&expected).unwrap().len();
+
+        let exact = apply(&two, ReadBudget::new(2, required).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(exact).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(matches!(
+            apply(&two, ReadBudget::new(2, required - 1).unwrap()),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == required - 1
+        ));
+
+        let exact_items = apply(&two, ReadBudget::new(2, 4096).unwrap()).unwrap();
+        assert_eq!(exact_items.items.len(), 2);
+        assert!(!exact_items.truncated);
+
+        let probed = apply(
+            &json!([
+                { "index": "audit" },
+                { "index": "orders" },
+                { "index": "users" },
+                { "index": "ignored" }
+            ]),
+            ReadBudget::new(2, 4096).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(probed.items.len(), 2);
+        assert_eq!(probed.items[0].name, "audit");
+        assert_eq!(probed.items[1].name, "orders");
+        assert!(probed.truncated);
+    }
+
+    #[test]
     fn search_declares_only_its_verified_exact_extensions() {
         let operations = search_operations(Capabilities {
             search: true,
@@ -1592,6 +1741,7 @@ mod tests {
 
         assert!(operations.contains(&CapabilityOperation::SearchListIndices));
         assert!(operations.contains(&CapabilityOperation::SearchListIndicesBounded));
+        assert!(operations.contains(&CapabilityOperation::SearchListIndicesBudgeted));
         assert!(operations.contains(&CapabilityOperation::SearchSearchBudgeted));
         assert!(operations.contains(&CapabilityOperation::SearchGetDocumentBudgeted));
         assert!(!operations.contains(&CapabilityOperation::DocumentListCollectionsBounded));
@@ -1884,6 +2034,9 @@ mod tests {
         assert!(adapter
             .operations()
             .contains(&CapabilityOperation::SearchGetDocumentBudgeted));
+        assert!(adapter
+            .operations()
+            .contains(&CapabilityOperation::SearchListIndicesBudgeted));
 
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1893,6 +2046,7 @@ mod tests {
             "dbtool-it-budgeted-{product}-{}-{unique}",
             std::process::id()
         );
+        let catalog_peer = format!("{index}-catalog-peer");
 
         let exercise = async {
             for (id, name, role) in [
@@ -1916,6 +2070,110 @@ mod tests {
                         "unexpected {product} fixture outcome for {id}: {outcome:?}"
                     )));
                 }
+            }
+
+            let peer_outcome = adapter
+                .put_doc(
+                    &catalog_peer,
+                    "catalog-probe",
+                    Value::Json(json!({"product": product, "purpose": "catalog probe"})),
+                )
+                .await?;
+            if peer_outcome.result != "created" {
+                return Err(Error::Internal(format!(
+                    "unexpected {product} catalog peer outcome: {peer_outcome:?}"
+                )));
+            }
+
+            let mut complete_catalog = None;
+            for _ in 0..40 {
+                let catalog = adapter
+                    .list_indices_budgeted(ReadBudget::new(
+                        10_000,
+                        MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES,
+                    )?)
+                    .await?;
+                let has_main = catalog.items.iter().any(|item| item.name == index);
+                let has_peer = catalog.items.iter().any(|item| item.name == catalog_peer);
+                if has_main && has_peer && !catalog.truncated {
+                    complete_catalog = Some(catalog);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let complete_catalog = complete_catalog.ok_or_else(|| {
+                Error::Query(format!(
+                    "{product} did not expose both budgeted index catalog fixtures"
+                ))
+            })?;
+            let catalog_items = complete_catalog.items.len();
+            if catalog_items < 2 {
+                return Err(Error::Internal(format!(
+                    "{product} catalog fixture count is unexpectedly {catalog_items}"
+                )));
+            }
+            let complete_catalog_json = serde_json::to_vec(&complete_catalog)
+                .map_err(|error| Error::Serialization(error.to_string()))?;
+
+            let item_exact = adapter
+                .list_indices_budgeted(ReadBudget::new(
+                    catalog_items,
+                    MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES,
+                )?)
+                .await?;
+            let item_exact_json = serde_json::to_vec(&item_exact)
+                .map_err(|error| Error::Serialization(error.to_string()))?;
+            if item_exact_json != complete_catalog_json || item_exact.truncated {
+                return Err(Error::Internal(format!(
+                    "{product} exact item catalog changed: expected={complete_catalog:?}, actual={item_exact:?}"
+                )));
+            }
+
+            let item_probed = adapter
+                .list_indices_budgeted(ReadBudget::new(
+                    catalog_items - 1,
+                    MAX_INDEX_CATALOG_RESPONSE_BODY_BYTES,
+                )?)
+                .await?;
+            if item_probed.items.len() != catalog_items - 1 || !item_probed.truncated {
+                return Err(Error::Internal(format!(
+                    "{product} N+1 catalog probe was not exact: {item_probed:?}"
+                )));
+            }
+
+            let catalog_bytes = complete_catalog_json.len();
+            let byte_exact = adapter
+                .list_indices_budgeted(ReadBudget::new(catalog_items, catalog_bytes)?)
+                .await?;
+            let byte_exact_json = serde_json::to_vec(&byte_exact)
+                .map_err(|error| Error::Serialization(error.to_string()))?;
+            if byte_exact_json != complete_catalog_json {
+                return Err(Error::Internal(format!(
+                    "{product} exact byte catalog changed: expected={complete_catalog:?}, actual={byte_exact:?}"
+                )));
+            }
+            let byte_error = match adapter
+                .list_indices_budgeted(ReadBudget::new(catalog_items, catalog_bytes - 1)?)
+                .await
+            {
+                Err(error) => error,
+                Ok(value) => {
+                    return Err(Error::Internal(format!(
+                        "{product} N-1 byte catalog unexpectedly succeeded: {value:?}"
+                    )))
+                }
+            };
+            if !matches!(
+                byte_error,
+                Error::ReadBudgetExceeded {
+                    unit: "bytes",
+                    limit,
+                    ..
+                } if limit == catalog_bytes - 1
+            ) {
+                return Err(Error::Internal(format!(
+                    "{product} N-1 byte catalog returned the wrong error: {byte_error}"
+                )));
             }
 
             let search_budget = ReadBudget::new(2, 1024 * 1024)?;
@@ -2052,10 +2310,15 @@ mod tests {
         .await;
 
         let cleanup = adapter.delete_index(&index).await;
+        let peer_cleanup = adapter.delete_index(&catalog_peer).await;
         let absence = async {
             for _ in 0..40 {
                 let indices = adapter.list_indices_bounded(10_000).await?;
-                if indices.items.iter().all(|item| item.name != index) {
+                if indices
+                    .items
+                    .iter()
+                    .all(|item| item.name != index && item.name != catalog_peer)
+                {
                     return Ok::<bool, Error>(true);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -2066,11 +2329,14 @@ mod tests {
 
         if let Err(error) = exercise {
             panic!(
-                "{product} budgeted search lifecycle failed before cleanup: {error}; cleanup={cleanup:?}; absence={absence:?}"
+                "{product} budgeted search lifecycle failed before cleanup: {error}; cleanup={cleanup:?}; peer_cleanup={peer_cleanup:?}; absence={absence:?}"
             );
         }
         let cleanup = cleanup.expect("live budgeted search index should delete cleanly");
+        let peer_cleanup =
+            peer_cleanup.expect("live budgeted search catalog peer should delete cleanly");
         assert!(cleanup.acknowledged);
+        assert!(peer_cleanup.acknowledged);
         assert!(absence.expect("live index absence check should succeed"));
     }
 

@@ -24,6 +24,27 @@ The real OpenSearch row is the product-completion claim. The Python fixture
 proves the HTTPS transport and file-backed seed path but is not represented as
 a real OpenSearch security product run; that is tracked separately.
 
+## IF-T74 index scalar-byte envelope refresh
+
+Run at (UTC): 2026-07-16T03:19:08Z
+
+`SearchEngine.list_indices_budgeted` and the exact
+`search.list_indices_budgeted` operation now account each complete `IndexInfo`,
+the returned `BoundedList`, and the N+1 probe against the caller's item and byte
+budgets. Zero and probe-overflow item budgets and zero/oversized byte budgets
+fail before HTTP dispatch. OpenSearch 2.17.1 Docker validation created two
+isolated indices, passed item N/N+1 and exact byte N/N-1 boundaries, deleted
+both indices, and left only the pre-existing system indices.
+
+CAT indices has no reliable cross-version `size` or cursor parameter. The
+adapter therefore caps its raw JSON body at the smaller of the caller byte
+budget and 1 MiB, then constructs and observes no more than N+1 portable index
+objects. This is an explicit transport boundary, not a claim that OpenSearch
+scans only N+1 server-side rows.
+
+Verification: `cargo test -p adapter-search` 37/37 PASS; strict all-target
+Clippy, rustfmt and diff check PASS; OpenSearch live exact catalog 1/1 PASS.
+
 Cleanup: PASS through the public document delete and confirmed delete-index APIs; only OpenSearch system indices remained
 
 Commits: `2e93c35`, `7a6bbdd`, `926be55`, `932655d`, `b9dd9fd`, `dbe1f32`, `ce19cb4`, IF-T76 caller/docs commit
