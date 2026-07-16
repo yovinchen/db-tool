@@ -112,6 +112,7 @@ capability_operations! {
     DocumentAggregate => "document.aggregate",
     DocumentAggregateBounded => "document.aggregate_bounded",
     DocumentAggregateBudgeted => "document.aggregate_budgeted",
+    DocumentAggregateWriteBudgeted => "document.aggregate_write_budgeted",
     DocumentDropCollection => "document.drop_collection",
     DocumentDropCollectionBudgeted => "document.drop_collection_budgeted",
     TimeSeriesListMeasurements => "time_series.list_measurements",
@@ -194,6 +195,7 @@ impl CapabilityOperation {
         Self::DocumentUpdateManyBudgeted,
         Self::DocumentDeleteOneBudgeted,
         Self::DocumentDeleteManyBudgeted,
+        Self::DocumentAggregateWriteBudgeted,
         Self::DocumentDropCollectionBudgeted,
     ];
     /// Exact time-series mutation contracts.
@@ -223,6 +225,7 @@ impl CapabilityOperation {
         Self::DocumentUpdateManyBudgeted,
         Self::DocumentDeleteOneBudgeted,
         Self::DocumentDeleteManyBudgeted,
+        Self::DocumentAggregateWriteBudgeted,
         Self::DocumentDropCollectionBudgeted,
         Self::TimeSeriesWritePointsBudgeted,
         Self::SearchIndexDocumentBudgeted,
@@ -899,6 +902,10 @@ mod tests {
                 "document.delete_many_budgeted",
             ),
             (
+                CapabilityOperation::DocumentAggregateWriteBudgeted,
+                "document.aggregate_write_budgeted",
+            ),
+            (
                 CapabilityOperation::DocumentDropCollectionBudgeted,
                 "document.drop_collection_budgeted",
             ),
@@ -985,7 +992,7 @@ mod tests {
             CapabilityOperation::KEY_VALUE_EXISTENCE,
             [CapabilityOperation::KeyValueExists]
         );
-        assert_eq!(CapabilityOperation::BUDGETED_MUTATIONS.len(), 19);
+        assert_eq!(CapabilityOperation::BUDGETED_MUTATIONS.len(), 20);
         for family in [
             CapabilityOperation::SQL_BUDGETED_MUTATIONS,
             CapabilityOperation::CQL_BUDGETED_MUTATIONS,

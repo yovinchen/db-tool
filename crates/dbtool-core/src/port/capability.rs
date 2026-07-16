@@ -713,6 +713,32 @@ pub trait DocumentStore: Connector {
         })
     }
 
+    /// Run an explicitly mutating aggregation under separate input and output
+    /// envelopes.
+    ///
+    /// This operation is reserved for pipelines such as MongoDB `$out` and
+    /// `$merge`. Implementations must completely prevalidate the source
+    /// collection, every stage, and every statically represented destination
+    /// against [`InputBudget`] plus protocol syntax and fixed limits before
+    /// constructing or sending the backend command. [`ReadBudget`] bounds any
+    /// cursor response. After the command may have reached the backend, every
+    /// transport, execution, response-budget, or decoding failure must be
+    /// returned as [`crate::Error::OutcomeIndeterminate`]. Read-only aggregate
+    /// methods must reject write stages instead of silently authorizing this
+    /// stronger contract.
+    async fn aggregate_write_budgeted(
+        &self,
+        _collection: &str,
+        _pipeline: Vec<Value>,
+        _input_budget: InputBudget,
+        _response_budget: ReadBudget,
+    ) -> Result<BoundedList<Document>> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "DocumentStore.aggregate_write_budgeted",
+        })
+    }
+
     /// Drop a document collection.
     ///
     /// This lifecycle method is optional and is never inferred from the coarse
@@ -1818,6 +1844,17 @@ mod tests {
             DocumentStore::delete_many_budgeted(&connector, "users", Value::Null, input_budget)
                 .await,
             "DocumentStore.delete_many_budgeted",
+        );
+        assert_unsupported(
+            DocumentStore::aggregate_write_budgeted(
+                &connector,
+                "users",
+                vec![Value::Json(serde_json::json!({ "$out": "archive" }))],
+                input_budget,
+                read_budget,
+            )
+            .await,
+            "DocumentStore.aggregate_write_budgeted",
         );
         assert_unsupported(
             DocumentStore::drop_collection_budgeted(&connector, "users", input_budget).await,

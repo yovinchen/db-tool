@@ -56,6 +56,12 @@ struct MongoDropInput<'a> {
     collection: &'a str,
 }
 
+#[derive(Serialize)]
+struct MongoAggregateInput<'a> {
+    collection: &'a str,
+    pipeline: &'a [Value],
+}
+
 pub struct MongoAdapter {
     db: Database,
 }
@@ -363,10 +369,7 @@ impl DocumentStore for MongoAdapter {
         let limiter = MongoDocumentLimiter::new(budget, "MongoDB aggregate result")?;
         let probe_items = limiter.probe_items()?;
         let col = self.db.collection::<mongodb::bson::Document>(collection);
-        let pipeline = pipeline
-            .into_iter()
-            .map(value_to_document)
-            .collect::<Result<Vec<_>>>()?;
+        let pipeline = prepare_mongo_read_aggregate(collection, pipeline)?;
 
         // The driver necessarily materializes one server response before the
         // adapter can inspect raw BSON lengths. Keeping the protocol batch at
@@ -381,6 +384,32 @@ impl DocumentStore for MongoAdapter {
             .map_err(|e| Error::Query(e.to_string()))?;
 
         collect_budgeted_cursor(cursor, limiter, probe_items).await
+    }
+
+    async fn aggregate_write_budgeted(
+        &self,
+        collection: &str,
+        pipeline: Vec<Value>,
+        input_budget: InputBudget,
+        response_budget: ReadBudget,
+    ) -> Result<BoundedList<Document>> {
+        let limiter =
+            MongoDocumentLimiter::new(response_budget, "MongoDB mutating aggregate response")?;
+        let probe_items = limiter.probe_items()?;
+        let pipeline =
+            prepare_mongo_aggregate_write(self.db.name(), collection, &pipeline, input_budget)?;
+        let cursor = self
+            .db
+            .collection::<mongodb::bson::Document>(collection)
+            .aggregate(pipeline)
+            .with_type::<mongodb::bson::Document>()
+            .batch_size(MONGO_BUDGETED_BATCH_SIZE)
+            .await
+            .map_err(|error| mongo_outcome_indeterminate("mutating aggregate", error))?;
+
+        collect_budgeted_cursor(cursor, limiter, probe_items)
+            .await
+            .map_err(|error| mongo_outcome_indeterminate("mutating aggregate response", error))
     }
 
     async fn drop_collection(&self, collection: &str) -> Result<()> {
@@ -450,10 +479,7 @@ impl MongoAdapter {
             ));
         }
         let col = self.db.collection::<mongodb::bson::Document>(collection);
-        let pipeline = pipeline
-            .into_iter()
-            .map(value_to_document)
-            .collect::<Result<Vec<_>>>()?;
+        let pipeline = prepare_mongo_read_aggregate(collection, pipeline)?;
         let mut cursor = col
             .aggregate(pipeline)
             .await
@@ -478,6 +504,7 @@ fn mongo_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::DocumentListCollectionsBudgeted,
         CapabilityOperation::DocumentFindBudgeted,
         CapabilityOperation::DocumentAggregateBudgeted,
+        CapabilityOperation::DocumentAggregateWriteBudgeted,
         CapabilityOperation::DocumentInsertBudgeted,
         CapabilityOperation::DocumentUpdateOne,
         CapabilityOperation::DocumentUpdateOneBudgeted,
@@ -616,6 +643,154 @@ fn prepare_mongo_drop(database: &str, collection: &str, budget: InputBudget) -> 
         "$db": database,
     };
     validate_mongo_wire_request(&command, None)
+}
+
+fn prepare_mongo_read_aggregate(
+    collection: &str,
+    pipeline: Vec<Value>,
+) -> Result<Vec<bson::Document>> {
+    let pipeline = pipeline
+        .into_iter()
+        .map(value_to_document)
+        .collect::<Result<Vec<_>>>()?;
+    if pipeline.iter().any(mongo_aggregate_stage_writes) {
+        return Err(Error::Config(format!(
+            "MongoDB read-only aggregate on collection '{collection}' contains $out/$merge; use document.aggregate_write_budgeted"
+        )));
+    }
+    Ok(pipeline)
+}
+
+fn prepare_mongo_aggregate_write(
+    database: &str,
+    collection: &str,
+    pipeline: &[Value],
+    budget: InputBudget,
+) -> Result<Vec<bson::Document>> {
+    validate_mongo_collection_name(database, collection)?;
+    let request = MongoAggregateInput {
+        collection,
+        pipeline,
+    };
+    InputLimiter::new(budget, "MongoDB mutating aggregate input")?
+        .validate_items_with_request(pipeline, &request)?;
+
+    let pipeline = pipeline
+        .iter()
+        .cloned()
+        .map(value_to_document)
+        .collect::<Result<Vec<_>>>()?;
+    let mut destination = None;
+    for (index, stage) in pipeline.iter().enumerate() {
+        if stage.len() != 1 || !stage.keys().all(|key| key.starts_with('$')) {
+            return Err(Error::Config(format!(
+                "MongoDB aggregate pipeline stage {} must contain exactly one operator",
+                index + 1
+            )));
+        }
+        validate_mongo_bson_document(stage, "aggregate pipeline stage")?;
+        let Some((target_database, target_collection)) = mongo_aggregate_destination(stage)? else {
+            continue;
+        };
+        let target_database = if target_database.is_empty() {
+            database.to_owned()
+        } else {
+            target_database
+        };
+        if destination.is_some() {
+            return Err(Error::Config(
+                "MongoDB mutating aggregate must contain exactly one $out/$merge stage".into(),
+            ));
+        }
+        if index + 1 != pipeline.len() {
+            return Err(Error::Config(
+                "MongoDB $out/$merge stage must be the final pipeline stage".into(),
+            ));
+        }
+        validate_mongo_database_name(&target_database)?;
+        validate_mongo_collection_name(&target_database, &target_collection)?;
+        destination = Some((target_database, target_collection));
+    }
+    if destination.is_none() {
+        return Err(Error::Config(
+            "MongoDB mutating aggregate requires exactly one final $out/$merge stage".into(),
+        ));
+    }
+
+    let command = bson::doc! {
+        "aggregate": collection,
+        "pipeline": pipeline.clone(),
+        "cursor": bson::Document::new(),
+        "$db": database,
+    };
+    validate_mongo_wire_request(&command, None)?;
+    Ok(pipeline)
+}
+
+fn mongo_aggregate_stage_writes(stage: &bson::Document) -> bool {
+    stage.contains_key("$out") || stage.contains_key("$merge")
+}
+
+fn mongo_aggregate_destination(stage: &bson::Document) -> Result<Option<(String, String)>> {
+    match (stage.get("$out"), stage.get("$merge")) {
+        (Some(_), Some(_)) => Err(Error::Config(
+            "MongoDB aggregate stage must not contain both $out and $merge".into(),
+        )),
+        (Some(specification), None) => {
+            parse_mongo_aggregate_namespace(specification, "$out").map(Some)
+        }
+        (None, Some(Bson::String(collection))) => Ok(Some((String::new(), collection.clone()))),
+        (None, Some(Bson::Document(options))) => {
+            let target = options.get("into").ok_or_else(|| {
+                Error::Config("MongoDB $merge requires an 'into' destination".into())
+            })?;
+            parse_mongo_aggregate_namespace(target, "$merge.into").map(Some)
+        }
+        (None, Some(_)) => Err(Error::Config(
+            "MongoDB $merge destination must be a collection string or object".into(),
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_mongo_aggregate_namespace(value: &Bson, label: &str) -> Result<(String, String)> {
+    match value {
+        Bson::String(collection) => Ok((String::new(), collection.clone())),
+        Bson::Document(options) => {
+            let collection = options.get_str("coll").map_err(|_| {
+                Error::Config(format!("MongoDB {label} object requires string 'coll'"))
+            })?;
+            let database = match options.get("db") {
+                None => String::new(),
+                Some(Bson::String(database)) => database.clone(),
+                Some(_) => {
+                    return Err(Error::Config(format!(
+                        "MongoDB {label} object 'db' must be a string"
+                    )))
+                }
+            };
+            Ok((database, collection.to_owned()))
+        }
+        _ => Err(Error::Config(format!(
+            "MongoDB {label} destination must be a collection string or object"
+        ))),
+    }
+}
+
+fn validate_mongo_database_name(database: &str) -> Result<()> {
+    if database.is_empty() {
+        return Ok(());
+    }
+    if database.as_bytes().contains(&0)
+        || database
+            .chars()
+            .any(|character| matches!(character, '/' | '\\' | '.' | ' ' | '"' | '$'))
+    {
+        return Err(Error::Config(
+            "MongoDB aggregate destination database contains a forbidden character".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_mongo_collection_name(database: &str, collection: &str) -> Result<()> {
@@ -1085,6 +1260,7 @@ mod tests {
             CapabilityOperation::DocumentListCollectionsBudgeted,
             CapabilityOperation::DocumentFindBudgeted,
             CapabilityOperation::DocumentAggregateBudgeted,
+            CapabilityOperation::DocumentAggregateWriteBudgeted,
             CapabilityOperation::DocumentInsertBudgeted,
             CapabilityOperation::DocumentUpdateOne,
             CapabilityOperation::DocumentUpdateOneBudgeted,
@@ -1243,6 +1419,97 @@ mod tests {
                 InputBudget::new(1, drop_bytes, drop_bytes - 1).unwrap(),
             ),
             Err(Error::InputBudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn mutating_aggregate_has_an_exact_input_contract_and_read_paths_reject_it() {
+        let collection = "events";
+        let pipeline = vec![
+            Value::Json(serde_json::json!({"$match": {"active": true}})),
+            Value::Json(serde_json::json!({"$out": "events_archive"})),
+        ];
+        let item_bytes = pipeline
+            .iter()
+            .map(|stage| serde_json::to_vec(stage).unwrap().len())
+            .max()
+            .unwrap();
+        let request_bytes = serde_json::to_vec(&MongoAggregateInput {
+            collection,
+            pipeline: &pipeline,
+        })
+        .unwrap()
+        .len();
+        assert!(prepare_mongo_aggregate_write(
+            "dbtool",
+            collection,
+            &pipeline,
+            InputBudget::new(pipeline.len(), item_bytes, request_bytes).unwrap(),
+        )
+        .is_ok());
+        let merge_pipeline = vec![Value::Json(serde_json::json!({
+            "$merge": {
+                "into": {"db": "archive_db", "coll": "events_archive"},
+                "whenMatched": "replace",
+                "whenNotMatched": "insert"
+            }
+        }))];
+        assert!(prepare_mongo_aggregate_write(
+            "dbtool",
+            collection,
+            &merge_pipeline,
+            InputBudget::default(),
+        )
+        .is_ok());
+        assert!(matches!(
+            prepare_mongo_aggregate_write(
+                "dbtool",
+                collection,
+                &pipeline,
+                InputBudget::new(pipeline.len(), item_bytes, request_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == request_bytes - 1
+        ));
+        assert!(matches!(
+            prepare_mongo_read_aggregate(collection, pipeline.clone()),
+            Err(Error::Config(message)) if message.contains("aggregate_write_budgeted")
+        ));
+        assert!(matches!(
+            prepare_mongo_aggregate_write(
+                "dbtool",
+                collection,
+                &[Value::Json(serde_json::json!({"$match": {}}))],
+                InputBudget::default(),
+            ),
+            Err(Error::Config(message)) if message.contains("requires exactly one")
+        ));
+        assert!(matches!(
+            prepare_mongo_aggregate_write(
+                "dbtool",
+                collection,
+                &[
+                    Value::Json(serde_json::json!({"$out": "archive"})),
+                    Value::Json(serde_json::json!({"$match": {}})),
+                ],
+                InputBudget::default(),
+            ),
+            Err(Error::Config(message)) if message.contains("final pipeline stage")
+        ));
+        assert!(matches!(
+            prepare_mongo_aggregate_write(
+                "dbtool",
+                collection,
+                &[Value::Json(serde_json::json!({
+                    "$out": "archive",
+                    "$merge": "other"
+                }))],
+                InputBudget::default(),
+            ),
+            Err(Error::Config(message)) if message.contains("exactly one operator")
         ));
     }
 
@@ -1561,6 +1828,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let collection = format!("dbtool_it_input_{suffix}");
+        let aggregate_target = format!("{collection}_archive");
         let connector = factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
         for operation in [
             CapabilityOperation::DocumentInsertBudgeted,
@@ -1568,6 +1836,7 @@ mod tests {
             CapabilityOperation::DocumentUpdateManyBudgeted,
             CapabilityOperation::DocumentDeleteOneBudgeted,
             CapabilityOperation::DocumentDeleteManyBudgeted,
+            CapabilityOperation::DocumentAggregateWriteBudgeted,
             CapabilityOperation::DocumentDropCollectionBudgeted,
         ] {
             assert!(connector.operations().contains(&operation));
@@ -1612,6 +1881,118 @@ mod tests {
                 .await?;
             assert_eq!(inserted.inserted, 3);
             assert_eq!(inserted.ids.len(), 3);
+
+            let aggregate_pipeline = vec![
+                Value::Json(serde_json::json!({"$match": {"kind": "input-budget"}})),
+                Value::Json(serde_json::json!({"$out": &aggregate_target})),
+            ];
+            let aggregate_item_bytes = aggregate_pipeline
+                .iter()
+                .map(|stage| serde_json::to_vec(stage).unwrap().len())
+                .max()
+                .unwrap();
+            let aggregate_request_bytes = serde_json::to_vec(&MongoAggregateInput {
+                collection: &collection,
+                pipeline: &aggregate_pipeline,
+            })
+            .unwrap()
+            .len();
+            let error = store
+                .aggregate_write_budgeted(
+                    &collection,
+                    aggregate_pipeline.clone(),
+                    InputBudget::new(
+                        aggregate_pipeline.len(),
+                        aggregate_item_bytes,
+                        aggregate_request_bytes - 1,
+                    )?,
+                    ReadBudget::with_default_bytes(1)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+            assert!(!store.list_collections().await?.contains(&aggregate_target));
+
+            let error = store
+                .aggregate_budgeted(
+                    &collection,
+                    aggregate_pipeline.clone(),
+                    ReadBudget::with_default_bytes(1)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "CONFIG_ERROR");
+            assert!(!store.list_collections().await?.contains(&aggregate_target));
+
+            let aggregate_response = store
+                .aggregate_write_budgeted(
+                    &collection,
+                    aggregate_pipeline,
+                    InputBudget::new(2, aggregate_item_bytes, aggregate_request_bytes)?,
+                    ReadBudget::with_default_bytes(1)?,
+                )
+                .await?;
+            assert!(aggregate_response.items.is_empty());
+            assert!(!aggregate_response.truncated);
+            assert_eq!(
+                store
+                    .find(&aggregate_target, Value::Null, FindOptions::default())
+                    .await?
+                    .len(),
+                3
+            );
+
+            let merge_pipeline = vec![
+                Value::Json(serde_json::json!({"$match": {"kind": "input-budget"}})),
+                Value::Json(serde_json::json!({
+                    "$merge": {
+                        "into": &aggregate_target,
+                        "whenMatched": "replace",
+                        "whenNotMatched": "insert"
+                    }
+                })),
+            ];
+            let merge_item_bytes = merge_pipeline
+                .iter()
+                .map(|stage| serde_json::to_vec(stage).unwrap().len())
+                .max()
+                .unwrap();
+            let merge_request_bytes = serde_json::to_vec(&MongoAggregateInput {
+                collection: &collection,
+                pipeline: &merge_pipeline,
+            })
+            .unwrap()
+            .len();
+            let merge_response = store
+                .aggregate_write_budgeted(
+                    &collection,
+                    merge_pipeline,
+                    InputBudget::new(2, merge_item_bytes, merge_request_bytes)?,
+                    ReadBudget::with_default_bytes(1)?,
+                )
+                .await?;
+            assert!(merge_response.items.is_empty());
+            assert!(!merge_response.truncated);
+            assert_eq!(
+                store
+                    .find(&aggregate_target, Value::Null, FindOptions::default())
+                    .await?
+                    .len(),
+                3
+            );
+
+            let aggregate_drop_bytes = serde_json::to_vec(&MongoDropInput {
+                collection: &aggregate_target,
+            })
+            .unwrap()
+            .len();
+            store
+                .drop_collection_budgeted(
+                    &aggregate_target,
+                    InputBudget::new(1, aggregate_drop_bytes, aggregate_drop_bytes)?,
+                )
+                .await?;
+            assert!(!store.list_collections().await?.contains(&aggregate_target));
 
             let one_filter = Value::Json(serde_json::json!({"_id": 1}));
             let one_update = Value::Json(serde_json::json!({"state": "updated-one"}));
@@ -1724,19 +2105,15 @@ mod tests {
         }
         .await;
 
-        if store
-            .list_collections()
-            .await
-            .unwrap()
-            .contains(&collection)
-        {
-            store.drop_collection(&collection).await.unwrap();
+        let remaining = store.list_collections().await.unwrap();
+        for candidate in [&collection, &aggregate_target] {
+            if remaining.contains(candidate) {
+                store.drop_collection(candidate).await.unwrap();
+            }
         }
-        assert!(!store
-            .list_collections()
-            .await
-            .unwrap()
-            .contains(&collection));
+        let remaining = store.list_collections().await.unwrap();
+        assert!(!remaining.contains(&collection));
+        assert!(!remaining.contains(&aggregate_target));
         exercise.unwrap();
         connector.close().await.unwrap();
     }
