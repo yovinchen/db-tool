@@ -89,6 +89,12 @@ fn resolve_consume_position(options: &ConsumeOptions) -> Result<(Option<i32>, Op
     Ok((partition, offset))
 }
 
+fn validate_kafka_consume_options(options: &ConsumeOptions) -> Result<()> {
+    options
+        .validate()
+        .map_err(|message| Error::Config(format!("Kafka consume: {message}")))
+}
+
 #[cfg(test)]
 fn validate_consume_position(partition: Option<i32>, offset: Option<i64>) -> Result<()> {
     resolve_consume_position(&ConsumeOptions {
@@ -172,6 +178,23 @@ mod tests {
         validate_produce_message(&message(Some(0), None)).unwrap();
         validate_consume_position(None, None).unwrap();
         validate_consume_position(Some(3), Some(42)).unwrap();
+    }
+
+    #[test]
+    fn kafka_consume_rejects_invalid_byte_envelopes_before_client_access() {
+        for options in [
+            ConsumeOptions {
+                max_message_bytes: 0,
+                ..Default::default()
+            },
+            ConsumeOptions {
+                max_batch_bytes: dbtool_core::model::MAX_READ_BYTES + 1,
+                ..Default::default()
+            },
+        ] {
+            let error = validate_kafka_consume_options(&options).unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message.contains("Kafka consume")));
+        }
     }
 
     #[test]

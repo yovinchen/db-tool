@@ -2,6 +2,22 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr};
 
+use super::{DEFAULT_READ_BYTES, MAX_READ_BYTES};
+
+/// Default byte ceiling for one complete caller-visible consumed message.
+pub const DEFAULT_CONSUME_MESSAGE_BYTES: usize = DEFAULT_READ_BYTES;
+
+/// Default cumulative byte ceiling for one complete consumed message batch.
+pub const DEFAULT_CONSUME_BATCH_BYTES: usize = DEFAULT_READ_BYTES;
+
+const fn default_consume_message_bytes() -> usize {
+    DEFAULT_CONSUME_MESSAGE_BYTES
+}
+
+const fn default_consume_batch_bytes() -> usize {
+    DEFAULT_CONSUME_BATCH_BYTES
+}
+
 /// A backend-native, lossless position for a consumed message.
 ///
 /// The legacy [`Message::partition`] and [`Message::offset`] fields remain for
@@ -224,6 +240,15 @@ pub enum AckMode {
 pub struct ConsumeOptions {
     pub max: usize,
     pub timeout: std::time::Duration,
+    /// Hard byte ceiling for one complete caller-visible [`Message`]. The
+    /// payload, key, headers, cursor, metadata, and portable scalar fields all
+    /// contribute through the stable serde representation.
+    #[serde(default = "default_consume_message_bytes")]
+    pub max_message_bytes: usize,
+    /// Hard cumulative byte ceiling for the complete caller-visible
+    /// `Vec<Message>` response. This is independent of the message count.
+    #[serde(default = "default_consume_batch_bytes")]
+    pub max_batch_bytes: usize,
     /// Partition to read from (Kafka-style); None = all.
     pub partition: Option<i32>,
     pub offset: Option<i64>,
@@ -248,8 +273,21 @@ impl ConsumeOptions {
         if self.max == 0 {
             return Err("consume max must be greater than zero".to_owned());
         }
+        if self.max.checked_add(1).is_none() {
+            return Err("consume max is too large to reserve an internal item probe".to_owned());
+        }
         if self.timeout.is_zero() {
             return Err("consume timeout must be greater than zero".to_owned());
+        }
+        if self.max_message_bytes == 0 || self.max_message_bytes > MAX_READ_BYTES {
+            return Err(format!(
+                "consume max_message_bytes must be between 1 and the hard {MAX_READ_BYTES}-byte ceiling"
+            ));
+        }
+        if self.max_batch_bytes == 0 || self.max_batch_bytes > MAX_READ_BYTES {
+            return Err(format!(
+                "consume max_batch_bytes must be between 1 and the hard {MAX_READ_BYTES}-byte ceiling"
+            ));
         }
         if self.partition.is_some_and(|partition| partition < 0) {
             return Err("consume partition must be non-negative".to_owned());
@@ -281,6 +319,8 @@ impl Default for ConsumeOptions {
         Self {
             max: 100,
             timeout: std::time::Duration::from_secs(5),
+            max_message_bytes: DEFAULT_CONSUME_MESSAGE_BYTES,
+            max_batch_bytes: DEFAULT_CONSUME_BATCH_BYTES,
             partition: None,
             offset: None,
             cursor: None,
@@ -502,6 +542,8 @@ mod tests {
         let options = ConsumeOptions::default();
         assert_eq!(options.identity, ConsumerIdentity::Stateless);
         assert_eq!(options.ack, AckMode::None);
+        assert_eq!(options.max_message_bytes, DEFAULT_CONSUME_MESSAGE_BYTES);
+        assert_eq!(options.max_batch_bytes, DEFAULT_CONSUME_BATCH_BYTES);
         assert!(options.validate().is_ok());
 
         let legacy: ConsumeOptions = serde_json::from_value(serde_json::json!({
@@ -513,6 +555,46 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.identity, ConsumerIdentity::Stateless);
         assert_eq!(legacy.ack, AckMode::None);
+        assert_eq!(legacy.max_message_bytes, DEFAULT_CONSUME_MESSAGE_BYTES);
+        assert_eq!(legacy.max_batch_bytes, DEFAULT_CONSUME_BATCH_BYTES);
+    }
+
+    #[test]
+    fn consume_byte_budgets_have_stable_wire_names_and_hard_bounds() {
+        let options = ConsumeOptions {
+            max_message_bytes: 1024,
+            max_batch_bytes: 4096,
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&options).unwrap();
+        assert_eq!(wire["max_message_bytes"], 1024);
+        assert_eq!(wire["max_batch_bytes"], 4096);
+        assert!(options.validate().is_ok());
+
+        for invalid in [
+            ConsumeOptions {
+                max_message_bytes: 0,
+                ..Default::default()
+            },
+            ConsumeOptions {
+                max_message_bytes: MAX_READ_BYTES + 1,
+                ..Default::default()
+            },
+            ConsumeOptions {
+                max_batch_bytes: 0,
+                ..Default::default()
+            },
+            ConsumeOptions {
+                max_batch_bytes: MAX_READ_BYTES + 1,
+                ..Default::default()
+            },
+            ConsumeOptions {
+                max: usize::MAX,
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ pub mod throttle;
 
 pub use atomic_file::write_file_atomically;
 pub use formatter::{Format, Formatter};
-pub use limiter::{ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter};
+pub use limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter, ReadLimiter, ResultLimiter};
 pub use manager::ConnectionManager;
 pub use resolver::ConnectionResolver;
 pub use safety::SafetyGuard;

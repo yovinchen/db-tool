@@ -1,5 +1,5 @@
 use crate::{
-    model::{BoundedList, MetadataBudget, ReadBudget, ResultSet},
+    model::{BoundedList, ConsumeOptions, Message, MetadataBudget, ReadBudget, ResultSet},
     Error, Result,
 };
 use serde::Serialize;
@@ -255,6 +255,62 @@ impl ReadLimiter {
     }
 }
 
+/// Applies the two consume byte limits before a protocol acknowledges or
+/// commits any delivery.
+///
+/// Each message is measured independently as a complete [`Message`], then
+/// charged to one cumulative batch limiter. [`Self::finish`] additionally
+/// measures the complete caller-visible `Vec<Message>` envelope, including
+/// delimiters that are not present in the sum of individual items.
+pub struct MessageReadLimiter {
+    single_budget: ReadBudget,
+    batch: ReadLimiter,
+    subject: String,
+    max_items: usize,
+}
+
+impl MessageReadLimiter {
+    pub fn new(options: &ConsumeOptions, subject: impl Into<String>) -> Result<Self> {
+        let subject = subject.into();
+        Ok(Self {
+            single_budget: ReadBudget::new(1, options.max_message_bytes)?,
+            batch: ReadLimiter::new(
+                ReadBudget::new(options.max, options.max_batch_bytes)?,
+                format!("{subject} batch"),
+            )?,
+            subject,
+            max_items: options.max,
+        })
+    }
+
+    /// Charge one fully converted message before any acknowledgement action.
+    pub fn observe(&mut self, message: &Message) -> Result<()> {
+        let mut single = ReadLimiter::new(self.single_budget, format!("{} message", self.subject))?;
+        if !single.observe_item(message)? {
+            return Err(Error::Internal(
+                "single-message limiter unexpectedly produced a probe item".into(),
+            ));
+        }
+        if !self.batch.observe_item(message)? {
+            return Err(Error::ReadBudgetExceeded {
+                subject: format!("{} batch", self.subject),
+                unit: "items",
+                limit: self.max_items,
+            });
+        }
+        Ok(())
+    }
+
+    /// Verify the final visible batch envelope before returning or confirming
+    /// any of its messages.
+    pub fn finish(self, messages: Vec<Message>) -> Result<Vec<Message>> {
+        self.batch.finish_with(messages, |messages, truncated| {
+            debug_assert!(!truncated, "consume batches never retain a probe item");
+            messages
+        })
+    }
+}
+
 enum CountingError {
     BudgetExceeded,
     Serialization(serde_json::Error),
@@ -385,7 +441,8 @@ impl MetadataLimiter {
 mod tests {
     use super::*;
     use crate::model::Value;
-    use std::collections::BTreeMap;
+    use bytes::Bytes;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn truncates_rows_over_limit() {
@@ -635,6 +692,81 @@ mod tests {
                 limit,
                 ..
             }) if limit == required - 1
+        ));
+    }
+
+    #[test]
+    fn message_read_limiter_charges_each_complete_message_and_the_batch_envelope() {
+        let message = Message {
+            key: Some(Bytes::from_static(b"key")),
+            payload: Bytes::from_static(b"payload"),
+            headers: HashMap::from([("trace".to_owned(), "abc".to_owned())]),
+            partition: Some(1),
+            offset: Some(2),
+            timestamp: Some(3),
+            cursor: Some(crate::model::MessageCursor::Kafka {
+                topic: "events".to_owned(),
+                partition: 1,
+                offset: 2,
+            }),
+            metadata: Some(crate::model::MessageMetadata::Amqp {
+                delivery_tag: 7,
+                redelivered: true,
+                exchange: "events".to_owned(),
+                routing_key: "orders".to_owned(),
+            }),
+        };
+        let message_bytes = serde_json::to_vec(&message).unwrap().len();
+        let batch_bytes = serde_json::to_vec(&vec![message.clone(), message.clone()])
+            .unwrap()
+            .len();
+
+        let exact = ConsumeOptions {
+            max: 2,
+            max_message_bytes: message_bytes,
+            max_batch_bytes: batch_bytes,
+            ..Default::default()
+        };
+        let mut limiter = MessageReadLimiter::new(&exact, "Kafka consume").unwrap();
+        limiter.observe(&message).unwrap();
+        limiter.observe(&message).unwrap();
+        assert_eq!(
+            limiter
+                .finish(vec![message.clone(), message.clone()])
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let too_small_message = ConsumeOptions {
+            max_message_bytes: message_bytes - 1,
+            ..exact.clone()
+        };
+        assert!(matches!(
+            MessageReadLimiter::new(&too_small_message, "Kafka consume")
+                .unwrap()
+                .observe(&message),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == message_bytes - 1
+        ));
+
+        let too_small_batch = ConsumeOptions {
+            max_batch_bytes: batch_bytes - 1,
+            ..exact
+        };
+        let mut limiter = MessageReadLimiter::new(&too_small_batch, "Kafka consume").unwrap();
+        limiter.observe(&message).unwrap();
+        limiter.observe(&message).unwrap();
+        assert!(matches!(
+            limiter.finish(vec![message.clone(), message]),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == batch_bytes - 1
         ));
     }
 }

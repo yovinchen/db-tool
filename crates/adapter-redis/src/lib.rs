@@ -14,7 +14,7 @@ use dbtool_core::{
         },
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter},
+    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter},
 };
 use futures::{future::BoxFuture, StreamExt};
 use redis::{
@@ -1008,6 +1008,7 @@ impl RedisAdapter {
         stream: &str,
         options: ConsumeOptions,
     ) -> Result<Vec<Message>> {
+        let mut read_limiter = MessageReadLimiter::new(&options, "Redis Stream consume")?;
         let offset = redis_stream_start(&self.kind, &options)?;
         let block_ms = duration_millis_usize(options.timeout)?;
         let mut c = self.conn.lock().await;
@@ -1026,10 +1027,13 @@ impl RedisAdapter {
         let reply = parse_stream_read_reply(reply, stream)?;
         let mut entries = Vec::new();
         extend_unique_stream_entries(&mut entries, &mut HashSet::new(), reply, options.max)?;
-        entries
-            .into_iter()
-            .map(|entry| stream_id_to_message(stream, entry))
-            .collect()
+        let mut messages = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let message = stream_id_to_message(stream, entry)?;
+            read_limiter.observe(&message)?;
+            messages.push(message);
+        }
+        read_limiter.finish(messages)
     }
 
     async fn consume_stream_group(
@@ -1046,7 +1050,7 @@ impl RedisAdapter {
         let deadline = checked_deadline(options.timeout)?;
         let mut c = self.conn.lock().await;
         if Instant::now() >= deadline {
-            return Ok(vec![]);
+            return MessageReadLimiter::new(&options, "Redis Stream consume")?.finish(vec![]);
         }
         // Do not reserve from an untrusted embedded max value before Redis has
         // actually returned any bounded data.
@@ -1082,11 +1086,14 @@ impl RedisAdapter {
         // Convert every entry before advancing broker-owned state. Missing or
         // unrepresentable payload/header data leaves the complete batch in the
         // PEL for explicit recovery.
-        let messages = entries
-            .iter()
-            .cloned()
-            .map(|entry| stream_id_to_message(stream, entry))
-            .collect::<Result<Vec<_>>>()?;
+        let mut read_limiter = MessageReadLimiter::new(&options, "Redis Stream consume")?;
+        let mut messages = Vec::with_capacity(entries.len());
+        for entry in entries.iter().cloned() {
+            let message = stream_id_to_message(stream, entry)?;
+            read_limiter.observe(&message)?;
+            messages.push(message);
+        }
+        let messages = read_limiter.finish(messages)?;
 
         if options.ack == AckMode::OnSuccess && !entries.is_empty() {
             let mut command = redis::cmd("XACK");
@@ -1127,6 +1134,7 @@ impl RedisAdapter {
 
         let mut stream = pubsub.on_message();
         let mut messages = Vec::new();
+        let mut read_limiter = MessageReadLimiter::new(&options, "Redis Pub/Sub consume")?;
 
         while messages.len() < options.max {
             let now = Instant::now();
@@ -1142,7 +1150,7 @@ impl RedisAdapter {
                     let channel = message
                         .get_channel::<String>()
                         .map_err(|e| Error::Query(e.to_string()))?;
-                    messages.push(Message {
+                    let message = Message {
                         key: None,
                         payload: payload.into(),
                         headers: HashMap::from([("redis_channel".to_owned(), channel)]),
@@ -1151,13 +1159,15 @@ impl RedisAdapter {
                         timestamp: None,
                         cursor: None,
                         metadata: None,
-                    });
+                    };
+                    read_limiter.observe(&message)?;
+                    messages.push(message);
                 }
                 Ok(None) | Err(_) => break,
             }
         }
 
-        Ok(messages)
+        read_limiter.finish(messages)
     }
 
     async fn stream_detail(&self, stream: &str) -> Result<TopicDetail> {
@@ -2714,6 +2724,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redis_live_consume_budget_failure_stays_pending_before_xack() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let client = Client::open(dsn.raw_with_scheme("redis").unwrap()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        let suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let stream = format!("dbtool_it_budget_stream_{suffix}");
+        let group = format!("dbtool_it_budget_group_{suffix}");
+        let member = format!("dbtool_it_budget_member_{suffix}");
+        let id: String = redis::cmd("XADD")
+            .arg(&stream)
+            .arg("*")
+            .arg("payload")
+            .arg("budget-must-fail-before-xack")
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&stream)
+            .arg(&group)
+            .arg("0")
+            .query_async::<()>(&mut direct)
+            .await
+            .unwrap();
+
+        let connector = factory(dsn).await.unwrap();
+        let consumer = connector.as_consumer().unwrap();
+        let options = |max_message_bytes, ack| ConsumeOptions {
+            max: 1,
+            timeout: std::time::Duration::from_secs(2),
+            max_message_bytes,
+            identity: ConsumerIdentity::Group {
+                group: group.clone(),
+                member: Some(member.clone()),
+            },
+            ack,
+            ..Default::default()
+        };
+        assert!(matches!(
+            consumer
+                .consume(&stream, options(1, AckMode::OnSuccess))
+                .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit: 1,
+                ..
+            })
+        ));
+        let pending: redis::streams::StreamPendingCountReply = redis::cmd("XPENDING")
+            .arg(&stream)
+            .arg(&group)
+            .arg(&id)
+            .arg(&id)
+            .arg(1)
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.ids.len(),
+            1,
+            "budget failure must leave the delivery pending before XACK"
+        );
+
+        let recovered = consumer
+            .consume(
+                &stream,
+                options(dbtool_core::model::DEFAULT_READ_BYTES, AckMode::OnSuccess),
+            )
+            .await
+            .expect("the pending delivery should be replayable with a sufficient budget");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].payload.as_ref(),
+            b"budget-must-fail-before-xack"
+        );
+        assert_eq!(
+            recovered[0].cursor,
+            Some(MessageCursor::RedisStream {
+                stream: stream.clone(),
+                id: id.clone(),
+            })
+        );
+        let pending: redis::streams::StreamPendingCountReply = redis::cmd("XPENDING")
+            .arg(&stream)
+            .arg(&group)
+            .arg(&id)
+            .arg(&id)
+            .arg(1)
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert!(pending.ids.is_empty());
+
+        redis::cmd("DEL")
+            .arg(&stream)
+            .query_async::<u64>(&mut direct)
+            .await
+            .unwrap();
+        connector.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn redis_live_lifetime_contract_preserves_bytes_deadlines_and_write_conditions() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
             return;
@@ -2884,14 +3006,12 @@ mod tests {
         let consume_options = |group: &str, member: Option<&str>, ack, max| ConsumeOptions {
             max,
             timeout: std::time::Duration::from_secs(2),
-            partition: None,
-            offset: None,
-            cursor: None,
             identity: ConsumerIdentity::Group {
                 group: group.to_owned(),
                 member: member.map(str::to_owned),
             },
             ack,
+            ..Default::default()
         };
         let message_ids = |messages: &[Message]| {
             messages

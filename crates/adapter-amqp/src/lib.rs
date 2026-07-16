@@ -10,7 +10,7 @@ use dbtool_core::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::MetadataLimiter,
+    service::limiter::{MessageReadLimiter, MetadataLimiter},
 };
 use futures::future::BoxFuture;
 use lapin::{
@@ -166,6 +166,7 @@ impl MessageConsumer for AmqpAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_queue(source)?;
         validate_consume_options(&options)?;
+        let mut read_limiter = MessageReadLimiter::new(&options, "AMQP consume")?;
 
         let deadline = checked_deadline(options.timeout)?;
         let acknowledgement_reserve =
@@ -229,7 +230,7 @@ impl MessageConsumer for AmqpAdapter {
                         .await);
                     }
                     last_delivery_tag = Some(delivery_tag);
-                    messages.push(Message {
+                    let message = Message {
                         key: None,
                         payload: payload.into(),
                         headers,
@@ -246,7 +247,11 @@ impl MessageConsumer for AmqpAdapter {
                             exchange,
                             routing_key,
                         }),
-                    });
+                    };
+                    if let Err(error) = read_limiter.observe(&message) {
+                        return Err(abort_unacknowledged_batch(&channel, deadline, error).await);
+                    }
+                    messages.push(message);
 
                     // basic.get reports the number of ready messages that
                     // remained immediately after this delivery. Once it is
@@ -265,6 +270,13 @@ impl MessageConsumer for AmqpAdapter {
                 }
             }
         }
+
+        let messages = match read_limiter.finish(messages) {
+            Ok(messages) => messages,
+            Err(error) => {
+                return Err(abort_unacknowledged_batch(&channel, deadline, error).await);
+            }
+        };
 
         if let Some(delivery_tag) = last_delivery_tag {
             // This channel is created exclusively for this one consume call,

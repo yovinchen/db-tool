@@ -4,11 +4,17 @@ use adapter_kafka::factory;
 use dbtool_core::{
     dsn::Dsn,
     error::Error,
-    model::{DeleteResourceOptions, MessageResource, MessageResourceKind, MetadataBudget},
+    model::{
+        ConsumeOptions, DeleteResourceOptions, Message, MessageResource, MessageResourceKind,
+        MetadataBudget,
+    },
     port::CapabilityOperation,
 };
 use rskafka::client::ClientBuilder;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[tokio::test]
 async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
@@ -74,6 +80,61 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
     assert_eq!(detail.info.partitions, 2);
     assert_eq!(detail.watermarks.len(), 2);
 
+    connector
+        .as_producer()
+        .expect("Kafka adapter should expose production")
+        .produce(
+            &topic,
+            vec![Message {
+                key: Some(b"key".to_vec().into()),
+                payload: b"budgeted-pure-kafka-message".to_vec().into(),
+                headers: HashMap::from([("trace".to_owned(), "pure".to_owned())]),
+                partition: Some(0),
+                offset: None,
+                timestamp: None,
+                cursor: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .expect("pure Kafka budget fixture should publish");
+    let consumer = connector
+        .as_consumer()
+        .expect("Kafka adapter should expose consumption");
+    assert!(matches!(
+        consumer
+            .consume(
+                &topic,
+                ConsumeOptions {
+                    max: 1,
+                    timeout: Duration::from_secs(5),
+                    partition: Some(0),
+                    max_message_bytes: 1,
+                    ..Default::default()
+                },
+            )
+            .await,
+        Err(Error::ReadBudgetExceeded {
+            unit: "bytes",
+            limit: 1,
+            ..
+        })
+    ));
+    let consumed = consumer
+        .consume(
+            &topic,
+            ConsumeOptions {
+                max: 1,
+                timeout: Duration::from_secs(5),
+                partition: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("pure Kafka message should remain readable with a sufficient budget");
+    assert_eq!(consumed.len(), 1);
+    assert_eq!(consumed[0].payload.as_ref(), b"budgeted-pure-kafka-message");
+
     let deleted = connector
         .as_admin_mutate()
         .expect("Kafka adapter should expose topic deletion")
@@ -88,5 +149,5 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
         .expect("delete should use the hard-bounded private detail and absence path");
     assert!(deleted.acknowledged);
     assert!(deleted.verified_absent);
-    assert_eq!(deleted.messages_before, Some(0));
+    assert_eq!(deleted.messages_before, Some(1));
 }

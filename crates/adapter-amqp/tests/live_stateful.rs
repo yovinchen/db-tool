@@ -277,3 +277,106 @@ async fn failed_batch_conversion_requeues_every_delivery_before_ack() {
         .await
         .expect("adapter connection should close");
 }
+
+#[tokio::test]
+async fn consume_byte_budget_failure_requeues_before_batch_ack() {
+    let Some(dsn) = integration_dsn() else {
+        return;
+    };
+    let queue = unique_queue();
+    let connector = factory(Dsn::parse(&dsn).expect("integration DSN should parse"))
+        .await
+        .expect("AMQP adapter should connect");
+    connector
+        .as_producer()
+        .expect("AMQP adapter should expose a producer")
+        .produce(
+            &queue,
+            vec![Message {
+                key: None,
+                payload: b"budget-must-fail-before-ack".to_vec().into(),
+                headers: HashMap::new(),
+                partition: None,
+                offset: None,
+                timestamp: None,
+                cursor: None,
+                metadata: None,
+            }],
+        )
+        .await
+        .expect("budget fixture should publish");
+
+    let error = connector
+        .as_consumer()
+        .expect("AMQP adapter should expose a consumer")
+        .consume(
+            &queue,
+            ConsumeOptions {
+                max: 1,
+                timeout: Duration::from_secs(5),
+                max_batch_bytes: 1,
+                ack: AckMode::OnSuccess,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("complete batch must exceed the one-byte budget");
+    assert!(matches!(
+        error,
+        Error::ReadBudgetExceeded {
+            unit: "bytes",
+            limit: 1,
+            ..
+        }
+    ));
+
+    let fixture = Connection::connect(&dsn, ConnectionProperties::default())
+        .await
+        .expect("fixture connection should open");
+    let channel = fixture
+        .create_channel()
+        .await
+        .expect("fixture channel should open");
+    let mut ready = 0;
+    for _ in 0..50 {
+        ready = channel
+            .queue_declare(
+                &queue,
+                QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .expect("budget fixture queue should remain available")
+            .message_count();
+        if ready == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(ready, 1, "budget failure must requeue before basic.ack");
+    let delivery = channel
+        .basic_get(&queue, BasicGetOptions::default())
+        .await
+        .expect("requeued budget fixture should be readable")
+        .expect("requeued budget fixture should exist");
+    assert!(delivery.delivery.redelivered);
+    channel
+        .basic_ack(delivery.delivery.delivery_tag, BasicAckOptions::default())
+        .await
+        .expect("fixture cleanup should acknowledge the delivery");
+    channel
+        .queue_delete(&queue, QueueDeleteOptions::default())
+        .await
+        .expect("fixture queue should delete cleanly");
+    fixture
+        .close(200, "fixture complete")
+        .await
+        .expect("fixture connection should close");
+    connector
+        .close()
+        .await
+        .expect("adapter connection should close");
+}

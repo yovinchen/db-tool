@@ -13,7 +13,7 @@ use dbtool_core::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter},
+    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter},
 };
 use futures::future::BoxFuture;
 use rskafka::{
@@ -30,13 +30,14 @@ use std::{
 
 use super::{
     kafka_messages_before, resolve_consume_position, validate_kafka_delete_request,
-    validate_produce_message,
+    validate_kafka_consume_options, validate_produce_message,
 };
 
 // Kafka's Metadata API does not paginate. Keep the unavoidable protocol frame
 // bounded before rskafka allocates or decodes it, then retain only the N+1
 // catalog probe at the portable boundary.
 const KAFKA_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const KAFKA_MAX_FETCH_BYTES: i32 = KAFKA_MAX_RESPONSE_BYTES as i32 - 512;
 const KAFKA_DELETE_MAX_PARTITIONS: usize = 100_000;
 
 pub struct RskafkaAdapter {
@@ -52,6 +53,10 @@ pub fn connect(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
         let brokers = vec![format!("{host}:{port}")];
         let client = ClientBuilder::new(brokers.clone())
             .client_id("dbtool")
+            // Freeze the ordinary consumer's receive frame ceiling as the
+            // final builder setting. A future DSN option mapper must remain
+            // before this call so it cannot silently restore unbounded reads.
+            .max_message_size(KAFKA_MAX_RESPONSE_BYTES)
             .build()
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
@@ -191,18 +196,17 @@ impl MessageProducer for RskafkaAdapter {
 impl MessageConsumer for RskafkaAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_topic(source)?;
+        validate_kafka_consume_options(&options)?;
         let (requested_partition, requested_offset) = resolve_consume_position(&options)?;
-        if options.max == 0 {
-            return Ok(vec![]);
-        }
+        let mut read_limiter = MessageReadLimiter::new(&options, "Kafka consume")?;
 
         let deadline = consume_deadline(options.timeout)?;
         let Some(remaining) = remaining_until(deadline) else {
-            return Ok(vec![]);
+            return read_limiter.finish(vec![]);
         };
         let topics = match tokio::time::timeout(remaining, self.topic_infos()).await {
             Ok(result) => result?,
-            Err(_) => return Ok(vec![]),
+            Err(_) => return read_limiter.finish(vec![]),
         };
         let topic = require_topic(topics, source)?;
 
@@ -236,7 +240,7 @@ impl MessageConsumer for RskafkaAdapter {
                         .map_err(|e| Error::Query(e.to_string()))?,
                 };
                 let (records, _) = client
-                    .fetch_records(offset, 1..1_048_576, max_wait_ms)
+                    .fetch_records(offset, 1..KAFKA_MAX_FETCH_BYTES, max_wait_ms)
                     .await
                     .map_err(|e| Error::Query(e.to_string()))?;
                 Ok::<_, Error>(records)
@@ -250,7 +254,7 @@ impl MessageConsumer for RskafkaAdapter {
                 if messages.len() >= options.max {
                     break;
                 }
-                messages.push(Message {
+                let message = Message {
                     key: record.record.key.map(Into::into),
                     payload: record.record.value.unwrap_or_default().into(),
                     headers: record
@@ -268,11 +272,13 @@ impl MessageConsumer for RskafkaAdapter {
                         offset: record.offset,
                     }),
                     metadata: None,
-                });
+                };
+                read_limiter.observe(&message)?;
+                messages.push(message);
             }
         }
 
-        Ok(messages)
+        read_limiter.finish(messages)
     }
 }
 

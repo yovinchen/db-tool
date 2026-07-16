@@ -12,7 +12,7 @@ use dbtool_core::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter},
+    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter},
 };
 use futures::future::BoxFuture;
 use rdkafka::{
@@ -33,7 +33,7 @@ use std::{
 
 use super::{
     kafka_messages_before, resolve_consume_position, validate_kafka_delete_request,
-    validate_produce_message,
+    validate_kafka_consume_options, validate_produce_message,
 };
 
 // Kafka metadata has no pagination. librdkafka enforces this receive-frame
@@ -193,10 +193,11 @@ impl MessageProducer for RdkafkaAdapter {
 impl MessageConsumer for RdkafkaAdapter {
     async fn consume(&self, source: &str, options: ConsumeOptions) -> Result<Vec<Message>> {
         validate_topic(source)?;
+        validate_kafka_consume_options(&options)?;
         let group = native_consumer_group(&self.kind.0, &options)?;
         let deadline = consume_deadline(options.timeout)?;
         match group {
-            Some(group) => self.consume_group(source, group, options.ack, options.max, deadline),
+            Some(group) => self.consume_group(source, group, &options, deadline),
             None => self.consume_stateless(source, &options, deadline),
         }
     }
@@ -556,7 +557,7 @@ impl RdkafkaAdapter {
         let (requested_partition, requested_offset) = resolve_consume_position(options)?;
         let consumer = self.consumer("dbtool")?;
         let Some(remaining) = remaining_until(deadline) else {
-            return Ok(vec![]);
+            return MessageReadLimiter::new(options, "Kafka consume")?.finish(vec![]);
         };
         let topic = require_topic(self.topic_infos_with(&consumer, remaining)?, source)?;
         let partitions = if let Some(partition) = requested_partition {
@@ -570,7 +571,7 @@ impl RdkafkaAdapter {
                 Some(offset) => offset,
                 None => {
                     let Some(remaining) = remaining_until(deadline) else {
-                        return Ok(vec![]);
+                        return MessageReadLimiter::new(options, "Kafka consume")?.finish(vec![]);
                     };
                     self.low_watermark_with(&consumer, source, partition, remaining)?
                 }
@@ -580,26 +581,25 @@ impl RdkafkaAdapter {
                 .map_err(kafka_query_error)?;
         }
         consumer.assign(&assignment).map_err(kafka_query_error)?;
-        collect_native_messages(&consumer, source, options.max, deadline)
+        collect_native_messages(&consumer, source, options, deadline)
     }
 
     fn consume_group(
         &self,
         source: &str,
         group: &str,
-        ack: AckMode,
-        max: usize,
+        options: &ConsumeOptions,
         deadline: Instant,
     ) -> Result<Vec<Message>> {
         let consumer = self.consumer(group)?;
         let Some(remaining) = remaining_until(deadline) else {
-            return Ok(vec![]);
+            return MessageReadLimiter::new(options, "Kafka consume")?.finish(vec![]);
         };
         require_topic(self.topic_infos_with(&consumer, remaining)?, source)?;
         consumer.subscribe(&[source]).map_err(kafka_query_error)?;
 
-        let messages = collect_native_messages(&consumer, source, max, deadline)?;
-        if ack == AckMode::OnSuccess && !messages.is_empty() {
+        let messages = collect_native_messages(&consumer, source, options, deadline)?;
+        if options.ack == AckMode::OnSuccess && !messages.is_empty() {
             let offsets = next_offsets_for_batch(source, &messages)?;
             consumer
                 .commit(&offsets, CommitMode::Sync)
@@ -713,18 +713,23 @@ fn native_consumer_group<'a>(kind: &str, options: &'a ConsumeOptions) -> Result<
 fn collect_native_messages(
     consumer: &BaseConsumer,
     source: &str,
-    max: usize,
+    options: &ConsumeOptions,
     deadline: Instant,
 ) -> Result<Vec<Message>> {
     let mut messages = Vec::new();
-    while messages.len() < max && Instant::now() < deadline {
+    let mut read_limiter = MessageReadLimiter::new(options, "Kafka consume")?;
+    while messages.len() < options.max && Instant::now() < deadline {
         match consumer.poll(remaining_poll_timeout(deadline)) {
-            Some(Ok(message)) => messages.push(native_message_to_core(source, &message)?),
+            Some(Ok(message)) => {
+                let message = native_message_to_core(source, &message)?;
+                read_limiter.observe(&message)?;
+                messages.push(message);
+            }
             Some(Err(KafkaError::PartitionEOF(_))) | None => {}
             Some(Err(error)) => return Err(kafka_query_error(error)),
         }
     }
-    Ok(messages)
+    read_limiter.finish(messages)
 }
 
 fn native_message_to_core(expected_topic: &str, message: &BorrowedMessage<'_>) -> Result<Message> {
@@ -828,16 +833,27 @@ fn bounded_admin_consumer(base: &ClientConfig, group: &str) -> Result<BaseConsum
 
 fn bounded_admin_config(base: &ClientConfig, group: &str) -> Result<ClientConfig> {
     let mut config = consumer_client_config(base, group)?;
-    // Apply after DSN parameters so callers cannot raise the receive budget
-    // and silently turn this admin catalog request back into an unbounded read.
+    freeze_consumer_receive_budget(&mut config);
+    Ok(config)
+}
+
+fn freeze_consumer_receive_budget(config: &mut ClientConfig) {
+    // Apply only after every DSN parameter has entered the base config. This
+    // protects ordinary consumption as well as metadata/lag clients from a
+    // caller raising librdkafka's receive frame ceilings.
     config.set(
         "receive.message.max.bytes",
         KAFKA_MAX_RESPONSE_BYTES.to_string(),
     );
     // librdkafka requires the receive ceiling to exceed the aggregate fetch
-    // ceiling by at least 512 bytes. Bound both values after DSN overrides.
-    config.set("fetch.max.bytes", KAFKA_MAX_FETCH_BYTES.to_string());
-    Ok(config)
+    // ceiling by at least 512 bytes. Keep the per-partition ceiling inside the
+    // same hard response envelope.
+    config
+        .set("fetch.max.bytes", KAFKA_MAX_FETCH_BYTES.to_string())
+        .set(
+            "max.partition.fetch.bytes",
+            KAFKA_MAX_FETCH_BYTES.to_string(),
+        );
 }
 
 fn observe_kafka_lag_work(observed: &mut usize, budget: MetadataBudget) -> Result<()> {
@@ -864,6 +880,7 @@ fn consumer_client_config(base: &ClientConfig, group: &str) -> Result<ClientConf
         .set("enable.auto.offset.store", "false")
         .set("enable.partition.eof", "true")
         .set("auto.offset.reset", "earliest");
+    freeze_consumer_receive_budget(&mut config);
     Ok(config)
 }
 
@@ -1261,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn kafka_catalog_budget_is_isolated_from_normal_client_parameters() {
+    fn kafka_receive_budgets_override_dsn_for_every_consumer_client() {
         let dsn = Dsn::parse(
             "kafka://127.0.0.1:9092?kafka.receive.message.max.bytes=999999999&kafka.fetch.max.bytes=999999999",
         )
@@ -1270,6 +1287,21 @@ mod tests {
 
         assert_eq!(config.get("receive.message.max.bytes"), Some("999999999"));
         assert_eq!(config.get("fetch.max.bytes"), Some("999999999"));
+
+        let ordinary = consumer_client_config(&config, "ordinary-group").unwrap();
+        assert_eq!(ordinary.get("group.id"), Some("ordinary-group"));
+        assert_eq!(
+            ordinary.get("receive.message.max.bytes"),
+            Some(KAFKA_MAX_RESPONSE_BYTES.to_string().as_str())
+        );
+        assert_eq!(
+            ordinary.get("fetch.max.bytes"),
+            Some(KAFKA_MAX_FETCH_BYTES.to_string().as_str())
+        );
+        assert_eq!(
+            ordinary.get("max.partition.fetch.bytes"),
+            Some(KAFKA_MAX_FETCH_BYTES.to_string().as_str())
+        );
 
         let catalog = bounded_catalog_config(&config).unwrap();
         assert_eq!(
@@ -1625,6 +1657,23 @@ mod tests {
             .consumer_lag(&group)
             .await
             .expect("uncommitted group lag inspection should succeed")
+            .iter()
+            .all(|entry| entry.topic != topic));
+
+        let mut budget_failure = options(AckMode::OnSuccess, 4, Duration::from_secs(10));
+        budget_failure.max_message_bytes = 1;
+        assert!(matches!(
+            consumer.consume(&topic, budget_failure).await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(admin_inspect
+            .consumer_lag(&group)
+            .await
+            .expect("budget failure must leave committed offsets absent")
             .iter()
             .all(|entry| entry.topic != topic));
 

@@ -282,6 +282,29 @@ async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_suppor
     ));
 
     tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut budget_failure = durable_options(&durable_name, 2, AckMode::OnSuccess);
+    budget_failure.max_message_bytes = 1;
+    assert!(matches!(
+        consumer.consume(&subject, budget_failure).await,
+        Err(Error::ReadBudgetExceeded {
+            unit: "bytes",
+            limit: 1,
+            ..
+        })
+    ));
+    let durable_info = jetstream
+        .get_stream(&stream_name)
+        .await
+        .expect("stream should exist after a consume budget failure")
+        .consumer_info(&durable_name)
+        .await
+        .expect("durable should remain inspectable after a budget failure");
+    assert_eq!(
+        durable_info.ack_floor.stream_sequence, 0,
+        "budget failure must occur before the first double-ACK"
+    );
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
     let replayed = consumer
         .consume(&subject, durable_options(&durable_name, 2, AckMode::None))
         .await

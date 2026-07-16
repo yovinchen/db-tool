@@ -12,7 +12,7 @@ use dbtool_core::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter},
+    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter},
 };
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
@@ -136,22 +136,18 @@ impl MessageConsumer for NatsAdapter {
 
         match &options.identity {
             ConsumerIdentity::Stateless => {
-                if let Some(ConsumeCursor::NatsJetstream { stream_sequence }) = options.cursor {
-                    self.consume_jetstream_stateless(
-                        source,
-                        options.max,
-                        options.timeout,
-                        stream_sequence,
-                    )
-                    .await
-                } else {
-                    self.consume_core_nats(source, None, options.max, options.timeout)
+                if let Some(ConsumeCursor::NatsJetstream { stream_sequence }) =
+                    options.cursor.as_ref()
+                {
+                    self.consume_jetstream_stateless(source, &options, *stream_sequence)
                         .await
+                } else {
+                    self.consume_core_nats(source, None, &options).await
                 }
             }
             ConsumerIdentity::Group { group, member } => {
                 debug_assert!(member.is_none());
-                self.consume_core_nats(source, Some(group.as_str()), options.max, options.timeout)
+                self.consume_core_nats(source, Some(group.as_str()), &options)
                     .await
             }
             ConsumerIdentity::Durable { name } => {
@@ -532,10 +528,9 @@ impl NatsAdapter {
         &self,
         subject: &str,
         queue_group: Option<&str>,
-        max: usize,
-        wait: std::time::Duration,
+        options: &ConsumeOptions,
     ) -> Result<Vec<Message>> {
-        let deadline = checked_deadline(wait)?;
+        let deadline = checked_deadline(options.timeout)?;
         let mut subscriber = match queue_group {
             Some(group) => self
                 .client
@@ -554,7 +549,8 @@ impl NatsAdapter {
             .map_err(|error| Error::Connection(error.to_string()))?;
 
         let mut messages = Vec::new();
-        while messages.len() < max {
+        let mut read_limiter = MessageReadLimiter::new(options, "NATS consume")?;
+        while messages.len() < options.max {
             let now = Instant::now();
             if now >= deadline {
                 break;
@@ -563,7 +559,7 @@ impl NatsAdapter {
             match timeout(deadline - now, subscriber.next()).await {
                 Ok(Some(message)) => {
                     let headers = nats_headers_to_core(message.headers.as_ref())?;
-                    messages.push(Message {
+                    let message = Message {
                         key: None,
                         payload: message.payload,
                         headers,
@@ -572,25 +568,26 @@ impl NatsAdapter {
                         timestamp: None,
                         cursor: None,
                         metadata: None,
-                    });
+                    };
+                    read_limiter.observe(&message)?;
+                    messages.push(message);
                 }
                 Ok(None) | Err(_) => break,
             }
         }
 
-        Ok(messages)
+        read_limiter.finish(messages)
     }
 
     async fn consume_jetstream_stateless(
         &self,
         subject: &str,
-        max: usize,
-        wait: std::time::Duration,
+        options: &ConsumeOptions,
         start_sequence: u64,
     ) -> Result<Vec<Message>> {
         use async_nats::jetstream::consumer::{pull, AckPolicy, DeliverPolicy};
 
-        let deadline = checked_deadline(wait)?;
+        let deadline = checked_deadline(options.timeout)?;
         let jetstream = self.jetstream();
         let stream_name = jetstream
             .stream_by_subject(subject)
@@ -605,7 +602,8 @@ impl NatsAdapter {
                 deliver_policy: DeliverPolicy::ByStartSequence { start_sequence },
                 ack_policy: AckPolicy::None,
                 filter_subject: subject.to_owned(),
-                inactive_threshold: wait
+                inactive_threshold: options
+                    .timeout
                     .checked_add(std::time::Duration::from_secs(5))
                     .ok_or_else(|| {
                         Error::Config(
@@ -624,13 +622,14 @@ impl NatsAdapter {
                 .ok_or_else(|| Error::Query("NATS JetStream consume deadline elapsed".into()))?;
             let mut batch = consumer
                 .fetch()
-                .max_messages(max)
+                .max_messages(options.max)
                 .expires(remaining)
                 .messages()
                 .await
                 .map_err(|error| Error::Query(error.to_string()))?;
             let mut messages = Vec::new();
-            while messages.len() < max {
+            let mut read_limiter = MessageReadLimiter::new(options, "NATS consume")?;
+            while messages.len() < options.max {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     break;
                 };
@@ -638,9 +637,11 @@ impl NatsAdapter {
                     Ok(Some(item)) => item.map_err(|error| Error::Query(error.to_string()))?,
                     Ok(None) | Err(_) => break,
                 };
-                messages.push(jetstream_message_to_core(item)?);
+                let message = jetstream_message_to_core(item)?;
+                read_limiter.observe(&message)?;
+                messages.push(message);
             }
-            Ok(messages)
+            read_limiter.finish(messages)
         }
         .await;
 
@@ -684,11 +685,14 @@ impl NatsAdapter {
         // Conversion is deliberately complete before the first ACK. A malformed
         // header or delivery envelope therefore leaves the whole fetched batch
         // unacknowledged and eligible for redelivery.
-        let messages = native_messages
-            .iter()
-            .cloned()
-            .map(jetstream_message_to_core)
-            .collect::<Result<Vec<_>>>()?;
+        let mut read_limiter = MessageReadLimiter::new(options, "NATS JetStream consume")?;
+        let mut messages = Vec::with_capacity(native_messages.len());
+        for native_message in native_messages.iter().cloned() {
+            let message = jetstream_message_to_core(native_message)?;
+            read_limiter.observe(&message)?;
+            messages.push(message);
+        }
+        let messages = read_limiter.finish(messages)?;
 
         if options.ack == AckMode::OnSuccess {
             let remaining = deadline
