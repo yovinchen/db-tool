@@ -1,21 +1,60 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{BoundedList, Document, FindOptions, InsertOutcome, ReadBudget, UpdateOutcome, Value},
+    model::{
+        BoundedList, Document, FindOptions, InputBudget, InsertOutcome, ReadBudget, UpdateOutcome,
+        Value,
+    },
     port::{
         capability::DocumentStore,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::{ListLimiter, ReadLimiter},
+    service::{InputLimiter, ListLimiter, ReadLimiter},
 };
 use futures::future::BoxFuture;
 use mongodb::{
     bson::{self, Bson},
+    results::{DeleteResult, InsertManyResult, UpdateResult},
     Client, Database,
 };
+use serde::Serialize;
 use std::collections::BTreeMap;
 
 const MONGO_BUDGETED_BATCH_SIZE: u32 = 1;
+const MONGO_MAX_BSON_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+const MONGO_MAX_MESSAGE_BYTES: usize = 48 * 1024 * 1024;
+const MONGO_MAX_WRITE_BATCH_ITEMS: usize = 100_000;
+const MONGO_MAX_NAMESPACE_BYTES: usize = 255;
+const MONGO_OP_MSG_HEADER_BYTES: usize = 16 + 4;
+const MONGO_OP_MSG_BODY_SECTION_BYTES: usize = 1;
+const MONGO_OP_MSG_SEQUENCE_SECTION_BYTES: usize = 1 + 4;
+const MONGO_DRIVER_COMMAND_HEADROOM_BYTES: usize = 16 * 1024;
+
+#[derive(Serialize)]
+struct MongoInsertInput<'a> {
+    collection: &'a str,
+    documents: &'a [Document],
+}
+
+#[derive(Serialize)]
+struct MongoUpdateInput<'a> {
+    collection: &'a str,
+    filter: &'a Value,
+    update: &'a Value,
+    many: bool,
+}
+
+#[derive(Serialize)]
+struct MongoDeleteInput<'a> {
+    collection: &'a str,
+    filter: &'a Value,
+    many: bool,
+}
+
+#[derive(Serialize)]
+struct MongoDropInput<'a> {
+    collection: &'a str,
+}
 
 pub struct MongoAdapter {
     db: Database,
@@ -192,25 +231,26 @@ impl DocumentStore for MongoAdapter {
     }
 
     async fn insert(&self, collection: &str, docs: Vec<Document>) -> Result<InsertOutcome> {
-        let col = self.db.collection::<mongodb::bson::Document>(collection);
-        let bson_docs: Vec<_> = docs
-            .into_iter()
-            .map(core_document_to_bson)
-            .collect::<Result<Vec<_>>>()?;
-        let count = u64::try_from(bson_docs.len())
-            .map_err(|_| Error::Serialization("document count exceeds the u64 range".into()))?;
-        let result = col
-            .insert_many(bson_docs)
+        self.insert_budgeted(collection, docs, InputBudget::default())
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(InsertOutcome {
-            inserted: count,
-            ids: result
-                .inserted_ids
-                .into_values()
-                .map(inserted_id_string)
-                .collect(),
-        })
+    }
+
+    async fn insert_budgeted(
+        &self,
+        collection: &str,
+        docs: Vec<Document>,
+        budget: InputBudget,
+    ) -> Result<InsertOutcome> {
+        let bson_docs = prepare_mongo_insert(self.db.name(), collection, &docs, budget)?;
+        let expected = bson_docs.len();
+        let result = self
+            .db
+            .collection::<mongodb::bson::Document>(collection)
+            .insert_many(bson_docs)
+            .ordered(true)
+            .await
+            .map_err(|error| mongo_outcome_indeterminate("insert many", error))?;
+        decode_insert_result(result, expected)
     }
 
     async fn update(
@@ -219,11 +259,13 @@ impl DocumentStore for MongoAdapter {
         filter: Value,
         update: Value,
     ) -> Result<UpdateOutcome> {
-        self.update_many(collection, filter, update).await
+        self.update_many_budgeted(collection, filter, update, InputBudget::default())
+            .await
     }
 
     async fn delete(&self, collection: &str, filter: Value) -> Result<u64> {
-        self.delete_many(collection, filter).await
+        self.delete_many_budgeted(collection, filter, InputBudget::default())
+            .await
     }
 
     async fn update_one(
@@ -232,7 +274,18 @@ impl DocumentStore for MongoAdapter {
         filter: Value,
         update: Value,
     ) -> Result<UpdateOutcome> {
-        self.update_documents(collection, filter, update, false)
+        self.update_one_budgeted(collection, filter, update, InputBudget::default())
+            .await
+    }
+
+    async fn update_one_budgeted(
+        &self,
+        collection: &str,
+        filter: Value,
+        update: Value,
+        budget: InputBudget,
+    ) -> Result<UpdateOutcome> {
+        self.update_documents_budgeted(collection, filter, update, false, budget)
             .await
     }
 
@@ -242,16 +295,49 @@ impl DocumentStore for MongoAdapter {
         filter: Value,
         update: Value,
     ) -> Result<UpdateOutcome> {
-        self.update_documents(collection, filter, update, true)
+        self.update_many_budgeted(collection, filter, update, InputBudget::default())
+            .await
+    }
+
+    async fn update_many_budgeted(
+        &self,
+        collection: &str,
+        filter: Value,
+        update: Value,
+        budget: InputBudget,
+    ) -> Result<UpdateOutcome> {
+        self.update_documents_budgeted(collection, filter, update, true, budget)
             .await
     }
 
     async fn delete_one(&self, collection: &str, filter: Value) -> Result<u64> {
-        self.delete_documents(collection, filter, false).await
+        self.delete_one_budgeted(collection, filter, InputBudget::default())
+            .await
+    }
+
+    async fn delete_one_budgeted(
+        &self,
+        collection: &str,
+        filter: Value,
+        budget: InputBudget,
+    ) -> Result<u64> {
+        self.delete_documents_budgeted(collection, filter, false, budget)
+            .await
     }
 
     async fn delete_many(&self, collection: &str, filter: Value) -> Result<u64> {
-        self.delete_documents(collection, filter, true).await
+        self.delete_many_budgeted(collection, filter, InputBudget::default())
+            .await
+    }
+
+    async fn delete_many_budgeted(
+        &self,
+        collection: &str,
+        filter: Value,
+        budget: InputBudget,
+    ) -> Result<u64> {
+        self.delete_documents_budgeted(collection, filter, true, budget)
+            .await
     }
 
     async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>> {
@@ -298,49 +384,57 @@ impl DocumentStore for MongoAdapter {
     }
 
     async fn drop_collection(&self, collection: &str) -> Result<()> {
+        self.drop_collection_budgeted(collection, InputBudget::default())
+            .await
+    }
+
+    async fn drop_collection_budgeted(&self, collection: &str, budget: InputBudget) -> Result<()> {
+        prepare_mongo_drop(self.db.name(), collection, budget)?;
         self.db
             .collection::<mongodb::bson::Document>(collection)
             .drop()
             .await
-            .map_err(|e| Error::Query(e.to_string()))
+            .map_err(|error| mongo_outcome_indeterminate("drop collection", error))
     }
 }
 
 impl MongoAdapter {
-    async fn update_documents(
+    async fn update_documents_budgeted(
         &self,
         collection: &str,
         filter: Value,
         update: Value,
         many: bool,
+        budget: InputBudget,
     ) -> Result<UpdateOutcome> {
+        let (filter, update) =
+            prepare_mongo_update(self.db.name(), collection, &filter, &update, many, budget)?;
         let col = self.db.collection::<mongodb::bson::Document>(collection);
-        let filter = value_to_document(filter)?;
-        ensure_nonempty_filter(&filter, if many { "update many" } else { "update one" })?;
-        let update = update_document(update)?;
         let result = if many {
             col.update_many(filter, update).await
         } else {
             col.update_one(filter, update).await
         }
-        .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(UpdateOutcome {
-            matched: result.matched_count,
-            modified: result.modified_count,
-        })
+        .map_err(|error| mongo_outcome_indeterminate("update documents", error))?;
+        decode_update_result(result, many)
     }
 
-    async fn delete_documents(&self, collection: &str, filter: Value, many: bool) -> Result<u64> {
+    async fn delete_documents_budgeted(
+        &self,
+        collection: &str,
+        filter: Value,
+        many: bool,
+        budget: InputBudget,
+    ) -> Result<u64> {
+        let filter = prepare_mongo_delete(self.db.name(), collection, &filter, many, budget)?;
         let col = self.db.collection::<mongodb::bson::Document>(collection);
-        let filter = value_to_document(filter)?;
-        ensure_nonempty_filter(&filter, if many { "delete many" } else { "delete one" })?;
         let result = if many {
             col.delete_many(filter).await
         } else {
             col.delete_one(filter).await
         }
-        .map_err(|e| Error::Query(e.to_string()))?;
-        Ok(result.deleted_count)
+        .map_err(|error| mongo_outcome_indeterminate("delete documents", error))?;
+        decode_delete_result(result, many)
     }
 
     async fn aggregate_with_limit(
@@ -384,13 +478,299 @@ fn mongo_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::DocumentListCollectionsBudgeted,
         CapabilityOperation::DocumentFindBudgeted,
         CapabilityOperation::DocumentAggregateBudgeted,
+        CapabilityOperation::DocumentInsertBudgeted,
         CapabilityOperation::DocumentUpdateOne,
+        CapabilityOperation::DocumentUpdateOneBudgeted,
         CapabilityOperation::DocumentUpdateMany,
+        CapabilityOperation::DocumentUpdateManyBudgeted,
         CapabilityOperation::DocumentDeleteOne,
+        CapabilityOperation::DocumentDeleteOneBudgeted,
         CapabilityOperation::DocumentDeleteMany,
+        CapabilityOperation::DocumentDeleteManyBudgeted,
         CapabilityOperation::DocumentDropCollection,
+        CapabilityOperation::DocumentDropCollectionBudgeted,
     ]);
     operations
+}
+
+fn prepare_mongo_insert(
+    database: &str,
+    collection: &str,
+    documents: &[Document],
+    budget: InputBudget,
+) -> Result<Vec<bson::Document>> {
+    validate_mongo_collection_name(database, collection)?;
+    let request = MongoInsertInput {
+        collection,
+        documents,
+    };
+    InputLimiter::new(budget, "MongoDB insert input")?
+        .validate_items_with_request(documents, &request)?;
+    if documents.len() > MONGO_MAX_WRITE_BATCH_ITEMS {
+        return Err(Error::Config(format!(
+            "MongoDB insert batch exceeds the fixed {MONGO_MAX_WRITE_BATCH_ITEMS}-item ceiling"
+        )));
+    }
+
+    let mut bson_documents = Vec::with_capacity(documents.len());
+    for document in documents.iter().cloned() {
+        let mut document = core_document_to_bson(document)?;
+        if !document.contains_key("_id") {
+            document.insert("_id", bson::oid::ObjectId::new());
+        }
+        validate_mongo_bson_document(&document, "insert document")?;
+        bson_documents.push(document);
+    }
+
+    let command = bson::doc! {
+        "insert": collection,
+        "ordered": true,
+        "$db": database,
+    };
+    validate_mongo_wire_request(&command, Some(("documents", &bson_documents)))?;
+    Ok(bson_documents)
+}
+
+fn prepare_mongo_update(
+    database: &str,
+    collection: &str,
+    filter: &Value,
+    update: &Value,
+    many: bool,
+    budget: InputBudget,
+) -> Result<(bson::Document, bson::Document)> {
+    validate_mongo_collection_name(database, collection)?;
+    let request = MongoUpdateInput {
+        collection,
+        filter,
+        update,
+        many,
+    };
+    InputLimiter::new(budget, "MongoDB update input")?.validate_request(&request)?;
+
+    let filter = value_to_document(filter.clone())?;
+    ensure_nonempty_filter(&filter, if many { "update many" } else { "update one" })?;
+    let update = update_document(update.clone())?;
+    validate_mongo_bson_document(&filter, "update filter")?;
+    validate_mongo_bson_document(&update, "update expression")?;
+    let operation = bson::doc! {
+        "q": filter.clone(),
+        "u": update.clone(),
+        "multi": many,
+        "upsert": false,
+    };
+    validate_mongo_bson_document(&operation, "update operation")?;
+    let command = bson::doc! {
+        "update": collection,
+        "ordered": true,
+        "$db": database,
+    };
+    validate_mongo_wire_request(
+        &command,
+        Some(("updates", std::slice::from_ref(&operation))),
+    )?;
+    Ok((filter, update))
+}
+
+fn prepare_mongo_delete(
+    database: &str,
+    collection: &str,
+    filter: &Value,
+    many: bool,
+    budget: InputBudget,
+) -> Result<bson::Document> {
+    validate_mongo_collection_name(database, collection)?;
+    let request = MongoDeleteInput {
+        collection,
+        filter,
+        many,
+    };
+    InputLimiter::new(budget, "MongoDB delete input")?.validate_request(&request)?;
+
+    let filter = value_to_document(filter.clone())?;
+    ensure_nonempty_filter(&filter, if many { "delete many" } else { "delete one" })?;
+    validate_mongo_bson_document(&filter, "delete filter")?;
+    let operation = bson::doc! {
+        "q": filter.clone(),
+        "limit": if many { 0 } else { 1 },
+    };
+    validate_mongo_bson_document(&operation, "delete operation")?;
+    let command = bson::doc! {
+        "delete": collection,
+        "ordered": true,
+        "$db": database,
+    };
+    validate_mongo_wire_request(
+        &command,
+        Some(("deletes", std::slice::from_ref(&operation))),
+    )?;
+    Ok(filter)
+}
+
+fn prepare_mongo_drop(database: &str, collection: &str, budget: InputBudget) -> Result<()> {
+    validate_mongo_collection_name(database, collection)?;
+    InputLimiter::new(budget, "MongoDB drop collection input")?
+        .validate_request(&MongoDropInput { collection })?;
+    let command = bson::doc! {
+        "drop": collection,
+        "$db": database,
+    };
+    validate_mongo_wire_request(&command, None)
+}
+
+fn validate_mongo_collection_name(database: &str, collection: &str) -> Result<()> {
+    if collection.is_empty() {
+        return Err(Error::Config(
+            "MongoDB collection name must not be empty".to_owned(),
+        ));
+    }
+    if collection.as_bytes().contains(&0) {
+        return Err(Error::Config(
+            "MongoDB collection name must not contain NUL".to_owned(),
+        ));
+    }
+    if collection.contains('$') {
+        return Err(Error::Config(
+            "MongoDB collection name must not contain '$'".to_owned(),
+        ));
+    }
+    if collection.starts_with("system.") {
+        return Err(Error::Config(
+            "MongoDB system.* collections are reserved for server use".to_owned(),
+        ));
+    }
+    let namespace_bytes = database
+        .len()
+        .checked_add(1)
+        .and_then(|bytes| bytes.checked_add(collection.len()))
+        .ok_or_else(|| Error::Config("MongoDB namespace length overflow".to_owned()))?;
+    if namespace_bytes > MONGO_MAX_NAMESPACE_BYTES {
+        return Err(Error::Config(format!(
+            "MongoDB namespace exceeds the fixed {MONGO_MAX_NAMESPACE_BYTES}-byte ceiling"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_mongo_bson_document(document: &bson::Document, subject: &str) -> Result<usize> {
+    let bytes = bson::to_vec(document)
+        .map_err(|error| Error::Serialization(format!("failed to encode {subject}: {error}")))?
+        .len();
+    validate_mongo_fixed_bytes(subject, bytes, MONGO_MAX_BSON_DOCUMENT_BYTES, "BSON")?;
+    Ok(bytes)
+}
+
+fn validate_mongo_fixed_bytes(subject: &str, bytes: usize, limit: usize, unit: &str) -> Result<()> {
+    if bytes > limit {
+        return Err(Error::Config(format!(
+            "MongoDB {subject} exceeds the fixed {limit}-byte {unit} ceiling"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_mongo_wire_request(
+    command: &bson::Document,
+    sequence: Option<(&str, &[bson::Document])>,
+) -> Result<()> {
+    let command_bytes = validate_mongo_bson_document(command, "command body")?;
+    let mut bytes = MONGO_OP_MSG_HEADER_BYTES
+        .checked_add(MONGO_OP_MSG_BODY_SECTION_BYTES)
+        .and_then(|bytes| bytes.checked_add(command_bytes))
+        .and_then(|bytes| bytes.checked_add(MONGO_DRIVER_COMMAND_HEADROOM_BYTES))
+        .ok_or_else(|| Error::Config("MongoDB command size overflow".to_owned()))?;
+
+    if let Some((identifier, documents)) = sequence {
+        bytes = bytes
+            .checked_add(MONGO_OP_MSG_SEQUENCE_SECTION_BYTES)
+            .and_then(|bytes| bytes.checked_add(identifier.len()))
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or_else(|| Error::Config("MongoDB command sequence size overflow".to_owned()))?;
+        for document in documents {
+            let document_bytes = validate_mongo_bson_document(document, "write operation")?;
+            bytes = bytes.checked_add(document_bytes).ok_or_else(|| {
+                Error::Config("MongoDB command sequence size overflow".to_owned())
+            })?;
+        }
+    }
+
+    validate_mongo_fixed_bytes("write command", bytes, MONGO_MAX_MESSAGE_BYTES, "message")
+}
+
+fn mongo_outcome_indeterminate(operation: &str, error: impl std::fmt::Display) -> Error {
+    Error::OutcomeIndeterminate(format!(
+        "MongoDB {operation} may have reached the backend; inspect collection state before retrying ({error})"
+    ))
+}
+
+fn decode_insert_result(result: InsertManyResult, expected: usize) -> Result<InsertOutcome> {
+    if result.inserted_ids.len() != expected {
+        return Err(mongo_outcome_indeterminate(
+            "insert result",
+            format!(
+                "driver returned {} inserted ids for {expected} documents",
+                result.inserted_ids.len()
+            ),
+        ));
+    }
+    let mut inserted_ids = result.inserted_ids;
+    let mut ids = Vec::with_capacity(expected);
+    for index in 0..expected {
+        let id = inserted_ids.remove(&index).ok_or_else(|| {
+            mongo_outcome_indeterminate(
+                "insert result",
+                format!("driver omitted inserted id at input index {index}"),
+            )
+        })?;
+        ids.push(inserted_id_string(id));
+    }
+    if !inserted_ids.is_empty() {
+        return Err(mongo_outcome_indeterminate(
+            "insert result",
+            "driver returned inserted ids outside the input index range",
+        ));
+    }
+    Ok(InsertOutcome {
+        inserted: expected as u64,
+        ids,
+    })
+}
+
+fn decode_update_result(result: UpdateResult, many: bool) -> Result<UpdateOutcome> {
+    if result.modified_count > result.matched_count || (!many && result.matched_count > 1) {
+        return Err(mongo_outcome_indeterminate(
+            "update result",
+            format!(
+                "invalid matched/modified counts {}/{} for {}",
+                result.matched_count,
+                result.modified_count,
+                if many { "update many" } else { "update one" }
+            ),
+        ));
+    }
+    if result.upserted_id.is_some() {
+        return Err(mongo_outcome_indeterminate(
+            "update result",
+            "driver reported an upsert id even though upsert was disabled",
+        ));
+    }
+    Ok(UpdateOutcome {
+        matched: result.matched_count,
+        modified: result.modified_count,
+    })
+}
+
+fn decode_delete_result(result: DeleteResult, many: bool) -> Result<u64> {
+    if !many && result.deleted_count > 1 {
+        return Err(mongo_outcome_indeterminate(
+            "delete result",
+            format!(
+                "driver reported {} deletions for delete one",
+                result.deleted_count
+            ),
+        ));
+    }
+    Ok(result.deleted_count)
 }
 
 async fn collect_budgeted_cursor(
@@ -705,16 +1085,184 @@ mod tests {
             CapabilityOperation::DocumentListCollectionsBudgeted,
             CapabilityOperation::DocumentFindBudgeted,
             CapabilityOperation::DocumentAggregateBudgeted,
+            CapabilityOperation::DocumentInsertBudgeted,
             CapabilityOperation::DocumentUpdateOne,
+            CapabilityOperation::DocumentUpdateOneBudgeted,
             CapabilityOperation::DocumentUpdateMany,
+            CapabilityOperation::DocumentUpdateManyBudgeted,
             CapabilityOperation::DocumentDeleteOne,
+            CapabilityOperation::DocumentDeleteOneBudgeted,
             CapabilityOperation::DocumentDeleteMany,
+            CapabilityOperation::DocumentDeleteManyBudgeted,
             CapabilityOperation::DocumentDropCollection,
+            CapabilityOperation::DocumentDropCollectionBudgeted,
         ] {
             assert!(operations.contains(&operation));
         }
         assert!(operations.contains(&CapabilityOperation::DocumentUpdate));
         assert!(operations.contains(&CapabilityOperation::DocumentDelete));
+    }
+
+    fn input_document(id: i64, state: &str) -> Document {
+        Document::from([
+            ("_id".to_owned(), Value::Int(id)),
+            ("kind".to_owned(), Value::Text("input-budget".to_owned())),
+            ("state".to_owned(), Value::Text(state.to_owned())),
+        ])
+    }
+
+    #[test]
+    fn mongo_mutation_preflight_counts_complete_targets_items_and_requests() {
+        let collection = "input_budget_docs";
+        let documents = vec![input_document(1, "created"), input_document(2, "created")];
+        let item_bytes = documents
+            .iter()
+            .map(|document| serde_json::to_vec(document).unwrap().len())
+            .max()
+            .unwrap();
+        let request_bytes = serde_json::to_vec(&MongoInsertInput {
+            collection,
+            documents: &documents,
+        })
+        .unwrap()
+        .len();
+        assert!(prepare_mongo_insert(
+            "dbtool",
+            collection,
+            &documents,
+            InputBudget::new(documents.len(), item_bytes, request_bytes).unwrap(),
+        )
+        .is_ok());
+        assert!(matches!(
+            prepare_mongo_insert(
+                "dbtool",
+                collection,
+                &documents,
+                InputBudget::new(1, item_bytes, request_bytes).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            prepare_mongo_insert(
+                "dbtool",
+                collection,
+                &documents,
+                InputBudget::new(documents.len(), item_bytes, request_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == request_bytes - 1
+        ));
+        assert!(matches!(
+            prepare_mongo_insert("dbtool", collection, &[], InputBudget::default()),
+            Err(Error::Config(message)) if message.contains("at least one")
+        ));
+
+        let filter = Value::Json(serde_json::json!({"_id": 1}));
+        let update = Value::Json(serde_json::json!({"state": "updated"}));
+        let update_request = MongoUpdateInput {
+            collection,
+            filter: &filter,
+            update: &update,
+            many: false,
+        };
+        let update_bytes = serde_json::to_vec(&update_request).unwrap().len();
+        assert!(prepare_mongo_update(
+            "dbtool",
+            collection,
+            &filter,
+            &update,
+            false,
+            InputBudget::new(1, update_bytes, update_bytes).unwrap(),
+        )
+        .is_ok());
+        assert!(matches!(
+            prepare_mongo_update(
+                "dbtool",
+                collection,
+                &filter,
+                &update,
+                false,
+                InputBudget::new(1, update_bytes, update_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == update_bytes - 1
+        ));
+
+        let delete_request = MongoDeleteInput {
+            collection,
+            filter: &filter,
+            many: true,
+        };
+        let delete_bytes = serde_json::to_vec(&delete_request).unwrap().len();
+        assert!(prepare_mongo_delete(
+            "dbtool",
+            collection,
+            &filter,
+            true,
+            InputBudget::new(1, delete_bytes, delete_bytes).unwrap(),
+        )
+        .is_ok());
+        assert!(matches!(
+            prepare_mongo_delete(
+                "dbtool",
+                collection,
+                &filter,
+                true,
+                InputBudget::new(1, delete_bytes - 1, delete_bytes).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == delete_bytes - 1
+        ));
+
+        let drop_bytes = serde_json::to_vec(&MongoDropInput { collection })
+            .unwrap()
+            .len();
+        assert!(prepare_mongo_drop(
+            "dbtool",
+            collection,
+            InputBudget::new(1, drop_bytes, drop_bytes).unwrap(),
+        )
+        .is_ok());
+        assert!(matches!(
+            prepare_mongo_drop(
+                "dbtool",
+                collection,
+                InputBudget::new(1, drop_bytes, drop_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn mongo_native_write_limits_and_post_dispatch_errors_are_fail_closed() {
+        for collection in ["", "bad\0name", "bad$name", "system.users"] {
+            assert!(validate_mongo_collection_name("dbtool", collection).is_err());
+        }
+        assert!(validate_mongo_collection_name("dbtool", "valid_name").is_ok());
+        assert!(validate_mongo_collection_name("d", &"x".repeat(253)).is_ok());
+        assert!(validate_mongo_collection_name("d", &"x".repeat(254)).is_err());
+        assert!(validate_mongo_fixed_bytes("fixture", 8, 8, "BSON").is_ok());
+        assert!(matches!(
+            validate_mongo_fixed_bytes("fixture", 9, 8, "BSON"),
+            Err(Error::Config(message)) if message.contains("fixed 8-byte")
+        ));
+
+        let error = mongo_outcome_indeterminate("insert many", "socket closed");
+        assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+        assert!(!error.is_retryable());
     }
 
     #[test]
@@ -1001,6 +1549,196 @@ mod tests {
         ));
         assert_eq!(probed.items.len(), total - 1);
         assert!(probed.truncated);
+    }
+
+    #[tokio::test]
+    async fn mongo_live_budgeted_mutations_reject_before_write_and_clean_collection() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MONGO_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let collection = format!("dbtool_it_input_{suffix}");
+        let connector = factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
+        for operation in [
+            CapabilityOperation::DocumentInsertBudgeted,
+            CapabilityOperation::DocumentUpdateOneBudgeted,
+            CapabilityOperation::DocumentUpdateManyBudgeted,
+            CapabilityOperation::DocumentDeleteOneBudgeted,
+            CapabilityOperation::DocumentDeleteManyBudgeted,
+            CapabilityOperation::DocumentDropCollectionBudgeted,
+        ] {
+            assert!(connector.operations().contains(&operation));
+        }
+        let store = connector.as_document().unwrap();
+
+        let documents = vec![
+            input_document(1, "created"),
+            input_document(2, "created"),
+            input_document(3, "created"),
+        ];
+        let item_bytes = documents
+            .iter()
+            .map(|document| serde_json::to_vec(document).unwrap().len())
+            .max()
+            .unwrap();
+        let insert_bytes = serde_json::to_vec(&MongoInsertInput {
+            collection: &collection,
+            documents: &documents,
+        })
+        .unwrap()
+        .len();
+
+        let exercise = async {
+            let error = store
+                .insert_budgeted(
+                    &collection,
+                    documents.clone(),
+                    InputBudget::new(documents.len(), item_bytes, insert_bytes - 1)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+            assert!(!store.list_collections().await?.contains(&collection));
+
+            let inserted = store
+                .insert_budgeted(
+                    &collection,
+                    documents.clone(),
+                    InputBudget::new(documents.len(), item_bytes, insert_bytes)?,
+                )
+                .await?;
+            assert_eq!(inserted.inserted, 3);
+            assert_eq!(inserted.ids.len(), 3);
+
+            let one_filter = Value::Json(serde_json::json!({"_id": 1}));
+            let one_update = Value::Json(serde_json::json!({"state": "updated-one"}));
+            let one_update_bytes = serde_json::to_vec(&MongoUpdateInput {
+                collection: &collection,
+                filter: &one_filter,
+                update: &one_update,
+                many: false,
+            })
+            .unwrap()
+            .len();
+            let error = store
+                .update_one_budgeted(
+                    &collection,
+                    one_filter.clone(),
+                    one_update.clone(),
+                    InputBudget::new(1, one_update_bytes, one_update_bytes - 1)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+            let unchanged = store
+                .find(&collection, one_filter.clone(), FindOptions::default())
+                .await?;
+            assert_eq!(unchanged[0]["state"], Value::Text("created".into()));
+
+            let updated = store
+                .update_one_budgeted(
+                    &collection,
+                    one_filter.clone(),
+                    one_update,
+                    InputBudget::default(),
+                )
+                .await?;
+            assert_eq!((updated.matched, updated.modified), (1, 1));
+
+            let group_filter = Value::Json(serde_json::json!({"kind": "input-budget"}));
+            let many_update = Value::Json(serde_json::json!({"state": "updated-many"}));
+            let updated = store
+                .update_many_budgeted(
+                    &collection,
+                    group_filter.clone(),
+                    many_update,
+                    InputBudget::default(),
+                )
+                .await?;
+            assert_eq!(updated.matched, 3);
+            assert_eq!(updated.modified, 3);
+
+            let delete_filter = Value::Json(serde_json::json!({"_id": 1}));
+            let delete_bytes = serde_json::to_vec(&MongoDeleteInput {
+                collection: &collection,
+                filter: &delete_filter,
+                many: false,
+            })
+            .unwrap()
+            .len();
+            let error = store
+                .delete_one_budgeted(
+                    &collection,
+                    delete_filter.clone(),
+                    InputBudget::new(1, delete_bytes, delete_bytes - 1)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+            assert_eq!(
+                store
+                    .find(&collection, delete_filter.clone(), FindOptions::default())
+                    .await?
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .delete_one_budgeted(&collection, delete_filter, InputBudget::default(),)
+                    .await?,
+                1
+            );
+            assert_eq!(
+                store
+                    .delete_many_budgeted(&collection, group_filter, InputBudget::default(),)
+                    .await?,
+                2
+            );
+            assert!(store
+                .find(&collection, Value::Null, FindOptions::default())
+                .await?
+                .is_empty());
+
+            let drop_bytes = serde_json::to_vec(&MongoDropInput {
+                collection: &collection,
+            })
+            .unwrap()
+            .len();
+            let error = store
+                .drop_collection_budgeted(
+                    &collection,
+                    InputBudget::new(1, drop_bytes, drop_bytes - 1)?,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+            assert!(store.list_collections().await?.contains(&collection));
+            store
+                .drop_collection_budgeted(&collection, InputBudget::new(1, drop_bytes, drop_bytes)?)
+                .await?;
+            assert!(!store.list_collections().await?.contains(&collection));
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        if store
+            .list_collections()
+            .await
+            .unwrap()
+            .contains(&collection)
+        {
+            store.drop_collection(&collection).await.unwrap();
+        }
+        assert!(!store
+            .list_collections()
+            .await
+            .unwrap()
+            .contains(&collection));
+        exercise.unwrap();
+        connector.close().await.unwrap();
     }
 
     #[test]
