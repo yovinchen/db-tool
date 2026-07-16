@@ -1,7 +1,7 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{BoundedList, IndexInfo, ReadBudget, Value},
+    model::{BoundedList, IndexInfo, InputBudget, ReadBudget, Value},
     port::{
         capability::{
             SearchDeleteIndexOutcome, SearchDocument, SearchEngine, SearchHits, SearchOptions,
@@ -9,7 +9,7 @@ use dbtool_core::{
         },
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::{ListLimiter, ReadLimiter, SearchReadLimiter},
+    service::{InputLimiter, ListLimiter, ReadLimiter, SearchReadLimiter},
 };
 use futures::future::BoxFuture;
 use rustls::{ClientConfig, RootCertStore};
@@ -24,6 +24,9 @@ use tokio_rustls::TlsConnector;
 use url::Url;
 
 const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HTTP_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEARCH_INDEX_BYTES: usize = 255;
+const MAX_SEARCH_DOCUMENT_ID_BYTES: usize = 512;
 // CAT indices has no reliable cursor/limit contract across OpenSearch and
 // Elasticsearch versions. Keep its unavoidable whole response materially
 // smaller than ordinary search responses before retaining only N+1 entries.
@@ -163,28 +166,54 @@ impl SearchEngine for SearchAdapter {
     }
 
     async fn index_doc(&self, index: &str, doc: Value) -> Result<SearchWriteOutcome> {
-        validate_resource(index, "index")?;
-        let body = core_value_to_json(doc)?;
+        self.index_doc_budgeted(index, doc, InputBudget::default())
+            .await
+    }
+
+    async fn index_doc_budgeted(
+        &self,
+        index: &str,
+        doc: Value,
+        budget: InputBudget,
+    ) -> Result<SearchWriteOutcome> {
+        let body = prepare_index_doc_input(index, doc, budget)?;
         let response = self
             .client
-            .request_json(
+            .request_json_mutation(
                 "POST",
                 &format!("/{}/_doc", percent_encode_path_segment(index)),
                 Some(&body),
+                "index document",
             )
             .await?;
         parse_write_response(response, "index document")
+            .map_err(|error| mutation_outcome_error("index document", error))
     }
 
     async fn put_doc(&self, index: &str, id: &str, doc: Value) -> Result<SearchWriteOutcome> {
-        validate_resource(index, "index")?;
-        validate_resource(id, "document id")?;
-        let body = core_value_to_json(doc)?;
+        self.put_doc_budgeted(index, id, doc, InputBudget::default())
+            .await
+    }
+
+    async fn put_doc_budgeted(
+        &self,
+        index: &str,
+        id: &str,
+        doc: Value,
+        budget: InputBudget,
+    ) -> Result<SearchWriteOutcome> {
+        let body = prepare_put_doc_input(index, id, doc, budget)?;
         let response = self
             .client
-            .request_json("PUT", &document_path(index, id, "_doc"), Some(&body))
+            .request_json_mutation(
+                "PUT",
+                &document_path(index, id, "_doc"),
+                Some(&body),
+                "put document",
+            )
             .await?;
         parse_write_response(response, "put document")
+            .map_err(|error| mutation_outcome_error("put document", error))
     }
 
     async fn get_doc(&self, index: &str, id: &str) -> Result<Option<SearchDocument>> {
@@ -226,37 +255,78 @@ impl SearchEngine for SearchAdapter {
     }
 
     async fn update_doc(&self, index: &str, id: &str, patch: Value) -> Result<SearchWriteOutcome> {
-        validate_resource(index, "index")?;
-        validate_resource(id, "document id")?;
-        let body = update_body(core_value_to_json(patch)?)?;
+        self.update_doc_budgeted(index, id, patch, InputBudget::default())
+            .await
+    }
+
+    async fn update_doc_budgeted(
+        &self,
+        index: &str,
+        id: &str,
+        patch: Value,
+        budget: InputBudget,
+    ) -> Result<SearchWriteOutcome> {
+        let body = prepare_update_doc_input(index, id, patch, budget)?;
         let response = self
             .client
-            .request_json("POST", &document_path(index, id, "_update"), Some(&body))
+            .request_json_mutation(
+                "POST",
+                &document_path(index, id, "_update"),
+                Some(&body),
+                "update document",
+            )
             .await?;
         parse_write_response(response, "update document")
+            .map_err(|error| mutation_outcome_error("update document", error))
     }
 
     async fn delete_doc(&self, index: &str, id: &str) -> Result<SearchWriteOutcome> {
-        validate_resource(index, "index")?;
-        validate_resource(id, "document id")?;
+        self.delete_doc_budgeted(index, id, InputBudget::default())
+            .await
+    }
+
+    async fn delete_doc_budgeted(
+        &self,
+        index: &str,
+        id: &str,
+        budget: InputBudget,
+    ) -> Result<SearchWriteOutcome> {
+        prepare_delete_doc_input(index, id, budget)?;
         let response = self
             .client
-            .request_json("DELETE", &document_path(index, id, "_doc"), None)
+            .request_json_mutation(
+                "DELETE",
+                &document_path(index, id, "_doc"),
+                None,
+                "delete document",
+            )
             .await?;
         parse_write_response(response, "delete document")
+            .map_err(|error| mutation_outcome_error("delete document", error))
     }
 
     async fn delete_index(&self, index: &str) -> Result<SearchDeleteIndexOutcome> {
-        validate_resource(index, "index")?;
+        self.delete_index_budgeted(index, InputBudget::default())
+            .await
+    }
+
+    async fn delete_index_budgeted(
+        &self,
+        index: &str,
+        budget: InputBudget,
+    ) -> Result<SearchDeleteIndexOutcome> {
+        prepare_delete_index_input(index, budget)?;
         let response = self
             .client
-            .request_json(
+            .request_json_mutation(
                 "DELETE",
                 &format!("/{}", percent_encode_path_segment(index)),
                 None,
+                "delete index",
             )
             .await?;
         parse_delete_index_response(response)
+            .map_err(|error| mutation_outcome_error("delete index", error))
     }
 }
 
@@ -400,6 +470,55 @@ impl SearchHttpClient {
     ) -> Result<JsonValue> {
         let response = self.request_json_response(method, path, body).await?;
         response.into_success()
+    }
+
+    /// Send one prevalidated mutation while preserving the pre-send/post-send
+    /// error boundary. DNS/TCP/TLS setup failures are known to occur before an
+    /// HTTP request can be sent. Once `send_http_request` starts, a partial
+    /// write, response transport failure, body overflow, parse failure, or
+    /// non-success status can no longer prove whether the backend mutated.
+    async fn request_json_mutation(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&JsonValue>,
+        operation: &'static str,
+    ) -> Result<JsonValue> {
+        let (request, body) = self.build_request(method, path, body)?;
+        let stream = TcpStream::connect((self.host.as_str(), self.port))
+            .await
+            .map_err(|error| Error::Connection(error.to_string()))?;
+
+        let response = if self.transport == SearchTransport::Tls {
+            let connector =
+                TlsConnector::from(Arc::new(tls_client_config(self.tls_ca.as_deref())?));
+            let server_name = ServerName::try_from(self.host.clone())
+                .map_err(|error| Error::Dsn(format!("invalid TLS server name: {error}")))?;
+            let stream = connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|error| Error::Connection(error.to_string()))?;
+            send_http_request(
+                stream,
+                &request,
+                &body,
+                ResponseBodyLimit::transport(MAX_HTTP_RESPONSE_BODY_BYTES),
+            )
+            .await
+        } else {
+            send_http_request(
+                stream,
+                &request,
+                &body,
+                ResponseBodyLimit::transport(MAX_HTTP_RESPONSE_BODY_BYTES),
+            )
+            .await
+        }
+        .map_err(|error| mutation_outcome_error(operation, error))?;
+
+        response
+            .into_success()
+            .map_err(|error| mutation_outcome_error(operation, error))
     }
 
     async fn request_json_with_body_limit(
@@ -973,6 +1092,108 @@ fn core_value_to_json(value: Value) -> Result<JsonValue> {
     value.to_plain_json()
 }
 
+fn prepare_index_doc_input(index: &str, doc: Value, budget: InputBudget) -> Result<JsonValue> {
+    validate_mutation_index(index)?;
+    let body = core_value_to_json(doc)?;
+    validate_document_body(&body, "index document")?;
+    validate_portable_mutation_input(
+        &json!({ "index": index, "document": &body }),
+        budget,
+        "search index document",
+    )?;
+    validate_http_json_body(&body, "search index document HTTP body")?;
+    Ok(body)
+}
+
+fn prepare_put_doc_input(
+    index: &str,
+    id: &str,
+    doc: Value,
+    budget: InputBudget,
+) -> Result<JsonValue> {
+    validate_mutation_index(index)?;
+    validate_mutation_document_id(id)?;
+    let body = core_value_to_json(doc)?;
+    validate_document_body(&body, "put document")?;
+    validate_portable_mutation_input(
+        &json!({ "index": index, "id": id, "document": &body }),
+        budget,
+        "search put document",
+    )?;
+    validate_http_json_body(&body, "search put document HTTP body")?;
+    Ok(body)
+}
+
+fn prepare_update_doc_input(
+    index: &str,
+    id: &str,
+    patch: Value,
+    budget: InputBudget,
+) -> Result<JsonValue> {
+    validate_mutation_index(index)?;
+    validate_mutation_document_id(id)?;
+    let patch = core_value_to_json(patch)?;
+    validate_portable_mutation_input(
+        &json!({ "index": index, "id": id, "patch": &patch }),
+        budget,
+        "search update document",
+    )?;
+    let body = update_body(patch)?;
+    validate_http_json_body(&body, "search update document HTTP body")?;
+    Ok(body)
+}
+
+fn prepare_delete_doc_input(index: &str, id: &str, budget: InputBudget) -> Result<()> {
+    validate_mutation_index(index)?;
+    validate_mutation_document_id(id)?;
+    validate_portable_mutation_input(
+        &json!({ "index": index, "id": id }),
+        budget,
+        "search delete document",
+    )
+}
+
+fn prepare_delete_index_input(index: &str, budget: InputBudget) -> Result<()> {
+    validate_mutation_index(index)?;
+    validate_portable_mutation_input(&json!({ "index": index }), budget, "search delete index")
+}
+
+fn validate_portable_mutation_input(
+    input: &JsonValue,
+    budget: InputBudget,
+    subject: &str,
+) -> Result<()> {
+    InputLimiter::new(budget, subject)?.validate_request(input)
+}
+
+fn validate_http_json_body(body: &JsonValue, subject: &str) -> Result<()> {
+    validate_http_json_body_with_limit(body, subject, MAX_HTTP_REQUEST_BODY_BYTES)
+}
+
+fn validate_http_json_body_with_limit(
+    body: &JsonValue,
+    subject: &str,
+    max_bytes: usize,
+) -> Result<()> {
+    InputLimiter::new(InputBudget::new(1, max_bytes, max_bytes)?, subject)?.validate_request(body)
+}
+
+fn validate_document_body(body: &JsonValue, operation: &str) -> Result<()> {
+    if !body.is_object() {
+        return Err(Error::Config(format!(
+            "search {operation} body must be a JSON object"
+        )));
+    }
+    Ok(())
+}
+
+fn mutation_outcome_error(operation: &str, error: Error) -> Error {
+    match error {
+        Error::OutcomeIndeterminate(_) => error,
+        error => Error::OutcomeIndeterminate(format!("search {operation}: {error}")),
+    }
+}
+
 fn parse_write_response(response: JsonValue, operation: &str) -> Result<SearchWriteOutcome> {
     serde_json::from_value(response).map_err(|e| {
         Error::Serialization(format!(
@@ -1007,6 +1228,58 @@ fn update_body(patch: JsonValue) -> Result<JsonValue> {
 fn validate_resource(resource: &str, label: &str) -> Result<()> {
     if resource.is_empty() {
         return Err(Error::Config(format!("search {label} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_mutation_index(index: &str) -> Result<()> {
+    validate_resource(index, "index")?;
+    if index.len() > MAX_SEARCH_INDEX_BYTES {
+        return Err(Error::Config(format!(
+            "search index exceeds the {MAX_SEARCH_INDEX_BYTES}-byte protocol limit"
+        )));
+    }
+    if index == "." || index == ".." {
+        return Err(Error::Config(
+            "search index must not be '.' or '..'".to_owned(),
+        ));
+    }
+    if index.starts_with(['-', '_', '+']) {
+        return Err(Error::Config(
+            "search index must not start with '-', '_', or '+'".to_owned(),
+        ));
+    }
+    if index.to_lowercase() != index {
+        return Err(Error::Config(
+            "search index must use lowercase characters".to_owned(),
+        ));
+    }
+    if index.chars().any(|character| {
+        character.is_control()
+            || character.is_whitespace()
+            || matches!(
+                character,
+                '\\' | '/' | '*' | '?' | '"' | '<' | '>' | '|' | ',' | '#' | ':'
+            )
+    }) {
+        return Err(Error::Config(
+            "search index contains a character forbidden by the protocol".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mutation_document_id(id: &str) -> Result<()> {
+    validate_resource(id, "document id")?;
+    if id.len() > MAX_SEARCH_DOCUMENT_ID_BYTES {
+        return Err(Error::Config(format!(
+            "search document id exceeds the {MAX_SEARCH_DOCUMENT_ID_BYTES}-byte protocol limit"
+        )));
+    }
+    if id.chars().any(char::is_control) {
+        return Err(Error::Config(
+            "search document id contains a control character".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1096,6 +1369,7 @@ fn search_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     operations.push(CapabilityOperation::SearchListIndicesBounded);
     operations.push(CapabilityOperation::SearchListIndicesBudgeted);
     operations.extend_from_slice(CapabilityOperation::SEARCH_BUDGETED_READS);
+    operations.extend_from_slice(CapabilityOperation::SEARCH_BUDGETED_MUTATIONS);
     operations
 }
 
@@ -1554,6 +1828,163 @@ mod tests {
     }
 
     #[test]
+    fn exact_mutation_inputs_accept_n_bytes_and_reject_n_minus_one() {
+        fn exact(input: &JsonValue) -> InputBudget {
+            let bytes = serde_json::to_vec(input).unwrap().len();
+            InputBudget::new(1, bytes, bytes).unwrap()
+        }
+
+        fn n_minus_one(input: &JsonValue) -> InputBudget {
+            let bytes = serde_json::to_vec(input).unwrap().len();
+            InputBudget::new(1, bytes - 1, bytes).unwrap()
+        }
+
+        fn assert_input_error(result: Result<impl Sized>, input: &JsonValue) {
+            let limit = serde_json::to_vec(input).unwrap().len() - 1;
+            assert!(matches!(
+                result,
+                Err(Error::InputBudgetExceeded {
+                    unit: "bytes",
+                    limit: actual,
+                    ..
+                }) if actual == limit
+            ));
+        }
+
+        let document = json!({"name": "alice", "role": "reader"});
+        let index_input = json!({"index": "users", "document": &document});
+        assert_eq!(
+            prepare_index_doc_input("users", Value::Json(document.clone()), exact(&index_input),)
+                .unwrap(),
+            document
+        );
+        assert_input_error(
+            prepare_index_doc_input(
+                "users",
+                Value::Json(document.clone()),
+                n_minus_one(&index_input),
+            ),
+            &index_input,
+        );
+
+        let put_input = json!({"index": "users", "id": "user-1", "document": &document});
+        prepare_put_doc_input(
+            "users",
+            "user-1",
+            Value::Json(document.clone()),
+            exact(&put_input),
+        )
+        .unwrap();
+        assert_input_error(
+            prepare_put_doc_input(
+                "users",
+                "user-1",
+                Value::Json(document.clone()),
+                n_minus_one(&put_input),
+            ),
+            &put_input,
+        );
+
+        let patch = json!({"role": "writer"});
+        let update_input = json!({"index": "users", "id": "user-1", "patch": &patch});
+        prepare_update_doc_input(
+            "users",
+            "user-1",
+            Value::Json(patch.clone()),
+            exact(&update_input),
+        )
+        .unwrap();
+        assert_input_error(
+            prepare_update_doc_input(
+                "users",
+                "user-1",
+                Value::Json(patch),
+                n_minus_one(&update_input),
+            ),
+            &update_input,
+        );
+
+        let delete_doc_input = json!({"index": "users", "id": "user-1"});
+        prepare_delete_doc_input("users", "user-1", exact(&delete_doc_input)).unwrap();
+        assert_input_error(
+            prepare_delete_doc_input("users", "user-1", n_minus_one(&delete_doc_input)),
+            &delete_doc_input,
+        );
+
+        let delete_index_input = json!({"index": "users"});
+        prepare_delete_index_input("users", exact(&delete_index_input)).unwrap();
+        assert_input_error(
+            prepare_delete_index_input("users", n_minus_one(&delete_index_input)),
+            &delete_index_input,
+        );
+    }
+
+    #[test]
+    fn mutation_http_body_limit_is_exact_and_target_rules_fail_preflight() {
+        let body = json!({"name": "alice", "profile": {"role": "reader"}});
+        let bytes = serde_json::to_vec(&body).unwrap().len();
+        validate_http_json_body_with_limit(&body, "search test body", bytes).unwrap();
+        assert!(matches!(
+            validate_http_json_body_with_limit(&body, "search test body", bytes - 1),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == bytes - 1
+        ));
+
+        for index in [
+            "Uppercase",
+            "_reserved",
+            "+alias",
+            "two words",
+            "wild*card",
+            ".",
+            "..",
+        ] {
+            assert!(matches!(
+                validate_mutation_index(index),
+                Err(Error::Config(_))
+            ));
+        }
+        assert!(validate_mutation_index("valid-index.v1").is_ok());
+        assert!(matches!(
+            validate_mutation_index(&"x".repeat(MAX_SEARCH_INDEX_BYTES + 1)),
+            Err(Error::Config(message)) if message.contains("255-byte")
+        ));
+        assert!(matches!(
+            validate_mutation_document_id(&"x".repeat(MAX_SEARCH_DOCUMENT_ID_BYTES + 1)),
+            Err(Error::Config(message)) if message.contains("512-byte")
+        ));
+        assert!(matches!(
+            prepare_index_doc_input(
+                "valid-index",
+                Value::Text("not-an-object".to_owned()),
+                InputBudget::default(),
+            ),
+            Err(Error::Config(message)) if message.contains("JSON object")
+        ));
+    }
+
+    #[test]
+    fn post_send_mutation_errors_are_stably_indeterminate() {
+        for error in [
+            Error::Connection("connection reset after write".to_owned()),
+            Error::Query("HTTP 503".to_owned()),
+            Error::Serialization("invalid response".to_owned()),
+            Error::ReadBudgetExceeded {
+                subject: "response".to_owned(),
+                unit: "bytes",
+                limit: 8,
+            },
+        ] {
+            let error = mutation_outcome_error("put document", error);
+            assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+            assert!(!error.is_retryable());
+        }
+    }
+
+    #[test]
     fn budgeted_get_charges_source_extra_and_optional_envelope() {
         let document = parse_document_response(json!({
             "_index": "users",
@@ -1744,6 +2175,9 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::SearchListIndicesBudgeted));
         assert!(operations.contains(&CapabilityOperation::SearchSearchBudgeted));
         assert!(operations.contains(&CapabilityOperation::SearchGetDocumentBudgeted));
+        for operation in CapabilityOperation::SEARCH_BUDGETED_MUTATIONS {
+            assert!(operations.contains(operation));
+        }
         assert!(!operations.contains(&CapabilityOperation::DocumentListCollectionsBounded));
     }
 
@@ -1902,6 +2336,21 @@ mod tests {
                 .await,
             Err(Error::Config(message)) if message.contains("greater than zero")
         ));
+
+        assert!(matches!(
+            adapter
+                .put_doc_budgeted(
+                    "users",
+                    "user-1",
+                    Value::Json(json!({"name": "alice"})),
+                    InputBudget {
+                        max_items: 0,
+                        ..InputBudget::default()
+                    },
+                )
+                .await,
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
     }
 
     #[test]
@@ -2037,6 +2486,9 @@ mod tests {
         assert!(adapter
             .operations()
             .contains(&CapabilityOperation::SearchListIndicesBudgeted));
+        for operation in CapabilityOperation::SEARCH_BUDGETED_MUTATIONS {
+            assert!(adapter.operations().contains(operation));
+        }
 
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2047,22 +2499,83 @@ mod tests {
             std::process::id()
         );
         let catalog_peer = format!("{index}-catalog-peer");
+        let exact_budget = |input: &JsonValue| {
+            let bytes = serde_json::to_vec(input)
+                .expect("live search mutation input should serialize")
+                .len();
+            InputBudget::new(1, bytes, bytes).expect("live exact input budget should be valid")
+        };
 
         let exercise = async {
+            let rejected_document = json!({"name": "must-not-create-index"});
+            let rejected_input =
+                json!({"index": &index, "id": "rejected", "document": &rejected_document});
+            let rejected_bytes = serde_json::to_vec(&rejected_input)
+                .map_err(|error| Error::Serialization(error.to_string()))?
+                .len();
+            let rejected = adapter
+                .put_doc_budgeted(
+                    &index,
+                    "rejected",
+                    Value::Json(rejected_document),
+                    InputBudget::new(1, rejected_bytes, rejected_bytes - 1)?,
+                )
+                .await
+                .expect_err("N-1 put must fail before creating an index");
+            if rejected.code() != "INPUT_BUDGET_EXCEEDED" {
+                return Err(Error::Internal(format!(
+                    "{product} N-1 put returned the wrong error: {rejected}"
+                )));
+            }
+            if adapter
+                .list_indices_bounded(10_000)
+                .await?
+                .items
+                .iter()
+                .any(|item| item.name == index)
+            {
+                return Err(Error::Internal(format!(
+                    "{product} N-1 put created the target index"
+                )));
+            }
+
+            let generated_document = json!({
+                "name": "Generated",
+                "role": "temporary",
+                "product": product,
+            });
+            let generated_input =
+                json!({"index": &index, "document": &generated_document});
+            let generated = adapter
+                .index_doc_budgeted(
+                    &index,
+                    Value::Json(generated_document),
+                    exact_budget(&generated_input),
+                )
+                .await?;
+            if generated.id.is_empty() || generated.result != "created" {
+                return Err(Error::Internal(format!(
+                    "unexpected {product} generated-id outcome: {generated:?}"
+                )));
+            }
+
             for (id, name, role) in [
                 ("alice", "Alice", "reader"),
                 ("bob", "Bob", "writer"),
                 ("carol", "Carol", "reviewer"),
             ] {
+                let document = json!({
+                    "name": name,
+                    "role": role,
+                    "profile": {"bio": format!("{product} complete source")}
+                });
+                let input = json!({"index": &index, "id": id, "document": &document});
                 let outcome = adapter
-                    .put_doc(
+                    .put_doc_budgeted(
                         &index,
                         id,
-                        Value::Json(json!({
-                            "name": name,
-                            "role": role,
-                            "profile": {"bio": format!("{product} complete source")}
-                        })),
+                        Value::Json(document),
+                        exact_budget(&input),
                     )
                     .await?;
                 if outcome.id != id || outcome.result != "created" {
@@ -2070,6 +2583,59 @@ mod tests {
                         "unexpected {product} fixture outcome for {id}: {outcome:?}"
                     )));
                 }
+            }
+
+            let patch = json!({"role": "reader", "updated": true});
+            let patch_input = json!({"index": &index, "id": "alice", "patch": &patch});
+            let updated = adapter
+                .update_doc_budgeted(
+                    &index,
+                    "alice",
+                    Value::Json(patch),
+                    exact_budget(&patch_input),
+                )
+                .await?;
+            if updated.id != "alice" || updated.result != "updated" {
+                return Err(Error::Internal(format!(
+                    "unexpected {product} update outcome: {updated:?}"
+                )));
+            }
+
+            let generated_delete_input = json!({"index": &index, "id": &generated.id});
+            let generated_delete_bytes = serde_json::to_vec(&generated_delete_input)
+                .map_err(|error| Error::Serialization(error.to_string()))?
+                .len();
+            let rejected_delete = adapter
+                .delete_doc_budgeted(
+                    &index,
+                    &generated.id,
+                    InputBudget::new(1, generated_delete_bytes, generated_delete_bytes - 1)?,
+                )
+                .await
+                .expect_err("N-1 delete must fail before sending");
+            if rejected_delete.code() != "INPUT_BUDGET_EXCEEDED"
+                || adapter.get_doc(&index, &generated.id).await?.is_none()
+            {
+                return Err(Error::Internal(format!(
+                    "{product} N-1 document delete changed remote state: {rejected_delete}"
+                )));
+            }
+            let deleted = adapter
+                .delete_doc_budgeted(
+                    &index,
+                    &generated.id,
+                    exact_budget(&generated_delete_input),
+                )
+                .await?;
+            if deleted.id != generated.id || deleted.result != "deleted" {
+                return Err(Error::Internal(format!(
+                    "unexpected {product} document delete outcome: {deleted:?}"
+                )));
+            }
+            if adapter.get_doc(&index, &generated.id).await?.is_some() {
+                return Err(Error::Internal(format!(
+                    "{product} generated document survived exact delete"
+                )));
             }
 
             let peer_outcome = adapter
@@ -2271,6 +2837,17 @@ mod tests {
                     "{product} budgeted get lost the source: {document:?}"
                 )));
             }
+            if document
+                .source
+                .as_ref()
+                .and_then(|value| value.get("updated"))
+                .and_then(JsonValue::as_bool)
+                != Some(true)
+            {
+                return Err(Error::Internal(format!(
+                    "{product} exact update was not visible: {document:?}"
+                )));
+            }
 
             let missing = adapter
                 .get_doc_budgeted(&index, "missing", ReadBudget::new(1, 1024 * 1024)?)
@@ -2305,12 +2882,43 @@ mod tests {
                 )));
             }
 
+            let delete_index_input = json!({"index": &index});
+            let delete_index_bytes = serde_json::to_vec(&delete_index_input)
+                .map_err(|error| Error::Serialization(error.to_string()))?
+                .len();
+            let rejected_delete = adapter
+                .delete_index_budgeted(
+                    &index,
+                    InputBudget::new(1, delete_index_bytes, delete_index_bytes - 1)?,
+                )
+                .await
+                .expect_err("N-1 index delete must fail before sending");
+            if rejected_delete.code() != "INPUT_BUDGET_EXCEEDED"
+                || !adapter
+                    .list_indices_bounded(10_000)
+                    .await?
+                    .items
+                    .iter()
+                    .any(|item| item.name == index)
+            {
+                return Err(Error::Internal(format!(
+                    "{product} N-1 index delete changed remote state: {rejected_delete}"
+                )));
+            }
+
             Ok::<(), Error>(())
         }
         .await;
 
-        let cleanup = adapter.delete_index(&index).await;
-        let peer_cleanup = adapter.delete_index(&catalog_peer).await;
+        let cleanup = adapter
+            .delete_index_budgeted(&index, exact_budget(&json!({"index": &index})))
+            .await;
+        let peer_cleanup = adapter
+            .delete_index_budgeted(
+                &catalog_peer,
+                exact_budget(&json!({"index": &catalog_peer})),
+            )
+            .await;
         let absence = async {
             for _ in 0..40 {
                 let indices = adapter.list_indices_bounded(10_000).await?;
