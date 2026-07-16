@@ -98,6 +98,15 @@ impl Connector for NatsAdapter {
 #[async_trait::async_trait]
 impl MessageProducer for NatsAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
+        // Preserve the legacy empty-batch no-op while keeping the exact
+        // contract strict for newly negotiated callers.
+        validate_subject(target)?;
+        if messages.is_empty() {
+            return Ok(ProduceOutcome {
+                produced: 0,
+                placements: vec![],
+            });
+        }
         self.produce_budgeted(target, messages, ProduceBudget::default())
             .await
     }

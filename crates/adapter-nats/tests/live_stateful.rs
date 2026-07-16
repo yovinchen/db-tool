@@ -126,6 +126,12 @@ async fn budgeted_core_nats_publish_rejects_before_jetstream_write_then_round_tr
         .as_producer()
         .expect("NATS adapter should expose a producer");
 
+    let legacy_empty = producer
+        .produce(&subject, vec![])
+        .await
+        .expect("legacy empty NATS batch should remain a no-op");
+    assert_eq!(legacy_empty.produced, 0);
+
     assert!(matches!(
         producer
             .produce_budgeted(
@@ -162,11 +168,24 @@ async fn budgeted_core_nats_publish_rejects_before_jetstream_write_then_round_tr
         .await
         .expect("exact budgeted Core NATS publish should succeed");
     assert_eq!(outcome.produced, 1);
-    let info = stream
-        .info()
-        .await
-        .expect("stream state should refresh after successful input");
-    assert_eq!(info.state.messages, 1);
+    // Core NATS flush confirms that the server processed the publish, but it
+    // is not a per-message JetStream PubAck. Give the independently managed
+    // stream a small bounded window to expose the retained record.
+    let retention_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let info = loop {
+        let info = stream
+            .info()
+            .await
+            .expect("stream state should refresh after successful input");
+        if info.state.messages == 1 {
+            break info;
+        }
+        assert!(
+            tokio::time::Instant::now() < retention_deadline,
+            "JetStream did not retain the flushed Core NATS publish before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     let first_sequence = info.state.first_sequence;
     let stored = stream
         .get_raw_message(first_sequence)
