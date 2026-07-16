@@ -1,15 +1,32 @@
 # Release Feature And Packaging Evidence
 
-Result: LOCAL_HOST_PASS_WITH_STRICT_CROSS_TARGET_BOUNDARY
+Result: LOCAL_HOST_FINAL_PASS_WITH_STRICT_CROSS_TARGET_BOUNDARY
 
-Run at (UTC): 2026-07-15T20:32:52Z
+Run at (UTC): 2026-07-16T13:46:46Z
 
-Host: macOS arm64; workspace version `0.1.0`
+Host: macOS arm64; workspace version `0.1.0`; verified source commit
+`687967f` (the following evidence-only commit changes no Rust or packaging code)
+
+## Final local gate
+
+| Gate | Result |
+| --- | --- |
+| `./scripts/verify.sh` | PASS: fmt, workspace check, strict workspace Clippy, all workspace unit/integration/doctests, SQLite core smoke, 27-task DB manifest, eight TiDB HA drill manifests, final-goal validator |
+| `RUSTFLAGS='-D deprecated' cargo check --workspace --lib --bins` | PASS: no unapproved first-party production legacy API call |
+| `./scripts/validate-feature-matrix.sh` | PASS: minimal/default/portable/full/full-native CLI and TUI composition plus pure/native Kafka exclusivity |
+| `cargo build --release -p dbtool-cli --no-default-features --features portable` | PASS in 1m15s |
+| archive + npm + Python package generation and archive smoke | PASS for the selected native `aarch64-apple-darwin` target |
+| isolated npm offline install and Python `--no-index` venv install | both returned exact `dbtool 0.1.0` |
+| `./scripts/smoke-docker-image.sh` | PASS: cold Docker build, image `sha256:88e54b25e32f25ae44f0bbf9b14a4641792cf6d6450b7508f9d5f1860fcea6b6`, non-root runtime SQLite core smoke |
+
+The first sandboxed `verify.sh` attempt could not bind the AMQP fixture's local
+temporary listener (`Operation not permitted`). The complete script was rerun
+with host loopback permission and passed; this was a sandbox boundary, not a
+suppressed test failure.
 
 ## Feature composition boundary
 
-The feature matrix is unchanged by this packaging-only slice. Its final rerun is
-tracked by IF-T51 after all interface work is complete.
+The feature matrix was rerun after IF-T75 and IF-T78 closed.
 
 | Build | Last verified result | Verified boundary |
 | --- | --- | --- |

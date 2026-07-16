@@ -138,9 +138,10 @@ local configuration, and all 20 non-messaging mutation input envelopes are
 closed. The 64-method legacy API lifecycle is also closed: every first-party
 production target passes a workspace compile with deprecated calls denied.
 Cross-platform artifact replacement is implemented but still awaits the
-current-SHA Windows x64 runtime and arm64 compile/link evidence. IF-T51 remains
-open until the final local all-feature compile/test/package pass is recorded and
-the six-platform CI matrix succeeds; IF-T52 remains an external-product gate.
+current-SHA Windows x64 runtime and arm64 compile/link evidence. IF-T51's final
+macOS arm64 compile/test/package/Docker gate is recorded as PASS and remains
+open only until the six-platform CI matrix succeeds; IF-T52 remains an
+external-product gate.
 
 Real-product completeness is tracked separately in
 `docs/db-completeness-tasks.md`. A connector or test script being present does
