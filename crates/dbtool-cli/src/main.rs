@@ -3,7 +3,7 @@ mod cmd;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use dbtool_core::config::LimitsConfig;
-use dbtool_core::model::DEFAULT_READ_BYTES;
+use dbtool_core::model::{DEFAULT_INPUT_ITEM_BYTES, DEFAULT_READ_BYTES};
 use dbtool_core::service::{formatter::Format, FlowControl};
 use dbtool_registry::build_registry;
 use std::path::PathBuf;
@@ -37,6 +37,10 @@ struct Cli {
     /// Maximum cumulative bytes in one bounded read response or write input batch
     #[arg(long, global = true, default_value_t = DEFAULT_READ_BYTES)]
     max_bytes: usize,
+
+    /// Maximum bytes in one logical item of a portable mutation input
+    #[arg(long, global = true, default_value_t = DEFAULT_INPUT_ITEM_BYTES)]
+    max_item_bytes: usize,
 
     /// Maximum in-process concurrent operations for this command
     #[arg(long, global = true)]
@@ -199,6 +203,7 @@ async fn main() {
         format: cli.format.into(),
         limit: cli.limit,
         max_bytes: cli.max_bytes,
+        max_item_bytes: cli.max_item_bytes,
         throttle_overrides: LimitsConfig {
             max_concurrency: cli.max_concurrency,
             rate: cli.rate,
@@ -216,10 +221,10 @@ async fn main() {
         command => match ctx.throttle_config() {
             Ok(config) => {
                 let flow = FlowControl::new(config);
-                let indeterminate_timeout = uses_indeterminate_timeout(&command);
+                let mutation_timeout_subject = mutation_timeout_subject(&command);
                 let operation = run_data_command(&ctx, command);
-                if indeterminate_timeout {
-                    flow.run_single_mutation("message produce", operation).await
+                if let Some(subject) = mutation_timeout_subject {
+                    flow.run_single_mutation(subject, operation).await
                 } else {
                     flow.run_single(operation).await
                 }
@@ -238,13 +243,34 @@ async fn main() {
     }
 }
 
-fn uses_indeterminate_timeout(command: &Commands) -> bool {
-    matches!(
-        command,
-        Commands::Mq(cmd::mq::MqCmd {
-            action: cmd::mq::MqAction::Produce { .. }
-        })
-    )
+fn mutation_timeout_subject(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Sql(cmd::sql::SqlCmd { action }) if cmd::sql::action_may_mutate(action) => {
+            Some("SQL execute")
+        }
+        Commands::Cql(cmd::cql::CqlCmd {
+            action: cmd::cql::CqlAction::Exec { .. },
+        }) => Some("CQL execute"),
+        Commands::Kv(cmd::kv::KvCmd { action }) if cmd::kv::action_may_mutate(action) => {
+            Some("key-value mutation")
+        }
+        Commands::Doc(cmd::doc::DocCmd { action }) if cmd::doc::action_may_mutate(action) => {
+            Some("document mutation")
+        }
+        Commands::Import(_) => Some("data import"),
+        Commands::Ts(cmd::ts::TsCmd {
+            action: cmd::ts::TsAction::Write { .. },
+        }) => Some("time-series write"),
+        Commands::Search(cmd::search::SearchCmd { action })
+            if cmd::search::action_may_mutate(action) =>
+        {
+            Some("search mutation")
+        }
+        Commands::Mq(cmd::mq::MqCmd { action }) if cmd::mq::action_may_mutate(action) => {
+            Some("message mutation")
+        }
+        _ => None,
+    }
 }
 
 async fn run_data_command(ctx: &cmd::Context, command: Commands) -> dbtool_core::Result<String> {
@@ -283,7 +309,27 @@ mod tests {
     }
 
     #[test]
-    fn only_message_produce_uses_indeterminate_outer_timeout_semantics() {
+    fn global_input_item_budget_is_documented_and_parsed() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--max-item-bytes"));
+        assert!(help.contains("logical item"));
+
+        let parsed = Cli::try_parse_from([
+            "dbtool",
+            "--max-item-bytes",
+            "4096",
+            "--dsn",
+            "sqlite::memory:",
+            "ping",
+        ])
+        .unwrap();
+        assert_eq!(parsed.max_item_bytes, 4096);
+        assert_eq!(parsed.limit, 100);
+        assert_eq!(parsed.max_bytes, DEFAULT_READ_BYTES);
+    }
+
+    #[test]
+    fn every_mutation_surface_uses_indeterminate_outer_timeout_semantics() {
         let produce = parsed_command(&[
             "dbtool",
             "--dsn",
@@ -293,7 +339,7 @@ mod tests {
             "events",
             "payload",
         ]);
-        assert!(uses_indeterminate_timeout(&produce));
+        assert_eq!(mutation_timeout_subject(&produce), Some("message mutation"));
 
         let consume = parsed_command(&[
             "dbtool",
@@ -303,7 +349,7 @@ mod tests {
             "consume",
             "events",
         ]);
-        assert!(!uses_indeterminate_timeout(&consume));
+        assert_eq!(mutation_timeout_subject(&consume), None);
 
         let sql_write = parsed_command(&[
             "dbtool",
@@ -313,6 +359,134 @@ mod tests {
             "exec",
             "INSERT INTO events VALUES (1)",
         ]);
-        assert!(!uses_indeterminate_timeout(&sql_write));
+        assert_eq!(mutation_timeout_subject(&sql_write), Some("SQL execute"));
+
+        let sql_read = parsed_command(&[
+            "dbtool",
+            "--dsn",
+            "sqlite::memory:",
+            "sql",
+            "exec",
+            "SELECT 1",
+        ]);
+        assert_eq!(mutation_timeout_subject(&sql_read), None);
+
+        for args in [
+            vec![
+                "dbtool",
+                "--dsn",
+                "redis://127.0.0.1:6379",
+                "kv",
+                "set",
+                "key",
+                "value",
+            ],
+            vec![
+                "dbtool",
+                "--dsn",
+                "mongodb://127.0.0.1/app",
+                "doc",
+                "insert",
+                "users",
+                "{}",
+            ],
+            vec![
+                "dbtool",
+                "--dsn",
+                "prometheus://127.0.0.1:9090",
+                "ts",
+                "write",
+                "metric",
+                "1",
+            ],
+            vec![
+                "dbtool",
+                "--dsn",
+                "opensearch://127.0.0.1:9200",
+                "search",
+                "index",
+                "logs",
+                "{}",
+            ],
+        ] {
+            assert!(mutation_timeout_subject(&parsed_command(&args)).is_some());
+        }
+
+        let raw_read = parsed_command(&[
+            "dbtool",
+            "--dsn",
+            "redis://127.0.0.1:6379",
+            "kv",
+            "raw",
+            "GET",
+            "key",
+        ]);
+        assert_eq!(mutation_timeout_subject(&raw_read), None);
+
+        let raw_write = parsed_command(&[
+            "dbtool",
+            "--dsn",
+            "redis://127.0.0.1:6379",
+            "kv",
+            "raw",
+            "SET",
+            "key",
+            "value",
+        ]);
+        assert_eq!(
+            mutation_timeout_subject(&raw_write),
+            Some("key-value mutation")
+        );
+
+        for args in [
+            vec![
+                "dbtool",
+                "--dsn",
+                "kafka://127.0.0.1:9092",
+                "mq",
+                "delete",
+                "--kind",
+                "kafka-topic",
+                "events",
+            ],
+            vec![
+                "dbtool",
+                "--dsn",
+                "kafka://127.0.0.1:9092",
+                "mq",
+                "consume",
+                "events",
+                "--group",
+                "workers",
+                "--ack",
+                "none",
+            ],
+            vec![
+                "dbtool",
+                "--dsn",
+                "amqp://127.0.0.1:5672",
+                "mq",
+                "consume",
+                "events",
+                "--ack",
+                "on-success",
+            ],
+        ] {
+            assert_eq!(
+                mutation_timeout_subject(&parsed_command(&args)),
+                Some("message mutation")
+            );
+        }
+
+        let readonly_aggregate = parsed_command(&[
+            "dbtool",
+            "--dsn",
+            "mongodb://127.0.0.1/app",
+            "doc",
+            "aggregate",
+            "users",
+            "[]",
+        ]);
+        assert_eq!(mutation_timeout_subject(&readonly_aggregate), None);
     }
 }

@@ -2,12 +2,12 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::{ReadBudget, Value},
+    model::{InputBudget, ReadBudget, Value},
     port::{
         capability::{SearchHits, SearchOptions},
         CapabilityOperation,
     },
-    service::safety::SafetyGuard,
+    service::{safety::SafetyGuard, InputLimiter},
     Result,
 };
 
@@ -93,6 +93,13 @@ pub enum SearchAction {
 
 pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
     let read_budget = search_read_budget(&cmd.action, ctx.limit, ctx.max_bytes)?;
+    let input_budget = if action_may_mutate(&cmd.action) {
+        let budget = ctx.input_budget()?;
+        preflight_search_mutation(&cmd.action, budget)?;
+        Some(budget)
+    } else {
+        None
+    };
     let dsn = ctx.resolve_dsn()?;
     match &cmd.action {
         SearchAction::Index { .. }
@@ -165,12 +172,25 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
         }
         SearchAction::Index { index, doc } => {
             let doc = parse_json_value(&doc)?;
-            let outcome = se.index_doc(&index, doc).await?;
+            let outcome = se
+                .index_doc_budgeted(
+                    &index,
+                    doc,
+                    input_budget.expect("index actions construct an input budget"),
+                )
+                .await?;
             ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
         }
         SearchAction::Put { index, id, doc } => {
             let doc = parse_json_value(&doc)?;
-            let outcome = se.put_doc(&index, &id, doc).await?;
+            let outcome = se
+                .put_doc_budgeted(
+                    &index,
+                    &id,
+                    doc,
+                    input_budget.expect("put actions construct an input budget"),
+                )
+                .await?;
             ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
         }
         SearchAction::Get { index, id } => {
@@ -182,15 +202,33 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
         }
         SearchAction::Update { index, id, patch } => {
             let patch = parse_json_value(&patch)?;
-            let outcome = se.update_doc(&index, &id, patch).await?;
+            let outcome = se
+                .update_doc_budgeted(
+                    &index,
+                    &id,
+                    patch,
+                    input_budget.expect("update actions construct an input budget"),
+                )
+                .await?;
             ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
         }
         SearchAction::Delete { index, id } => {
-            let outcome = se.delete_doc(&index, &id).await?;
+            let outcome = se
+                .delete_doc_budgeted(
+                    &index,
+                    &id,
+                    input_budget.expect("delete actions construct an input budget"),
+                )
+                .await?;
             ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
         }
         SearchAction::DeleteIndex { index } => {
-            let outcome = se.delete_index(&index).await?;
+            let outcome = se
+                .delete_index_budgeted(
+                    &index,
+                    input_budget.expect("delete-index actions construct an input budget"),
+                )
+                .await?;
             ctx.render_success(&kind, outcome, start.elapsed().as_millis() as u64, false)
         }
     })
@@ -207,30 +245,79 @@ fn search_operation_for_action(action: &SearchAction) -> (CapabilityOperation, &
             "SearchEngine.search_budgeted",
         ),
         SearchAction::Index { .. } => (
-            CapabilityOperation::SearchIndexDocument,
-            "SearchEngine.index_doc",
+            CapabilityOperation::SearchIndexDocumentBudgeted,
+            "SearchEngine.index_doc_budgeted",
         ),
         SearchAction::Put { .. } => (
-            CapabilityOperation::SearchPutDocument,
-            "SearchEngine.put_doc",
+            CapabilityOperation::SearchPutDocumentBudgeted,
+            "SearchEngine.put_doc_budgeted",
         ),
         SearchAction::Get { .. } => (
             CapabilityOperation::SearchGetDocumentBudgeted,
             "SearchEngine.get_doc_budgeted",
         ),
         SearchAction::Update { .. } => (
-            CapabilityOperation::SearchUpdateDocument,
-            "SearchEngine.update_doc",
+            CapabilityOperation::SearchUpdateDocumentBudgeted,
+            "SearchEngine.update_doc_budgeted",
         ),
         SearchAction::Delete { .. } => (
-            CapabilityOperation::SearchDeleteDocument,
-            "SearchEngine.delete_doc",
+            CapabilityOperation::SearchDeleteDocumentBudgeted,
+            "SearchEngine.delete_doc_budgeted",
         ),
         SearchAction::DeleteIndex { .. } => (
-            CapabilityOperation::SearchDeleteIndex,
-            "SearchEngine.delete_index",
+            CapabilityOperation::SearchDeleteIndexBudgeted,
+            "SearchEngine.delete_index_budgeted",
         ),
     }
+}
+
+fn preflight_search_mutation(action: &SearchAction, budget: InputBudget) -> Result<()> {
+    let request = match action {
+        SearchAction::Index { index, doc } => serde_json::json!({
+            "index": index,
+            "document": parse_search_object(doc, "index document")?,
+        }),
+        SearchAction::Put { index, id, doc } => serde_json::json!({
+            "index": index,
+            "id": id,
+            "document": parse_search_object(doc, "put document")?,
+        }),
+        SearchAction::Update { index, id, patch } => serde_json::json!({
+            "index": index,
+            "id": id,
+            "patch": parse_search_object(patch, "update patch")?,
+        }),
+        SearchAction::Delete { index, id } => serde_json::json!({
+            "index": index,
+            "id": id,
+        }),
+        SearchAction::DeleteIndex { index } => serde_json::json!({ "index": index }),
+        SearchAction::Indices | SearchAction::Search { .. } | SearchAction::Get { .. } => {
+            return Ok(())
+        }
+    };
+    InputLimiter::new(budget, "CLI search mutation input")?.validate_request(&request)
+}
+
+fn parse_search_object(raw: &str, label: &str) -> Result<serde_json::Value> {
+    let value = parse_json_value(raw)?.to_plain_json()?;
+    if !value.is_object() {
+        return Err(Error::Config(format!(
+            "search {label} must be a JSON object"
+        )));
+    }
+    Ok(value)
+}
+
+pub(crate) fn action_may_mutate(action: &SearchAction) -> bool {
+    matches!(
+        action,
+        SearchAction::Index { .. }
+            | SearchAction::Put { .. }
+            | SearchAction::Update { .. }
+            | SearchAction::Delete { .. }
+            | SearchAction::DeleteIndex { .. }
+    )
 }
 
 fn search_read_budget(
@@ -307,6 +394,7 @@ mod tests {
             format: Format::Json,
             limit,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write: false,
             confirm: None,
@@ -352,6 +440,101 @@ mod tests {
                 }) if kind == "legacy-search" && actual_needed == needed
             ));
         }
+    }
+
+    #[test]
+    fn every_search_mutation_selects_an_exact_input_budgeted_operation() {
+        let cases = [
+            (
+                SearchAction::Index {
+                    index: "logs".to_owned(),
+                    doc: "{}".to_owned(),
+                },
+                CapabilityOperation::SearchIndexDocumentBudgeted,
+                "SearchEngine.index_doc_budgeted",
+            ),
+            (
+                SearchAction::Put {
+                    index: "logs".to_owned(),
+                    id: "one".to_owned(),
+                    doc: "{}".to_owned(),
+                },
+                CapabilityOperation::SearchPutDocumentBudgeted,
+                "SearchEngine.put_doc_budgeted",
+            ),
+            (
+                SearchAction::Update {
+                    index: "logs".to_owned(),
+                    id: "one".to_owned(),
+                    patch: "{}".to_owned(),
+                },
+                CapabilityOperation::SearchUpdateDocumentBudgeted,
+                "SearchEngine.update_doc_budgeted",
+            ),
+            (
+                SearchAction::Delete {
+                    index: "logs".to_owned(),
+                    id: "one".to_owned(),
+                },
+                CapabilityOperation::SearchDeleteDocumentBudgeted,
+                "SearchEngine.delete_doc_budgeted",
+            ),
+            (
+                SearchAction::DeleteIndex {
+                    index: "logs".to_owned(),
+                },
+                CapabilityOperation::SearchDeleteIndexBudgeted,
+                "SearchEngine.delete_index_budgeted",
+            ),
+        ];
+        for (action, operation, needed) in cases {
+            assert_eq!(search_operation_for_action(&action), (operation, needed));
+            assert!(matches!(
+                require_search_operation(&[], operation, "legacy-search", needed),
+                Err(Error::UnsupportedCapability {
+                    needed: actual_needed,
+                    ..
+                }) if actual_needed == needed
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn search_mutation_input_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(1);
+        ctx.allow_write = true;
+        ctx.max_item_bytes = 1;
+        let error = run(
+            &ctx,
+            SearchCmd {
+                action: SearchAction::Index {
+                    index: "logs".to_owned(),
+                    doc: r#"{"message":"hello"}"#.to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InputBudgetExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn search_mutation_shape_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(1);
+        ctx.allow_write = true;
+        ctx.dsn = None;
+        let error = run(
+            &ctx,
+            SearchCmd {
+                action: SearchAction::Index {
+                    index: "logs".to_owned(),
+                    doc: "[]".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("JSON object")));
     }
 
     #[tokio::test]

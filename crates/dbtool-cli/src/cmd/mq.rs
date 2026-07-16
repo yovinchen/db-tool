@@ -120,6 +120,19 @@ pub enum MqAction {
     },
 }
 
+pub(crate) fn action_may_mutate(action: &MqAction) -> bool {
+    match action {
+        MqAction::Produce { .. } | MqAction::Delete { .. } => true,
+        MqAction::Consume {
+            group,
+            durable,
+            ack,
+            ..
+        } => group.is_some() || durable.is_some() || matches!(ack, Some(MqAckMode::OnSuccess)),
+        MqAction::Topics | MqAction::Detail { .. } | MqAction::Lag { .. } => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum MqResourceKind {
     KafkaTopic,
@@ -779,6 +792,7 @@ mod tests {
             format: dbtool_core::service::formatter::Format::Json,
             limit: 1,
             max_bytes: dbtool_core::model::DEFAULT_PRODUCE_BATCH_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write: true,
             confirm: None,
@@ -869,6 +883,7 @@ mod tests {
             format: dbtool_core::service::formatter::Format::Json,
             limit: 1,
             max_bytes: 0,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write: false,
             confirm: None,
@@ -964,6 +979,7 @@ mod tests {
             format: dbtool_core::service::formatter::Format::Json,
             limit: usize::MAX,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write: false,
             confirm: None,

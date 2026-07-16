@@ -3,11 +3,44 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     dsn::Dsn,
     error::Error,
-    model::{Document, FindOptions, Value},
+    model::{Document, FindOptions, InputBudget, Value},
     port::CapabilityOperation,
-    service::safety::SafetyGuard,
+    service::{safety::SafetyGuard, InputLimiter},
     Result,
 };
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct DocumentInsertInput<'a> {
+    collection: &'a str,
+    documents: &'a [Document],
+}
+
+#[derive(Serialize)]
+struct DocumentUpdateInput<'a> {
+    collection: &'a str,
+    filter: &'a Value,
+    update: &'a Value,
+    many: bool,
+}
+
+#[derive(Serialize)]
+struct DocumentDeleteInput<'a> {
+    collection: &'a str,
+    filter: &'a Value,
+    many: bool,
+}
+
+#[derive(Serialize)]
+struct DocumentDropInput<'a> {
+    collection: &'a str,
+}
+
+#[derive(Serialize)]
+struct DocumentAggregateInput<'a> {
+    collection: &'a str,
+    pipeline: &'a [Value],
+}
 
 #[derive(Args)]
 pub struct DocCmd {
@@ -75,7 +108,7 @@ pub enum DocAction {
     },
     /// Run a bounded JSON aggregation pipeline.
     #[command(
-        long_about = "Run a bounded JSON aggregation pipeline. Read-only pipelines execute normally. Pipelines containing MongoDB $out or $merge must expose exactly one statically resolvable output namespace and require both --allow-write and a --confirm token bound to the connection, source collection, target namespace, and complete pipeline before dbtool connects."
+        long_about = "Run a bounded JSON aggregation pipeline. Read-only pipelines use document.aggregate_budgeted. Pipelines containing MongoDB $out or $merge must expose exactly one statically resolvable output namespace, fit the global mutation input envelope before DSN resolution, advertise document.aggregate_write_budgeted, and require both --allow-write and a --confirm token bound to the connection, source collection, target namespace, and complete pipeline before dbtool connects."
     )]
     Aggregate {
         /// Collection name.
@@ -91,6 +124,45 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             Some(ctx.read_budget()?)
         }
         _ => None,
+    };
+    let aggregate_pipeline = match &cmd.action {
+        DocAction::Aggregate { pipeline, .. } => Some(parse_pipeline(pipeline)?),
+        _ => None,
+    };
+    let aggregate_write = aggregate_pipeline
+        .as_deref()
+        .is_some_and(pipeline_has_write_stage);
+    let input_budget = if matches!(
+        cmd.action,
+        DocAction::Insert { .. }
+            | DocAction::Update { .. }
+            | DocAction::Delete { .. }
+            | DocAction::Drop { .. }
+    ) || aggregate_write
+    {
+        let budget = ctx.input_budget()?;
+        if aggregate_write {
+            let collection = match &cmd.action {
+                DocAction::Aggregate { collection, .. } => collection,
+                _ => {
+                    return Err(Error::Internal(
+                        "mutating aggregate classification lost its action".into(),
+                    ))
+                }
+            };
+            preflight_document_aggregate(
+                collection,
+                aggregate_pipeline.as_deref().ok_or_else(|| {
+                    Error::Internal("validated aggregate pipeline is missing".into())
+                })?,
+                budget,
+            )?;
+        } else {
+            preflight_document_mutation(&cmd.action, budget)?;
+        }
+        Some(budget)
+    } else {
+        None
     };
     let dsn = ctx.resolve_dsn()?;
     match &cmd.action {
@@ -118,10 +190,12 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
         }
         DocAction::Aggregate {
             collection,
-            pipeline,
+            pipeline: _,
         } => {
-            let pipeline = parse_pipeline(pipeline)?;
-            check_aggregate_safety(ctx, &dsn, collection, &pipeline)?;
+            let pipeline = aggregate_pipeline
+                .as_deref()
+                .ok_or_else(|| Error::Internal("validated aggregate pipeline is missing".into()))?;
+            check_aggregate_safety(ctx, &dsn, collection, pipeline)?;
         }
         DocAction::Collections | DocAction::Find { .. } => {}
     }
@@ -181,7 +255,13 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             doc: raw_doc,
         } => {
             let d = parse_document(&raw_doc)?;
-            let outcome = doc.insert(&collection, vec![d]).await?;
+            let outcome = doc
+                .insert_budgeted(
+                    &collection,
+                    vec![d],
+                    input_budget.expect("insert actions construct an input budget"),
+                )
+                .await?;
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
         DocAction::Update {
@@ -193,9 +273,21 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             let filter = parse_nonempty_json_object(&filter, "--filter")?.into();
             let update = parse_json_object(&update, "--update")?.into();
             let outcome = if many {
-                doc.update_many(&collection, filter, update).await?
+                doc.update_many_budgeted(
+                    &collection,
+                    filter,
+                    update,
+                    input_budget.expect("update actions construct an input budget"),
+                )
+                .await?
             } else {
-                doc.update_one(&collection, filter, update).await?
+                doc.update_one_budgeted(
+                    &collection,
+                    filter,
+                    update,
+                    input_budget.expect("update actions construct an input budget"),
+                )
+                .await?
             };
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
@@ -206,9 +298,19 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
         } => {
             let filter = parse_nonempty_json_object(&filter, "--filter")?.into();
             let deleted = if many {
-                doc.delete_many(&collection, filter).await?
+                doc.delete_many_budgeted(
+                    &collection,
+                    filter,
+                    input_budget.expect("delete actions construct an input budget"),
+                )
+                .await?
             } else {
-                doc.delete_one(&collection, filter).await?
+                doc.delete_one_budgeted(
+                    &collection,
+                    filter,
+                    input_budget.expect("delete actions construct an input budget"),
+                )
+                .await?
             };
             ctx.render_success(
                 &kind,
@@ -218,7 +320,11 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             )
         }
         DocAction::Drop { collection } => {
-            doc.drop_collection(&collection).await?;
+            doc.drop_collection_budgeted(
+                &collection,
+                input_budget.expect("drop actions construct an input budget"),
+            )
+            .await?;
             ctx.render_success(
                 &kind,
                 serde_json::json!({ "dropped": true, "collection": collection }),
@@ -228,16 +334,24 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
         }
         DocAction::Aggregate {
             collection,
-            pipeline,
+            pipeline: _,
         } => {
-            let pipeline = parse_pipeline(&pipeline)?;
-            let result = doc
-                .aggregate_budgeted(
+            let pipeline = aggregate_pipeline
+                .ok_or_else(|| Error::Internal("validated aggregate pipeline is missing".into()))?;
+            let response_budget =
+                read_budget.expect("aggregate actions construct a response budget");
+            let result = if aggregate_write {
+                doc.aggregate_write_budgeted(
                     &collection,
                     pipeline,
-                    read_budget.expect("aggregate actions construct a read budget"),
+                    input_budget.expect("mutating aggregates construct an input budget"),
+                    response_budget,
                 )
-                .await?;
+                .await?
+            } else {
+                doc.aggregate_budgeted(&collection, pipeline, response_budget)
+                    .await?
+            };
             ctx.render_success(&kind, result.items, elapsed(), result.truncated)
         }
     })
@@ -252,24 +366,28 @@ fn document_operation_for_action(
             "DocumentStore.list_collections_budgeted",
         )),
         DocAction::Update { many: true, .. } => Some((
-            CapabilityOperation::DocumentUpdateMany,
-            "DocumentStore.update_many",
+            CapabilityOperation::DocumentUpdateManyBudgeted,
+            "DocumentStore.update_many_budgeted",
         )),
         DocAction::Update { many: false, .. } => Some((
-            CapabilityOperation::DocumentUpdateOne,
-            "DocumentStore.update_one",
+            CapabilityOperation::DocumentUpdateOneBudgeted,
+            "DocumentStore.update_one_budgeted",
         )),
         DocAction::Delete { many: true, .. } => Some((
-            CapabilityOperation::DocumentDeleteMany,
-            "DocumentStore.delete_many",
+            CapabilityOperation::DocumentDeleteManyBudgeted,
+            "DocumentStore.delete_many_budgeted",
         )),
         DocAction::Delete { many: false, .. } => Some((
-            CapabilityOperation::DocumentDeleteOne,
-            "DocumentStore.delete_one",
+            CapabilityOperation::DocumentDeleteOneBudgeted,
+            "DocumentStore.delete_one_budgeted",
         )),
         DocAction::Drop { .. } => Some((
-            CapabilityOperation::DocumentDropCollection,
-            "DocumentStore.drop_collection",
+            CapabilityOperation::DocumentDropCollectionBudgeted,
+            "DocumentStore.drop_collection_budgeted",
+        )),
+        DocAction::Aggregate { .. } if action_may_mutate(action) => Some((
+            CapabilityOperation::DocumentAggregateWriteBudgeted,
+            "DocumentStore.aggregate_write_budgeted",
         )),
         DocAction::Aggregate { .. } => Some((
             CapabilityOperation::DocumentAggregateBudgeted,
@@ -279,9 +397,103 @@ fn document_operation_for_action(
             CapabilityOperation::DocumentFindBudgeted,
             "DocumentStore.find_budgeted",
         )),
-        DocAction::Insert { .. } => {
-            Some((CapabilityOperation::DocumentInsert, "DocumentStore.insert"))
+        DocAction::Insert { .. } => Some((
+            CapabilityOperation::DocumentInsertBudgeted,
+            "DocumentStore.insert_budgeted",
+        )),
+    }
+}
+
+fn preflight_document_mutation(action: &DocAction, budget: InputBudget) -> Result<()> {
+    match action {
+        DocAction::Insert { collection, doc } => {
+            validate_mutation_collection(collection)?;
+            let documents = [parse_document(doc)?];
+            InputLimiter::new(budget, "CLI document insert input")?.validate_items_with_request(
+                &documents,
+                &DocumentInsertInput {
+                    collection,
+                    documents: &documents,
+                },
+            )
         }
+        DocAction::Update {
+            collection,
+            filter,
+            update,
+            many,
+        } => {
+            validate_mutation_collection(collection)?;
+            let filter = Value::Json(parse_nonempty_json_object(filter, "--filter")?);
+            let update = Value::Json(parse_json_object(update, "--update")?);
+            InputLimiter::new(budget, "CLI document update input")?.validate_request(
+                &DocumentUpdateInput {
+                    collection,
+                    filter: &filter,
+                    update: &update,
+                    many: *many,
+                },
+            )
+        }
+        DocAction::Delete {
+            collection,
+            filter,
+            many,
+        } => {
+            validate_mutation_collection(collection)?;
+            let filter = Value::Json(parse_nonempty_json_object(filter, "--filter")?);
+            InputLimiter::new(budget, "CLI document delete input")?.validate_request(
+                &DocumentDeleteInput {
+                    collection,
+                    filter: &filter,
+                    many: *many,
+                },
+            )
+        }
+        DocAction::Drop { collection } => {
+            validate_mutation_collection(collection)?;
+            InputLimiter::new(budget, "CLI document drop input")?
+                .validate_request(&DocumentDropInput { collection })
+        }
+        DocAction::Collections | DocAction::Find { .. } | DocAction::Aggregate { .. } => Ok(()),
+    }
+}
+
+fn preflight_document_aggregate(
+    collection: &str,
+    pipeline: &[Value],
+    budget: InputBudget,
+) -> Result<()> {
+    validate_mutation_collection(collection)?;
+    InputLimiter::new(budget, "CLI mutating aggregate input")?.validate_items_with_request(
+        pipeline,
+        &DocumentAggregateInput {
+            collection,
+            pipeline,
+        },
+    )
+}
+
+fn pipeline_has_write_stage(pipeline: &[Value]) -> bool {
+    pipeline.iter().any(|stage| {
+        matches!(
+            stage,
+            Value::Json(serde_json::Value::Object(stage))
+                if stage.contains_key("$out") || stage.contains_key("$merge")
+        )
+    })
+}
+
+pub(crate) fn action_may_mutate(action: &DocAction) -> bool {
+    match action {
+        DocAction::Insert { .. }
+        | DocAction::Update { .. }
+        | DocAction::Delete { .. }
+        | DocAction::Drop { .. } => true,
+        DocAction::Aggregate { pipeline, .. } => {
+            parse_pipeline(pipeline).is_ok_and(|pipeline| pipeline_has_write_stage(&pipeline))
+        }
+        DocAction::Collections | DocAction::Find { .. } => false,
     }
 }
 
@@ -862,6 +1074,7 @@ mod tests {
             format: Format::Json,
             limit: 100,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,
@@ -1086,6 +1299,119 @@ mod tests {
             Err(Error::UnsupportedCapability { needed, .. })
                 if needed == "DocumentStore.aggregate_budgeted"
         ));
+    }
+
+    #[test]
+    fn every_document_mutation_selects_an_exact_input_budgeted_operation() {
+        let cases = [
+            (
+                DocAction::Insert {
+                    collection: "users".to_owned(),
+                    doc: "{}".to_owned(),
+                },
+                CapabilityOperation::DocumentInsertBudgeted,
+                "DocumentStore.insert_budgeted",
+            ),
+            (
+                DocAction::Update {
+                    collection: "users".to_owned(),
+                    filter: r#"{"id":1}"#.to_owned(),
+                    update: r#"{"active":true}"#.to_owned(),
+                    many: false,
+                },
+                CapabilityOperation::DocumentUpdateOneBudgeted,
+                "DocumentStore.update_one_budgeted",
+            ),
+            (
+                DocAction::Update {
+                    collection: "users".to_owned(),
+                    filter: r#"{"id":1}"#.to_owned(),
+                    update: r#"{"active":true}"#.to_owned(),
+                    many: true,
+                },
+                CapabilityOperation::DocumentUpdateManyBudgeted,
+                "DocumentStore.update_many_budgeted",
+            ),
+            (
+                DocAction::Delete {
+                    collection: "users".to_owned(),
+                    filter: r#"{"id":1}"#.to_owned(),
+                    many: false,
+                },
+                CapabilityOperation::DocumentDeleteOneBudgeted,
+                "DocumentStore.delete_one_budgeted",
+            ),
+            (
+                DocAction::Delete {
+                    collection: "users".to_owned(),
+                    filter: r#"{"id":1}"#.to_owned(),
+                    many: true,
+                },
+                CapabilityOperation::DocumentDeleteManyBudgeted,
+                "DocumentStore.delete_many_budgeted",
+            ),
+            (
+                DocAction::Drop {
+                    collection: "users".to_owned(),
+                },
+                CapabilityOperation::DocumentDropCollectionBudgeted,
+                "DocumentStore.drop_collection_budgeted",
+            ),
+            (
+                DocAction::Aggregate {
+                    collection: "users".to_owned(),
+                    pipeline: r#"[{"$out":"users_archive"}]"#.to_owned(),
+                },
+                CapabilityOperation::DocumentAggregateWriteBudgeted,
+                "DocumentStore.aggregate_write_budgeted",
+            ),
+        ];
+
+        for (action, operation, needed) in cases {
+            assert_eq!(
+                document_operation_for_action(&action),
+                Some((operation, needed))
+            );
+            assert!(matches!(
+                require_document_operation(&[], operation, "legacy-document", needed),
+                Err(Error::UnsupportedCapability {
+                    needed: actual_needed,
+                    ..
+                }) if actual_needed == needed
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn document_mutation_input_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(true, "mongodb://127.0.0.1:1/app");
+        ctx.dsn = None;
+        ctx.max_item_bytes = 1;
+        let error = run(
+            &ctx,
+            DocCmd {
+                action: DocAction::Insert {
+                    collection: "users".to_owned(),
+                    doc: r#"{"name":"alice"}"#.to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InputBudgetExceeded { .. }));
+
+        let error = run(
+            &ctx,
+            DocCmd {
+                action: DocAction::Aggregate {
+                    collection: "users".to_owned(),
+                    pipeline: r#"[{"$out":"users_archive"}]"#.to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InputBudgetExceeded { .. }));
     }
 
     #[test]

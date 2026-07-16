@@ -175,7 +175,7 @@ fn invalid_catalog_limits_fail_before_connection_for_all_three_surfaces() {
         assert_eq!(error["error"]["code"], "CONFIG_ERROR");
         assert!(error["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("limit")));
+            .is_some_and(|message| message.contains("limit") || message.contains("budget")));
     }
 }
 

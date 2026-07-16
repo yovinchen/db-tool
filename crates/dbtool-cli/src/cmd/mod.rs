@@ -16,7 +16,7 @@ use dbtool_core::{
     config::{file::CONNECTION_CONFIG_MAX_NAME_BYTES, ConnectionConfig, LimitsConfig},
     dsn::Dsn,
     error::Error,
-    model::{MetadataBudget, ReadBudget, MAX_READ_BYTES},
+    model::{InputBudget, MetadataBudget, ReadBudget, MAX_READ_BYTES},
     service::ConnectionResolver,
 };
 use serde::Serialize;
@@ -28,6 +28,7 @@ pub struct Context {
     pub format: Format,
     pub limit: usize,
     pub max_bytes: usize,
+    pub max_item_bytes: usize,
     pub throttle_overrides: LimitsConfig,
     pub allow_write: bool,
     pub confirm: Option<String>,
@@ -69,6 +70,14 @@ impl Context {
     /// administration responses. Validation happens before backend access.
     pub fn metadata_budget(&self) -> dbtool_core::Result<MetadataBudget> {
         MetadataBudget::new(self.limit, self.max_bytes)
+    }
+
+    /// Build the caller-owned envelope for portable mutation inputs. The
+    /// global item limit is reused as `max_items`, while `--max-bytes` bounds
+    /// the complete request and `--max-item-bytes` independently bounds each
+    /// logical value. Mutation commands call this before resolving a DSN.
+    pub fn input_budget(&self) -> dbtool_core::Result<InputBudget> {
+        InputBudget::new(self.limit, self.max_item_bytes, self.max_bytes)
     }
 
     pub fn ensure_write_allowed(&self) -> dbtool_core::Result<()> {

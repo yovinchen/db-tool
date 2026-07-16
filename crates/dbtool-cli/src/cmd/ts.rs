@@ -4,6 +4,7 @@ use dbtool_core::{
     error::Error,
     model::{Point, ReadBudget, TimeRange, TimeSeriesReadBudget},
     port::CapabilityOperation,
+    service::InputLimiter,
     Result,
 };
 use std::collections::HashMap;
@@ -93,6 +94,26 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
         TsAction::Measurements => None,
         TsAction::Write { .. } => None,
     };
+    let write_request = match &cmd.action {
+        TsAction::Write {
+            measurement,
+            value,
+            field,
+            tags,
+            timestamp_ms,
+        } => {
+            let budget = ctx.input_budget()?;
+            let points = vec![Point {
+                measurement: measurement.clone(),
+                tags: parse_tags(tags)?,
+                fields: HashMap::from([(field.clone(), *value)]),
+                timestamp: timestamp_ms.unwrap_or_else(now_millis),
+            }];
+            InputLimiter::new(budget, "CLI time-series write input")?.validate_batch(&points)?;
+            Some((points, budget))
+        }
+        TsAction::Measurements | TsAction::Query { .. } => None,
+    };
 
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
@@ -138,19 +159,16 @@ pub async fn run(ctx: &Context, cmd: TsCmd) -> Result<String> {
             ctx.render_success(&kind, result, start.elapsed().as_millis() as u64, truncated)
         }
         TsAction::Write {
-            measurement,
-            value,
-            field,
-            tags,
-            timestamp_ms,
+            measurement: _,
+            value: _,
+            field: _,
+            tags: _,
+            timestamp_ms: _,
         } => {
-            let point = Point {
-                measurement,
-                tags: parse_tags(&tags)?,
-                fields: HashMap::from([(field, value)]),
-                timestamp: timestamp_ms.unwrap_or_else(now_millis),
-            };
-            ts.write_points(vec![point]).await?;
+            let (points, budget) = write_request.ok_or_else(|| {
+                Error::Internal("validated time-series write request is missing".into())
+            })?;
+            ts.write_points_budgeted(points, budget).await?;
             ctx.render_success(
                 &kind,
                 serde_json::json!({ "written_points": 1, "written_samples": 1 }),
@@ -172,8 +190,8 @@ fn time_series_operation_for_action(action: &TsAction) -> (CapabilityOperation, 
             "TimeSeriesStore.query_range_bounded",
         ),
         TsAction::Write { .. } => (
-            CapabilityOperation::TimeSeriesWritePoints,
-            "TimeSeriesStore.write_points",
+            CapabilityOperation::TimeSeriesWritePointsBudgeted,
+            "TimeSeriesStore.write_points_budgeted",
         ),
     }
 }
@@ -317,6 +335,7 @@ mod tests {
             format: Format::Json,
             limit: 100,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,
@@ -371,6 +390,55 @@ mod tests {
                 "TimeSeriesStore.query_range_bounded"
             )
         );
+    }
+
+    #[test]
+    fn time_series_write_requires_the_exact_input_budgeted_operation() {
+        let action = TsAction::Write {
+            measurement: "requests_total".to_owned(),
+            value: 1.0,
+            field: "value".to_owned(),
+            tags: Vec::new(),
+            timestamp_ms: Some(1),
+        };
+        assert_eq!(
+            time_series_operation_for_action(&action),
+            (
+                CapabilityOperation::TimeSeriesWritePointsBudgeted,
+                "TimeSeriesStore.write_points_budgeted"
+            )
+        );
+        assert!(matches!(
+            require_time_series_operation(
+                &[CapabilityOperation::TimeSeriesWritePoints],
+                CapabilityOperation::TimeSeriesWritePointsBudgeted,
+                "legacy-time-series",
+                "TimeSeriesStore.write_points_budgeted",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "TimeSeriesStore.write_points_budgeted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn time_series_write_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(true);
+        ctx.max_item_bytes = 1;
+        let error = run(
+            &ctx,
+            TsCmd {
+                action: TsAction::Write {
+                    measurement: "requests_total".to_owned(),
+                    value: 1.0,
+                    field: "value".to_owned(),
+                    tags: Vec::new(),
+                    timestamp_ms: Some(1),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InputBudgetExceeded { .. }));
     }
 
     #[tokio::test]

@@ -2,12 +2,14 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::Value,
+    model::{InputBudget, SqlExecuteInput, Value},
     port::CapabilityOperation,
-    service::safety::{SafetyGuard, StatementKind},
+    service::{
+        safety::{SafetyGuard, StatementKind},
+        InputLimiter,
+    },
     Result,
 };
-
 #[derive(Args)]
 #[command(
     about = "Run SQL queries, writes, and schema inspection commands.",
@@ -65,15 +67,23 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
         SqlAction::Schema { .. } => Some(ctx.metadata_budget()?),
         SqlAction::Exec { .. } => None,
     };
-    let dsn = ctx.resolve_dsn()?;
-    let target = ctx.confirmation_target(&dsn)?;
-
     let parsed_params = match &cmd.action {
         SqlAction::Query { params, .. } | SqlAction::Exec { params, .. } => {
             Some(parse_sql_params(params)?)
         }
         SqlAction::Tables { .. } | SqlAction::Schema { .. } | SqlAction::Schemas => None,
     };
+    let input_budget = match &cmd.action {
+        SqlAction::Exec { sql, .. } => {
+            let budget = ctx.input_budget()?;
+            preflight_sql_execute(sql, parsed_params.as_deref().unwrap_or_default(), budget)?;
+            Some(budget)
+        }
+        _ => None,
+    };
+
+    let dsn = ctx.resolve_dsn()?;
+    let target = ctx.confirmation_target(&dsn)?;
 
     match &cmd.action {
         SqlAction::Query { sql, .. } => ensure_readonly_query(sql)?,
@@ -123,7 +133,11 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
         }
         SqlAction::Exec { sql, .. } => {
             let outcome = sql_engine
-                .execute(&sql, parsed_params.as_deref().unwrap_or_default())
+                .execute_budgeted(
+                    &sql,
+                    parsed_params.as_deref().unwrap_or_default(),
+                    input_budget.expect("execute actions construct an input budget"),
+                )
                 .await?;
             ctx.render_success(
                 conn.kind().0.as_str(),
@@ -194,12 +208,27 @@ fn sql_operation_for_action(action: &SqlAction) -> Option<(CapabilityOperation, 
             CapabilityOperation::SqlListSchemasBudgeted,
             "SqlEngine.list_schemas_budgeted",
         )),
-        SqlAction::Exec { .. } => Some((CapabilityOperation::SqlExecute, "SqlEngine.execute")),
+        SqlAction::Exec { .. } => Some((
+            CapabilityOperation::SqlExecuteBudgeted,
+            "SqlEngine.execute_budgeted",
+        )),
         SqlAction::Schema { .. } => Some((
             CapabilityOperation::SqlDescribeTableBounded,
             "SqlEngine.describe_table_bounded",
         )),
     }
+}
+
+fn preflight_sql_execute(sql: &str, params: &[Value], budget: InputBudget) -> Result<()> {
+    let input = SqlExecuteInput { sql, params };
+    let limiter = InputLimiter::new(budget, "CLI SQL execute input")?;
+    if params.is_empty() {
+        limiter.validate_request(&input)?;
+    } else {
+        limiter.validate_items_with_request(params, &input)?;
+    }
+
+    Ok(())
 }
 
 fn require_sql_operation(
@@ -236,6 +265,19 @@ fn ensure_readonly_query(sql: &str) -> Result<()> {
     match SafetyGuard::check(sql, false, None) {
         Ok(StatementKind::Read) => Ok(()),
         _ => Err(Error::WriteNotAllowed),
+    }
+}
+
+pub(crate) fn action_may_mutate(action: &SqlAction) -> bool {
+    match action {
+        SqlAction::Exec { sql, .. } => !matches!(
+            SafetyGuard::check(sql, false, None),
+            Ok(StatementKind::Read)
+        ),
+        SqlAction::Query { .. }
+        | SqlAction::Tables { .. }
+        | SqlAction::Schema { .. }
+        | SqlAction::Schemas => false,
     }
 }
 
@@ -425,6 +467,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn sql_execute_requires_the_exact_input_budgeted_operation() {
+        let action = SqlAction::Exec {
+            sql: "insert into events values (?)".to_owned(),
+            params: "[1]".to_owned(),
+        };
+        assert_eq!(
+            sql_operation_for_action(&action),
+            Some((
+                CapabilityOperation::SqlExecuteBudgeted,
+                "SqlEngine.execute_budgeted"
+            ))
+        );
+        assert!(matches!(
+            require_sql_operation(
+                &[CapabilityOperation::SqlExecute],
+                CapabilityOperation::SqlExecuteBudgeted,
+                "legacy-sql",
+                "SqlEngine.execute_budgeted",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "SqlEngine.execute_budgeted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sql_execute_input_budget_is_rejected_before_dsn_resolution() {
+        let ctx = Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: dbtool_core::service::formatter::Format::Json,
+            limit: 1,
+            max_bytes: dbtool_core::model::DEFAULT_INPUT_BATCH_BYTES,
+            max_item_bytes: 1,
+            throttle_overrides: Default::default(),
+            allow_write: true,
+            confirm: None,
+        };
+        let error = run(
+            &ctx,
+            SqlCmd {
+                action: SqlAction::Exec {
+                    sql: "insert into events values (1)".to_owned(),
+                    params: "[]".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InputBudgetExceeded { .. }));
+    }
+
     #[tokio::test]
     async fn sql_query_budget_is_rejected_before_dsn_resolution() {
         let ctx = Context {
@@ -434,6 +529,7 @@ mod tests {
             format: dbtool_core::service::formatter::Format::Json,
             limit: 1,
             max_bytes: 0,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write: false,
             confirm: None,
@@ -461,6 +557,7 @@ mod tests {
             format: dbtool_core::service::formatter::Format::Json,
             limit: 1,
             max_bytes: 0,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write: false,
             confirm: None,
@@ -485,6 +582,7 @@ mod tests {
             format: dbtool_core::service::formatter::Format::Json,
             limit: usize::MAX,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write: false,
             confirm: None,

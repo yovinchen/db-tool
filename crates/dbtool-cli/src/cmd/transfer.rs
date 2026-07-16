@@ -3,11 +3,12 @@ use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
     model::{
-        Document, FindOptions, KeyExpiry, KeyValueRestoreOutcome, ReadBudget, ResultSet, Value,
+        Document, FindOptions, InputBudget, KeyExpiry, KeyValueRestoreOutcome, ReadBudget,
+        ResultSet, Value,
     },
     port::CapabilityOperation,
     service::{
-        limiter::{ReadLimiter, ResultLimiter},
+        limiter::{InputLimiter, ReadLimiter, ResultLimiter},
         safety::{SafetyGuard, StatementKind},
         write_file_atomically,
     },
@@ -221,6 +222,19 @@ enum PreparedImport {
     },
 }
 
+#[derive(Serialize)]
+struct SqlImportInput<'a> {
+    table: &'a str,
+    columns: &'a [String],
+    rows: &'a [Vec<Value>],
+}
+
+#[derive(Serialize)]
+struct DocumentImportInput<'a> {
+    collection: &'a str,
+    documents: &'a [Document],
+}
+
 pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
     let read_budget = ctx.read_budget()?;
     if let ExportAction::Sql { query, .. } = &cmd.action {
@@ -408,6 +422,8 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
     let artifact = read_artifact(import_input(&cmd.action))?;
     validate_import_artifact(&cmd.action, &artifact)?;
     let prepared = prepare_import(cmd.action, artifact, ctx.limit)?;
+    let input_budget = ctx.input_budget()?;
+    preflight_prepared_import(&prepared, input_budget)?;
     let document_id_probe_budget = match &prepared {
         PreparedImport::Doc { documents, .. }
             if documents
@@ -435,14 +451,16 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
         } => {
             require_transfer_operation(
                 &operations,
-                CapabilityOperation::SqlInsertRowsAtomic,
+                CapabilityOperation::SqlInsertRowsAtomicBudgeted,
                 &kind,
             )?;
             let sql = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "SqlEngine",
             })?;
-            let inserted = sql.insert_rows_atomic(&table, &columns, &rows).await?;
+            let inserted = sql
+                .insert_rows_atomic_budgeted(&table, &columns, &rows, input_budget)
+                .await?;
             ctx.render_success(
                 &kind,
                 serde_json::json!({
@@ -461,7 +479,7 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
         } => {
             require_transfer_operation(
                 &operations,
-                CapabilityOperation::KeyValueRestoreWithExpiry,
+                CapabilityOperation::KeyValueRestoreWithExpiryBudgeted,
                 &kind,
             )?;
             if replace_existing {
@@ -502,11 +520,12 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             for entry in entries {
                 let was_present_at_preflight = existing.contains(&entry.key);
                 let outcome = kv
-                    .restore_with_expiry(
+                    .restore_with_expiry_budgeted(
                         &entry.key,
                         &entry.value,
                         entry.expiry,
                         !was_present_at_preflight,
+                        input_budget,
                     )
                     .await?;
                 match outcome {
@@ -566,7 +585,8 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
             }
             let count = usize_to_u64(documents.len(), "imported document count")?;
             if count > 0 {
-                docs.insert(&collection, documents).await?;
+                docs.insert_budgeted(&collection, documents, input_budget)
+                    .await?;
             }
             ctx.render_success(
                 &kind,
@@ -594,8 +614,66 @@ fn document_import_operations(documents: &[Document]) -> Vec<CapabilityOperation
     {
         operations.push(CapabilityOperation::DocumentFindBudgeted);
     }
-    operations.push(CapabilityOperation::DocumentInsert);
+    operations.push(CapabilityOperation::DocumentInsertBudgeted);
     operations
+}
+
+fn preflight_prepared_import(prepared: &PreparedImport, budget: InputBudget) -> Result<()> {
+    match prepared {
+        PreparedImport::Sql {
+            table,
+            columns,
+            rows,
+        } => {
+            let request = SqlImportInput {
+                table,
+                columns,
+                rows,
+            };
+            let limiter = InputLimiter::new(budget, "CLI atomic SQL import input")?;
+            if rows.is_empty() {
+                limiter.validate_request(&request)
+            } else {
+                limiter.validate_items_with_request(rows, &request)
+            }
+        }
+        PreparedImport::Kv { entries, .. } => {
+            let limiter = InputLimiter::new(budget, "CLI KV restore input")?;
+            for entry in entries {
+                // The conditional-create flag depends on the target state
+                // observed after connecting. Prevalidate both encodings so
+                // neither branch can introduce a post-connect budget error.
+                limiter.validate_request(&(
+                    entry.key.as_str(),
+                    entry.value.as_slice(),
+                    entry.expiry,
+                    true,
+                ))?;
+                limiter.validate_request(&(
+                    entry.key.as_str(),
+                    entry.value.as_slice(),
+                    entry.expiry,
+                    false,
+                ))?;
+            }
+            Ok(())
+        }
+        PreparedImport::Doc {
+            collection,
+            documents,
+        } => {
+            if documents.is_empty() {
+                return Ok(());
+            }
+            InputLimiter::new(budget, "CLI document import input")?.validate_items_with_request(
+                documents,
+                &DocumentImportInput {
+                    collection,
+                    documents,
+                },
+            )
+        }
+    }
 }
 
 fn require_transfer_operation(
@@ -1406,6 +1484,7 @@ mod tests {
             format: Format::Json,
             limit: 100,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,
@@ -1417,12 +1496,23 @@ mod tests {
         assert!(matches!(
             require_transfer_operation(
                 &[CapabilityOperation::DocumentFind],
-                CapabilityOperation::DocumentInsert,
+                CapabilityOperation::DocumentInsertBudgeted,
                 "partial-document",
             ),
             Err(Error::UnsupportedCapability { kind, needed })
-                if kind == "partial-document" && needed == "document.insert"
+                if kind == "partial-document" && needed == "document.insert_budgeted"
         ));
+        for operation in [
+            CapabilityOperation::SqlInsertRowsAtomicBudgeted,
+            CapabilityOperation::KeyValueRestoreWithExpiryBudgeted,
+            CapabilityOperation::DocumentInsertBudgeted,
+        ] {
+            assert!(matches!(
+                require_transfer_operation(&[], operation, "legacy-transfer"),
+                Err(Error::UnsupportedCapability { needed, .. })
+                    if needed == operation.as_str()
+            ));
+        }
         assert!(matches!(
             require_transfer_operation(
                 &[CapabilityOperation::KeyValueGet],
@@ -1439,15 +1529,45 @@ mod tests {
                 "name".to_owned(),
                 Value::Text("without-id".to_owned()),
             )])]),
-            [CapabilityOperation::DocumentInsert]
+            [CapabilityOperation::DocumentInsertBudgeted]
         );
         assert_eq!(
             document_import_operations(&[Document::from([("_id".to_owned(), Value::Int(1),)])]),
             [
                 CapabilityOperation::DocumentFindBudgeted,
-                CapabilityOperation::DocumentInsert
+                CapabilityOperation::DocumentInsertBudgeted
             ]
         );
+    }
+
+    #[test]
+    fn every_import_family_preflights_its_complete_exact_request() {
+        let tiny = InputBudget::new(1, 1, dbtool_core::model::DEFAULT_INPUT_BATCH_BYTES).unwrap();
+        let imports = [
+            PreparedImport::Sql {
+                table: "events".to_owned(),
+                columns: vec!["id".to_owned()],
+                rows: vec![vec![Value::Int(1)]],
+            },
+            PreparedImport::Kv {
+                entries: vec![PreparedKvEntry {
+                    key: "events:key".to_owned(),
+                    value: b"value".to_vec(),
+                    expiry: KeyExpiry::Persistent,
+                }],
+                replace_existing: false,
+            },
+            PreparedImport::Doc {
+                collection: "events".to_owned(),
+                documents: vec![Document::from([("id".to_owned(), Value::Int(1))])],
+            },
+        ];
+        for prepared in imports {
+            assert!(matches!(
+                preflight_prepared_import(&prepared, tiny),
+                Err(Error::InputBudgetExceeded { .. })
+            ));
+        }
     }
 
     #[tokio::test]

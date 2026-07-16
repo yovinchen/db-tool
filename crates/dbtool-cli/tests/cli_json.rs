@@ -327,7 +327,7 @@ fn global_max_bytes_enforces_zero_exact_and_hard_ceiling_before_dispatch() {
 fn sql_catalog_limit_rejects_zero_and_probe_overflow_before_connecting() {
     for (limit, expected) in [
         ("0".to_owned(), "global --limit"),
-        (usize::MAX.to_string(), "catalog item limit"),
+        (usize::MAX.to_string(), "read item budget"),
     ] {
         let output = dbtool(&[
             "--dsn",

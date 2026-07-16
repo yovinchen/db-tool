@@ -256,6 +256,7 @@ mod tests {
             format: Format::Json,
             limit: 100,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write: false,
             confirm: None,

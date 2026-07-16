@@ -2,9 +2,9 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::{decode_canonical_base64, ReadBudget, Value},
+    model::{decode_canonical_base64, InputBudget, ReadBudget, Value},
     port::{capability::SetOptions, CapabilityOperation},
-    service::{ReadLimiter, SafetyGuard},
+    service::{InputLimiter, ReadLimiter, SafetyGuard},
     Result,
 };
 
@@ -79,14 +79,35 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
     };
     let read_budget = match (&cmd.action, raw_plan.as_ref()) {
         (KvAction::Get { .. }, _) => Some(ReadBudget::new(1, ctx.max_bytes)?),
-        (KvAction::Scan { .. }, _)
-        | (
-            KvAction::Raw { .. },
-            Some(RawCommandPlan {
-                access: RawCommandAccess::ReadOnly,
-                ..
-            }),
-        ) => Some(ctx.read_budget()?),
+        (KvAction::Scan { .. }, _) | (KvAction::Raw { .. }, _) => Some(ctx.read_budget()?),
+        _ => None,
+    };
+    let input_budget = match (&cmd.action, raw_plan.as_ref()) {
+        (KvAction::Set { key, ttl, nx, .. }, _) => {
+            let budget = ctx.input_budget()?;
+            preflight_set(
+                key,
+                prepared_set
+                    .as_deref()
+                    .ok_or_else(|| Error::Internal("prepared KV value is missing".into()))?,
+                &SetOptions {
+                    ttl_secs: *ttl,
+                    nx: *nx,
+                },
+                budget,
+            )?;
+            Some(budget)
+        }
+        (KvAction::Del { keys }, _) => {
+            let budget = ctx.input_budget()?;
+            InputLimiter::new(budget, "CLI Redis DEL input")?.validate_batch(keys)?;
+            Some(budget)
+        }
+        (KvAction::Raw { args }, Some(plan)) if plan.is_mutation() => {
+            let budget = ctx.input_budget()?;
+            InputLimiter::new(budget, "CLI Redis raw mutation input")?.validate_batch(args)?;
+            Some(budget)
+        }
         _ => None,
     };
 
@@ -169,8 +190,13 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             let value = prepared_set
                 .as_deref()
                 .ok_or_else(|| Error::Internal("prepared KV value is missing".into()))?;
-            kv.set(&key, value, SetOptions { ttl_secs: ttl, nx })
-                .await?;
+            kv.set_budgeted(
+                &key,
+                value,
+                SetOptions { ttl_secs: ttl, nx },
+                input_budget.expect("SET actions construct an input budget"),
+            )
+            .await?;
             ctx.render_success(&kind, serde_json::json!({"ok": true}), elapsed(), false)
         }
         KvAction::Scan { pattern } => {
@@ -185,13 +211,23 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
             ctx.render_success(&kind, keys, elapsed(), truncated)
         }
         KvAction::Del { keys } => {
-            let n = kv.delete(&keys).await?;
+            let n = kv
+                .delete_budgeted(
+                    &keys,
+                    input_budget.expect("DEL actions construct an input budget"),
+                )
+                .await?;
             ctx.render_success(&kind, serde_json::json!({"deleted": n}), elapsed(), false)
         }
         KvAction::Raw { args } => {
             let mutation = raw_plan.as_ref().is_some_and(RawCommandPlan::is_mutation);
             let val = if mutation {
-                kv.raw_command(&args).await?
+                kv.raw_command_io_budgeted(
+                    &args,
+                    input_budget.expect("raw mutations construct an input budget"),
+                    read_budget.expect("raw mutations construct a response budget"),
+                )
+                .await?
             } else {
                 let value = kv
                     .raw_command_bounded(
@@ -215,20 +251,40 @@ fn kv_operation_for_action(
             CapabilityOperation::KeyValueGetBounded,
             "KeyValueStore.get_bounded",
         ),
-        KvAction::Set { .. } => (CapabilityOperation::KeyValueSet, "KeyValueStore.set"),
+        KvAction::Set { .. } => (
+            CapabilityOperation::KeyValueSetBudgeted,
+            "KeyValueStore.set_budgeted",
+        ),
         KvAction::Scan { .. } => (
             CapabilityOperation::KeyValueScanBounded,
             "KeyValueStore.scan_bounded",
         ),
-        KvAction::Del { .. } => (CapabilityOperation::KeyValueDelete, "KeyValueStore.delete"),
+        KvAction::Del { .. } => (
+            CapabilityOperation::KeyValueDeleteBudgeted,
+            "KeyValueStore.delete_budgeted",
+        ),
         KvAction::Raw { .. } if raw_plan.is_some_and(RawCommandPlan::is_mutation) => (
-            CapabilityOperation::KeyValueRawCommand,
-            "KeyValueStore.raw_command",
+            CapabilityOperation::KeyValueRawCommandIoBudgeted,
+            "KeyValueStore.raw_command_io_budgeted",
         ),
         KvAction::Raw { .. } => (
             CapabilityOperation::KeyValueRawCommandBounded,
             "KeyValueStore.raw_command_bounded",
         ),
+    }
+}
+
+fn preflight_set(key: &str, value: &[u8], options: &SetOptions, budget: InputBudget) -> Result<()> {
+    InputLimiter::new(budget, "CLI Redis SET input")?.validate_request(&(key, value, options))
+}
+
+pub(crate) fn action_may_mutate(action: &KvAction) -> bool {
+    match action {
+        KvAction::Set { .. } | KvAction::Del { .. } => true,
+        KvAction::Raw { args } => {
+            normalized_raw_command(args).is_ok_and(|command| is_raw_mutation(&command))
+        }
+        KvAction::Get { .. } | KvAction::Scan { .. } => false,
     }
 }
 
@@ -729,6 +785,7 @@ mod tests {
             format: Format::Json,
             limit: 2,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,
@@ -758,6 +815,34 @@ mod tests {
 
     #[test]
     fn every_kv_action_requires_its_exact_operation_before_access() {
+        assert_eq!(
+            kv_operation_for_action(
+                &KvAction::Set {
+                    key: "key".to_owned(),
+                    value: Some("value".to_owned()),
+                    value_base64: None,
+                    ttl: None,
+                    nx: false,
+                },
+                None,
+            ),
+            (
+                CapabilityOperation::KeyValueSetBudgeted,
+                "KeyValueStore.set_budgeted"
+            )
+        );
+        assert_eq!(
+            kv_operation_for_action(
+                &KvAction::Del {
+                    keys: vec!["key".to_owned()],
+                },
+                None,
+            ),
+            (
+                CapabilityOperation::KeyValueDeleteBudgeted,
+                "KeyValueStore.delete_budgeted"
+            )
+        );
         let action = KvAction::Raw {
             args: strings(&["GET", "key"]),
         };
@@ -787,10 +872,42 @@ mod tests {
         assert_eq!(
             kv_operation_for_action(&mutation, Some(&mutation_plan)),
             (
-                CapabilityOperation::KeyValueRawCommand,
-                "KeyValueStore.raw_command"
+                CapabilityOperation::KeyValueRawCommandIoBudgeted,
+                "KeyValueStore.raw_command_io_budgeted"
             )
         );
+        assert!(matches!(
+            require_kv_operation(
+                &[CapabilityOperation::KeyValueRawCommand],
+                CapabilityOperation::KeyValueRawCommandIoBudgeted,
+                "legacy-kv",
+                "KeyValueStore.raw_command_io_budgeted",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "KeyValueStore.raw_command_io_budgeted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mutation_input_budget_is_rejected_before_connecting() {
+        let mut ctx = test_context(true);
+        ctx.max_item_bytes = 1;
+        ctx.dsn = None;
+        let error = run(
+            &ctx,
+            KvCmd {
+                action: KvAction::Set {
+                    key: "key".to_owned(),
+                    value: Some("value".to_owned()),
+                    value_base64: None,
+                    ttl: None,
+                    nx: false,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InputBudgetExceeded { .. }));
     }
 
     #[tokio::test]

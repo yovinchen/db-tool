@@ -2,8 +2,12 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
+    model::InputBudget,
     port::CapabilityOperation,
-    service::safety::{SafetyGuard, StatementKind},
+    service::{
+        safety::{SafetyGuard, StatementKind},
+        InputLimiter,
+    },
     Result,
 };
 
@@ -59,6 +63,14 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
         CqlAction::Schema { .. } => Some(ctx.metadata_budget()?),
         CqlAction::Exec { .. } => None,
     };
+    let input_budget = match &cmd.action {
+        CqlAction::Exec { cql } => {
+            let budget = ctx.input_budget()?;
+            preflight_cql_execute(cql, budget)?;
+            Some(budget)
+        }
+        _ => None,
+    };
     let dsn = ctx.resolve_dsn()?;
     let target = ctx.confirmation_target(&dsn)?;
 
@@ -93,7 +105,12 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
             ctx.render_success(&kind, result, elapsed(), truncated)
         }
         CqlAction::Exec { cql: statement } => {
-            let outcome = cql.execute_cql(&statement).await?;
+            let outcome = cql
+                .execute_cql_budgeted(
+                    &statement,
+                    input_budget.expect("execute actions construct an input budget"),
+                )
+                .await?;
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
         CqlAction::Keyspaces => {
@@ -142,12 +159,19 @@ fn cql_operation_for_action(action: &CqlAction) -> Option<(CapabilityOperation, 
             CapabilityOperation::CqlListTablesBudgeted,
             "CqlEngine.list_cql_tables_budgeted",
         )),
-        CqlAction::Exec { .. } => Some((CapabilityOperation::CqlExecute, "CqlEngine.execute_cql")),
+        CqlAction::Exec { .. } => Some((
+            CapabilityOperation::CqlExecuteBudgeted,
+            "CqlEngine.execute_cql_budgeted",
+        )),
         CqlAction::Schema { .. } => Some((
             CapabilityOperation::CqlDescribeTableBounded,
             "CqlEngine.describe_cql_table_bounded",
         )),
     }
+}
+
+fn preflight_cql_execute(cql: &str, budget: InputBudget) -> Result<()> {
+    InputLimiter::new(budget, "CLI CQL execute input")?.validate_request(&("cql", cql))
 }
 
 fn require_cql_operation(
@@ -206,6 +230,7 @@ mod tests {
             format: Format::Json,
             limit: 100,
             max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            max_item_bytes: dbtool_core::model::DEFAULT_INPUT_ITEM_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,
@@ -362,6 +387,47 @@ mod tests {
             Err(Error::UnsupportedCapability { needed, .. })
                 if needed == "CqlEngine.query_cql_budgeted"
         ));
+    }
+
+    #[test]
+    fn cql_execute_requires_the_exact_input_budgeted_operation() {
+        let action = CqlAction::Exec {
+            cql: "insert into app.events (id) values (1)".to_owned(),
+        };
+        assert_eq!(
+            cql_operation_for_action(&action),
+            Some((
+                CapabilityOperation::CqlExecuteBudgeted,
+                "CqlEngine.execute_cql_budgeted"
+            ))
+        );
+        assert!(matches!(
+            require_cql_operation(
+                &[CapabilityOperation::CqlExecute],
+                CapabilityOperation::CqlExecuteBudgeted,
+                "legacy-cql",
+                "CqlEngine.execute_cql_budgeted",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "CqlEngine.execute_cql_budgeted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cql_execute_input_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(true);
+        ctx.max_item_bytes = 1;
+        let error = run(
+            &ctx,
+            CqlCmd {
+                action: CqlAction::Exec {
+                    cql: "insert into app.events (id) values (1)".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InputBudgetExceeded { .. }));
     }
 
     #[tokio::test]
