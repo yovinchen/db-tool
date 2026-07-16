@@ -11,12 +11,81 @@ pub use sqlite::sqlite_factory;
 use chrono::{DateTime, Utc};
 use dbtool_core::{
     error::{Error, Result},
-    model::{IndexInfo, Value},
-    service::limiter::{ListLimiter, MetadataLimiter},
+    model::{ColumnMeta, IndexInfo, ReadBudget, ResultSet, Value},
+    service::limiter::{ListLimiter, MetadataLimiter, ReadLimiter},
 };
 use std::collections::BTreeSet;
 
 use crate::identifier::{parse_table_ref, validate_identifier, TableRef};
+
+/// Builds one SQL result under the shared row-and-recursive-byte envelope.
+///
+/// SQLx exposes column metadata on the first decoded row, so adapters create
+/// this object before backend access, register that complete metadata vector
+/// once, and then charge every decoded row before it is retained. An empty
+/// SQLx result has no row from which portable column metadata can be derived
+/// and therefore preserves the existing `ResultSet::empty()` representation.
+pub(crate) struct SqlReadEnvelope {
+    limiter: ReadLimiter,
+    columns: Option<Vec<ColumnMeta>>,
+    rows: Vec<Vec<Value>>,
+}
+
+impl SqlReadEnvelope {
+    pub(crate) fn new(budget: ReadBudget, backend: &str) -> Result<Self> {
+        Ok(Self {
+            limiter: ReadLimiter::new(budget, format!("{backend} SQL query result"))?,
+            columns: None,
+            rows: Vec::new(),
+        })
+    }
+
+    pub(crate) fn probe_rows(&self) -> Result<usize> {
+        self.limiter.probe_items()
+    }
+
+    pub(crate) fn observe_columns(&mut self, columns: Vec<ColumnMeta>) -> Result<()> {
+        if self.columns.is_some() {
+            return Err(Error::Internal(
+                "SQL read envelope observed column metadata more than once".into(),
+            ));
+        }
+        self.limiter.observe_header(&columns)?;
+        self.columns = Some(columns);
+        Ok(())
+    }
+
+    pub(crate) fn column_count(&self) -> usize {
+        self.columns.as_ref().map_or(0, Vec::len)
+    }
+
+    pub(crate) fn observe_row(&mut self, row: Vec<Value>) -> Result<()> {
+        if self.columns.is_none() {
+            return Err(Error::Internal(
+                "SQL read envelope observed a row before column metadata".into(),
+            ));
+        }
+        self.limiter.retain_item(row, &mut self.rows)
+    }
+
+    pub(crate) fn observed_rows(&self) -> usize {
+        self.limiter.observed_items()
+    }
+
+    pub(crate) fn finish(self) -> Result<ResultSet> {
+        let Self {
+            limiter,
+            columns,
+            rows,
+        } = self;
+        let columns = columns.unwrap_or_default();
+        limiter.finish_with(rows, move |rows, truncated| ResultSet {
+            columns,
+            rows,
+            truncated,
+        })
+    }
+}
 
 /// Validate a caller's catalog budget and convert its N+1 probe to the signed
 /// integer accepted by SQL LIMIT parameters. Callers use this before acquiring
@@ -182,6 +251,91 @@ mod bounded_catalog_tests {
             assert!(matches!(
                 bounded_metadata_limit(&limiter, "test"),
                 Err(Error::Config(_))
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_envelope_tests {
+    use super::*;
+    use dbtool_core::model::ReadBudget;
+
+    fn test_columns() -> Vec<ColumnMeta> {
+        vec![ColumnMeta {
+            name: "payload".into(),
+            type_name: "JSON".into(),
+            nullable: true,
+            primary_key: false,
+            default_value: None,
+        }]
+    }
+
+    fn envelope(max_items: usize, max_bytes: usize) -> SqlReadEnvelope {
+        let mut envelope =
+            SqlReadEnvelope::new(ReadBudget::new(max_items, max_bytes).unwrap(), "test").unwrap();
+        envelope.observe_columns(test_columns()).unwrap();
+        envelope
+    }
+
+    #[test]
+    fn sql_read_envelope_distinguishes_n_from_n_plus_one() {
+        let mut exact = envelope(2, 4096);
+        exact.observe_row(vec![Value::Int(1)]).unwrap();
+        exact.observe_row(vec![Value::Int(2)]).unwrap();
+        let exact = exact.finish().unwrap();
+        assert_eq!(exact.rows.len(), 2);
+        assert!(!exact.truncated);
+
+        let mut probed = envelope(2, 4096);
+        probed.observe_row(vec![Value::Int(1)]).unwrap();
+        probed.observe_row(vec![Value::Int(2)]).unwrap();
+        probed.observe_row(vec![Value::Int(3)]).unwrap();
+        let probed = probed.finish().unwrap();
+        assert_eq!(probed.rows, [vec![Value::Int(1)], vec![Value::Int(2)]]);
+        assert!(probed.truncated);
+    }
+
+    #[test]
+    fn sql_read_envelope_accepts_exact_resultset_bytes_and_rejects_n_minus_one() {
+        let row = vec![Value::Json(serde_json::json!({
+            "nested": [{"value": "recursive"}]
+        }))];
+        let expected = ResultSet {
+            columns: test_columns(),
+            rows: vec![row.clone()],
+            truncated: false,
+        };
+        let required = serde_json::to_vec(&expected).unwrap().len();
+
+        let mut exact = envelope(1, required);
+        exact.observe_row(row.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&exact.finish().unwrap()).unwrap().len(),
+            required
+        );
+
+        let mut short = envelope(1, required - 1);
+        let error = match short.observe_row(row) {
+            Ok(()) => short.finish().unwrap_err(),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::ReadBudgetExceeded { .. }));
+    }
+
+    #[test]
+    fn sql_read_envelope_fails_closed_for_large_recursive_value_variants() {
+        for value in [
+            Value::Text("x".repeat(4096)),
+            Value::Bytes(vec![0x5a; 4096]),
+            Value::Json(serde_json::json!({
+                "outer": [{"inner": "x".repeat(4096)}]
+            })),
+        ] {
+            let mut envelope = envelope(1, 512);
+            assert!(matches!(
+                envelope.observe_row(vec![value]),
+                Err(Error::ReadBudgetExceeded { .. })
             ));
         }
     }

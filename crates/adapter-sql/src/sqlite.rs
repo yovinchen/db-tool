@@ -2,8 +2,8 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ResultSet, TableInfo,
-        TableKind, TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, IndexInfo, MetadataBudget, ReadBudget, ResultSet,
+        TableInfo, TableKind, TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
@@ -21,6 +21,7 @@ use crate::{
     identifier::{parse_table_ref, validate_optional_schema},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, sqlite_value},
+    SqlReadEnvelope,
 };
 
 pub struct SqliteAdapter {
@@ -77,6 +78,7 @@ impl Connector for SqliteAdapter {
     fn operations(&self) -> Vec<CapabilityOperation> {
         let mut operations = CapabilityOperation::SQL.to_vec();
         operations.extend([
+            CapabilityOperation::SqlQueryBudgeted,
             CapabilityOperation::SqlInsertRowsAtomic,
             CapabilityOperation::SqlListSchemasBounded,
             CapabilityOperation::SqlListTablesBounded,
@@ -189,6 +191,55 @@ impl SqlEngine for SqliteAdapter {
             rows: result_rows,
             truncated: false,
         }))
+    }
+
+    async fn query_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: ReadBudget,
+    ) -> Result<ResultSet> {
+        // Validate the complete caller envelope before parsing SQL or touching
+        // the pool, including the N+1 overflow check.
+        let mut envelope = SqlReadEnvelope::new(budget, "SQLite")?;
+        let probe_rows = envelope.probe_rows()?;
+
+        // SQLx/SQLite exposes no configurable per-value allocation ceiling.
+        // A native SQLite row is therefore materialized by the driver before
+        // dbtool can recursively charge it; the shared 16 MiB response ceiling
+        // still fails closed before that decoded row is retained or returned.
+        let mut stream = bind_sqlite_params(sql, params)?.fetch(&self.pool);
+        while envelope.observed_rows() < probe_rows {
+            let Some(row) = stream
+                .try_next()
+                .await
+                .map_err(|error| Error::Query(error.to_string()))?
+            else {
+                break;
+            };
+
+            if envelope.observed_rows() == 0 {
+                envelope.observe_columns(
+                    row.columns()
+                        .iter()
+                        .map(|column| ColumnMeta {
+                            name: column.name().to_owned(),
+                            type_name: column_type_name(column),
+                            nullable: true,
+                            primary_key: false,
+                            default_value: None,
+                        })
+                        .collect(),
+                )?;
+            }
+            let decoded = (0..envelope.column_count())
+                .map(|index| sqlite_value(&row, index))
+                .collect::<Result<Vec<_>>>()?;
+            envelope.observe_row(decoded)?;
+        }
+        drop(stream);
+
+        envelope.finish()
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
@@ -705,7 +756,9 @@ fn sqlite_catalog(schema: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbtool_core::model::{MetadataBudget, TableKind, Value, DEFAULT_METADATA_BYTES};
+    use dbtool_core::model::{
+        MetadataBudget, ReadBudget, TableKind, Value, DEFAULT_METADATA_BYTES, DEFAULT_READ_BYTES,
+    };
 
     async fn memory_sqlite() -> Box<dyn Connector> {
         sqlite_factory(Dsn::parse("sqlite::memory:").unwrap())
@@ -1273,6 +1326,126 @@ mod tests {
         ));
         assert!(matches!(
             sql.query_bounded("not valid sql", &[], usize::MAX).await,
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sqlite_budgeted_query_advertises_and_distinguishes_n_from_n_plus_one() {
+        let connector = memory_sqlite().await;
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlQueryBudgeted));
+        let sql = connector.as_sql().unwrap();
+
+        let limited = sql
+            .query_budgeted(
+                "with recursive numbers(value) as (
+                    select 1
+                    union all
+                    select value + 1 from numbers where value < 10000
+                 )
+                 select value from numbers",
+                &[],
+                ReadBudget::new(3, DEFAULT_READ_BYTES).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            limited.rows,
+            [
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)]
+            ]
+        );
+        assert!(limited.truncated);
+
+        let exact = sql
+            .query_budgeted(
+                "select ? as value union all select ? union all select ?",
+                &[Value::Int(7), Value::Int(8), Value::Int(9)],
+                ReadBudget::new(3, DEFAULT_READ_BYTES).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.rows.len(), 3);
+        assert!(!exact.truncated);
+    }
+
+    #[tokio::test]
+    async fn sqlite_budgeted_query_enforces_complete_result_bytes_and_large_values() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+        let statement = "select ? as payload";
+        let params = [Value::Text("nested payload".repeat(16))];
+        let baseline = sql
+            .query_budgeted(
+                statement,
+                &params,
+                ReadBudget::new(1, DEFAULT_READ_BYTES).unwrap(),
+            )
+            .await
+            .unwrap();
+        let required = serde_json::to_vec(&baseline).unwrap().len();
+
+        let exact = sql
+            .query_budgeted(statement, &params, ReadBudget::new(1, required).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&exact).unwrap().len(), required);
+        assert!(matches!(
+            sql.query_budgeted(
+                statement,
+                &params,
+                ReadBudget::new(1, required - 1).unwrap()
+            )
+            .await,
+            Err(Error::ReadBudgetExceeded { .. })
+        ));
+
+        for (statement, value) in [
+            ("select ? as payload", Value::Text("x".repeat(4096))),
+            (
+                "select cast(? as blob) as payload",
+                Value::Bytes(vec![0x5a; 4096]),
+            ),
+        ] {
+            assert!(matches!(
+                sql.query_budgeted(statement, &[value], ReadBudget::new(1, 512).unwrap())
+                    .await,
+                Err(Error::ReadBudgetExceeded { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_budgeted_query_rejects_invalid_budget_before_sql() {
+        let connector = memory_sqlite().await;
+        let sql = connector.as_sql().unwrap();
+
+        assert!(matches!(
+            sql.query_budgeted(
+                "not valid sql",
+                &[],
+                ReadBudget {
+                    max_items: 0,
+                    max_bytes: DEFAULT_READ_BYTES,
+                }
+            )
+            .await,
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            sql.query_budgeted(
+                "not valid sql",
+                &[],
+                ReadBudget {
+                    max_items: usize::MAX,
+                    max_bytes: DEFAULT_READ_BYTES,
+                }
+            )
+            .await,
             Err(Error::Config(_))
         ));
     }

@@ -2,8 +2,8 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, MetadataBudget, ResultSet, TableInfo, TableKind,
-        TableSchema, Value,
+        BoundedList, ColumnMeta, ExecOutcome, MetadataBudget, ReadBudget, ResultSet, TableInfo,
+        TableKind, TableSchema, Value,
     },
     port::{
         capability::SqlEngine,
@@ -21,6 +21,7 @@ use crate::{
     identifier::{parse_table_ref, validate_optional_schema, TableRef},
     quoted_identifier, quoted_table, structured_json, timestamp_utc, validate_atomic_insert,
     value::{column_type_name, mysql_value},
+    SqlReadEnvelope,
 };
 
 pub struct MySqlAdapter {
@@ -31,6 +32,7 @@ pub struct MySqlAdapter {
 fn mysql_operations() -> Vec<CapabilityOperation> {
     let mut operations = CapabilityOperation::SQL.to_vec();
     operations.extend([
+        CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::SqlInsertRowsAtomic,
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListTablesBounded,
@@ -267,6 +269,87 @@ impl SqlEngine for MySqlAdapter {
             rows: result_rows,
             truncated: false,
         }))
+    }
+
+    async fn query_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: ReadBudget,
+    ) -> Result<ResultSet> {
+        // Validate before acquiring a socket or binding parameters so invalid
+        // caller envelopes cannot trigger backend work.
+        let mut envelope = SqlReadEnvelope::new(budget, &self.kind.0)?;
+        let probe_rows = envelope.probe_rows()?;
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|error| Error::Connection(error.to_string()))?;
+
+        // SQLx 0.8 does not expose a configurable inbound MySQL packet or
+        // decoded-row ceiling. The driver can therefore assemble one protocol
+        // value before dbtool charges it. Recursive charging still happens
+        // before retention, and any early stop retires the socket so unread
+        // frames can never be drained by a later pool checkout.
+        let mut stream = bind_mysql_params(sql, params)?.fetch(&mut *connection);
+        while envelope.observed_rows() < probe_rows {
+            let row = match stream.try_next().await {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(error) => {
+                    drop(stream);
+                    connection.close_on_drop();
+                    return Err(Error::Query(error.to_string()));
+                }
+            };
+
+            if envelope.observed_rows() == 0 {
+                let columns = row
+                    .columns()
+                    .iter()
+                    .map(|column| ColumnMeta {
+                        name: column.name().to_owned(),
+                        type_name: column_type_name(column),
+                        nullable: true,
+                        primary_key: false,
+                        default_value: None,
+                    })
+                    .collect();
+                if let Err(error) = envelope.observe_columns(columns) {
+                    drop(stream);
+                    connection.close_on_drop();
+                    return Err(error);
+                }
+            }
+
+            let decoded = (0..envelope.column_count())
+                .map(|index| mysql_value(&row, index))
+                .collect::<Result<Vec<_>>>();
+            let decoded = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    drop(stream);
+                    connection.close_on_drop();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = envelope.observe_row(decoded) {
+                drop(stream);
+                connection.close_on_drop();
+                return Err(error);
+            }
+        }
+
+        let retire_connection = envelope.observed_rows() == probe_rows;
+        drop(stream);
+        if retire_connection {
+            connection
+                .close()
+                .await
+                .map_err(|error| Error::Connection(error.to_string()))?;
+        }
+        envelope.finish()
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
@@ -727,8 +810,43 @@ mod tests {
     }
 
     #[test]
-    fn mysql_advertises_bounded_table_description() {
+    fn mysql_family_advertises_bounded_query_and_table_description() {
+        assert!(mysql_operations().contains(&CapabilityOperation::SqlQueryBudgeted));
         assert!(mysql_operations().contains(&CapabilityOperation::SqlDescribeTableBounded));
+    }
+
+    #[tokio::test]
+    async fn mysql_live_budgeted_query_distinguishes_n_from_n_plus_one() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MYSQL_DSN") else {
+            return;
+        };
+        let connector = mysql_factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlQueryBudgeted));
+        let sql = connector.as_sql().unwrap();
+
+        let limited = sql
+            .query_budgeted(
+                "SELECT 1 AS value UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4",
+                &[],
+                ReadBudget::new(3, dbtool_core::model::DEFAULT_READ_BYTES).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.rows.len(), 3);
+        assert!(limited.truncated);
+
+        let exact = sql
+            .query_budgeted(
+                "SELECT ? AS value UNION ALL SELECT ? UNION ALL SELECT ?",
+                &[Value::Int(7), Value::Int(8), Value::Int(9)],
+                ReadBudget::new(3, dbtool_core::model::DEFAULT_READ_BYTES).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.rows.len(), 3);
+        assert!(!exact.truncated);
     }
 
     #[tokio::test]
