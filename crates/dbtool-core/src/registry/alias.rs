@@ -1,5 +1,5 @@
 /// Protocol family alias table — single source of truth (see §3.8 / §6.3).
-/// (canonical_scheme, &[aliases])
+/// Entry shape: `(canonical_scheme, &[aliases])`.
 pub const PROTOCOL_ALIASES: &[(&str, &[&str])] = &[
     ("mysql", &["mariadb", "tidb"]),
     ("sqlserver", &["mssql"]),

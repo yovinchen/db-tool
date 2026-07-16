@@ -1,7 +1,8 @@
 use crate::{
     model::{
-        series::Series, BoundedList, ConsumeOptions, Message, MetadataBudget, ProduceBudget,
-        ReadBudget, ResultSet, SearchDocument, SearchHits, SeriesSet, TimeSeriesReadBudget,
+        series::Series, BoundedList, ConsumeOptions, InputBudget, Message, MetadataBudget,
+        ProduceBudget, ReadBudget, ResultSet, SearchDocument, SearchHits, SeriesSet,
+        TimeSeriesReadBudget,
     },
     Error, Result,
 };
@@ -638,6 +639,98 @@ impl MessageReadLimiter {
             debug_assert!(!truncated, "consume batches never retain a probe item");
             messages
         })
+    }
+}
+
+/// Prevalidates a complete portable mutation input before remote side effects.
+///
+/// A scalar request is charged as one complete item and again as its complete
+/// request envelope. A batch is rejected when empty, charges every item before
+/// acceptance, and then charges the caller-supplied complete request or batch.
+/// Compact JSON is streamed into a checked counting writer, so validation does
+/// not allocate a second encoded copy. The complete request passed to this
+/// limiter must include every caller-controlled target/resource name; adapters
+/// must additionally enforce protocol syntax and fixed limits.
+pub struct InputLimiter {
+    budget: InputBudget,
+    subject: String,
+}
+
+impl InputLimiter {
+    pub fn new(budget: InputBudget, subject: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            budget: budget.validate()?,
+            subject: subject.into(),
+        })
+    }
+
+    /// Validate one complete scalar mutation request.
+    ///
+    /// The same serialized value is checked against both the per-item and the
+    /// complete-request ceilings. This performs no remote access.
+    pub fn validate_request<T: Serialize + ?Sized>(&self, request: &T) -> Result<()> {
+        self.validate_item(request, 0)?;
+        self.validate_complete(request, "request")
+    }
+
+    /// Validate a non-empty batch whose complete request is the batch itself.
+    pub fn validate_batch<T: Serialize>(&self, items: &[T]) -> Result<()> {
+        self.validate_items_with_request(items, items)
+    }
+
+    /// Validate non-empty logical items and their complete enclosing request.
+    ///
+    /// Adapters use this when the wire request contains context in addition to
+    /// the items, for example SQL text plus bound parameters or a collection
+    /// target plus document filters and an update expression. The complete
+    /// request must include all caller-controlled targets; fitting the byte
+    /// envelope does not replace their protocol-specific validation.
+    pub fn validate_items_with_request<T, R>(&self, items: &[T], request: &R) -> Result<()>
+    where
+        T: Serialize,
+        R: Serialize + ?Sized,
+    {
+        if items.is_empty() {
+            return Err(Error::Config(
+                "input batch must contain at least one item".to_owned(),
+            ));
+        }
+        if items.len() > self.budget.max_items {
+            return Err(self.budget_error("batch", "items", self.budget.max_items));
+        }
+        for (index, item) in items.iter().enumerate() {
+            self.validate_item(item, index)?;
+        }
+        self.validate_complete(request, "batch")
+    }
+
+    fn validate_item<T: Serialize + ?Sized>(&self, item: &T, index: usize) -> Result<()> {
+        ReadLimiter::measure_serialized(item, self.budget.max_item_bytes)
+            .map(|_| ())
+            .map_err(|error| {
+                self.map_counting_error(error, &format!("item {index}"), self.budget.max_item_bytes)
+            })
+    }
+
+    fn validate_complete<T: Serialize + ?Sized>(&self, value: &T, scope: &str) -> Result<()> {
+        ReadLimiter::measure_serialized(value, self.budget.max_batch_bytes)
+            .map(|_| ())
+            .map_err(|error| self.map_counting_error(error, scope, self.budget.max_batch_bytes))
+    }
+
+    fn map_counting_error(&self, error: CountingError, scope: &str, limit: usize) -> Error {
+        match error {
+            CountingError::BudgetExceeded => self.budget_error(scope, "bytes", limit),
+            CountingError::Serialization(error) => Error::Serialization(error.to_string()),
+        }
+    }
+
+    fn budget_error(&self, scope: &str, unit: &'static str, limit: usize) -> Error {
+        Error::InputBudgetExceeded {
+            subject: format!("{} {scope}", self.subject),
+            unit,
+            limit,
+        }
     }
 }
 
@@ -1815,6 +1908,132 @@ mod tests {
                 limit,
                 ..
             } if limit == batch_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn input_limiter_enforces_exact_n_n_plus_one_and_byte_boundaries() {
+        let items = vec!["alpha".to_owned(), "bravo".to_owned()];
+        let item_bytes = items
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len())
+            .max()
+            .unwrap();
+        let batch_bytes = serde_json::to_vec(&items).unwrap().len();
+        let exact = InputBudget::new(2, item_bytes, batch_bytes).unwrap();
+
+        InputLimiter::new(exact, "document insert")
+            .unwrap()
+            .validate_batch(&items)
+            .unwrap();
+
+        let too_many = vec!["alpha".to_owned(), "bravo".to_owned(), "charlie".to_owned()];
+        assert!(matches!(
+            InputLimiter::new(exact, "document insert")
+                .unwrap()
+                .validate_batch(&too_many),
+            Err(Error::InputBudgetExceeded {
+                unit: "items",
+                limit: 2,
+                ..
+            })
+        ));
+
+        let item_error = InputLimiter::new(
+            InputBudget::new(2, item_bytes - 1, batch_bytes).unwrap(),
+            "document insert",
+        )
+        .unwrap()
+        .validate_batch(&items)
+        .unwrap_err();
+        assert!(matches!(
+            item_error,
+            Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == item_bytes - 1
+        ));
+
+        let batch_error = InputLimiter::new(
+            InputBudget::new(2, item_bytes, batch_bytes - 1).unwrap(),
+            "document insert",
+        )
+        .unwrap()
+        .validate_batch(&items)
+        .unwrap_err();
+        assert!(matches!(
+            batch_error,
+            Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == batch_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn input_limiter_charges_complete_requests_and_rejects_empty_batches() {
+        let items = vec![serde_json::json!({ "id": 1 })];
+        let request = serde_json::json!({
+            "collection": "users",
+            "filter": { "tenant": "one" },
+            "updates": items,
+        });
+        let item_bytes = serde_json::to_vec(&items[0]).unwrap().len();
+        let request_bytes = serde_json::to_vec(&request).unwrap().len();
+
+        InputLimiter::new(
+            InputBudget::new(1, item_bytes, request_bytes).unwrap(),
+            "document update",
+        )
+        .unwrap()
+        .validate_items_with_request(&items, &request)
+        .unwrap();
+
+        assert!(matches!(
+            InputLimiter::new(
+                InputBudget::new(1, item_bytes, request_bytes - 1).unwrap(),
+                "document update",
+            )
+            .unwrap()
+            .validate_items_with_request(&items, &request),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == request_bytes - 1
+        ));
+
+        let scalar = serde_json::json!({ "statement": "DELETE FROM t" });
+        let scalar_bytes = serde_json::to_vec(&scalar).unwrap().len();
+        InputLimiter::new(
+            InputBudget::new(1, scalar_bytes, scalar_bytes).unwrap(),
+            "SQL execute",
+        )
+        .unwrap()
+        .validate_request(&scalar)
+        .unwrap();
+        assert!(matches!(
+            InputLimiter::new(
+                InputBudget::new(1, scalar_bytes, scalar_bytes - 1).unwrap(),
+                "SQL execute",
+            )
+            .unwrap()
+            .validate_request(&scalar),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == scalar_bytes - 1
+        ));
+
+        let empty: Vec<serde_json::Value> = Vec::new();
+        assert!(matches!(
+            InputLimiter::new(InputBudget::default(), "empty mutation")
+                .unwrap()
+                .validate_batch(&empty),
+            Err(Error::Config(message)) if message.contains("at least one item")
         ));
     }
 }

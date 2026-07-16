@@ -1,5 +1,6 @@
 pub mod bounded;
 pub mod document;
+pub mod input;
 pub mod kv;
 pub mod message;
 pub mod meta;
@@ -13,6 +14,10 @@ pub use bounded::{
     MAX_METADATA_BYTES, MAX_READ_BYTES,
 };
 pub use document::{Document, FindOptions, InsertOutcome, UpdateOutcome};
+pub use input::{
+    InputBudget, DEFAULT_INPUT_BATCH_BYTES, DEFAULT_INPUT_ITEMS, DEFAULT_INPUT_ITEM_BYTES,
+    MAX_INPUT_BYTES, MAX_INPUT_ITEMS,
+};
 pub use kv::{KeyExpiry, KeyValueRestoreOutcome, KeyValueSnapshot};
 pub use message::{
     AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,

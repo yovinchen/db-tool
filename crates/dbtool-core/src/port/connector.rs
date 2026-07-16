@@ -38,7 +38,9 @@ capability_operations! {
     SqlQueryBounded => "sql.query_bounded",
     SqlQueryBudgeted => "sql.query_budgeted",
     SqlExecute => "sql.execute",
+    SqlExecuteBudgeted => "sql.execute_budgeted",
     SqlInsertRowsAtomic => "sql.insert_rows_atomic",
+    SqlInsertRowsAtomicBudgeted => "sql.insert_rows_atomic_budgeted",
     SqlListSchemas => "sql.list_schemas",
     SqlListSchemasBounded => "sql.list_schemas_bounded",
     SqlListSchemasBudgeted => "sql.list_schemas_budgeted",
@@ -51,6 +53,7 @@ capability_operations! {
     CqlQueryBounded => "cql.query_bounded",
     CqlQueryBudgeted => "cql.query_budgeted",
     CqlExecute => "cql.execute",
+    CqlExecuteBudgeted => "cql.execute_budgeted",
     CqlListKeyspaces => "cql.list_keyspaces",
     CqlListKeyspacesBounded => "cql.list_keyspaces_bounded",
     CqlListKeyspacesBudgeted => "cql.list_keyspaces_budgeted",
@@ -79,32 +82,43 @@ capability_operations! {
     KeyValueGetWithExpiry => "kv.get_with_expiry",
     KeyValueGetWithExpiryBounded => "kv.get_with_expiry_bounded",
     KeyValueSet => "kv.set",
+    KeyValueSetBudgeted => "kv.set_budgeted",
     KeyValueRestoreWithExpiry => "kv.restore_with_expiry",
+    KeyValueRestoreWithExpiryBudgeted => "kv.restore_with_expiry_budgeted",
     KeyValueDelete => "kv.delete",
+    KeyValueDeleteBudgeted => "kv.delete_budgeted",
     KeyValueScan => "kv.scan",
     KeyValueScanBounded => "kv.scan_bounded",
     KeyValueRawCommand => "kv.raw_command",
     KeyValueRawCommandBounded => "kv.raw_command_bounded",
+    KeyValueRawCommandIoBudgeted => "kv.raw_command_io_budgeted",
     DocumentListCollections => "document.list_collections",
     DocumentListCollectionsBounded => "document.list_collections_bounded",
     DocumentListCollectionsBudgeted => "document.list_collections_budgeted",
     DocumentFind => "document.find",
     DocumentFindBudgeted => "document.find_budgeted",
     DocumentInsert => "document.insert",
+    DocumentInsertBudgeted => "document.insert_budgeted",
     DocumentUpdate => "document.update",
     DocumentDelete => "document.delete",
     DocumentUpdateOne => "document.update_one",
+    DocumentUpdateOneBudgeted => "document.update_one_budgeted",
     DocumentUpdateMany => "document.update_many",
+    DocumentUpdateManyBudgeted => "document.update_many_budgeted",
     DocumentDeleteOne => "document.delete_one",
+    DocumentDeleteOneBudgeted => "document.delete_one_budgeted",
     DocumentDeleteMany => "document.delete_many",
+    DocumentDeleteManyBudgeted => "document.delete_many_budgeted",
     DocumentAggregate => "document.aggregate",
     DocumentAggregateBounded => "document.aggregate_bounded",
     DocumentAggregateBudgeted => "document.aggregate_budgeted",
     DocumentDropCollection => "document.drop_collection",
+    DocumentDropCollectionBudgeted => "document.drop_collection_budgeted",
     TimeSeriesListMeasurements => "time_series.list_measurements",
     TimeSeriesListMeasurementsBounded => "time_series.list_measurements_bounded",
     TimeSeriesListMeasurementsBudgeted => "time_series.list_measurements_budgeted",
     TimeSeriesWritePoints => "time_series.write_points",
+    TimeSeriesWritePointsBudgeted => "time_series.write_points_budgeted",
     TimeSeriesQueryRange => "time_series.query_range",
     TimeSeriesQueryRangeBounded => "time_series.query_range_bounded",
     SearchListIndices => "search.list_indices",
@@ -113,12 +127,17 @@ capability_operations! {
     SearchSearch => "search.search",
     SearchSearchBudgeted => "search.search_budgeted",
     SearchIndexDocument => "search.index_doc",
+    SearchIndexDocumentBudgeted => "search.index_doc_budgeted",
     SearchPutDocument => "search.put_doc",
+    SearchPutDocumentBudgeted => "search.put_doc_budgeted",
     SearchGetDocument => "search.get_doc",
     SearchGetDocumentBudgeted => "search.get_doc_budgeted",
     SearchUpdateDocument => "search.update_doc",
+    SearchUpdateDocumentBudgeted => "search.update_doc_budgeted",
     SearchDeleteDocument => "search.delete_doc",
+    SearchDeleteDocumentBudgeted => "search.delete_doc_budgeted",
     SearchDeleteIndex => "search.delete_index",
+    SearchDeleteIndexBudgeted => "search.delete_index_budgeted",
     MessageProduce => "message.produce",
     MessageProduceBudgeted => "message.produce_budgeted",
     MessageConsume => "message.consume",
@@ -151,6 +170,66 @@ impl CapabilityOperation {
         Self::CqlListKeyspaces,
         Self::CqlListTables,
         Self::CqlDescribeTable,
+    ];
+    /// Exact SQL mutation contracts. Legacy `sql=true` and the corresponding
+    /// unbudgeted operation names never authorize these methods.
+    pub const SQL_BUDGETED_MUTATIONS: &'static [Self] =
+        &[Self::SqlExecuteBudgeted, Self::SqlInsertRowsAtomicBudgeted];
+    /// Exact CQL mutation contracts. Legacy `cql=true` never authorizes them.
+    pub const CQL_BUDGETED_MUTATIONS: &'static [Self] = &[Self::CqlExecuteBudgeted];
+    /// Exact key-value mutation contracts, including the raw command contract
+    /// whose input and response budgets are intentionally separate.
+    pub const KEY_VALUE_BUDGETED_MUTATIONS: &'static [Self] = &[
+        Self::KeyValueSetBudgeted,
+        Self::KeyValueRestoreWithExpiryBudgeted,
+        Self::KeyValueDeleteBudgeted,
+        Self::KeyValueRawCommandIoBudgeted,
+    ];
+    /// Exact document mutation contracts. Target-only drop operations have no
+    /// document body, but still budget their variable-sized target input and
+    /// retain the same exact preflight and outcome semantics.
+    pub const DOCUMENT_BUDGETED_MUTATIONS: &'static [Self] = &[
+        Self::DocumentInsertBudgeted,
+        Self::DocumentUpdateOneBudgeted,
+        Self::DocumentUpdateManyBudgeted,
+        Self::DocumentDeleteOneBudgeted,
+        Self::DocumentDeleteManyBudgeted,
+        Self::DocumentDropCollectionBudgeted,
+    ];
+    /// Exact time-series mutation contracts.
+    pub const TIME_SERIES_BUDGETED_MUTATIONS: &'static [Self] =
+        &[Self::TimeSeriesWritePointsBudgeted];
+    /// Exact search mutation contracts. Target-only deletion methods still
+    /// budget their variable-sized index and identifier inputs.
+    pub const SEARCH_BUDGETED_MUTATIONS: &'static [Self] = &[
+        Self::SearchIndexDocumentBudgeted,
+        Self::SearchPutDocumentBudgeted,
+        Self::SearchUpdateDocumentBudgeted,
+        Self::SearchDeleteDocumentBudgeted,
+        Self::SearchDeleteIndexBudgeted,
+    ];
+    /// Every first-party exact mutation operation governed by the shared
+    /// preflight and post-write outcome contract.
+    pub const BUDGETED_MUTATIONS: &'static [Self] = &[
+        Self::SqlExecuteBudgeted,
+        Self::SqlInsertRowsAtomicBudgeted,
+        Self::CqlExecuteBudgeted,
+        Self::KeyValueSetBudgeted,
+        Self::KeyValueRestoreWithExpiryBudgeted,
+        Self::KeyValueDeleteBudgeted,
+        Self::KeyValueRawCommandIoBudgeted,
+        Self::DocumentInsertBudgeted,
+        Self::DocumentUpdateOneBudgeted,
+        Self::DocumentUpdateManyBudgeted,
+        Self::DocumentDeleteOneBudgeted,
+        Self::DocumentDeleteManyBudgeted,
+        Self::DocumentDropCollectionBudgeted,
+        Self::TimeSeriesWritePointsBudgeted,
+        Self::SearchIndexDocumentBudgeted,
+        Self::SearchPutDocumentBudgeted,
+        Self::SearchUpdateDocumentBudgeted,
+        Self::SearchDeleteDocumentBudgeted,
+        Self::SearchDeleteIndexBudgeted,
     ];
     /// Item-and-byte read envelopes are optional backend-aware contracts.
     /// Legacy family booleans and row/item-only bounded methods never imply
@@ -594,6 +673,9 @@ mod tests {
         assert!(CapabilityOperation::KEY_VALUE_BUDGETED_READS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::KEY_VALUE_BUDGETED_MUTATIONS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
         assert!(connector.as_kv().is_some());
         assert!(connector.as_sql().is_none());
         assert!(connector.as_cql().is_none());
@@ -771,6 +853,79 @@ mod tests {
                 CapabilityOperation::MessageProduceBudgeted,
                 "message.produce_budgeted",
             ),
+            (
+                CapabilityOperation::SqlExecuteBudgeted,
+                "sql.execute_budgeted",
+            ),
+            (
+                CapabilityOperation::SqlInsertRowsAtomicBudgeted,
+                "sql.insert_rows_atomic_budgeted",
+            ),
+            (
+                CapabilityOperation::CqlExecuteBudgeted,
+                "cql.execute_budgeted",
+            ),
+            (CapabilityOperation::KeyValueSetBudgeted, "kv.set_budgeted"),
+            (
+                CapabilityOperation::KeyValueRestoreWithExpiryBudgeted,
+                "kv.restore_with_expiry_budgeted",
+            ),
+            (
+                CapabilityOperation::KeyValueDeleteBudgeted,
+                "kv.delete_budgeted",
+            ),
+            (
+                CapabilityOperation::KeyValueRawCommandIoBudgeted,
+                "kv.raw_command_io_budgeted",
+            ),
+            (
+                CapabilityOperation::DocumentInsertBudgeted,
+                "document.insert_budgeted",
+            ),
+            (
+                CapabilityOperation::DocumentUpdateOneBudgeted,
+                "document.update_one_budgeted",
+            ),
+            (
+                CapabilityOperation::DocumentUpdateManyBudgeted,
+                "document.update_many_budgeted",
+            ),
+            (
+                CapabilityOperation::DocumentDeleteOneBudgeted,
+                "document.delete_one_budgeted",
+            ),
+            (
+                CapabilityOperation::DocumentDeleteManyBudgeted,
+                "document.delete_many_budgeted",
+            ),
+            (
+                CapabilityOperation::DocumentDropCollectionBudgeted,
+                "document.drop_collection_budgeted",
+            ),
+            (
+                CapabilityOperation::TimeSeriesWritePointsBudgeted,
+                "time_series.write_points_budgeted",
+            ),
+            (
+                CapabilityOperation::SearchIndexDocumentBudgeted,
+                "search.index_doc_budgeted",
+            ),
+            (
+                CapabilityOperation::SearchPutDocumentBudgeted,
+                "search.put_doc_budgeted",
+            ),
+            (
+                CapabilityOperation::SearchUpdateDocumentBudgeted,
+                "search.update_doc_budgeted",
+            ),
+            (
+                CapabilityOperation::SearchDeleteDocumentBudgeted,
+                "search.delete_doc_budgeted",
+            ),
+            (
+                CapabilityOperation::SearchDeleteIndexBudgeted,
+                "search.delete_index_budgeted",
+            ),
         ] {
             assert_eq!(operation.as_str(), stable_name);
             assert_eq!(
@@ -830,6 +985,29 @@ mod tests {
             CapabilityOperation::KEY_VALUE_EXISTENCE,
             [CapabilityOperation::KeyValueExists]
         );
+        assert_eq!(CapabilityOperation::BUDGETED_MUTATIONS.len(), 19);
+        for family in [
+            CapabilityOperation::SQL_BUDGETED_MUTATIONS,
+            CapabilityOperation::CQL_BUDGETED_MUTATIONS,
+            CapabilityOperation::KEY_VALUE_BUDGETED_MUTATIONS,
+            CapabilityOperation::DOCUMENT_BUDGETED_MUTATIONS,
+            CapabilityOperation::TIME_SERIES_BUDGETED_MUTATIONS,
+            CapabilityOperation::SEARCH_BUDGETED_MUTATIONS,
+        ] {
+            assert!(family
+                .iter()
+                .all(|operation| CapabilityOperation::BUDGETED_MUTATIONS.contains(operation)));
+        }
+        assert!(CapabilityOperation::BUDGETED_MUTATIONS
+            .iter()
+            .all(|operation| {
+                !CapabilityOperation::SQL.contains(operation)
+                    && !CapabilityOperation::CQL.contains(operation)
+                    && !CapabilityOperation::KEY_VALUE.contains(operation)
+                    && !CapabilityOperation::DOCUMENT.contains(operation)
+                    && !CapabilityOperation::TIME_SERIES.contains(operation)
+                    && !CapabilityOperation::SEARCH.contains(operation)
+            }));
     }
 
     #[test]
@@ -935,6 +1113,7 @@ mod tests {
                     && !CapabilityOperation::BOUNDED_CATALOGS.contains(operation)
                     && !CapabilityOperation::BOUNDED_NESTED_METADATA.contains(operation)
                     && !CapabilityOperation::BUDGETED_READS.contains(operation)
+                    && !CapabilityOperation::BUDGETED_MUTATIONS.contains(operation)
                     && ![
                         CapabilityOperation::DocumentUpdateOne,
                         CapabilityOperation::DocumentUpdateMany,
@@ -988,6 +1167,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::SEARCH_BUDGETED_READS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::BUDGETED_MUTATIONS
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         for operation in [
