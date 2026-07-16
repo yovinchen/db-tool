@@ -328,6 +328,7 @@ fn cassandra_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> 
     let mut operations = capabilities.operations();
     operations.extend([
         CapabilityOperation::SqlQueryBudgeted,
+        CapabilityOperation::SqlExecuteBudgeted,
         CapabilityOperation::CqlQueryBudgeted,
         CapabilityOperation::CqlExecuteBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
@@ -489,7 +490,17 @@ impl SqlEngine for CassandraAdapter {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
-        preflight_cassandra_sql_execute(sql, params, InputBudget::default())?;
+        self.execute_budgeted(sql, params, InputBudget::default())
+            .await
+    }
+
+    async fn execute_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: InputBudget,
+    ) -> Result<ExecOutcome> {
+        preflight_cassandra_sql_execute(sql, params, budget)?;
         self.send_cql_mutation(sql).await
     }
 
@@ -1258,6 +1269,7 @@ mod tests {
         });
         for operation in [
             CapabilityOperation::SqlQueryBudgeted,
+            CapabilityOperation::SqlExecuteBudgeted,
             CapabilityOperation::CqlQueryBudgeted,
             CapabilityOperation::CqlExecuteBudgeted,
             CapabilityOperation::SqlListSchemasBounded,
@@ -1368,7 +1380,11 @@ mod tests {
         assert!(connector
             .operations()
             .contains(&CapabilityOperation::CqlExecuteBudgeted));
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::SqlExecuteBudgeted));
         let cql = connector.as_cql().unwrap();
+        let sql = connector.as_sql().unwrap();
 
         let exercise = async {
             let error = cql
@@ -1400,6 +1416,12 @@ mod tests {
                 InputBudget::default(),
             )
             .await?;
+            sql.execute_budgeted(
+                &format!("INSERT INTO {table} (id, note) VALUES (2, 'sql-compatible')"),
+                &[],
+                InputBudget::default(),
+            )
+            .await?;
             cql.execute_cql_budgeted(
                 &format!("UPDATE {table} SET note = 'updated' WHERE id = 1"),
                 InputBudget::default(),
@@ -1411,6 +1433,15 @@ mod tests {
             assert_eq!(readback.rows.len(), 1);
             assert_eq!(readback.rows[0][0], Value::Int(1));
             assert_eq!(readback.rows[0][1], Value::Text("updated".into()));
+            let sql_readback = cql
+                .query_cql(&format!("SELECT id, note FROM {table} WHERE id = 2"))
+                .await?;
+            assert_eq!(sql_readback.rows.len(), 1);
+            assert_eq!(sql_readback.rows[0][0], Value::Int(2));
+            assert_eq!(
+                sql_readback.rows[0][1],
+                Value::Text("sql-compatible".into())
+            );
 
             cql.execute_cql_budgeted(
                 &format!("DELETE FROM {table} WHERE id = 1"),
@@ -1422,6 +1453,12 @@ mod tests {
                 .await?
                 .rows
                 .is_empty());
+            sql.execute_budgeted(
+                &format!("DELETE FROM {table} WHERE id = 2"),
+                &[],
+                InputBudget::default(),
+            )
+            .await?;
             cql.execute_cql_budgeted(
                 &format!("DROP TABLE {table}"),
                 InputBudget::default(),
