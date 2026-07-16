@@ -231,7 +231,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
         ExportAction::Sql { .. } | ExportAction::Kv { .. } => None,
     };
     let dsn = ctx.resolve_dsn()?;
-    let connection = ctx.safety_target(&dsn);
+    let connection = ctx.safety_target_display(&dsn);
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
     let start = std::time::Instant::now();
@@ -420,7 +420,7 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
     };
 
     let dsn = ctx.resolve_dsn()?;
-    let safety_target = ctx.safety_target(&dsn);
+    let safety_target = ctx.confirmation_target(&dsn)?;
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
     let start = std::time::Instant::now();

@@ -65,7 +65,7 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
         CqlAction::Exec { .. } => None,
     };
     let dsn = ctx.resolve_dsn()?;
-    let target = ctx.safety_target(&dsn);
+    let target = ctx.confirmation_target(&dsn)?;
 
     match &cmd.action {
         CqlAction::Query { cql } => ensure_readonly_query(cql)?,

@@ -111,7 +111,7 @@ pub async fn run(ctx: &Context, cmd: KvCmd) -> Result<String> {
         SafetyGuard::check_destructive_operation_with_scope(
             "redis_raw_mutation",
             &plan.resource_label(),
-            &ctx.safety_target(&dsn),
+            &ctx.confirmation_target(&dsn)?,
             &scope,
             ctx.allow_write,
             ctx.confirm.as_deref(),

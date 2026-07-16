@@ -112,7 +112,7 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             SafetyGuard::check_destructive_operation(
                 "drop_collection",
                 collection,
-                &ctx.safety_target(&dsn),
+                &ctx.confirmation_target(&dsn)?,
                 ctx.allow_write,
                 ctx.confirm.as_deref(),
             )?;
@@ -354,7 +354,7 @@ fn check_many_confirmation(
     SafetyGuard::check_destructive_operation_with_scope(
         &format!("{operation}_many"),
         collection,
-        &ctx.safety_target(dsn),
+        &ctx.confirmation_target(dsn)?,
         &scope,
         ctx.allow_write,
         ctx.confirm.as_deref(),
@@ -469,13 +469,15 @@ fn check_aggregate_safety(
     };
 
     ensure_write_allowed(ctx)?;
-    let resolved_target = format!("dsn:{}", parsed_dsn.redacted());
-    let connection_target = ctx.safety_target(dsn);
-    let confirmation_target = if connection_target == resolved_target {
-        resolved_target
+    let resolved_display = format!("dsn:{}", parsed_dsn.redacted());
+    let connection_display = ctx.safety_target_display(dsn);
+    let confirmation_display = if connection_display == resolved_display {
+        resolved_display
     } else {
-        format!("{connection_target}|{resolved_target}")
+        format!("{connection_display}|{resolved_display}")
     };
+    let confirmation_target =
+        SafetyGuard::bind_target_scope(&confirmation_display, &parsed_dsn.raw)?;
     let confirmation_scope = serde_json::to_string(&(source_collection, pipeline))
         .map_err(|error| Error::Serialization(error.to_string()))?;
     SafetyGuard::check_destructive_operation_with_scope(

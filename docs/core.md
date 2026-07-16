@@ -6,6 +6,12 @@
 
 `Dsn::parse` expands `${VAR}` placeholders before storing `Dsn::raw`, so adapters receive the actual connection string. Use `Dsn::redacted()` or `redact_dsn` for logs and command output.
 
+Redacted DSNs are display labels, not unique connection identities. Destructive
+callers use `SafetyGuard::bind_target_scope(display, resolved_dsn)` so token
+calculation includes a hidden digest of the complete expanded target while the
+public impact object retains only the display label. Never persist the bound
+internal string in logs or transfer artifacts.
+
 ## Protocol Families
 
 Aliases live in `registry::alias::PROTOCOL_ALIASES`. Register adapters through `Registry::register_family` when a backend covers a whole protocol family.
@@ -57,6 +63,11 @@ Top-level catalog item bounds are complete; caller-owned scalar byte accounting 
 tracked by IF-T74.
 
 These services are intentionally adapter-agnostic so the CLI, TUI, and embedded library paths can share the same behavior.
+
+`SafetyGuard` strips only its validated internal hidden-scope suffix when it
+builds `impact.target`, but uses the complete bound target for token calculation.
+This preserves deterministic two-process confirmation without publishing raw
+credentials or a public DSN fingerprint.
 
 The service-free embedded smoke lives in
 `crates/dbtool-registry/tests/embedded_library.rs`. It builds the adapter

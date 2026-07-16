@@ -11,7 +11,7 @@ pub mod sql;
 pub mod transfer;
 pub mod ts;
 
-use dbtool_core::service::{formatter::Format, ThrottleConfig};
+use dbtool_core::service::{formatter::Format, SafetyGuard, ThrottleConfig};
 use dbtool_core::{
     config::{file::CONNECTION_CONFIG_MAX_NAME_BYTES, ConnectionConfig, LimitsConfig},
     dsn::Dsn,
@@ -156,19 +156,35 @@ impl Context {
         Ok(throttle)
     }
 
-    pub fn safety_target(&self, resolved_dsn: &str) -> String {
-        if let Some(name) = &self.conn {
-            if matches!(
-                validate_connection_reference(name),
-                Ok(ConnectionReferenceKind::Name)
-            ) {
-                return format!("conn:{name}");
+    /// Return the caller-visible connection label used in artifacts and
+    /// confirmation impact. This value is intentionally redacted and must not
+    /// be used by itself as the confirmation token identity.
+    pub fn safety_target_display(&self, resolved_dsn: &str) -> String {
+        if self.dsn.is_none() {
+            if let Some(name) = &self.conn {
+                if matches!(
+                    validate_connection_reference(name),
+                    Ok(ConnectionReferenceKind::Name)
+                ) {
+                    return format!("conn:{name}");
+                }
             }
         }
 
-        dbtool_core::dsn::Dsn::parse(resolved_dsn)
+        Dsn::parse(resolved_dsn)
             .map(|dsn| format!("dsn:{}", dsn.redacted()))
             .unwrap_or_else(|_| "dsn:<unparsed>".to_owned())
+    }
+
+    /// Bind the safe display label to the complete resolved DSN without
+    /// exposing the DSN or its digest in `impact.target`.
+    ///
+    /// The returned internal string may only be passed directly to
+    /// `SafetyGuard`; artifacts and user-facing output must use
+    /// [`Self::safety_target_display`].
+    pub fn confirmation_target(&self, resolved_dsn: &str) -> dbtool_core::Result<String> {
+        let display = self.safety_target_display(resolved_dsn);
+        SafetyGuard::bind_target_scope(&display, resolved_dsn)
     }
 
     pub fn render_success<T: Serialize>(

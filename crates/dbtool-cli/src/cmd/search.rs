@@ -107,7 +107,7 @@ pub async fn run(ctx: &Context, cmd: SearchCmd) -> Result<String> {
             SafetyGuard::check_destructive_operation(
                 "delete_search_index",
                 index,
-                &ctx.safety_target(&dsn),
+                &ctx.confirmation_target(&dsn)?,
                 ctx.allow_write,
                 ctx.confirm.as_deref(),
             )?;

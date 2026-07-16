@@ -813,7 +813,7 @@ fn authorize_sql_statement(
         return Err(Error::Config("SQL command requires a statement".to_owned()));
     }
 
-    let target = safety_target(&connection.dsn);
+    let target = safety_target(&connection.dsn)?;
     match SafetyGuard::check_with_target(sql, &target, true, None) {
         Ok(StatementKind::Read) => Ok(StatementKind::Read),
         Ok(StatementKind::Write) => {
@@ -848,10 +848,14 @@ fn parse_json_value(raw: &str) -> Result<Value> {
         .map_err(|e| Error::Serialization(e.to_string()))
 }
 
-fn safety_target(raw_dsn: &str) -> String {
-    Dsn::parse(raw_dsn)
-        .map(|dsn| format!("dsn:{}", dsn.redacted()))
-        .unwrap_or_else(|_| "dsn:<unparsed>".to_owned())
+fn safety_target(raw_dsn: &str) -> Result<String> {
+    match Dsn::parse(raw_dsn) {
+        Ok(dsn) => {
+            let display = format!("dsn:{}", dsn.redacted());
+            SafetyGuard::bind_target_scope(&display, &dsn.raw)
+        }
+        Err(_) => SafetyGuard::bind_target_scope("dsn:<unparsed>", raw_dsn),
+    }
 }
 
 fn unsupported(connector: &dyn dbtool_core::port::Connector, needed: &'static str) -> Error {
@@ -939,6 +943,59 @@ mod tests {
             assert!(command_requires_write(&format!("sql query {statement}")).unwrap());
             assert!(command_requires_write(&format!("sql {statement}")).unwrap());
         }
+    }
+
+    #[test]
+    fn tui_confirmation_targets_bind_hidden_dsn_identity_without_exposing_it() {
+        let first_marker = "TUI_TOKEN_MARKER_ONE";
+        let second_marker = "TUI_TOKEN_MARKER_TWO";
+        let first = safety_target(&format!(
+            "nats://{first_marker}@127.0.0.1:4222?auth=tenant-one"
+        ))
+        .unwrap();
+        let second = safety_target(&format!(
+            "nats://{second_marker}@127.0.0.1:4222?auth=tenant-two"
+        ))
+        .unwrap();
+        for target in [&first, &second] {
+            assert!(!target.contains(first_marker));
+            assert!(!target.contains(second_marker));
+            assert!(!target.contains("tenant-one"));
+            assert!(!target.contains("tenant-two"));
+        }
+
+        let first_error =
+            SafetyGuard::check_with_target("drop table events", &first, true, None).unwrap_err();
+        let (first_token, first_impact) = match first_error {
+            Error::ConfirmRequired {
+                confirm_token,
+                impact,
+            } => (confirm_token, impact),
+            other => panic!("expected confirmation requirement, got {other:?}"),
+        };
+        let second_token =
+            match SafetyGuard::check_with_target("drop table events", &second, true, None)
+                .unwrap_err()
+            {
+                Error::ConfirmRequired { confirm_token, .. } => confirm_token,
+                other => panic!("expected confirmation requirement, got {other:?}"),
+            };
+        assert_ne!(first_token, second_token);
+        let visible = first_impact["target"].as_str().unwrap();
+        assert!(visible.starts_with("dsn:nats://***@127.0.0.1:4222"));
+        assert!(!visible.contains(first_marker));
+        assert!(!visible.contains("tenant-one"));
+
+        let variable = "DBTOOL_TUI_CONFIRMATION_SCOPE_TOKEN";
+        let template = format!("nats://${{{variable}}}@127.0.0.1:4222?auth=tenant");
+        std::env::set_var(variable, first_marker);
+        let first_expansion = safety_target(&template).unwrap();
+        std::env::set_var(variable, second_marker);
+        let second_expansion = safety_target(&template).unwrap();
+        std::env::remove_var(variable);
+        assert_ne!(first_expansion, second_expansion);
+        assert!(!first_expansion.contains(first_marker));
+        assert!(!second_expansion.contains(second_marker));
     }
 
     #[test]

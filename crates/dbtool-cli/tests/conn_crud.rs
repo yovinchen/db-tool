@@ -1052,25 +1052,31 @@ fn oversized_or_control_connection_references_fail_before_dispatch_without_echoi
 }
 
 #[test]
-fn destructive_safety_targets_redact_userinfo_query_and_fragment_for_all_input_modes() {
+fn destructive_safety_targets_hide_and_bind_complete_resolved_connection_identity() {
     let root = root("safety-target-redaction");
-    let token_marker = "NATS_SAFETY_TARGET_TOKEN_MARKER";
-    let query_marker = "NATS_SAFETY_TARGET_QUERY_MARKER";
+    let first_marker = "NATS_SAFETY_TARGET_TOKEN_ONE";
+    let second_marker = "NATS_SAFETY_TARGET_TOKEN_TWO";
     let cases = [
-        (token_marker, format!("nats://{token_marker}@127.0.0.1:1")),
         (
-            query_marker,
-            format!("nats://127.0.0.1:1?auth={query_marker}#fragment-{query_marker}"),
+            first_marker,
+            format!("nats://{first_marker}@127.0.0.1:1?auth=tenant-one#fragment-{first_marker}"),
+        ),
+        (
+            second_marker,
+            format!("nats://{second_marker}@127.0.0.1:1?auth=tenant-two#fragment-{second_marker}"),
         ),
     ];
 
-    for (marker, dsn) in cases {
-        for selector in ["--dsn", "--conn"] {
+    let mut direct_first_token = None;
+    for selector in ["--dsn", "--conn"] {
+        let mut tokens = Vec::new();
+        let mut targets = Vec::new();
+        for (marker, dsn) in &cases {
             let output = clean_command(
                 &root,
                 &[
                     selector,
-                    &dsn,
+                    dsn,
                     "--allow-write",
                     "mq",
                     "delete",
@@ -1089,6 +1095,134 @@ fn destructive_safety_targets_redact_userinfo_query_and_fragment_for_all_input_m
             assert!(target.starts_with("dsn:nats://"));
             assert!(target.contains("***"));
             assert!(!target.contains(marker));
+            targets.push(target.to_owned());
+            tokens.push(confirmation_token(&error));
+        }
+        assert_eq!(targets[0], targets[1]);
+        assert_ne!(tokens[0], tokens[1]);
+        if selector == "--dsn" {
+            direct_first_token = Some(tokens[0].clone());
         }
     }
+
+    let path = config_path(&root);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let write_named = |dsn: &str| {
+        fs::write(&path, format!("[connections.local]\ndsn = {dsn:?}\n")).unwrap();
+    };
+    write_named(&cases[0].1);
+    let named_first = stderr_json(
+        clean_command(
+            &root,
+            &[
+                "--conn",
+                "local",
+                "--allow-write",
+                "mq",
+                "delete",
+                "--kind",
+                "nats-jetstream",
+                "review-topic",
+            ],
+        )
+        .output()
+        .unwrap(),
+    );
+    assert_eq!(named_first["error"]["impact"]["target"], "conn:local");
+    let named_first_token = confirmation_token(&named_first);
+
+    write_named(&cases[1].1);
+    let named_second = stderr_json(
+        clean_command(
+            &root,
+            &[
+                "--conn",
+                "local",
+                "--allow-write",
+                "mq",
+                "delete",
+                "--kind",
+                "nats-jetstream",
+                "review-topic",
+            ],
+        )
+        .output()
+        .unwrap(),
+    );
+    assert_eq!(named_second["error"]["impact"]["target"], "conn:local");
+    assert_ne!(named_first_token, confirmation_token(&named_second));
+
+    let stale_replay = stderr_json(
+        clean_command(
+            &root,
+            &[
+                "--conn",
+                "local",
+                "--allow-write",
+                "--confirm",
+                &named_first_token,
+                "mq",
+                "delete",
+                "--kind",
+                "nats-jetstream",
+                "review-topic",
+            ],
+        )
+        .output()
+        .unwrap(),
+    );
+    assert_eq!(stale_replay["error"]["code"], "INTERNAL_ERROR");
+
+    let precedence = stderr_json(
+        clean_command(
+            &root,
+            &[
+                "--conn",
+                "local",
+                "--dsn",
+                &cases[0].1,
+                "--allow-write",
+                "mq",
+                "delete",
+                "--kind",
+                "nats-jetstream",
+                "review-topic",
+            ],
+        )
+        .output()
+        .unwrap(),
+    );
+    assert!(precedence["error"]["impact"]["target"]
+        .as_str()
+        .unwrap()
+        .starts_with("dsn:nats://"));
+    assert_eq!(confirmation_token(&precedence), direct_first_token.unwrap());
+
+    let variable = "DBTOOL_CONFIRMATION_SCOPE_EXPANSION";
+    let template =
+        format!("nats://${{{variable}}}@127.0.0.1:1?auth=${{{variable}}}#${{{variable}}}");
+    let mut expanded_tokens = Vec::new();
+    for marker in [first_marker, second_marker] {
+        let mut command = clean_command(
+            &root,
+            &[
+                "--dsn",
+                &template,
+                "--allow-write",
+                "mq",
+                "delete",
+                "--kind",
+                "nats-jetstream",
+                "review-topic",
+            ],
+        );
+        command.env(variable, marker);
+        let output = command.output().unwrap();
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+        let error = stderr_json(output);
+        assert_eq!(error["error"]["code"], "CONFIRM_REQUIRED");
+        expanded_tokens.push(confirmation_token(&error));
+    }
+    assert_ne!(expanded_tokens[0], expanded_tokens[1]);
+    fs::remove_dir_all(root).ok();
 }

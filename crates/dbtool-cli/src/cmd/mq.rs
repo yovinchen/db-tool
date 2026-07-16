@@ -245,7 +245,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
         SafetyGuard::check_destructive_operation_with_scope(
             "delete_message_resource",
             &safety_resource,
-            &ctx.safety_target(&dsn),
+            &ctx.confirmation_target(&dsn)?,
             &confirmation_scope,
             ctx.allow_write,
             ctx.confirm.as_deref(),

@@ -71,7 +71,7 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
         SqlAction::Exec { .. } => None,
     };
     let dsn = ctx.resolve_dsn()?;
-    let target = ctx.safety_target(&dsn);
+    let target = ctx.confirmation_target(&dsn)?;
 
     let parsed_params = match &cmd.action {
         SqlAction::Query { params, .. } | SqlAction::Exec { params, .. } => {
