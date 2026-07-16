@@ -2,15 +2,15 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        BoundedList, ColumnMeta, ExecOutcome, ForeignKeyInfo, IndexInfo, MetadataBudget,
-        ReadBudget, ResultSet, RoutineInfo, RoutineKind, SequenceInfo, TableInfo, TableKind,
-        TableSchema, TablespaceInfo, Value, DEFAULT_METADATA_BYTES,
+        BoundedList, ColumnMeta, ExecOutcome, ForeignKeyInfo, IndexInfo, InputBudget,
+        MetadataBudget, ReadBudget, ResultSet, RoutineInfo, RoutineKind, SequenceInfo, TableInfo,
+        TableKind, TableSchema, TablespaceInfo, Value, DEFAULT_METADATA_BYTES,
     },
     port::{
         capability::{Db2Engine, SqlEngine},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
+    service::limiter::{InputLimiter, ListLimiter, MetadataLimiter, ReadLimiter, ResultLimiter},
 };
 use futures::future::BoxFuture;
 use odbc_api::{
@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 const LEGACY_SCHEMA_MAX_ITEMS: usize = 100_000;
 const DB2_CATALOG_TEXT_MAX_OCTETS: i64 = 4096;
+const DB2_MAX_STATEMENT_BYTES: usize = 2_097_152;
+const DB2_MAX_PARAMETERS: usize = 32_767;
 // Db2 rejects a foreign key with more than 64 referencing columns. Bounding
 // both selected constraint identities and this per-constraint product keeps
 // the joined member query finite without splitting a valid composite key.
@@ -291,21 +293,39 @@ impl SqlEngine for Db2Adapter {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome> {
-        reject_params(params)?;
+        self.execute_budgeted(sql, params, InputBudget::default())
+            .await
+    }
+
+    async fn execute_budgeted(
+        &self,
+        sql: &str,
+        params: &[Value],
+        budget: InputBudget,
+    ) -> Result<ExecOutcome> {
+        preflight_db2_execute(sql, params, budget)?;
         let conn_str = self.conn_str.clone();
         let sql = sql.to_owned();
         tokio::task::spawn_blocking(move || {
             let env = get_env()?;
             let conn = open(env, &conn_str)?;
             conn.execute(&sql, ())
-                .map_err(|e| Error::Query(e.to_string()))?;
+                .map_err(|error| {
+                    Error::OutcomeIndeterminate(format!(
+                        "Db2 execute may have reached the backend: {error}; inspect database state before retrying"
+                    ))
+                })?;
             Ok::<_, Error>(ExecOutcome {
                 rows_affected: 0,
                 last_insert_id: None,
             })
         })
         .await
-        .map_err(|e| Error::Query(e.to_string()))?
+        .map_err(|error| {
+            Error::OutcomeIndeterminate(format!(
+                "Db2 execute worker ended after mutation dispatch became possible: {error}; inspect database state before retrying"
+            ))
+        })?
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
@@ -1988,6 +2008,7 @@ fn db2_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
         CapabilityOperation::SqlQueryBudgeted,
+        CapabilityOperation::SqlExecuteBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
         CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
@@ -2260,6 +2281,30 @@ fn reject_params(params: &[Value]) -> Result<()> {
     }
 }
 
+fn preflight_db2_execute(sql: &str, params: &[Value], budget: InputBudget) -> Result<()> {
+    let request = ("sql", sql, "params", params);
+    let limiter = InputLimiter::new(budget, "Db2 execute input")?;
+    if params.is_empty() {
+        limiter.validate_request(&request)?;
+    } else {
+        limiter.validate_items_with_request(params, &request)?;
+    }
+    if sql.as_bytes().contains(&0) {
+        return Err(Error::Query("Db2 statement contains a NUL byte".to_owned()));
+    }
+    if sql.len() > DB2_MAX_STATEMENT_BYTES {
+        return Err(Error::Query(format!(
+            "Db2 statement exceeds the fixed {DB2_MAX_STATEMENT_BYTES}-byte ceiling"
+        )));
+    }
+    if params.len() > DB2_MAX_PARAMETERS {
+        return Err(Error::Query(format!(
+            "Db2 request exceeds the fixed {DB2_MAX_PARAMETERS}-parameter ceiling"
+        )));
+    }
+    reject_params(params)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2307,6 +2352,7 @@ mod tests {
         });
         for operation in [
             CapabilityOperation::SqlQueryBudgeted,
+            CapabilityOperation::SqlExecuteBudgeted,
             CapabilityOperation::SqlListSchemasBounded,
             CapabilityOperation::SqlListSchemasBudgeted,
             CapabilityOperation::SqlListTablesBounded,
@@ -2324,6 +2370,55 @@ mod tests {
         ] {
             assert!(operations.contains(&operation), "missing {operation:?}");
         }
+    }
+
+    #[test]
+    fn execute_budget_preflight_is_exact_and_counts_unsupported_params_before_access() {
+        let scalar_bytes = (1..=1024)
+            .find(|bytes| {
+                preflight_db2_execute(
+                    "delete from jobs",
+                    &[],
+                    InputBudget::new(1, *bytes, *bytes).unwrap(),
+                )
+                .is_ok()
+            })
+            .expect("small Db2 scalar request must fit");
+        preflight_db2_execute(
+            "delete from jobs",
+            &[],
+            InputBudget::new(1, scalar_bytes, scalar_bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            preflight_db2_execute(
+                "delete from jobs",
+                &[],
+                InputBudget::new(1, scalar_bytes, scalar_bytes - 1).unwrap(),
+            ),
+            Err(Error::InputBudgetExceeded { .. })
+        ));
+
+        let params = [Value::Int(1), Value::Int(2)];
+        assert!(matches!(
+            preflight_db2_execute(
+                "update jobs set id = ?",
+                &params,
+                InputBudget {
+                    max_items: 1,
+                    ..InputBudget::default()
+                },
+            ),
+            Err(Error::InputBudgetExceeded { unit: "items", .. })
+        ));
+        assert!(matches!(
+            preflight_db2_execute("update jobs set id = ?", &params, InputBudget::default(),),
+            Err(Error::Query(_))
+        ));
+        assert!(matches!(
+            preflight_db2_execute("x\0y", &[], InputBudget::default()),
+            Err(Error::Query(_))
+        ));
     }
 
     #[test]
