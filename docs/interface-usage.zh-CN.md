@@ -299,7 +299,8 @@ dbtool --dsn "$MONGO_DSN" --allow-write \
   doc delete users --filter '{"id":42}'
 ```
 
-CLI 默认调用 `document.update_one` / `document.delete_one`，即使过滤器匹配多条也只
+CLI 默认协商并调用 `document.update_one_budgeted` /
+`document.delete_one_budgeted`，即使过滤器匹配多条也只
 变更一条。需要对全部匹配项执行变更时，必须显式增加 `--many`，先取得确认令牌，再以
 完全相同的连接、集合、操作、过滤器和更新内容执行第二次命令：
 
@@ -322,8 +323,9 @@ CLI 会在连接前拒绝 `{}`、数组、`null`、空集合名和 NUL 字符，
 边界再次拒绝空过滤器。
 
 嵌入式兼容说明：历史 `DocumentStore::update/delete` 继续保持批量语义，不做破坏性
-改名；新代码应先从 `Connector::operations()` 协商四个显式 operation，再调用
-`update_one/update_many/delete_one/delete_many`。粗粒度 `document=true` 不代表这些
+改名；新代码应先从 `Connector::operations()` 协商四个 exact operation，再调用
+`update_one_budgeted/update_many_budgeted/delete_one_budgeted/delete_many_budgeted`。
+粗粒度 `document=true` 不代表这些
 可选方法已实现，未声明时必须得到 `UNSUPPORTED_CAPABILITY`。
 
 ### 删除集合
@@ -343,9 +345,9 @@ dbtool --dsn "$MONGO_DSN" --allow-write \
   doc drop archived_events
 ```
 
-嵌入式调用方可使用 `DocumentStore::drop_collection`。不支持集合生命周期的
+嵌入式调用方可使用 `DocumentStore::drop_collection_budgeted`。不支持集合生命周期的
 connector 使用 trait 默认实现，返回 `UNSUPPORTED_CAPABILITY`。调用前必须先检查
-`document.drop_collection`；粗粒度 `document=true` 不授权集合生命周期。
+`document.drop_collection_budgeted`；粗粒度 `document=true` 不授权集合生命周期。
 
 ## TUI 写操作与终端恢复
 
@@ -480,8 +482,31 @@ method；旧族布尔值和仅按条数的 operation 不授权它们，trait 默
 6. CLI 会把相同值同步到响应 `meta.truncated`，export 的完整 artifact 还必须落在同一
    `--max-bytes` 内。
 
-公共 `query/query_cql/query_bounded/query_cql_bounded` 暂时保留为兼容接口；任何一方
-CLI、TUI、export 或交互式用户输入都必须协商 `*.query_budgeted`，不得回退。
+### 旧 API 生命周期与迁移
+
+所有已经存在 exact sibling 的无界、仅按条数或无输入信封方法都只作为 `0.1.x`
+嵌入式兼容面保留，并带有 Rust `#[deprecated]` 迁移提示；最早只能在 breaking
+release `0.2.0` 删除。旧 `CapabilityOperation` 名仍保留序列化兼容，但它们只说明旧
+实现存在，不能授权 exact 调用，新调用方也不得在 exact operation 缺失时回退：
+
+| Trait | `0.1.x` legacy 方法 | 新调用方必须协商并调用 |
+| --- | --- | --- |
+| `SqlEngine` | `query`, `query_bounded`, `execute`, `insert_rows_atomic`, `list_schemas`, `list_schemas_bounded`, `list_tables`, `list_tables_bounded`, `describe_table` | `query_budgeted`, `execute_budgeted`, `insert_rows_atomic_budgeted`, `list_schemas_budgeted`, `list_tables_budgeted`, `describe_table_bounded` |
+| `CqlEngine` | `query_cql`, `query_cql_bounded`, `execute_cql`, `list_keyspaces`, `list_keyspaces_bounded`, `list_cql_tables`, `list_cql_tables_bounded`, `describe_cql_table` | `query_cql_budgeted`, `execute_cql_budgeted`, `list_keyspaces_budgeted`, `list_cql_tables_budgeted`, `describe_cql_table_bounded` |
+| `KeyValueStore` | `get`, `get_with_expiry`, `set`, `restore_with_expiry`, `delete`, `scan`, `raw_command` | `get_bounded`, `get_with_expiry_bounded`, `set_budgeted`, `restore_with_expiry_budgeted`, `delete_budgeted`, `scan_bounded`; RAW 只读用 `raw_command_bounded`，写入用 `raw_command_io_budgeted` |
+| `DocumentStore` | `list_collections`, `list_collections_bounded`, `find`, `insert`, `update`, `delete`, `update_one`, `update_many`, `delete_one`, `delete_many`, `aggregate`, `aggregate_bounded`, `drop_collection` | `list_collections_budgeted`, `find_budgeted`, `insert_budgeted`；`update`/`update_many` 用 `update_many_budgeted`，`delete`/`delete_many` 用 `delete_many_budgeted`，单条用 `update_one_budgeted`/`delete_one_budgeted`；aggregate 只读用 `aggregate_budgeted`，`$out/$merge` 用 `aggregate_write_budgeted`；集合删除用 `drop_collection_budgeted` |
+| `TimeSeriesStore` | `list_measurements`, `list_measurements_bounded`, `write_points`, `query_range` | `list_measurements_budgeted`, `write_points_budgeted`, `query_range_bounded` |
+| `SearchEngine` | `list_indices`, `list_indices_bounded`, `search`, `index_doc`, `put_doc`, `get_doc`, `update_doc`, `delete_doc`, `delete_index` | 对应 `*_budgeted` exact 方法 |
+| `MessageProducer` | `produce` | `produce_budgeted` |
+| `AdminInspect` | `list_topics`, `list_topics_bounded`, `topic_detail`, `consumer_lag` | `list_topics_budgeted`, `topic_detail_bounded`, `consumer_lag_bounded` |
+| `Db2Engine` | `list_sequences`, `list_sequences_bounded`, `list_routines`, `list_routines_bounded`, `list_tablespaces`, `list_tablespaces_bounded`, `list_foreign_keys`, `list_foreign_keys_bounded`, `generate_ddl` | 对应 `*_budgeted`，DDL 使用 `generate_ddl_bounded` |
+
+`exists`、带完整 `ConsumeOptions` 的 `consume`、目标绑定的 `delete_resource` 本身已经是
+有限/精确合同，因此不属于本轮弃用。CLI、TUI、transfer 和 embedded 推荐范式均遵循
+`exact operation -> accessor -> exact method`。production 中只有 `DocumentStore`
+`update_many -> update` 和 `delete_many -> delete` 两个带局部说明的
+`0.1.x` legacy-to-legacy 默认桥接；它们不是 exact 默认实现。其余保留调用
+只出现在带局部 `#[allow(deprecated)]` 的 `0.1.x compatibility` 测试中。
 
 `export sql` 只接受只读语句。新生成的 `sql-rows` v3 artifact 使用
 `dbtool-value-v2` typed wire codec，并必须包含 `truncated` 完整性字段；部分 artifact
@@ -498,7 +523,8 @@ dbtool --dsn "$POSTGRES_DSN" --limit 1000 --allow-write \
 ```
 
 导入在连接目标前完成 artifact 版本、完整性、项目预算、table/column 标识符、重复列和
-行宽校验。连接后还必须协商到 `sql.insert_rows_atomic`；当前只有 SQLite、PostgreSQL 与
+行宽校验。连接后还必须协商到 `sql.insert_rows_atomic_budgeted`；当前只有
+SQLite、PostgreSQL 与
 MySQL 声明该可选 operation。适配器不会信任 CLI 的预检，还会独立执行同一组结构校验，
 然后遵循以下合同：
 
@@ -534,7 +560,8 @@ JSON 数字数组；每个 v3 KV entry 还必须带显式 `expiry`：`persistent
 artifact 只能诊断，不能导入。已成功读取后 key 的正常过期不会反向破坏 artifact 完整性，
 因为绝对 deadline 会随 artifact 保存时间自然流逝。
 
-`import kv` 不再提供统一 `--ttl`。导入只调用 `kv.restore_with_expiry`，由目标 Redis 的
+`import kv` 不再提供统一 `--ttl`。导入只调用
+`kv.restore_with_expiry_budgeted`，由目标 Redis 的
 `TIME` 在同一个 Lua 操作中判断 deadline：已过期或刚好到期返回 `expired_skipped` 且完全
 不执行 SET；未来 deadline 使用剩余毫秒执行 `SET PX [NX]`；persistent 使用
 `SET [NX]`。因此不会重新开始旧 PTTL，也不会短暂复活已经过期的 key。跨 Redis 实例迁移
@@ -618,6 +645,75 @@ dbtool --dsn "$PROMETHEUS_DSN" --limit 5000 --max-bytes 8388608 \
 
 CLI mock 服务测试会核对发给 Prometheus 的秒级 `start/end`；Prometheus 2.55.1 Docker
 实测会写入两个带标签和精确时间戳的样本，再用相对窗口和显式 epoch-ms 窗口逐值读回；另外分别验证 series 截断、sample 截断和小字节预算失败。当前 registry 的公共 `TimeSeriesStore` 实现只有 Prometheus；TimescaleDB 走 SQL 协议，InfluxDB/VictoriaMetrics/QuestDB 尚未注册，因此不将它们写成本接口的实测 PASS。Prometheus 不提供通用 series delete API；测试以唯一 metric namespace 和一次性 Docker volume/retention 完成隔离与清理。
+
+## 通用 mutation 输入信封与结果范式
+
+SQL/CQL execute、KV 写入、Document 写入、Search 写入和 Prometheus remote
+write 只由独立 exact operation 授权。CLI 复用三个全局参数构造同一份
+`InputBudget`：
+
+- `--limit` → `max_items`，限制一个批次的逻辑行、文档、键、参数或点数量；
+- `--max-item-bytes` → `max_item_bytes`，限制每个完整逻辑项；
+- `--max-bytes` → `max_batch_bytes`，限制包含 target、字段名和分隔符的完整请求。
+
+CLI 默认分别为 100、8 MiB 和 8 MiB；嵌入式 `InputBudget::default()` 的默认 item
+上限为 1,000。core 绝对上限为 100,000 items、16 MiB
+单项和 16 MiB 完整请求。零值或超过硬上限在解析 DSN/创建连接前返回
+`CONFIG_ERROR`。恰好 N bytes 可通过，N-1 返回稳定
+`INPUT_BUDGET_EXCEEDED`，并保证还没有开始远端 mutation：
+
+```bash
+dbtool --dsn "$POSTGRES_DSN" --allow-write \
+  --limit 100 --max-item-bytes 1048576 --max-bytes 8388608 \
+  sql exec 'UPDATE jobs SET state=$1 WHERE id=$2' \
+  --params '["done",42]'
+
+dbtool --dsn "$MONGO_DSN" --allow-write \
+  --limit 100 --max-item-bytes 1048576 --max-bytes 8388608 \
+  doc insert jobs '{"_id":42,"state":"created"}'
+```
+
+CLI 必须在连接前用 `InputLimiter` 计入完整请求，adapter 在首个写入前重复
+校验并追加协议固定边界；不能只检查 payload 而漏掉 table/key/collection/index/
+document ID/filter/update/options。嵌入式调用方采用相同顺序：
+
+```rust
+let budget = InputBudget::new(100, 1024 * 1024, 8 * 1024 * 1024)?;
+InputLimiter::new(budget, "application document insert")?
+    .validate_items_with_request(&documents, &serde_json::json!({
+        "collection": collection,
+        "documents": &documents,
+    }))?;
+require_operation(&connector, CapabilityOperation::DocumentInsertBudgeted)?;
+let result = connector
+    .as_document()
+    .ok_or(/* UNSUPPORTED_CAPABILITY */)?
+    .insert_budgeted(collection, documents, budget)
+    .await?;
+```
+
+exact operation 完整集合为：
+
+| 协议族 | exact mutation |
+| --- | --- |
+| SQL | `sql.execute_budgeted`, `sql.insert_rows_atomic_budgeted` |
+| CQL | `cql.execute_budgeted` |
+| KV | `kv.set_budgeted`, `kv.restore_with_expiry_budgeted`, `kv.delete_budgeted`, `kv.raw_command_io_budgeted` |
+| Document | `document.insert_budgeted`, `document.update_one_budgeted`, `document.update_many_budgeted`, `document.delete_one_budgeted`, `document.delete_many_budgeted`, `document.aggregate_write_budgeted`, `document.drop_collection_budgeted` |
+| Search | `search.index_doc_budgeted`, `search.put_doc_budgeted`, `search.update_doc_budgeted`, `search.delete_doc_budgeted`, `search.delete_index_budgeted` |
+| TimeSeries | `time_series.write_points_budgeted` |
+
+SQL atomic import 在一次事务成功 commit 后才报告 `atomic=true`；Mongo ordered
+insert、KV 多键导入、Search、Prometheus 等没有跨请求公共事务，必须按实际语义报告
+`atomic=false` 或 per-entry atomic，不能把“全部输入已预检”误写成“远端批次原子”。
+一旦首次写入、commit、broker/HTTP/driver dispatch 可能到达远端，后续连接、超时、
+响应大小、状态码或解析失败统一返回非重试 `OUTCOME_INDETERMINATE`。CLI 的 outer
+request/deadline timeout 对 SQL/CQL、KV mutation、Document mutation、import、Search、
+TS write、MQ produce/delete 以及会 ACK/commit 的 consume 使用相同语义；纯只读路径仍返回
+普通 `TIMEOUT`。调用方必须查询目标状态或使用业务幂等键后再决定补偿。
+
+每个真实产品的 N/N-1、完整 CRUD/readback 和零残留记录见
+[`mutation-input-budgets.md`](test-evidence/mutation-input-budgets.md)。
 
 ## Messaging / Kafka 字段范式
 

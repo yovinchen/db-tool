@@ -32,6 +32,34 @@ complete content/deletion verification, and public export/import all passed. The
 KV v3 refresh additionally proved per-key absolute-expiry preservation, expired
 skip without SET, no TTL extension, and expiry-bound replacement confirmation.
 
+## IF-T78 exact mutation refresh
+
+Run at (UTC): 2026-07-16T12:13:31Z
+
+`redis_live_budgeted_kv_mutations_reject_before_write_and_round_trip` passed
+1/1 against Redis 7.4.9. The adapter advertised exact SET, lifetime restore,
+DEL, and raw mutation request/response operations. N-1 SET/restore/raw and N+1
+DEL returned `INPUT_BUDGET_EXCEEDED` while all corresponding keys remained
+absent or unchanged. Exact operations preserved binary bytes, persistent
+lifetime, NX condition results, two-key delete counts, raw `OK`, and raw value
+readback. A one-byte raw response budget failed after SET as
+`OUTCOME_INDETERMINATE`, and direct bounded read proved the value existed.
+Final exact DEL removed every test key and the unique prefix scan was empty.
+
+IF-T78 fixture resource operations:
+
+| Resource | Create | Insert/write | Read all fixture data | Update/overwrite | Targeted delete | Metadata/admin | Guard | Limit/timeout | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| accepted key group `dbtool_it_input_<suffix>:{set,restore,delete:one,delete:two,raw,raw-response}` | six isolated keys created by exact SET/restore, direct delete fixtures, and raw SET PASS | binary SET, persistent restore, two raw SETs and two direct delete fixtures PASS | exact binary `00 ff 5a`, `restored`, `raw-value`, and post-response-budget value read back PASS | NX restore replacement rejected and original preserved PASS | exact two-key DEL returned 2; final six-key DEL and prefix scan empty PASS | persistent restore semantics and exact operation advertisement PASS | request N-1/N+1 rejected without changing matching state; raw response overflow marked `OUTCOME_INDETERMINATE` PASS | exact item/batch and raw response budgets exercised PASS | final prefix scan returned 0 keys PASS |
+| rejected preflight attempts on `dbtool_it_input_<suffix>:{set,restore,raw,delete:*}` | N-1 SET/restore/raw created 0/3 keys PASS | rejected before Redis command PASS | absent keys remained absent; both delete fixtures remained readable PASS | N/A | N+1 two-key DEL removed 0/2 PASS | prefix remained limited to accepted/direct fixtures PASS | `INPUT_BUDGET_EXCEEDED` PASS | N-1 byte and N+1 item envelopes rejected PASS | no separate rejected resource remained |
+
+Verification: adapter-redis 53/53 PASS; Redis Docker exact KV mutation 1/1
+PASS; strict Clippy, rustfmt, and diff check PASS. Implementation commit:
+`cfbb998`. Valkey/KeyDB/Dragonfly share this implementation but were not rerun
+for IF-T78, so their earlier complete compatibility evidence is not rewritten
+as a new live pass.
+
 Cleanup: PASS
 
-Commits: `974886f`, `561ea93`, `bea6bed`, `74a4907`, `19a3527`, `1ceffc8`, `2dd5590`, IF-T57, IF-T62, IF-T64
+Commits: `974886f`, `561ea93`, `bea6bed`, `74a4907`, `19a3527`, `1ceffc8`,
+`2dd5590`, `cfbb998`, IF-T57/IF-T62/IF-T64/IF-T78

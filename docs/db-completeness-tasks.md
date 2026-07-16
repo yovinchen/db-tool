@@ -34,8 +34,8 @@ successful service run are intentionally different states.
 | SQL | ping/caps, schemas/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/index metadata, typed values, limit/truncation, bound-parameter import with whole-batch rollback where advertised, write guard/confirm, cleanup |
 | CQL | ping/caps, keyspaces/tables, CREATE, INSERT, SELECT, UPDATE, targeted DELETE, schema/primary-key metadata, typed values, limit, write guard, cleanup |
 | KV/cache | ping/caps, text/binary/empty SET+GET, missing distinction, overwrite, TTL, exact N/N+1 SCAN, multi-page/error propagation, bounded typed raw read, confirmed allowlisted raw mutation, forbidden/unknown rejection, DELETE, post-delete read, cleanup |
-| Document | ping/caps with explicit one/many operations, collections, INSERT, FIND, single UPDATE/DELETE, confirmed multi UPDATE/DELETE with exact counts, aggregate, empty result verification, cleanup |
-| Search | ping/caps, write guard, index document, list indices, search/readback; update/delete are recorded `UNSUPPORTED` until the public capability exposes them |
+| Document | ping/caps with explicit one/many operations, collections, INSERT, FIND, single UPDATE/DELETE, confirmed multi UPDATE/DELETE with exact counts, read aggregate, exact confirmed `$out/$merge`, empty result verification, cleanup |
+| Search | ping/caps, write guard, exact auto-ID/stable-ID writes, list indices, search/get readback, patch update, document delete, target-bound index delete, and zero-index cleanup |
 | Time series | ping/caps, write guard, remote write, measurement list, range readback; update/delete are not applicable to the Prometheus model |
 | Messaging | ping/caps, write guard, produce/publish, bounded consume, list/detail/lag where the protocol supports them, timeout/ack behavior, cleanup where the public API supports it |
 
@@ -48,29 +48,29 @@ and test-hardening commits remain listed inside each evidence file.
 
 | Task | Family | Product / scheme | Environment | Harness | Live result | Evidence | Commit / boundary |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| DB-SQLITE-001 | SQL | SQLite `sqlite:` | service-free | Ready | COMPLETE | `docs/test-evidence/sqlite.md` | `d6bd18b`, IF-T58 atomic import refresh |
-| DB-POSTGRES-001 | SQL | PostgreSQL `postgres://` | Docker base | Ready | COMPLETE | `docs/test-evidence/postgresql.md` | `fe7cfb9`, IF-T58 atomic import refresh |
-| DB-MYSQL-001 | SQL | MySQL `mysql://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mysql.md` | `fe7cfb9`, IF-T58 atomic/MyISAM refresh |
+| DB-SQLITE-001 | SQL | SQLite `sqlite:` | service-free | Ready | COMPLETE | `docs/test-evidence/sqlite.md` | `a6e60c5`, IF-T78 exact mutation refresh |
+| DB-POSTGRES-001 | SQL | PostgreSQL `postgres://` | Docker base | Ready | COMPLETE | `docs/test-evidence/postgresql.md` | `a6e60c5`, IF-T78 exact mutation refresh |
+| DB-MYSQL-001 | SQL | MySQL `mysql://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mysql.md` | `a6e60c5`, IF-T78 exact mutation refresh |
 | DB-MARIADB-001 | SQL | MariaDB `mariadb://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/mariadb.md` | `6f423fb` |
 | DB-TIDB-001 | SQL | TiDB `tidb://` | Docker tidb | Ready | COMPLETE | `docs/test-evidence/tidb.md` | `4c2faa8`; basic, secure, transfer, TiProxy, SQL/PD resilience, TiKV boundary, and cold cert regeneration passed |
 | DB-COCKROACH-001 | SQL | CockroachDB `cockroach://` | Docker pg-compat | Ready | COMPLETE | `docs/test-evidence/cockroachdb.md` | `a776d20`; single-node insecure SQL surface |
 | DB-TIMESCALE-001 | SQL | TimescaleDB `timescale://` | Docker pg-compat | Ready | COMPLETE | `docs/test-evidence/timescaledb.md` | `c2a77fe`; generic SQL surface only |
-| DB-SQLSERVER-001 | SQL | SQL Server `sqlserver://` | Docker sqlserver | Ready | BLOCKED | - | local host is arm64; image gate requires x86_64 |
+| DB-SQLSERVER-001 | SQL | SQL Server `sqlserver://` | Docker sqlserver | Ready | BLOCKED | - | `325aa3c` exact execute service-free PASS; local host is arm64 and image gate requires x86_64 |
 | DB-REDSHIFT-001 | SQL | Redshift `redshift://` | external | Ready | EXTERNAL | - | `DBTOOL_IT_REDSHIFT_DSN` is not supplied |
-| DB-CASSANDRA-001 | CQL | Cassandra `cassandra://` | Docker cassandra | Ready | COMPLETE | `docs/test-evidence/cassandra.md` | `f3712b3`; SQL/CQL CRUD, types, full fixture, safety, limit, metadata, and cleanup passed |
+| DB-CASSANDRA-001 | CQL | Cassandra `cassandra://` | Docker cassandra | Ready | COMPLETE | `docs/test-evidence/cassandra.md` | `6fcd23c`, `94f3ffb`, IF-T78 exact CQL + SQL-compatible write/keyspace cleanup refresh |
 | DB-SCYLLA-001 | CQL | ScyllaDB `scylla://` | compatible alias only | Ready | PARTIAL | - | no real ScyllaDB product profile |
-| DB-DB2-001 | SQL/Db2 | IBM Db2 `db2://` | Docker db2 + host ODBC | Ready | BLOCKED | - | IBM Db2 ODBC driver is not registered on the host |
-| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | `1ceffc8`, `2dd5590`, IF-T57/IF-T62/IF-T64; binary/raw/SCAN plus v3 absolute-expiry artifact lifecycle and cleanup refreshed |
+| DB-DB2-001 | SQL/Db2 | IBM Db2 `db2://` | Docker db2 + host ODBC | Ready | BLOCKED | - | `b89f222` exact execute service-free PASS; IBM Db2 ODBC driver is not registered on the host |
+| DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | `cfbb998`, IF-T78 exact SET/restore/DEL/raw mutation refresh |
 | DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | `1ceffc8`, `29b3126`, IF-T64; atomic NX+TTL and v3 absolute-expiry artifact lifecycle refreshed |
 | DB-KEYDB-001 | KV/cache | KeyDB `keydb://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/keydb.md` | `1ceffc8`, `29b3126`, IF-T64; atomic NX+TTL and v3 absolute-expiry artifact lifecycle refreshed |
 | DB-DRAGONFLY-001 | KV/cache | Dragonfly `dragonfly://` | Docker compat-extra | Ready | COMPLETE | `docs/test-evidence/dragonfly.md` | `1ceffc8`, `29b3126`, IF-T64; integer `TIME` compatibility and v3 absolute-expiry artifact lifecycle refreshed |
-| DB-MONGO-001 | Document | MongoDB `mongodb://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mongodb.md` | `fe7cfb9`, IF-T61; explicit one/many counts, confirmation binding and zero collection residual |
-| DB-OPENSEARCH-001 | Search | OpenSearch `opensearch://` | Docker observability | Ready | COMPLETE | `docs/test-evidence/opensearch.md` | IF-T45; auto/stable ID writes, get/update/delete, aggregation, confirmed delete-index, zero residual test indices |
-| DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | COMPLETE | `docs/test-evidence/opensearch-security.md` | `b9dd9fd`; real plugin, CA/auth positive and negative checks |
-| DB-ELASTICSEARCH-001 | Search | Elasticsearch `elasticsearch://` | Docker elasticsearch | Ready | COMPLETE | `docs/test-evidence/elasticsearch.md` | IF-T45; full document/index CRUD and aggregation on 8.15.5; product-native HTTPS not covered |
-| DB-PROMETHEUS-001 | Time series | Prometheus `prometheus://` | Docker observability | Ready | COMPLETE | `docs/test-evidence/prometheus.md` | `b9dd9fd`; exact remote-write/readback/global-limit run |
+| DB-MONGO-001 | Document | MongoDB `mongodb://` | Docker base | Ready | COMPLETE | `docs/test-evidence/mongodb.md` | `83db841`, `ab06b88`, IF-T78 seven exact mutations including `$out/$merge` and zero collection residual |
+| DB-OPENSEARCH-001 | Search | OpenSearch `opensearch://` | Docker observability | Ready | COMPLETE | `docs/test-evidence/opensearch.md` | `3822948`, `4b6b6e2`, IF-T78 five exact mutations, every fixture document read back, zero test indices |
+| DB-OPENSEARCH-TLS-001 | Search | OpenSearch security HTTPS | Docker opensearch-security | Ready | COMPLETE | `docs/test-evidence/opensearch-security.md` | `b9dd9fd`; real plugin CA/auth checks passed previously; IF-T78 exact mutations were not rerun over HTTPS |
+| DB-ELASTICSEARCH-001 | Search | Elasticsearch `elasticsearch://` | Docker elasticsearch | Ready | COMPLETE | `docs/test-evidence/elasticsearch.md` | `3822948`, `4b6b6e2`, IF-T78 five exact mutations and every fixture document readback; product-native HTTPS not covered |
+| DB-PROMETHEUS-001 | Time series | Prometheus `prometheus://` | Docker observability | Ready | COMPLETE | `docs/test-evidence/prometheus.md` | `3c9c2d4`, IF-T78 exact remote-write and zero-series cleanup refresh |
 | DB-REDIS-MQ-001 | Messaging | Redis Streams/PubSub | Docker messaging | Ready | COMPLETE | `docs/test-evidence/redis-messaging.md` | `d2c88a2`, IF-T48; Redis/Valkey/KeyDB/Dragonfly group replay/XACK matrix, truthful lag negotiation and zero residual Streams passed |
-| DB-KAFKA-001 | Messaging | Kafka API on Redpanda | Docker messaging | Ready | COMPLETE | `docs/test-evidence/kafka-redpanda.md` | `d2c88a2`; pure/native and `kafka://`/`redpanda://`; lag/delete unsupported |
+| DB-KAFKA-001 | Messaging | Kafka API on Redpanda | Docker messaging | Ready | COMPLETE | `docs/test-evidence/kafka-redpanda.md` | `d2c88a2`, `de6b79e`; pure lag `UNSUPPORTED_CAPABILITY`, native committed-offset lag PASS, public topic delete/absence PASS |
 | DB-RABBITMQ-001 | Messaging | AMQP + RabbitMQ management | Docker messaging | Ready | COMPLETE | `docs/test-evidence/rabbitmq.md` | `d2c88a2`, IF-T47/IF-T59; confirms, ACKs, exact detail, conditional delete and zero residual queues passed |
 | DB-NATS-001 | Messaging | NATS Core + JetStream | Docker messaging | Ready | COMPLETE | `docs/test-evidence/nats.md` | `d2c88a2`; Core ephemeral and JetStream delete verified |
 | DB-MQ-TLS-001 | Messaging | AMQPS + NATS TLS | Docker messaging-tls | Ready | COMPLETE | `docs/test-evidence/messaging-tls.md` | `d2c88a2`; regenerated CA-backed TLS passed |

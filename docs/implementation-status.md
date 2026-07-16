@@ -11,16 +11,16 @@ usable.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Core contracts | Implemented | `Connector`, capability traits, shared models, registry, DSN parsing, redaction, protocol aliases, backward-compatible `CapabilityReport`, and stable method-level operation names are in place. Message production has an exact caller-owned `ProduceBudget` and stable input/outcome error contracts. |
+| Core contracts | Implemented | `Connector`, capability traits, shared models, registry, DSN parsing, redaction, protocol aliases, backward-compatible `CapabilityReport`, and stable method-level operation names are in place. Reads use family-specific finite envelopes; 20 SQL/CQL/KV/Document/Search/TimeSeries mutations share caller-owned `InputBudget/InputLimiter`; message production uses `ProduceBudget`. All 64 superseded unbounded/item-only APIs name an exact replacement, remain compatible through `0.1.x`, and are removable no earlier than `0.2.0`. |
 | Embedded library path | Implemented | `dbtool-registry` has a service-free embedded smoke that builds the registry directly, reuses a connection through `ConnectionManager`, checks exact operations before capability accessors, applies `SafetyGuard`, and runs SQL under `FlowControl` without spawning the CLI. |
-| CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `cql`, `db2`, `kv`, `doc`, `mq`, `search`, `ts`, `export`, and `import` command families exist. Every data method negotiates its exact operation before taking an accessor, and help describes safety boundaries, JSON inputs, bounded reads, and examples. |
+| CLI | Implemented | `ping`, `caps`, `conn`, `sql`, `cql`, `db2`, `kv`, `doc`, `mq`, `search`, `ts`, `export`, and `import` command families exist. Every data method negotiates its exact operation before taking an accessor; mutation inputs apply `--limit`, `--max-item-bytes`, and `--max-bytes` before DSN resolution; help and the Chinese usage guide describe safety, JSON, read/write envelopes, and examples. |
 | Output formats | Implemented | JSON is the default. `--format table` and `--format ndjson` are implemented for successful command output; errors always stay JSON so `error.code` and confirmation tokens remain machine-readable. |
 | SQL safety | Implemented | Query ASTs are recursively classified; data-modifying CTEs fail closed, `SELECT INTO` is destructive, locking SELECT is a write, all writes need `--allow-write`, and destructive SQL additionally needs a target-bound confirm token. Database least-privilege roles remain the final boundary for side-effectful vendor functions. |
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`, then apply CLI overrides such as `--rate`, `--request-timeout`, and `--deadline`; CLI execution uses the one-shot path so writes are not replayed. Message-produce execution timeout is conservatively non-retryable `OUTCOME_INDETERMINATE`, while pre-execution admission errors keep their ordinary codes. |
 | Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, observability, OpenSearch security-plugin TLS, and product-native Elasticsearch profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; feature-matrix gates prove minimal/default/portable/full/full-native composition and pure/native Kafka exclusivity; live Docker jobs are manual workflow inputs. |
 | Release artifacts | Implemented | Tags must equal the Cargo workspace version. Six-platform `portable` binaries contain every self-contained adapter while excluding host-ODBC Db2 and native Kafka; archive/npm/wheel packaging accepts only target-specific binaries, preflights every selected target before writing output, includes generated completions/manpage, enforces executable permissions, install-smokes the host package, and attaches all artifacts to GitHub Release. |
-| TUI | Implemented | Connection picker, exact-operation command dispatch, read limits, AST-based SQL write classification, readonly/one-shot confirmation, command history, per-capability forms, and RAII terminal restoration are covered by smoke and failure-path tests. |
+| TUI | Implemented | Connection picker, exact-operation command dispatch, finite read and mutation envelopes, AST-based SQL write classification, readonly/one-shot confirmation, command history, per-capability forms, and RAII terminal restoration are covered by smoke and failure-path tests. |
 
 ## Usable Database And Protocol Matrix
 
@@ -50,7 +50,7 @@ usable.
 | Valkey | `valkey://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Real Valkey compatibility live test |
 | KeyDB | `keydb://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Optional real KeyDB live test with `DBTOOL_IT_COMPAT_EXTRA=1` |
 | Dragonfly | `dragonfly://` | Redis | Redis-compatible KV lifecycle, TTL, raw write guard | Optional real Dragonfly live test with `DBTOOL_IT_COMPAT_EXTRA=1` |
-| MongoDB | `mongodb://` | MongoDB | collections, find（skip/sort/projection）, insert, explicit update-one/update-many/delete-one/delete-many, bounded aggregate, drop collection | MongoDB 7 Docker exact-cardinality lifecycle, target/content-bound bulk confirmation, and zero-residual cleanup |
+| MongoDB | `mongodb://` | MongoDB | collections, find（skip/sort/projection）, insert, explicit update-one/update-many/delete-one/delete-many, bounded read aggregate, exact confirmed `$out/$merge`, drop collection | MongoDB 7 Docker exact-cardinality CRUD, aggregate-write source/target readback, target/content-bound confirmation, and zero-residual cleanup |
 | Kafka | `kafka://` | Kafka | ping, exact budgeted produce/consume with key, headers, partition, offset/timestamp/cursor, topics, detail/watermarks, confirmed topic delete; pure backend lag explicitly unsupported | Redpanda pure field-fidelity, producer N/N-1 no-topic/readback/cleanup, cursor replay and deletion live tests |
 | Kafka native | `kafka://` with `full-native` | Kafka | librdkafka-backed exact budgeted production, field-fidelity/cursor stateless consume, dynamic group subscription, explicit ack-none replay or whole-batch on-success offset commit, topics/detail/delete, and real committed-offset lag; ephemeral calls reject static member identity | Native two-message producer N/N-1 no-topic/lag/cleanup, two-partition replay/commit/zero-lag/delete lifecycle, and field fidelity passed against Redpanda |
 | Redpanda | `redpanda://` | Kafka | Kafka-compatible field-fidelity lifecycle through product-named scheme | Real Redpanda pure/native live tests |
@@ -132,20 +132,15 @@ the stated dbtool objective.
 
 ## Active Verification Work
 
-Top-level catalog item bounds and exact method negotiation are complete. The
-read-envelope audit is tracked as IF-T67 through IF-T75 in
-`docs/interface-completion-tasks.zh-CN.md`. Nested schema/topic metadata,
-recursive SQL/CQL result bytes, multi-document accumulation, message batch bytes
-before ACK, and Redis-compatible KV read envelopes are complete. Cross-platform
-artifact replacement is implemented but still awaits current-SHA Windows CI
-evidence. Catalog scalar bytes and MessageProducer input envelopes are closed
-across every registered first-party producer. General mutation input envelopes
-and the legacy unbounded API lifecycle remain open. Structured time-series
-budgets, Search complete read envelopes, and bounded local connection
-configuration are closed.
-A bounded top-level name or row count is not evidence that nested values are
-bounded. IF-T51 remains open until the final all-feature compile, test, and
-packaging pass.
+Top-level and nested catalogs, recursive read envelopes, structured time-series
+budgets, Search complete responses, message consume/produce batches, bounded
+local configuration, and all 20 non-messaging mutation input envelopes are
+closed. The 64-method legacy API lifecycle is also closed: every first-party
+production target passes a workspace compile with deprecated calls denied.
+Cross-platform artifact replacement is implemented but still awaits the
+current-SHA Windows x64 runtime and arm64 compile/link evidence. IF-T51 remains
+open until the final local all-feature compile/test/package pass is recorded and
+the six-platform CI matrix succeeds; IF-T52 remains an external-product gate.
 
 Real-product completeness is tracked separately in
 `docs/db-completeness-tasks.md`. A connector or test script being present does
@@ -175,4 +170,6 @@ cannot mask another:
 - `docs/test-evidence/messaging-bounded-catalogs.md`
 - `docs/test-evidence/catalog-scalar-byte-budgets.md`
 - `docs/test-evidence/message-produce-input-budgets.md`
+- `docs/test-evidence/mutation-input-budgets.md`
+- `docs/test-evidence/legacy-api-lifecycle.md`
 - `docs/test-evidence/kv-read-envelopes.md`

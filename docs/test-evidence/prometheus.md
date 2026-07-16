@@ -45,14 +45,43 @@ zero budgets and probe overflow.
 
 Prometheus 2.55.1 Docker validation passed exact measurement item/byte
 boundaries and operation declaration. The measurement fixture is written under
-a unique per-run metric name; Prometheus exposes no generic immediate series
-delete API, so cleanup is the disposable Compose TSDB volume with one-hour
-retention. The independent raw HTTP JSON transport ceiling remains 16 MiB
-because its protocol wrapper is not the caller-visible catalog envelope.
+a unique per-run metric name. The independent raw HTTP JSON transport ceiling
+remains 16 MiB because its protocol wrapper is not the caller-visible catalog
+envelope.
 
 Verification: `cargo test -p adapter-timeseries` 26/26 PASS; strict all-target
 Clippy, rustfmt and diff check PASS; Prometheus live exact catalog 1/1 PASS.
 
-Cleanup: PASS by disposable Docker teardown; public series deletion is N/A
+## IF-T78 exact remote-write refresh
 
-Commits: `7a6bbdd`, `932655d`, `b9dd9fd`, `167f89f`, `73b8180`, IF-T73 caller/docs commit
+Run at (UTC): 2026-07-16T12:13:31Z
+
+`prometheus_live_budgeted_write_rejects_before_send_and_cleans_series` passed
+1/1 against Prometheus 2.55.1. N-1 complete-request bytes and N+1 point count
+returned `INPUT_BUDGET_EXCEEDED`; the explicit range query contained zero
+series afterward. The exact two-point batch produced two independently tagged
+series and both were read back. Metric/label syntax, non-empty fields, reserved
+`__name__`, compact JSON, protobuf, and Snappy body limits are checked before
+TCP connect. All failures after request bytes may be written are
+`OUTCOME_INDETERMINATE`.
+
+The integration-only Compose profile now enables Prometheus's admin API so the
+test can delete its unique series and clean tombstones. Final range polling was
+empty. This is cleanup evidence, not a new portable `TimeSeriesStore` delete
+capability; update/delete remain N/A for the append/query model.
+
+IF-T78 fixture resource operations:
+
+| Resource | Create | Insert/write | Read all fixture data | Update/overwrite | Targeted delete | Metadata/admin | Guard | Limit/timeout | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| accepted metric `dbtool_it_ts_input_<pid>_<epoch-ms>` with series `slot=one,two` | N/A; Prometheus series appear on append | exact remote write 2/2 points PASS | expected/actual 2/2 series; stable labels `slot=one`,`slot=two`; value `1.0` at the shared timestamp PASS | N/A for append-only portable model | N/A in public API | N/A in focused IF-T78; measurement catalog covered by the earlier IF-T74 run | complete metric/label/field/request validation before TCP connect PASS | exact 2-item/batch envelope and bounded range polling PASS | integration-only admin delete plus tombstone cleanup; final range 0/0 series PASS |
+| rejected pre-write phase on the same metric/series | N/A | N-1 batch bytes and N+1 point count rejected; 0/2 points sent PASS | explicit range returned 0/0 series before accepted write PASS | N/A | N/A | N/A | `INPUT_BUDGET_EXCEEDED` before send PASS | N-1 bytes and max-items 1 both rejected PASS | no rejected series required cleanup |
+
+Verification: adapter-timeseries 30/30 PASS; Prometheus Docker exact write
+1/1 PASS; strict Clippy, rustfmt, Compose config, and diff check PASS.
+Implementation commit: `3c9c2d4`.
+
+Cleanup: PASS through integration admin delete-series/tombstone cleanup; public series deletion is N/A
+
+Commits: `7a6bbdd`, `932655d`, `b9dd9fd`, `167f89f`, `73b8180`, `3c9c2d4`,
+IF-T73/IF-T78

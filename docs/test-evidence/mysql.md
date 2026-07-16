@@ -28,6 +28,32 @@ lifecycle, write and confirmation guards, complete three-row fixture readback,
 public export/import, typed parameterized atomic rollback, and zero-write MyISAM
 rejection all passed.
 
+## IF-T78 exact mutation refresh
+
+Run at (UTC): 2026-07-16T12:13:31Z
+
+Focused Docker test
+`mysql_live_budgeted_mutation_crud_rejects_before_write_and_cleans_up` passed
+1/1. N-1 CREATE produced zero matching `information_schema.tables` rows. The
+unique InnoDB `dbtool_exact_*` table then completed exact CREATE, bound INSERT,
+UPDATE, late-row budget rejection with count still 1, two-row atomic INSERT
+with returned count 2, complete ordered readback, targeted DELETE, and DROP.
+The final catalog query proved both accepted and rejected test tables absent.
+MySQL statement/identifier/placeholder/value checks and InnoDB transaction
+validation occur before the first batch row is written; uncertain commit or
+rollback results are non-retryable.
+
+IF-T78 fixture resource operations:
+
+| Resource | Create | Insert/write | Read all fixture data | Update/overwrite | Targeted delete | Metadata/admin | Guard | Limit/timeout | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| accepted `dbtool_exact_<suffix>` InnoDB table | exact CREATE + PK PASS | bound INSERT 1/1 plus atomic INSERT 2/2 PASS | after targeted delete 2/2 rows; stable IDs `1,2`; ID 1 state `updated` PASS | ID 1 `created` to `updated` PASS | ID 3 removed; IDs `1,2` remained PASS | final `information_schema.tables` count 0 PASS | late oversized second row rejected before transaction; existing count stayed 1 PASS | exact statement/params/batch accepted; N-1 late-row envelope rejected PASS | DROP; accepted and rejected tables absent PASS |
+| rejected `dbtool_rejected_<suffix>` InnoDB table | N-1 CREATE rejected before pool/dispatch PASS | N/A | catalog count 0/0 PASS | N/A | N/A | `information_schema.tables` never contained table PASS | `INPUT_BUDGET_EXCEEDED` PASS | one-byte request envelope rejected PASS | N/A; resource was never created |
+
+Verification: shared adapter-sql 49/49 PASS; MySQL Docker exact mutation 1/1
+PASS; strict Clippy, rustfmt, and diff check PASS. Implementation commit:
+`a6e60c5`.
+
 Cleanup: PASS
 
-Commits: `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`, IF-T58
+Commits: `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`, `a6e60c5`, IF-T58/IF-T78

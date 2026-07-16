@@ -45,6 +45,42 @@ scans only N+1 server-side rows.
 Verification: `cargo test -p adapter-search` 37/37 PASS; strict all-target
 Clippy, rustfmt and diff check PASS; OpenSearch live exact catalog 1/1 PASS.
 
+## IF-T78 exact mutation refresh
+
+Run at (UTC): 2026-07-16T12:13:31Z
+
+The shared OpenSearch lifecycle now negotiates and executes all five exact
+mutation operations. N-1 put left the target index absent. Exact auto-ID index,
+stable-ID put, patch update and readback, document delete, search/get, and
+index delete passed. N-1 document delete preserved the generated document, and
+N-1 index delete preserved the complete index. The main and catalog-peer
+indices were then removed through exact delete-index; final catalog polling
+proved zero test indices. Target syntax, 255-byte index, 512-byte ID, complete
+portable request, JSON body, and 16 MiB transport ceilings are validated before
+HTTP request bytes; all later failures are outcome-indeterminate.
+
+IF-T78 fixture resource operations (plain HTTP product run only):
+
+| Resource | Create | Insert/write | Read all fixture data | Update/overwrite | Targeted delete | Metadata/admin | Guard | Limit/timeout | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| accepted main index `dbtool-it-budgeted-opensearch-<pid>-<suffix>` | auto-ID write created index PASS | generated document plus stable IDs `alice,bob,carol`, 4/4 writes PASS | after generated delete, expected/actual total 3/3; stable IDs `alice,bob,carol`; bounded page 2 and aggregation count 3 PASS | `alice` patch returned `updated` and exact get exposed updated source PASS | generated ID exact delete returned `deleted`; get returned null PASS | main and peer both visible in complete index catalog PASS | N-1 document delete preserved generated document; N-1 index delete preserved main index PASS | exact mutation inputs; catalog N/N+1 and byte N/N-1; search budget 2 PASS | target-bound exact delete-index acknowledged; final catalog excluded main PASS |
+| rejected preflight phase on main index | N-1 stable-ID put created no index PASS | rejected before HTTP send PASS | index catalog count 0/0 before accepted write PASS | N/A | N/A | main absent after rejected put PASS | `INPUT_BUDGET_EXCEEDED` PASS | N-1 complete request bytes rejected PASS | N/A; rejected phase created no resource |
+| accepted peer index `dbtool-it-budgeted-opensearch-<pid>-<suffix>-catalog-peer` | stable-ID put created index PASS | `catalog-probe` 1/1 PASS | exact get returned 1/1 stable ID with complete `product/purpose` payload PASS | N/A | N/A | peer and main both present in exact catalog PASS | exact mutation operation and target syntax enforced PASS | peer request exact; catalog limits shared with main PASS | target-bound exact delete-index acknowledged; final catalog excluded peer PASS |
+
+The OpenSearch security-plugin HTTPS profile was not rerun for IF-T78. Its
+earlier CA/auth evidence remains in `opensearch-security.md` and is not used to
+claim the five exact mutations passed over HTTPS.
+
+Peer readback follow-up (UTC): 2026-07-16T13:21:27Z. The exact lifecycle was
+rerun after adding a stable-ID `get_doc_budgeted` assertion for the catalog-peer
+index; the complete `product/purpose` source matched 1/1 before both indices
+were deleted, and final catalog absence still passed.
+
+Verification: adapter-search 40/40 PASS; OpenSearch Docker shared exact
+lifecycle 1/1 PASS; strict Clippy, rustfmt, and diff check PASS.
+Implementation commits: `3822948`, `4b6b6e2`.
+
 Cleanup: PASS through the public document delete and confirmed delete-index APIs; only OpenSearch system indices remained
 
-Commits: `2e93c35`, `7a6bbdd`, `926be55`, `932655d`, `b9dd9fd`, `dbe1f32`, `ce19cb4`, IF-T76 caller/docs commit
+Commits: `2e93c35`, `7a6bbdd`, `926be55`, `932655d`, `b9dd9fd`, `dbe1f32`,
+`ce19cb4`, `3822948`, `4b6b6e2`, IF-T76/IF-T78

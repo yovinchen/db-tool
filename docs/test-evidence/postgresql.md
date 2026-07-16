@@ -26,6 +26,33 @@ schema/table/index inspection, complete two-row CRUD lifecycle, write and
 confirmation guards, complete three-row fixture readback, public export/import,
 typed parameterized atomic insert and late-error whole-batch rollback all passed.
 
+## IF-T78 exact mutation refresh
+
+Run at (UTC): 2026-07-16T12:13:31Z
+
+Focused Docker test
+`postgres_live_budgeted_mutation_crud_rejects_before_write_and_cleans_up`
+passed 1/1. N-1 CREATE produced zero matching `information_schema.tables`
+rows. The unique `dbtool_exact_*` table then completed exact CREATE, bound
+INSERT, UPDATE, late-row budget rejection with count still 1, two-row atomic
+INSERT with returned count 2, complete ordered readback, targeted DELETE, and
+DROP. The final catalog query proved both accepted and rejected test tables
+absent. Statement, identifier, parameter, value-conversion, generated SQL, and
+every late row are checked before transaction access; ambiguous commit or
+rollback failures return `OUTCOME_INDETERMINATE`.
+
+IF-T78 fixture resource operations:
+
+| Resource | Create | Insert/write | Read all fixture data | Update/overwrite | Targeted delete | Metadata/admin | Guard | Limit/timeout | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| accepted `dbtool_exact_<suffix>` | exact CREATE + PK PASS | bound INSERT 1/1 plus atomic INSERT 2/2 PASS | after targeted delete 2/2 rows; stable IDs `1,2`; ID 1 state `updated` PASS | ID 1 `created` to `updated` PASS | ID 3 removed; IDs `1,2` remained PASS | final `information_schema.tables` count 0 PASS | late oversized second row rejected before transaction; existing count stayed 1 PASS | exact statement/params/batch accepted; N-1 late-row envelope rejected PASS | DROP; accepted and rejected tables absent PASS |
+| rejected `dbtool_rejected_<suffix>` | N-1 CREATE rejected before pool/dispatch PASS | N/A | catalog count 0/0 PASS | N/A | N/A | `information_schema.tables` never contained table PASS | `INPUT_BUDGET_EXCEEDED` PASS | one-byte request envelope rejected PASS | N/A; resource was never created |
+
+Verification: shared adapter-sql 49/49 PASS; PostgreSQL Docker exact mutation
+1/1 PASS; strict Clippy, rustfmt, and diff check PASS. Implementation commit:
+`a6e60c5`.
+
 Cleanup: PASS
 
-Commits: `642bfd9`, `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`, IF-T58
+Commits: `642bfd9`, `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`, `a6e60c5`,
+IF-T58/IF-T78

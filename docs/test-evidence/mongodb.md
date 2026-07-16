@@ -52,10 +52,54 @@ and charges its name; `batchSize=N+1` bounds that protocol cursor batch.
 Verification: `cargo test -p adapter-mongo` 15/15 PASS; strict all-target Clippy,
 rustfmt and diff check PASS; Docker live exact catalog 1/1 PASS.
 
+## IF-T78 exact mutation refresh
+
+Run at (UTC): 2026-07-16T12:13:31Z
+
+`mongo_live_budgeted_mutations_reject_before_write_and_clean_collection`
+passed 1/1 against MongoDB 7.0.37. The initial six exact CRUD/lifecycle write operations were
+advertised. N-1 insert did not create the unique collection. Exact insert
+created three fully read-back documents; update-one returned 1/1, update-many
+returned 3/3, delete-one returned 1, and delete-many returned 2. N-1
+update/delete/drop preserved the observed document or collection state. The
+exact drop removed the collection and the final catalog did not contain it.
+Preflight also covers namespace syntax/length, each native BSON document,
+write-operation BSON, the batch ceiling, and a conservative complete OP_MSG
+size before driver dispatch.
+
+Verification: adapter-mongo 18/18 PASS; MongoDB Docker six-operation exact
+lifecycle 1/1 PASS; strict Clippy, rustfmt, and diff check PASS.
+Implementation commit: `83db841`.
+
+Aggregate-write follow-up run (UTC): 2026-07-16T12:32:48Z. The separate
+`document.aggregate_write_budgeted` operation raises the exact mutation count
+to seven. Ordinary `aggregate_budgeted` and legacy read aggregation reject
+`$out/$merge` before driver dispatch. An N-1 complete-pipeline budget created
+no target; exact `$out` copied all three source documents, exact `$merge`
+reconciled the same three stable IDs, and both responses stayed inside an
+independent `ReadBudget`. The test then dropped the target and source and a
+direct final MongoDB catalog query returned no `dbtool_it_input_*` collection.
+Post-dispatch cursor, decoding, transport, and response-budget failures map to
+non-retryable `OUTCOME_INDETERMINATE`.
+
+IF-T78 fixture resource operations:
+
+| Resource | Create | Insert/write | Read all fixture data | Update/overwrite | Targeted delete | Metadata/admin | Guard | Limit/timeout | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| accepted source `dbtool_it_input_<suffix>` | implicit collection creation by exact insert PASS | 3/3 documents; stable `_id` values `1,2,3` PASS | 3/3 source documents accounted by `$out` and update-many; final source read 0/0 after deletes PASS | update-one 1/1 then update-many 3/3 PASS | delete-one 1 plus delete-many 2; total 3/3 PASS | collection catalog contained source after rejected drop and excluded it after exact drop PASS | seven exact operations advertised; read-only aggregate rejected `$out/$merge` PASS | exact document/pipeline/namespace/OP_MSG envelope PASS | exact public drop; final source catalog absence PASS |
+| rejected preflight phases on source `dbtool_it_input_<suffix>` | N-1 insert created no collection PASS | rejected 0/3 before dispatch PASS | N-1 update preserved `_id=1`; N-1 delete preserved it; N-1 drop preserved collection PASS | 0 unintended modifications PASS | 0 unintended deletes PASS | catalog state matched every preflight assertion PASS | `INPUT_BUDGET_EXCEEDED` PASS | N-1 complete request envelopes rejected PASS | no separate rejected collection remained |
+| accepted aggregate target `dbtool_it_input_<suffix>_archive` | exact `$out` created target PASS | `$out` copied 3/3 documents PASS | complete target find returned 3/3 stable IDs; `$merge` retained 3/3 PASS | exact `$merge` used replace/insert reconciliation PASS | N/A | target catalog present after `$out`, absent after exact public drop PASS | read aggregation could not execute write stage PASS | exact two-stage pipeline plus independent response budget PASS | exact public drop; final target catalog absence PASS |
+| rejected aggregate target phase `dbtool_it_input_<suffix>_archive` | N-1 `$out` created no target PASS | rejected before dispatch PASS | target catalog count 0/0 PASS | N/A | N/A | target absent before accepted `$out` PASS | mutating pipeline required `aggregate_write_budgeted` PASS | N-1 complete-pipeline bytes rejected PASS | N/A; target was never created by rejected phase |
+
+Follow-up verification: core 151/151 plus doctest; adapter-mongo 19/19; focused
+MongoDB Docker aggregate-write lifecycle 1/1; strict Clippy and rustdoc PASS.
+Implementation commit: `ab06b88`.
+
 Cleanup: PASS
 
 Lifecycle boundary: `DocumentStore.drop_collection` is now public. Connectors
 without collection lifecycle support must return `UNSUPPORTED_CAPABILITY`
 instead of silently succeeding.
 
-Commits: `1cd4ed4`, `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`, IF-T61
+Commits: `1cd4ed4`, `974886f`, `561ea93`, `bea6bed`, `fe7cfb9`, `83db841`,
+`ab06b88`, IF-T61/IF-T78

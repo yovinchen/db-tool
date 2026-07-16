@@ -42,6 +42,40 @@ constructed and observed. Product-native HTTPS remains outside this run.
 Verification: shared adapter-search 37/37 PASS; strict all-target Clippy,
 rustfmt and diff check PASS; Elasticsearch live exact catalog 1/1 PASS.
 
+## IF-T78 exact mutation refresh
+
+Run at (UTC): 2026-07-16T12:13:31Z
+
+Elasticsearch 8.15.5 ran the same five-operation exact mutation contract as
+OpenSearch. N-1 put did not create an index; exact auto-ID index, stable-ID put,
+patch update/readback and document delete passed. N-1 document delete left the
+document readable and N-1 index delete left the index visible. Exact cleanup
+deleted both unique indices and the final catalog excluded them. Request
+targets/body are fully checked before HTTP dispatch and post-send errors cannot
+be automatically retried.
+
+IF-T78 fixture resource operations (plain HTTP product run only):
+
+| Resource | Create | Insert/write | Read all fixture data | Update/overwrite | Targeted delete | Metadata/admin | Guard | Limit/timeout | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| accepted main index `dbtool-it-budgeted-elasticsearch-<pid>-<suffix>` | auto-ID write created index PASS | generated document plus stable IDs `alice,bob,carol`, 4/4 writes PASS | after generated delete, expected/actual total 3/3; stable IDs `alice,bob,carol`; bounded page 2 and aggregation count 3 PASS | `alice` patch returned `updated` and exact get exposed updated source PASS | generated ID exact delete returned `deleted`; get returned null PASS | main and peer both visible in complete index catalog PASS | N-1 document delete preserved generated document; N-1 index delete preserved main index PASS | exact mutation inputs; catalog N/N+1 and byte N/N-1; search budget 2 PASS | target-bound exact delete-index acknowledged; final catalog excluded main PASS |
+| rejected preflight phase on main index | N-1 stable-ID put created no index PASS | rejected before HTTP send PASS | index catalog count 0/0 before accepted write PASS | N/A | N/A | main absent after rejected put PASS | `INPUT_BUDGET_EXCEEDED` PASS | N-1 complete request bytes rejected PASS | N/A; rejected phase created no resource |
+| accepted peer index `dbtool-it-budgeted-elasticsearch-<pid>-<suffix>-catalog-peer` | stable-ID put created index PASS | `catalog-probe` 1/1 PASS | exact get returned 1/1 stable ID with complete `product/purpose` payload PASS | N/A | N/A | peer and main both present in exact catalog PASS | exact mutation operation and target syntax enforced PASS | peer request exact; catalog limits shared with main PASS | target-bound exact delete-index acknowledged; final catalog excluded peer PASS |
+
+Product-native Elasticsearch HTTPS was not run in this campaign; the IF-T78
+claim is limited to the disposable security-disabled HTTP profile.
+
+Peer readback follow-up (UTC): 2026-07-16T13:21:27Z. The exact lifecycle was
+rerun after adding a stable-ID `get_doc_budgeted` assertion for the catalog-peer
+index; the complete `product/purpose` source matched 1/1 before both indices
+were deleted, and final catalog absence still passed.
+
+Verification: shared adapter-search 40/40 PASS; Elasticsearch Docker shared
+exact lifecycle 1/1 PASS; strict Clippy, rustfmt, and diff check PASS.
+Implementation commits: `3822948`, `4b6b6e2`. Product-native HTTPS remains outside this
+focused run.
+
 Cleanup: PASS through public document delete and target-bound delete-index before container teardown
 
-Commits: `2e93c35`, `932655d`, `b9dd9fd`, `dbe1f32`, `ce19cb4`, IF-T76 caller/docs commit
+Commits: `2e93c35`, `932655d`, `b9dd9fd`, `dbe1f32`, `ce19cb4`, `3822948`, `4b6b6e2`,
+IF-T76/IF-T78
