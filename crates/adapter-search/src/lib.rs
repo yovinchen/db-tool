@@ -2666,13 +2666,28 @@ mod tests {
                 .put_doc_budgeted(
                     &catalog_peer,
                     "catalog-probe",
-                    Value::Json(peer_document),
+                    Value::Json(peer_document.clone()),
                     exact_budget(&peer_input),
                 )
                 .await?;
             if peer_outcome.result != "created" {
                 return Err(Error::Internal(format!(
                     "unexpected {product} catalog peer outcome: {peer_outcome:?}"
+                )));
+            }
+            let peer_readback = adapter
+                .get_doc_budgeted(
+                    &catalog_peer,
+                    "catalog-probe",
+                    ReadBudget::new(1, MAX_HTTP_RESPONSE_BODY_BYTES)?,
+                )
+                .await?
+                .ok_or_else(|| Error::Query(format!("{product} lost the catalog peer fixture")))?;
+            if peer_readback.id != "catalog-probe"
+                || peer_readback.source.as_ref() != Some(&peer_document)
+            {
+                return Err(Error::Internal(format!(
+                    "{product} catalog peer readback was incomplete: {peer_readback:?}"
                 )));
             }
 
