@@ -138,8 +138,9 @@ read-envelope audit is tracked as IF-T67 through IF-T75 in
 recursive SQL/CQL result bytes, multi-document accumulation, message batch bytes
 before ACK, and Redis-compatible KV read envelopes are complete. Cross-platform
 artifact replacement is implemented but still awaits current-SHA Windows CI
-evidence. Structured time-series budgets, catalog scalar bytes, and the legacy
-unbounded API lifecycle remain open.
+evidence. Structured time-series budgets, catalog scalar bytes, Search complete
+read envelopes, producer/general mutation input envelopes, bounded local
+connection configuration, and the legacy unbounded API lifecycle remain open.
 A bounded top-level name or row count is not evidence that nested values are
 bounded. IF-T51 remains open until the final all-feature compile, test, and
 packaging pass.
