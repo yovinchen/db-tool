@@ -1,7 +1,7 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{BoundedList, IndexInfo, Value},
+    model::{BoundedList, IndexInfo, ReadBudget, Value},
     port::{
         capability::{
             SearchDeleteIndexOutcome, SearchDocument, SearchEngine, SearchHits, SearchOptions,
@@ -9,7 +9,7 @@ use dbtool_core::{
         },
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::ListLimiter,
+    service::{ListLimiter, SearchReadLimiter},
 };
 use futures::future::BoxFuture;
 use rustls::{ClientConfig, RootCertStore};
@@ -119,6 +119,30 @@ impl SearchEngine for SearchAdapter {
         search_hits_from_response(&response)
     }
 
+    async fn search_budgeted(
+        &self,
+        index: &str,
+        query: Value,
+        options: SearchOptions,
+        budget: ReadBudget,
+    ) -> Result<SearchHits> {
+        let budget = budget.validate()?;
+        validate_resource(index, "index")?;
+        let limiter = SearchReadLimiter::new(budget, "search response")?;
+        let body = budgeted_search_body(query, options, limiter.max_items())?;
+        let response = self
+            .client
+            .request_json_budgeted(
+                "POST",
+                &format!("/{}/_search", percent_encode_path_segment(index)),
+                Some(&body),
+                budget,
+                "search response transport",
+            )
+            .await?;
+        limiter.apply(search_hits_from_response(&response)?)
+    }
+
     async fn index_doc(&self, index: &str, doc: Value) -> Result<SearchWriteOutcome> {
         validate_resource(index, "index")?;
         let body = core_value_to_json(doc)?;
@@ -152,6 +176,34 @@ impl SearchEngine for SearchAdapter {
             .await?
             .map(parse_document_response)
             .transpose()
+    }
+
+    async fn get_doc_budgeted(
+        &self,
+        index: &str,
+        id: &str,
+        budget: ReadBudget,
+    ) -> Result<Option<SearchDocument>> {
+        let budget = budget.validate()?;
+        validate_resource(index, "index")?;
+        validate_resource(id, "document id")?;
+        let document = self
+            .client
+            .request_json_optional_budgeted(
+                "GET",
+                &document_path(index, id, "_doc"),
+                None,
+                budget,
+                "search get document transport",
+            )
+            .await?
+            .map(parse_document_response)
+            .transpose()?;
+        SearchReadLimiter::finish_optional_document(
+            budget,
+            "search get document response",
+            document,
+        )
     }
 
     async fn update_doc(&self, index: &str, id: &str, patch: Value) -> Result<SearchWriteOutcome> {
@@ -203,6 +255,69 @@ struct SearchHttpClient {
 enum SearchTransport {
     Plain,
     Tls,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponseBodyLimit {
+    max_bytes: usize,
+    overflow: ResponseBodyOverflow,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResponseBodyOverflow {
+    Connection,
+    ReadBudget {
+        subject: &'static str,
+        caller_limit: usize,
+    },
+}
+
+impl ResponseBodyLimit {
+    fn transport(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            overflow: ResponseBodyOverflow::Connection,
+        }
+    }
+
+    fn read_budget(caller_limit: usize, subject: &'static str) -> Self {
+        let max_bytes = caller_limit.min(MAX_HTTP_RESPONSE_BODY_BYTES);
+        let overflow = if caller_limit <= MAX_HTTP_RESPONSE_BODY_BYTES {
+            ResponseBodyOverflow::ReadBudget {
+                subject,
+                caller_limit,
+            }
+        } else {
+            ResponseBodyOverflow::Connection
+        };
+        Self {
+            max_bytes,
+            overflow,
+        }
+    }
+
+    fn exceeded(self, body_kind: &str) -> Error {
+        match self.overflow {
+            ResponseBodyOverflow::Connection => Error::Connection(format!(
+                "search HTTP response {body_kind} exceeds limit of {} bytes",
+                self.max_bytes
+            )),
+            ResponseBodyOverflow::ReadBudget {
+                subject,
+                caller_limit,
+            } => Error::ReadBudgetExceeded {
+                subject: subject.to_owned(),
+                unit: "bytes",
+                limit: caller_limit,
+            },
+        }
+    }
+}
+
+impl From<usize> for ResponseBodyLimit {
+    fn from(max_bytes: usize) -> Self {
+        Self::transport(max_bytes)
+    }
 }
 
 impl SearchHttpClient {
@@ -273,6 +388,25 @@ impl SearchHttpClient {
         response.into_success()
     }
 
+    async fn request_json_budgeted(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&JsonValue>,
+        budget: ReadBudget,
+        subject: &'static str,
+    ) -> Result<JsonValue> {
+        let response = self
+            .request_json_response_with_limit(
+                method,
+                path,
+                body,
+                ResponseBodyLimit::read_budget(budget.max_bytes, subject),
+            )
+            .await?;
+        response.into_success()
+    }
+
     async fn request_json_optional(
         &self,
         method: &str,
@@ -280,6 +414,25 @@ impl SearchHttpClient {
         body: Option<&JsonValue>,
     ) -> Result<Option<JsonValue>> {
         let response = self.request_json_response(method, path, body).await?;
+        response.into_optional()
+    }
+
+    async fn request_json_optional_budgeted(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&JsonValue>,
+        budget: ReadBudget,
+        subject: &'static str,
+    ) -> Result<Option<JsonValue>> {
+        let response = self
+            .request_json_response_with_limit(
+                method,
+                path,
+                body,
+                ResponseBodyLimit::read_budget(budget.max_bytes, subject),
+            )
+            .await?;
         response.into_optional()
     }
 
@@ -300,6 +453,22 @@ impl SearchHttpClient {
         body: Option<&JsonValue>,
         max_body_bytes: usize,
     ) -> Result<SearchHttpResponse> {
+        self.request_json_response_with_limit(
+            method,
+            path,
+            body,
+            ResponseBodyLimit::transport(max_body_bytes),
+        )
+        .await
+    }
+
+    async fn request_json_response_with_limit(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&JsonValue>,
+        body_limit: ResponseBodyLimit,
+    ) -> Result<SearchHttpResponse> {
         let (request, body) = self.build_request(method, path, body)?;
 
         let stream = TcpStream::connect((self.host.as_str(), self.port))
@@ -315,10 +484,10 @@ impl SearchHttpClient {
                 .connect(server_name, stream)
                 .await
                 .map_err(|e| Error::Connection(e.to_string()))?;
-            return send_http_request(stream, &request, &body, max_body_bytes).await;
+            return send_http_request(stream, &request, &body, body_limit).await;
         }
 
-        send_http_request(stream, &request, &body, max_body_bytes).await
+        send_http_request(stream, &request, &body, body_limit).await
     }
 
     fn build_request(
@@ -393,7 +562,7 @@ async fn send_http_request<S>(
     mut stream: S,
     request: &str,
     body: &[u8],
-    max_body_bytes: usize,
+    body_limit: ResponseBodyLimit,
 ) -> Result<SearchHttpResponse>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -409,18 +578,19 @@ where
             .map_err(|e| Error::Connection(e.to_string()))?;
     }
 
-    let response = read_bounded_http_response(&mut stream, max_body_bytes, true).await?;
-    parse_http_json_with_limit(&response, max_body_bytes)
+    let response = read_bounded_http_response(&mut stream, body_limit, true).await?;
+    parse_http_json_with_limit(&response, body_limit)
 }
 
 async fn read_bounded_http_response<S>(
     stream: &mut S,
-    max_body_bytes: usize,
+    body_limit: impl Into<ResponseBodyLimit>,
     tolerate_tls_close_notify_eof: bool,
 ) -> Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {
+    let body_limit = body_limit.into();
     let mut response = Vec::new();
     let mut buffer = [0_u8; 8192];
     let mut body_start = None;
@@ -449,7 +619,7 @@ where
             let body_len = next_len.checked_sub(body_start).ok_or_else(|| {
                 Error::Connection("search HTTP response body size underflow".into())
             })?;
-            ensure_http_body_within_limit(body_len, max_body_bytes, "body")?;
+            ensure_http_body_within_limit(body_len, body_limit, "body")?;
         }
         response.extend_from_slice(&buffer[..read]);
 
@@ -461,11 +631,11 @@ where
                 })?;
                 let header_text = std::str::from_utf8(&response[..header_end])
                     .map_err(|e| Error::Connection(format!("invalid HTTP headers: {e}")))?;
-                ensure_content_length_within_limit(header_text, max_body_bytes)?;
+                ensure_content_length_within_limit(header_text, body_limit)?;
                 let body_len = response.len().checked_sub(start).ok_or_else(|| {
                     Error::Connection("search HTTP response body size underflow".into())
                 })?;
-                ensure_http_body_within_limit(body_len, max_body_bytes, "body")?;
+                ensure_http_body_within_limit(body_len, body_limit, "body")?;
                 body_start = Some(start);
             } else if response.len() > MAX_HTTP_RESPONSE_HEADER_BYTES + 3 {
                 return Err(Error::Connection(format!(
@@ -645,6 +815,15 @@ fn search_body(query: Value, options: &SearchOptions) -> Result<JsonValue> {
     Ok(body)
 }
 
+fn budgeted_search_body(
+    query: Value,
+    mut options: SearchOptions,
+    max_items: usize,
+) -> Result<JsonValue> {
+    options.size = Some(options.size.unwrap_or(max_items).min(max_items));
+    search_body(query, &options)
+}
+
 fn looks_like_search_body(value: &JsonValue) -> bool {
     value.as_object().is_some_and(|object| {
         object.keys().any(|key| {
@@ -805,8 +984,9 @@ fn optional_bool(object: &mut Map<String, JsonValue>, field: &str) -> Result<Opt
 
 fn parse_http_json_with_limit(
     response: &[u8],
-    max_body_bytes: usize,
+    body_limit: impl Into<ResponseBodyLimit>,
 ) -> Result<SearchHttpResponse> {
+    let body_limit = body_limit.into();
     let header_end = find_http_header_end(response)
         .ok_or_else(|| Error::Connection("invalid HTTP response from search backend".into()))?;
     ensure_http_headers_within_limit(header_end)?;
@@ -819,8 +999,8 @@ fn parse_http_json_with_limit(
         .ok_or_else(|| Error::Connection("invalid HTTP response from search backend".into()))?;
     let header_text = std::str::from_utf8(headers)
         .map_err(|e| Error::Connection(format!("invalid HTTP headers: {e}")))?;
-    ensure_content_length_within_limit(header_text, max_body_bytes)?;
-    ensure_http_body_within_limit(body.len(), max_body_bytes, "body")?;
+    ensure_content_length_within_limit(header_text, body_limit)?;
+    ensure_http_body_within_limit(body.len(), body_limit, "body")?;
     let status = header_text
         .lines()
         .next()
@@ -828,7 +1008,7 @@ fn parse_http_json_with_limit(
         .and_then(|status| status.parse::<u16>().ok())
         .ok_or_else(|| Error::Connection("missing HTTP status".into()))?;
     let body = if has_chunked_transfer_encoding(header_text) {
-        decode_chunked_body_with_limit(body, max_body_bytes)?
+        decode_chunked_body_with_limit(body, body_limit)?
     } else {
         body.to_vec()
     };
@@ -852,6 +1032,7 @@ fn parse_http_json_with_limit(
 fn search_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.push(CapabilityOperation::SearchListIndicesBounded);
+    operations.extend_from_slice(CapabilityOperation::SEARCH_BUDGETED_READS);
     operations
 }
 
@@ -868,7 +1049,10 @@ fn ensure_http_headers_within_limit(header_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-fn ensure_content_length_within_limit(header_text: &str, max_body_bytes: usize) -> Result<()> {
+fn ensure_content_length_within_limit(
+    header_text: &str,
+    body_limit: ResponseBodyLimit,
+) -> Result<()> {
     let mut content_length = None;
     for line in header_text.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
@@ -892,10 +1076,8 @@ fn ensure_content_length_within_limit(header_text: &str, max_body_bytes: usize) 
     }
 
     if let Some(content_length) = content_length {
-        if content_length > max_body_bytes {
-            return Err(Error::Connection(format!(
-                "search HTTP Content-Length {content_length} exceeds limit of {max_body_bytes} bytes"
-            )));
+        if content_length > body_limit.max_bytes {
+            return Err(body_limit.exceeded("Content-Length"));
         }
     }
     Ok(())
@@ -903,13 +1085,11 @@ fn ensure_content_length_within_limit(header_text: &str, max_body_bytes: usize) 
 
 fn ensure_http_body_within_limit(
     body_bytes: usize,
-    max_body_bytes: usize,
+    body_limit: ResponseBodyLimit,
     body_kind: &str,
 ) -> Result<()> {
-    if body_bytes > max_body_bytes {
-        return Err(Error::Connection(format!(
-            "search HTTP response {body_kind} exceeds limit of {max_body_bytes} bytes"
-        )));
+    if body_bytes > body_limit.max_bytes {
+        return Err(body_limit.exceeded(body_kind));
     }
     Ok(())
 }
@@ -925,7 +1105,11 @@ fn has_chunked_transfer_encoding(header_text: &str) -> bool {
     })
 }
 
-fn decode_chunked_body_with_limit(body: &[u8], max_body_bytes: usize) -> Result<Vec<u8>> {
+fn decode_chunked_body_with_limit(
+    body: &[u8],
+    body_limit: impl Into<ResponseBodyLimit>,
+) -> Result<Vec<u8>> {
+    let body_limit = body_limit.into();
     let mut decoded = Vec::new();
     let mut position = 0;
 
@@ -964,7 +1148,7 @@ fn decode_chunked_body_with_limit(body: &[u8], max_body_bytes: usize) -> Result<
             .len()
             .checked_add(size)
             .ok_or_else(|| Error::Connection("search decoded body size overflow".into()))?;
-        ensure_http_body_within_limit(decoded_len, max_body_bytes, "decoded body")?;
+        ensure_http_body_within_limit(decoded_len, body_limit, "decoded body")?;
         decoded.extend_from_slice(&body[position..chunk_end]);
         position = framed_end;
     }
@@ -1091,6 +1275,42 @@ mod tests {
     }
 
     #[test]
+    fn budgeted_search_always_clamps_or_inserts_a_backend_size() {
+        let clamped = budgeted_search_body(
+            Value::Json(json!({"query": {"match_all": {}}, "size": 500})),
+            SearchOptions::default(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(clamped["size"], 2);
+
+        let caller_smaller = budgeted_search_body(
+            Value::Json(json!({"query": {"match_all": {}}})),
+            SearchOptions {
+                size: Some(1),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(caller_smaller["size"], 1);
+
+        let aggregation_only = budgeted_search_body(
+            Value::Json(json!({
+                "query": {"match_all": {}},
+                "aggregations": {"roles": {"terms": {"field": "role.keyword"}}}
+            })),
+            SearchOptions {
+                size: Some(0),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(aggregation_only["size"], 0);
+    }
+
+    #[test]
     fn explicit_from_option_overrides_body_offset() {
         let body = search_body(
             Value::Json(json!({ "query": { "match_all": {} }, "from": 20 })),
@@ -1177,6 +1397,63 @@ mod tests {
     }
 
     #[test]
+    fn budgeted_search_fails_closed_on_extra_hits_and_charges_the_portable_envelope() {
+        let response = json!({
+            "took": 7,
+            "timed_out": false,
+            "aggregations": {"roles": {"buckets": [{"key": "reader", "doc_count": 2}]}},
+            "_shards": {"total": 1, "successful": 1},
+            "hits": {
+                "total": {"value": 2, "relation": "eq"},
+                "max_score": 1.0,
+                "hits": [
+                    {"_id": "1", "_source": {"name": "alice", "profile": {"bio": "one"}}},
+                    {"_id": "2", "_source": {"name": "bob", "profile": {"bio": "two"}}}
+                ]
+            }
+        });
+        let parsed = search_hits_from_response(&response).unwrap();
+        let required = serde_json::to_vec(&parsed).unwrap().len();
+
+        assert_eq!(
+            SearchReadLimiter::new(
+                ReadBudget::new(2, required).unwrap(),
+                "adapter search response",
+            )
+            .unwrap()
+            .apply(parsed.clone())
+            .unwrap(),
+            parsed
+        );
+        assert!(matches!(
+            SearchReadLimiter::new(
+                ReadBudget::new(2, required - 1).unwrap(),
+                "adapter search response",
+            )
+            .unwrap()
+            .apply(parsed.clone()),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == required - 1
+        ));
+        assert!(matches!(
+            SearchReadLimiter::new(
+                ReadBudget::new(1, required).unwrap(),
+                "adapter search response",
+            )
+            .unwrap()
+            .apply(parsed),
+            Err(Error::ReadBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn parses_write_and_get_responses_without_dropping_backend_metadata() {
         let outcome = parse_write_response(
             json!({
@@ -1211,6 +1488,42 @@ mod tests {
         assert_eq!(document.id, "user-1");
         assert_eq!(document.source.unwrap()["name"], "alice");
         assert_eq!(document.extra["fields"]["role"][0], "reader");
+    }
+
+    #[test]
+    fn budgeted_get_charges_source_extra_and_optional_envelope() {
+        let document = parse_document_response(json!({
+            "_index": "users",
+            "_id": "user-1",
+            "_version": 3,
+            "found": true,
+            "_source": {"name": "alice", "profile": {"bio": "complete"}},
+            "fields": {"role": ["reader"]}
+        }))
+        .unwrap();
+        let required = serde_json::to_vec(&Some(document.clone())).unwrap().len();
+
+        assert_eq!(
+            SearchReadLimiter::finish_optional_document(
+                ReadBudget::new(1, required).unwrap(),
+                "adapter search get",
+                Some(document.clone()),
+            )
+            .unwrap(),
+            Some(document.clone())
+        );
+        assert!(matches!(
+            SearchReadLimiter::finish_optional_document(
+                ReadBudget::new(1, required - 1).unwrap(),
+                "adapter search get",
+                Some(document),
+            ),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == required - 1
+        ));
     }
 
     #[test]
@@ -1271,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn search_declares_only_its_verified_bounded_catalog_extension() {
+    fn search_declares_only_its_verified_exact_extensions() {
         let operations = search_operations(Capabilities {
             search: true,
             ..Default::default()
@@ -1279,6 +1592,8 @@ mod tests {
 
         assert!(operations.contains(&CapabilityOperation::SearchListIndices));
         assert!(operations.contains(&CapabilityOperation::SearchListIndicesBounded));
+        assert!(operations.contains(&CapabilityOperation::SearchSearchBudgeted));
+        assert!(operations.contains(&CapabilityOperation::SearchGetDocumentBudgeted));
         assert!(!operations.contains(&CapabilityOperation::DocumentListCollectionsBounded));
     }
 
@@ -1329,6 +1644,47 @@ mod tests {
     }
 
     #[test]
+    fn caller_budget_maps_content_length_chunked_and_no_length_overflow_to_read_error() {
+        let limit = ResponseBodyLimit::read_budget(8, "budgeted search transport");
+        let responses: [&[u8]; 3] = [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n123456789\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n\r\n123456789",
+        ];
+
+        for response in responses {
+            let error = parse_http_json_with_limit(response, limit).unwrap_err();
+            assert_eq!(error.code(), "READ_BUDGET_EXCEEDED");
+            assert!(matches!(
+                error,
+                Error::ReadBudgetExceeded {
+                    ref subject,
+                    unit: "bytes",
+                    limit: 8,
+                } if subject == "budgeted search transport"
+            ));
+        }
+    }
+
+    #[test]
+    fn caller_budget_is_intersected_with_the_fixed_transport_ceiling() {
+        let limit = ResponseBodyLimit::read_budget(
+            MAX_HTTP_RESPONSE_BODY_BYTES + 1,
+            "invalid oversized caller budget",
+        );
+        assert_eq!(limit.max_bytes, MAX_HTTP_RESPONSE_BODY_BYTES);
+        assert!(matches!(
+            ensure_http_body_within_limit(
+                MAX_HTTP_RESPONSE_BODY_BYTES + 1,
+                limit,
+                "body",
+            ),
+            Err(Error::Connection(message))
+                if message.contains(&MAX_HTTP_RESPONSE_BODY_BYTES.to_string())
+        ));
+    }
+
+    #[test]
     fn rejects_chunk_size_arithmetic_overflow() {
         let body = format!("{:X}\r\n", usize::MAX);
 
@@ -1359,6 +1715,42 @@ mod tests {
             error,
             Error::Connection(message)
                 if message.contains("body") && message.contains("8 bytes")
+        ));
+    }
+
+    #[tokio::test]
+    async fn budgeted_methods_validate_the_budget_before_opening_a_connection() {
+        let dsn = Dsn::parse("opensearch://127.0.0.1:1").unwrap();
+        let adapter = SearchAdapter {
+            client: SearchHttpClient::from_dsn(&dsn).unwrap(),
+            kind: ConnectorKind(dsn.scheme),
+        };
+
+        let invalid_items = ReadBudget {
+            max_items: 0,
+            max_bytes: 1024,
+        };
+        assert!(matches!(
+            adapter
+                .search_budgeted(
+                    "users",
+                    Value::Json(json!({"match_all": {}})),
+                    SearchOptions::default(),
+                    invalid_items,
+                )
+                .await,
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+
+        let invalid_bytes = ReadBudget {
+            max_items: 1,
+            max_bytes: 0,
+        };
+        assert!(matches!(
+            adapter
+                .get_doc_budgeted("users", "user-1", invalid_bytes)
+                .await,
+            Err(Error::Config(message)) if message.contains("greater than zero")
         ));
     }
 
@@ -1478,5 +1870,227 @@ mod tests {
         assert!(request.contains("Host: search.local:9201"));
         assert!(request.contains("Authorization: Basic YWxpY2U6c2VjcmV0"));
         assert!(body.contains(r#""name":"alice""#));
+    }
+
+    async fn run_live_budgeted_search_lifecycle(raw_dsn: &str, product: &str) {
+        let dsn = Dsn::parse(raw_dsn).expect("live search DSN should parse");
+        let adapter = SearchAdapter {
+            client: SearchHttpClient::from_dsn(&dsn).expect("live search client should build"),
+            kind: ConnectorKind(dsn.scheme),
+        };
+        assert!(adapter
+            .operations()
+            .contains(&CapabilityOperation::SearchSearchBudgeted));
+        assert!(adapter
+            .operations()
+            .contains(&CapabilityOperation::SearchGetDocumentBudgeted));
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the Unix epoch")
+            .as_nanos();
+        let index = format!(
+            "dbtool-it-budgeted-{product}-{}-{unique}",
+            std::process::id()
+        );
+
+        let exercise = async {
+            for (id, name, role) in [
+                ("alice", "Alice", "reader"),
+                ("bob", "Bob", "writer"),
+                ("carol", "Carol", "reviewer"),
+            ] {
+                let outcome = adapter
+                    .put_doc(
+                        &index,
+                        id,
+                        Value::Json(json!({
+                            "name": name,
+                            "role": role,
+                            "profile": {"bio": format!("{product} complete source")}
+                        })),
+                    )
+                    .await?;
+                if outcome.id != id || outcome.result != "created" {
+                    return Err(Error::Internal(format!(
+                        "unexpected {product} fixture outcome for {id}: {outcome:?}"
+                    )));
+                }
+            }
+
+            let search_budget = ReadBudget::new(2, 1024 * 1024)?;
+            let mut complete = None;
+            for _ in 0..40 {
+                let result = adapter
+                    .search_budgeted(
+                        &index,
+                        Value::Json(json!({
+                            "query": {"match_all": {}},
+                            "sort": [{"name.keyword": "asc"}],
+                            "size": 1000
+                        })),
+                        SearchOptions {
+                            source: true,
+                            ..Default::default()
+                        },
+                        search_budget,
+                    )
+                    .await?;
+                if result.total == 3 && result.hits.len() == 2 {
+                    complete = Some(result);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            let complete = complete.ok_or_else(|| {
+                Error::Query(format!(
+                    "{product} did not refresh the three budgeted search fixtures"
+                ))
+            })?;
+            if complete.total != 3 || complete.total_relation != "eq" {
+                return Err(Error::Internal(format!(
+                    "unexpected {product} total metadata: {complete:?}"
+                )));
+            }
+            let mut names = complete
+                .hits
+                .iter()
+                .filter_map(|hit| hit.get("_source")?.get("name")?.as_str())
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            if names != ["Alice", "Bob"] {
+                return Err(Error::Internal(format!(
+                    "{product} budgeted search lost complete sources: {complete:?}"
+                )));
+            }
+
+            let aggregation = adapter
+                .search_budgeted(
+                    &index,
+                    Value::Json(json!({
+                        "query": {"match_all": {}},
+                        "aggregations": {
+                            "roles": {"terms": {"field": "role.keyword"}}
+                        }
+                    })),
+                    SearchOptions {
+                        size: Some(0),
+                        ..Default::default()
+                    },
+                    ReadBudget::new(1, 1024 * 1024)?,
+                )
+                .await?;
+            let aggregation_count = aggregation
+                .aggregations
+                .as_ref()
+                .and_then(|value| value.get("roles"))
+                .and_then(|value| value.get("buckets"))
+                .and_then(JsonValue::as_array)
+                .map(|buckets| {
+                    buckets
+                        .iter()
+                        .filter_map(|bucket| bucket.get("doc_count").and_then(JsonValue::as_u64))
+                        .sum::<u64>()
+                });
+            if !aggregation.hits.is_empty() || aggregation_count != Some(3) {
+                return Err(Error::Internal(format!(
+                    "{product} aggregation-only response was incomplete: {aggregation:?}"
+                )));
+            }
+
+            let document = adapter
+                .get_doc_budgeted(&index, "alice", ReadBudget::new(1, 1024 * 1024)?)
+                .await?
+                .ok_or_else(|| Error::Query(format!("{product} lost the alice fixture")))?;
+            if document
+                .source
+                .as_ref()
+                .and_then(|value| value.get("name"))
+                .and_then(JsonValue::as_str)
+                != Some("Alice")
+            {
+                return Err(Error::Internal(format!(
+                    "{product} budgeted get lost the source: {document:?}"
+                )));
+            }
+
+            let missing = adapter
+                .get_doc_budgeted(&index, "missing", ReadBudget::new(1, 1024 * 1024)?)
+                .await?;
+            if missing.is_some() {
+                return Err(Error::Internal(format!(
+                    "{product} budgeted missing get returned a document: {missing:?}"
+                )));
+            }
+
+            let small_error = match adapter
+                .get_doc_budgeted(&index, "alice", ReadBudget::new(1, 1)?)
+                .await
+            {
+                Err(error) => error,
+                Ok(value) => {
+                    return Err(Error::Internal(format!(
+                        "{product} one-byte get unexpectedly succeeded: {value:?}"
+                    )))
+                }
+            };
+            if !matches!(
+                small_error,
+                Error::ReadBudgetExceeded {
+                    unit: "bytes",
+                    limit: 1,
+                    ..
+                }
+            ) {
+                return Err(Error::Internal(format!(
+                    "{product} small get returned the wrong error: {small_error}"
+                )));
+            }
+
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        let cleanup = adapter.delete_index(&index).await;
+        let absence = async {
+            for _ in 0..40 {
+                let indices = adapter.list_indices_bounded(10_000).await?;
+                if indices.items.iter().all(|item| item.name != index) {
+                    return Ok::<bool, Error>(true);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Ok(false)
+        }
+        .await;
+
+        if let Err(error) = exercise {
+            panic!(
+                "{product} budgeted search lifecycle failed before cleanup: {error}; cleanup={cleanup:?}; absence={absence:?}"
+            );
+        }
+        let cleanup = cleanup.expect("live budgeted search index should delete cleanly");
+        assert!(cleanup.acknowledged);
+        assert!(absence.expect("live index absence check should succeed"));
+    }
+
+    #[tokio::test]
+    async fn opensearch_live_budgeted_search_get_aggregation_and_cleanup() {
+        if std::env::var("DBTOOL_RUN_OBSERVABILITY_INTEGRATION").as_deref() != Ok("1") {
+            return;
+        }
+        let raw_dsn = std::env::var("DBTOOL_IT_OPENSEARCH_DSN")
+            .expect("DBTOOL_IT_OPENSEARCH_DSN is required for the live OpenSearch test");
+        run_live_budgeted_search_lifecycle(&raw_dsn, "opensearch").await;
+    }
+
+    #[tokio::test]
+    async fn elasticsearch_live_budgeted_search_get_aggregation_and_cleanup() {
+        if std::env::var("DBTOOL_RUN_ELASTICSEARCH_INTEGRATION").as_deref() != Ok("1") {
+            return;
+        }
+        let raw_dsn = std::env::var("DBTOOL_IT_ELASTICSEARCH_DSN")
+            .expect("DBTOOL_IT_ELASTICSEARCH_DSN is required for the live Elasticsearch test");
+        run_live_budgeted_search_lifecycle(&raw_dsn, "elasticsearch").await;
     }
 }
