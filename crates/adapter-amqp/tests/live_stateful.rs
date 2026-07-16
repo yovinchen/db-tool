@@ -2,7 +2,7 @@ use adapter_amqp::{factory, management_factory};
 use dbtool_core::{
     dsn::Dsn,
     error::Error,
-    model::{AckMode, ConsumeOptions, Message, MetadataBudget, ReadBudget},
+    model::{AckMode, ConsumeOptions, Message, MetadataBudget, ProduceBudget, ReadBudget},
     port::CapabilityOperation,
 };
 use lapin::{
@@ -29,6 +29,110 @@ fn unique_queue() -> String {
         .expect("system clock should be after Unix epoch")
         .as_nanos();
     format!("dbtool_it_amqp_atomic_ack_{}_{}", std::process::id(), nanos)
+}
+
+fn produce_message(payload: &'static [u8]) -> Message {
+    Message {
+        key: None,
+        payload: payload.to_vec().into(),
+        headers: HashMap::from([("trace".to_owned(), "budgeted".to_owned())]),
+        partition: None,
+        offset: None,
+        timestamp: None,
+        cursor: None,
+        metadata: None,
+    }
+}
+
+#[tokio::test]
+async fn budgeted_amqp_produce_rejects_before_queue_creation_then_round_trips() {
+    let Some(dsn) = integration_dsn() else {
+        return;
+    };
+    let queue = unique_queue();
+    let connector = factory(Dsn::parse(&dsn).expect("integration DSN should parse"))
+        .await
+        .expect("AMQP adapter should connect");
+    assert!(connector
+        .operations()
+        .contains(&CapabilityOperation::MessageProduceBudgeted));
+    let producer = connector
+        .as_producer()
+        .expect("AMQP adapter should expose a producer");
+    let candidate = produce_message(b"budgeted-amqp-round-trip");
+
+    assert!(matches!(
+        producer
+            .produce_budgeted(
+                &queue,
+                vec![candidate.clone()],
+                ProduceBudget::new(1, 1, 4096).unwrap(),
+            )
+            .await,
+        Err(Error::InputBudgetExceeded {
+            unit: "bytes",
+            limit: 1,
+            ..
+        })
+    ));
+
+    let fixture = Connection::connect(&dsn, ConnectionProperties::default())
+        .await
+        .expect("fixture connection should open");
+    let passive_channel = fixture
+        .create_channel()
+        .await
+        .expect("passive fixture channel should open");
+    assert!(passive_channel
+        .queue_declare(
+            &queue,
+            QueueDeclareOptions {
+                passive: true,
+                ..Default::default()
+            },
+            FieldTable::default(),
+        )
+        .await
+        .is_err());
+
+    let message_bytes = serde_json::to_vec(&candidate).unwrap().len();
+    let batch_bytes = serde_json::to_vec(&vec![candidate.clone()]).unwrap().len();
+    let outcome = producer
+        .produce_budgeted(
+            &queue,
+            vec![candidate.clone()],
+            ProduceBudget::new(1, message_bytes, batch_bytes).unwrap(),
+        )
+        .await
+        .expect("exact budgeted publish should succeed");
+    assert_eq!(outcome.produced, 1);
+
+    let channel = fixture
+        .create_channel()
+        .await
+        .expect("readback fixture channel should open");
+    let delivery = channel
+        .basic_get(&queue, BasicGetOptions::default())
+        .await
+        .expect("budgeted publish should be readable")
+        .expect("one budgeted delivery should exist");
+    assert_eq!(delivery.delivery.data, candidate.payload);
+    channel
+        .basic_ack(delivery.delivery.delivery_tag, BasicAckOptions::default())
+        .await
+        .expect("fixture delivery should acknowledge");
+    channel
+        .queue_delete(&queue, QueueDeleteOptions::default())
+        .await
+        .expect("budgeted queue should delete cleanly");
+    fixture
+        .close(200, "fixture complete")
+        .await
+        .expect("fixture connection should close");
+    connector
+        .close()
+        .await
+        .expect("adapter connection should close");
 }
 
 #[tokio::test]

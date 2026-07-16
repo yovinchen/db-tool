@@ -4,13 +4,13 @@ use dbtool_core::{
     model::{
         AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, DeleteResourceOutcome,
         LagInfo, Message, MessageMetadata, MessageResource, MessageResourceKind, MetadataBudget,
-        ProduceOutcome, TopicDetail, TopicInfo,
+        ProduceBudget, ProduceOutcome, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{MessageReadLimiter, MetadataLimiter},
+    service::limiter::{MessageReadLimiter, MessageWriteLimiter, MetadataLimiter},
 };
 use futures::future::BoxFuture;
 use lapin::{
@@ -106,49 +106,54 @@ impl Connector for AmqpAdapter {
 #[async_trait::async_trait]
 impl MessageProducer for AmqpAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
+        self.produce_budgeted(target, messages, ProduceBudget::default())
+            .await
+    }
+
+    async fn produce_budgeted(
+        &self,
+        target: &str,
+        messages: Vec<Message>,
+        budget: ProduceBudget,
+    ) -> Result<ProduceOutcome> {
         validate_queue(target)?;
-        for message in &messages {
-            validate_produce_message(message)?;
-        }
-        if messages.is_empty() {
-            return Ok(ProduceOutcome {
-                produced: 0,
-                placements: vec![],
-            });
-        }
+        let prepared = prepare_amqp_messages(messages, budget)?;
 
         let channel = self.channel().await?;
-        declare_queue(&channel, target, false).await?;
+        declare_queue(&channel, target, false)
+            .await
+            .map_err(|error| amqp_produce_indeterminate("queue declaration", error))?;
         channel
             .confirm_select(ConfirmSelectOptions::default())
             .await
-            .map_err(|e| Error::Query(e.to_string()))?;
+            .map_err(|error| amqp_produce_indeterminate("publisher-confirm setup", error))?;
 
         let mut produced = 0;
-        for message in messages {
-            let properties = properties_with_headers(&message.headers)?;
+        for message in prepared {
             let confirm = channel
                 .basic_publish(
                     "",
                     target,
                     BasicPublishOptions::default(),
                     &message.payload,
-                    properties,
+                    message.properties,
                 )
                 .await
-                .map_err(|e| Error::Query(e.to_string()))?
+                .map_err(|error| amqp_produce_indeterminate("publish dispatch", error))?
                 .await
-                .map_err(|e| Error::Query(e.to_string()))?;
+                .map_err(|error| amqp_produce_indeterminate("publisher confirmation", error))?;
             match confirm {
                 Confirmation::Ack(_) => produced += 1,
                 Confirmation::Nack(_) => {
-                    return Err(Error::Query(
-                        "AMQP broker rejected published message".into(),
+                    return Err(amqp_produce_indeterminate(
+                        "publisher confirmation",
+                        "broker returned NACK",
                     ));
                 }
                 Confirmation::NotRequested => {
-                    return Err(Error::Query(
-                        "AMQP publisher confirmation was not requested".into(),
+                    return Err(amqp_produce_indeterminate(
+                        "publisher confirmation",
+                        "confirmation was not requested",
                     ));
                 }
             }
@@ -413,12 +418,41 @@ impl AmqpAdapter {
 fn direct_amqp_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::MessageProduceBudgeted,
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
+}
+
+struct PreparedAmqpMessage {
+    payload: bytes::Bytes,
+    properties: BasicProperties,
+}
+
+fn prepare_amqp_messages(
+    messages: Vec<Message>,
+    budget: ProduceBudget,
+) -> Result<Vec<PreparedAmqpMessage>> {
+    MessageWriteLimiter::new(budget, "AMQP produce input")?.validate(&messages)?;
+    messages
+        .into_iter()
+        .map(|message| {
+            validate_produce_message(&message)?;
+            Ok(PreparedAmqpMessage {
+                payload: message.payload,
+                properties: properties_with_headers(&message.headers)?,
+            })
+        })
+        .collect()
+}
+
+fn amqp_produce_indeterminate(stage: &str, error: impl std::fmt::Display) -> Error {
+    Error::OutcomeIndeterminate(format!(
+        "AMQP produce failed during {stage} after a queue declaration or publish may have reached RabbitMQ ({error}); inspect queue state before retrying"
+    ))
 }
 
 pub(crate) fn enforce_topic_detail_budget(
@@ -466,7 +500,11 @@ async fn declare_queue(
 }
 
 pub(crate) fn validate_queue(queue: &str) -> Result<()> {
-    if queue.is_empty() || queue.len() > 255 || queue.bytes().any(|b| b.is_ascii_control()) {
+    if queue.is_empty()
+        || queue.len() > 255
+        || queue.starts_with("amq.")
+        || queue.bytes().any(|b| b.is_ascii_control())
+    {
         return Err(Error::Query(format!("invalid AMQP queue name: {queue:?}")));
     }
 
@@ -829,6 +867,73 @@ mod tests {
     }
 
     #[test]
+    fn amqp_produce_preflight_enforces_count_and_exact_byte_boundaries() {
+        let candidate = message();
+        let message_bytes = serde_json::to_vec(&candidate).unwrap().len();
+        let batch_bytes = serde_json::to_vec(&vec![candidate.clone()]).unwrap().len();
+        let exact = ProduceBudget::new(1, message_bytes, batch_bytes).unwrap();
+        assert_eq!(
+            prepare_amqp_messages(vec![candidate.clone()], exact)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let per_message_short = ProduceBudget::new(1, message_bytes - 1, batch_bytes).unwrap();
+        assert!(matches!(
+            prepare_amqp_messages(vec![candidate.clone()], per_message_short),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == message_bytes - 1
+        ));
+
+        let batch_short = ProduceBudget::new(1, message_bytes, batch_bytes - 1).unwrap();
+        assert!(matches!(
+            prepare_amqp_messages(vec![candidate.clone()], batch_short),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == batch_bytes - 1
+        ));
+
+        let two = vec![candidate.clone(), candidate];
+        assert!(matches!(
+            prepare_amqp_messages(two, ProduceBudget::new(1, 4096, 4096).unwrap()),
+            Err(Error::InputBudgetExceeded {
+                unit: "messages",
+                limit: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn amqp_prepares_the_complete_batch_before_queue_declaration() {
+        let valid = message();
+        let mut invalid = message();
+        invalid.key = Some(bytes::Bytes::from_static(b"unrepresentable"));
+
+        assert!(matches!(
+            prepare_amqp_messages(vec![valid, invalid], ProduceBudget::default()),
+            Err(Error::Config(message)) if message.contains("message key")
+        ));
+        assert!(validate_queue("amq.dbtool-reserved").is_err());
+    }
+
+    #[test]
+    fn amqp_failures_after_produce_starts_are_nonretryable() {
+        let error = amqp_produce_indeterminate("publisher confirmation", "socket closed");
+        assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+        assert!(!error.is_retryable());
+        assert!(
+            matches!(error, Error::OutcomeIndeterminate(message) if message.contains("inspect queue state"))
+        );
+    }
+
+    #[test]
     fn direct_amqp_declares_only_real_admin_operations() {
         let operations = direct_amqp_operations(Capabilities {
             producer: true,
@@ -838,6 +943,7 @@ mod tests {
         });
 
         assert!(operations.contains(&CapabilityOperation::MessageProduce));
+        assert!(operations.contains(&CapabilityOperation::MessageProduceBudgeted));
         assert!(operations.contains(&CapabilityOperation::MessageConsume));
         assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
         assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetail));
