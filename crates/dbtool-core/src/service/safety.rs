@@ -7,6 +7,8 @@ use sqlparser::{
 };
 use std::io::Write;
 
+const HIDDEN_TARGET_SCOPE_MARKER: &str = "\0dbtool-confirmation-scope-sha256:";
+
 /// Statement-level classification produced by the SQL parser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatementKind {
@@ -25,6 +27,29 @@ impl SafetyGuard {
         serde_json::to_writer(DigestWriter(&mut hasher), value)
             .map_err(|error| Error::Serialization(error.to_string()))?;
         Ok(hex::encode(hasher.finalize()))
+    }
+
+    /// Bind a human-readable target label to connection identity that must not
+    /// be exposed in confirmation output.
+    ///
+    /// The returned value is an internal SafetyGuard input, not a display
+    /// string. Confirmation tokens include the hidden digest, while
+    /// `impact.target` contains only `display_target`. This lets callers bind
+    /// credentials and provider-specific routing parameters without publishing
+    /// either the raw DSN or a reusable public fingerprint for offline guesses.
+    pub fn bind_target_scope(display_target: &str, hidden_scope: &str) -> Result<String> {
+        if display_target.is_empty()
+            || display_target.contains(HIDDEN_TARGET_SCOPE_MARKER)
+            || hidden_scope.is_empty()
+        {
+            return Err(Error::Config(
+                "confirmation target and hidden scope must be non-empty and unambiguous".into(),
+            ));
+        }
+        let digest = Self::confirmation_scope_digest(hidden_scope)?;
+        Ok(format!(
+            "{display_target}{HIDDEN_TARGET_SCOPE_MARKER}{digest}"
+        ))
     }
 
     /// Returns `Ok(StatementKind)` for safe operations; `Err` for blocked ones.
@@ -57,7 +82,7 @@ impl SafetyGuard {
             StatementKind::Destructive => {
                 let impact = serde_json::json!({
                     "op": analysis.operation,
-                    "target": target,
+                    "target": visible_confirmation_target(target),
                     "statements": analysis.statement_count,
                 });
                 let token = compute_token(&analysis.normalized_sql, target, &impact);
@@ -144,7 +169,7 @@ impl SafetyGuard {
         let impact = serde_json::json!({
             "op": operation,
             "resource": resource,
-            "target": target,
+            "target": visible_confirmation_target(target),
         });
         let mut normalized = format!("{} {}", impact["op"].as_str().unwrap_or_default(), resource);
         if let Some(scope) = confirmation_scope {
@@ -161,6 +186,17 @@ impl SafetyGuard {
                 impact,
             }),
         }
+    }
+}
+
+fn visible_confirmation_target(target: &str) -> &str {
+    let Some((visible, digest)) = target.rsplit_once(HIDDEN_TARGET_SCOPE_MARKER) else {
+        return target;
+    };
+    if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        visible
+    } else {
+        target
     }
 }
 
@@ -401,6 +437,94 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, changed);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn hidden_target_scope_changes_tokens_without_entering_public_impact() {
+        let display = "dsn:nats://127.0.0.1:4222?***";
+        let first_secret = "nats://TOKEN_A@127.0.0.1:4222?auth=tenant-a";
+        let second_secret = "nats://TOKEN_B@127.0.0.1:4222?auth=tenant-b";
+        let first = SafetyGuard::bind_target_scope(display, first_secret).unwrap();
+        let second = SafetyGuard::bind_target_scope(display, second_secret).unwrap();
+        assert_ne!(first, second);
+
+        let first_error =
+            SafetyGuard::check_destructive_operation("delete_stream", "events", &first, true, None)
+                .unwrap_err();
+        let first_token = match first_error {
+            Error::ConfirmRequired {
+                confirm_token,
+                impact,
+            } => {
+                assert_eq!(impact["target"], display);
+                let encoded = impact.to_string();
+                assert!(!encoded.contains("TOKEN_A"));
+                assert!(!encoded.contains("tenant-a"));
+                assert!(!encoded.contains(HIDDEN_TARGET_SCOPE_MARKER));
+                confirm_token
+            }
+            other => panic!("expected confirmation requirement, got {other:?}"),
+        };
+        let second_token = match SafetyGuard::check_destructive_operation(
+            "delete_stream",
+            "events",
+            &second,
+            true,
+            None,
+        )
+        .unwrap_err()
+        {
+            Error::ConfirmRequired { confirm_token, .. } => confirm_token,
+            other => panic!("expected confirmation requirement, got {other:?}"),
+        };
+        assert_ne!(first_token, second_token);
+
+        SafetyGuard::check_destructive_operation(
+            "delete_stream",
+            "events",
+            &first,
+            true,
+            Some(&first_token),
+        )
+        .unwrap();
+        assert!(matches!(
+            SafetyGuard::check_destructive_operation(
+                "delete_stream",
+                "events",
+                &second,
+                true,
+                Some(&first_token),
+            ),
+            Err(Error::Internal(message)) if message.contains("mismatch")
+        ));
+    }
+
+    #[test]
+    fn destructive_sql_uses_hidden_target_scope_but_displays_only_the_label() {
+        let display = "conn:production";
+        let first =
+            SafetyGuard::bind_target_scope(display, "postgres://host/a?tenant=one").unwrap();
+        let second =
+            SafetyGuard::bind_target_scope(display, "postgres://host/a?tenant=two").unwrap();
+        let first_error =
+            SafetyGuard::check_with_target("drop table events", &first, true, None).unwrap_err();
+        let (first_token, impact) = match first_error {
+            Error::ConfirmRequired {
+                confirm_token,
+                impact,
+            } => (confirm_token, impact),
+            other => panic!("expected confirmation requirement, got {other:?}"),
+        };
+        assert_eq!(impact["target"], display);
+
+        let second_token =
+            match SafetyGuard::check_with_target("drop table events", &second, true, None)
+                .unwrap_err()
+            {
+                Error::ConfirmRequired { confirm_token, .. } => confirm_token,
+                other => panic!("expected confirmation requirement, got {other:?}"),
+            };
+        assert_ne!(first_token, second_token);
     }
 
     #[test]
