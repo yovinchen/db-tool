@@ -1,12 +1,12 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{series::Series, BoundedList, Point, SeriesSet, TimeRange},
+    model::{series::Series, BoundedList, Point, SeriesSet, TimeRange, TimeSeriesReadBudget},
     port::{
         capability::TimeSeriesStore,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::ListLimiter,
+    service::{ListLimiter, TimeSeriesReadLimiter},
 };
 use futures::future::BoxFuture;
 use serde_json::{Map, Value as JsonValue};
@@ -100,6 +100,21 @@ impl TimeSeriesStore for PrometheusAdapter {
         let path = self.client.query_range_path(query, &range)?;
         let response = self.client.request_json("GET", &path, None).await?;
         series_set_from_response(&response)
+    }
+
+    async fn query_range_bounded(
+        &self,
+        query: &str,
+        range: TimeRange,
+        budget: TimeSeriesReadBudget,
+    ) -> Result<SeriesSet> {
+        // Validate the caller-owned envelope before constructing or issuing the
+        // backend request. The independent HTTP transport ceiling
+        // remains fixed at MAX_HTTP_RESPONSE_BODY_BYTES.
+        let limiter = TimeSeriesReadLimiter::new(budget, "Prometheus range query")?;
+        let path = self.client.query_range_path(query, &range)?;
+        let response = self.client.request_json("GET", &path, None).await?;
+        series_set_from_response_bounded(&response, limiter)
     }
 }
 
@@ -376,6 +391,7 @@ fn measurement_names_from_response_bounded(
 fn time_series_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.push(CapabilityOperation::TimeSeriesListMeasurementsBounded);
+    operations.push(CapabilityOperation::TimeSeriesQueryRangeBounded);
     operations
 }
 
@@ -434,6 +450,92 @@ fn series_set_from_response(response: &JsonValue) -> Result<SeriesSet> {
         series,
         truncated: false,
     })
+}
+
+fn series_set_from_response_bounded(
+    response: &JsonValue,
+    mut limiter: TimeSeriesReadLimiter,
+) -> Result<SeriesSet> {
+    ensure_success(response)?;
+    let result_type = response
+        .get("data")
+        .and_then(|data| data.get("resultType"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            Error::Serialization("prometheus query response is missing resultType".into())
+        })?;
+    if result_type != "matrix" {
+        return Err(Error::Serialization(format!(
+            "prometheus range query returned unsupported resultType '{result_type}', expected matrix"
+        )));
+    }
+    let results = response
+        .get("data")
+        .and_then(|data| data.get("result"))
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            Error::Serialization("prometheus query response result is not an array".into())
+        })?;
+    let mut series = Vec::with_capacity(limiter.probe_series()?.min(results.len()).min(256));
+
+    for item in results {
+        if !retain_prometheus_series(item, &mut limiter, &mut series)? {
+            break;
+        }
+    }
+
+    limiter.finish(series)
+}
+
+fn retain_prometheus_series(
+    item: &JsonValue,
+    limiter: &mut TimeSeriesReadLimiter,
+    retained: &mut Vec<Series>,
+) -> Result<bool> {
+    let metric = item
+        .get("metric")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| {
+            Error::Serialization("prometheus range series metric is not an object".into())
+        })?;
+    let labels = sorted_labels(metric);
+    let name = series_name(metric, &labels);
+    let mut columns = vec!["timestamp".to_owned(), "value".to_owned()];
+    columns.extend(labels.iter().map(|(key, _)| key.clone()));
+
+    match item.get("values") {
+        Some(JsonValue::Array(samples)) => limiter.retain_series(
+            name,
+            columns,
+            samples.iter().map(|sample| sample_row(sample, &labels)),
+            retained,
+        ),
+        // Keep malformed sample collections lazy as well: a malformed retained
+        // or sample-probe series is rejected, while a series-header probe never
+        // converts or inspects samples that cannot be caller-visible.
+        Some(_) => limiter.retain_series(
+            name,
+            columns,
+            std::iter::once(Err(Error::Serialization(
+                "prometheus range series values is not an array".into(),
+            ))),
+            retained,
+        ),
+        None => match item.get("value") {
+            Some(sample) => limiter.retain_series(
+                name,
+                columns,
+                std::iter::once_with(|| sample_row(sample, &labels)),
+                retained,
+            ),
+            None => limiter.retain_series(
+                name,
+                columns,
+                std::iter::empty::<Result<Vec<JsonValue>>>(),
+                retained,
+            ),
+        },
+    }
 }
 
 fn ensure_success(response: &JsonValue) -> Result<()> {
@@ -897,7 +999,35 @@ fn base64_encode(input: &[u8]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    fn matrix_response(result: Vec<JsonValue>) -> JsonValue {
+        json!({
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": result
+            }
+        })
+    }
+
+    fn matrix_series(name: &str, instance: &str, values: Vec<JsonValue>) -> JsonValue {
+        json!({
+            "metric": {
+                "__name__": name,
+                "instance": instance,
+                "job": "dbtool"
+            },
+            "values": values
+        })
+    }
+
+    fn retained_sample_count(result: &SeriesSet) -> usize {
+        result.series.iter().map(|series| series.values.len()).sum()
+    }
 
     #[test]
     fn parses_measurement_names() {
@@ -927,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn prometheus_declares_only_its_verified_bounded_catalog_extension() {
+    fn prometheus_declares_only_its_verified_bounded_extensions() {
         let operations = time_series_operations(Capabilities {
             time_series: true,
             ..Default::default()
@@ -935,6 +1065,7 @@ mod tests {
 
         assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurements));
         assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurementsBounded));
+        assert!(operations.contains(&CapabilityOperation::TimeSeriesQueryRangeBounded));
         assert!(!operations.contains(&CapabilityOperation::SearchListIndicesBounded));
     }
 
@@ -970,6 +1101,307 @@ mod tests {
         assert_eq!(result.series[0].values[0][0], json!(1710000000500_i64));
         assert_eq!(result.series[0].values[0][1], json!(1.0));
         assert_eq!(result.series[0].values[0][2], json!("localhost:9090"));
+    }
+
+    #[test]
+    fn bounded_range_uses_independent_series_and_cumulative_sample_probes() {
+        let response = matrix_response(vec![
+            matrix_series(
+                "up",
+                "a:9090",
+                vec![json!([1710000000, "1"]), json!([1710000001, "2"])],
+            ),
+            matrix_series(
+                "up",
+                "b:9090",
+                vec![json!([1710000000, "3"]), json!([1710000001, "4"])],
+            ),
+            matrix_series(
+                "up",
+                "c:9090",
+                vec![json!([1710000000, "5"]), json!([1710000001, "6"])],
+            ),
+        ]);
+
+        let exact = series_set_from_response_bounded(
+            &response,
+            TimeSeriesReadLimiter::new(TimeSeriesReadBudget::new(3, 6, 64 * 1024).unwrap(), "test")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exact.series.len(), 3);
+        assert_eq!(retained_sample_count(&exact), 6);
+        assert!(!exact.truncated);
+
+        let series_probe = series_set_from_response_bounded(
+            &response,
+            TimeSeriesReadLimiter::new(TimeSeriesReadBudget::new(2, 6, 64 * 1024).unwrap(), "test")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(series_probe.series.len(), 2);
+        assert_eq!(retained_sample_count(&series_probe), 4);
+        assert!(series_probe.truncated);
+
+        let sample_probe = series_set_from_response_bounded(
+            &response,
+            TimeSeriesReadLimiter::new(TimeSeriesReadBudget::new(3, 5, 64 * 1024).unwrap(), "test")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sample_probe.series.len(), 3);
+        assert_eq!(retained_sample_count(&sample_probe), 5);
+        assert_eq!(sample_probe.series[2].values.len(), 1);
+        assert!(sample_probe.truncated);
+    }
+
+    #[test]
+    fn bounded_range_bytes_accept_exact_portable_envelope_and_reject_n_minus_one() {
+        let response = matrix_response(vec![matrix_series(
+            "http_requests_total",
+            "api:8080",
+            vec![json!([1710000000, "42.5"])],
+        )]);
+        let complete = series_set_from_response_bounded(
+            &response,
+            TimeSeriesReadLimiter::new(TimeSeriesReadBudget::new(1, 1, 64 * 1024).unwrap(), "test")
+                .unwrap(),
+        )
+        .unwrap();
+        let exact_bytes = serde_json::to_vec(&complete).unwrap().len();
+
+        let exact = series_set_from_response_bounded(
+            &response,
+            TimeSeriesReadLimiter::new(
+                TimeSeriesReadBudget::new(1, 1, exact_bytes).unwrap(),
+                "test",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(exact).unwrap(), json!(complete));
+
+        let error = series_set_from_response_bounded(
+            &response,
+            TimeSeriesReadLimiter::new(
+                TimeSeriesReadBudget::new(1, 1, exact_bytes - 1).unwrap(),
+                "test",
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ReadBudgetExceeded { unit, limit, .. }
+                if unit == "bytes" && limit == exact_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn bounded_range_rejects_malformed_retained_and_probe_samples() {
+        let retained = matrix_response(vec![matrix_series(
+            "up",
+            "a:9090",
+            vec![json!("not-a-sample")],
+        )]);
+        let error = series_set_from_response_bounded(
+            &retained,
+            TimeSeriesReadLimiter::new(TimeSeriesReadBudget::new(1, 1, 64 * 1024).unwrap(), "test")
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Serialization(message) if message.contains("sample is not an array")
+        ));
+
+        let probe = matrix_response(vec![matrix_series(
+            "up",
+            "a:9090",
+            vec![json!([1710000000, "1"]), json!("not-a-sample")],
+        )]);
+        let error = series_set_from_response_bounded(
+            &probe,
+            TimeSeriesReadLimiter::new(TimeSeriesReadBudget::new(1, 1, 64 * 1024).unwrap(), "test")
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Serialization(message) if message.contains("sample is not an array")
+        ));
+    }
+
+    #[test]
+    fn bounded_range_does_not_convert_samples_after_the_series_probe() {
+        let response = matrix_response(vec![
+            matrix_series("up", "a:9090", vec![json!([1710000000, "1"])]),
+            matrix_series("up", "b:9090", vec![json!([1710000000, "2"])]),
+            json!({
+                "metric": {"__name__": "up", "instance": "c:9090"},
+                "values": "malformed-but-beyond-the-series-probe"
+            }),
+        ]);
+
+        let result = series_set_from_response_bounded(
+            &response,
+            TimeSeriesReadLimiter::new(TimeSeriesReadBudget::new(2, 2, 64 * 1024).unwrap(), "test")
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(result.series.len(), 2);
+        assert_eq!(retained_sample_count(&result), 2);
+        assert!(result.truncated);
+    }
+
+    #[tokio::test]
+    async fn bounded_range_rejects_invalid_budget_before_issuing_request() {
+        let dsn = Dsn::parse("prometheus://127.0.0.1:1").unwrap();
+        let adapter = PrometheusAdapter {
+            client: PrometheusHttpClient::from_dsn(&dsn).unwrap(),
+            kind: ConnectorKind(dsn.scheme),
+        };
+
+        let error = adapter
+            .query_range_bounded(
+                "up",
+                TimeRange::closed(1, 2).unwrap(),
+                TimeSeriesReadBudget {
+                    max_series: 0,
+                    max_samples: 1,
+                    max_bytes: 1024,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn prometheus_live_bounded_range_enforces_series_samples_bytes_and_operation() {
+        if std::env::var("DBTOOL_RUN_OBSERVABILITY_INTEGRATION").as_deref() != Ok("1") {
+            return;
+        }
+
+        let raw_dsn = std::env::var("DBTOOL_IT_PROMETHEUS_DSN")
+            .expect("DBTOOL_IT_PROMETHEUS_DSN is required for the live Prometheus test");
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let mut client = PrometheusHttpClient::from_dsn(&dsn).unwrap();
+        client.step = "1s".to_owned();
+        let adapter = PrometheusAdapter {
+            client,
+            kind: ConnectorKind(dsn.scheme),
+        };
+
+        assert!(adapter
+            .operations()
+            .contains(&CapabilityOperation::TimeSeriesQueryRangeBounded));
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let now_millis = i64::try_from(now).unwrap();
+        let timestamp = now_millis.div_euclid(1000) * 1000 - 8_000;
+        let metric = format!("dbtool_it_ts_budget_{}_{}", std::process::id(), now);
+        let points = ["one", "two", "three"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, slot)| Point {
+                measurement: metric.clone(),
+                tags: HashMap::from([("slot".to_owned(), slot.to_owned())]),
+                fields: HashMap::from([("value".to_owned(), index as f64 + 1.0)]),
+                timestamp,
+            })
+            .collect();
+        adapter.write_points(points).await.unwrap();
+
+        let range = TimeRange::closed(timestamp, timestamp + 1_000).unwrap();
+        let complete_budget = TimeSeriesReadBudget::new(3, 100, 1024 * 1024).unwrap();
+        let mut complete = None;
+        let mut last_observation = "no response".to_owned();
+        for _ in 0..40 {
+            match adapter
+                .query_range_bounded(&metric, range.clone(), complete_budget)
+                .await
+            {
+                Ok(result)
+                    if result.series.len() == 3
+                        && result.series.iter().all(|series| !series.values.is_empty()) =>
+                {
+                    complete = Some(result);
+                    break;
+                }
+                Ok(result) => {
+                    last_observation = format!(
+                        "observed {} series and {} samples",
+                        result.series.len(),
+                        retained_sample_count(&result)
+                    );
+                }
+                Err(error) => last_observation = error.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let complete = complete.unwrap_or_else(|| {
+            panic!("Prometheus did not expose the remote-write fixture: {last_observation}")
+        });
+        assert!(!complete.truncated);
+
+        let series_probe = adapter
+            .query_range_bounded(
+                &metric,
+                range.clone(),
+                TimeSeriesReadBudget::new(2, 100, 1024 * 1024).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(series_probe.series.len(), 2);
+        assert!(series_probe.truncated);
+
+        let sample_probe = adapter
+            .query_range_bounded(
+                &metric,
+                range.clone(),
+                TimeSeriesReadBudget::new(3, 1, 1024 * 1024).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retained_sample_count(&sample_probe), 1);
+        assert!(sample_probe.truncated);
+
+        let exact_bytes = serde_json::to_vec(&complete).unwrap().len();
+        let exact = adapter
+            .query_range_bounded(
+                &metric,
+                range.clone(),
+                TimeSeriesReadBudget::new(3, 100, exact_bytes).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(exact).unwrap(),
+            serde_json::to_value(&complete).unwrap()
+        );
+
+        let error = adapter
+            .query_range_bounded(
+                &metric,
+                range,
+                TimeSeriesReadBudget::new(3, 100, exact_bytes - 1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::ReadBudgetExceeded { unit, limit, .. }
+                if unit == "bytes" && limit == exact_bytes - 1
+        ));
+
+        // TimeSeriesStore has no delete operation. The metric is unique and the
+        // integration compose volume is disposable with one-hour retention.
     }
 
     #[test]
