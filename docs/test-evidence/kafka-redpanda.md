@@ -43,6 +43,28 @@ non-UTF-8 headers are rejected before a commit because the public Message model
 cannot represent them losslessly. The contract is at-least-once and does not
 claim exactly-once behavior.
 
+## IF-T74 topic scalar-byte envelope refresh
+
+Run at (UTC): 2026-07-16T03:24:39Z
+
+Both pure `rskafka` and native `librdkafka` backends now advertise and implement
+`message.admin.list_topics_budgeted`. `ReadBudget` is validated before a
+catalog client or metadata request is created; no more than N+1 complete
+`TopicInfo` values are constructed and retained, and the final `BoundedList`
+plus probe is byte-accounted. Item N/N+1 and exact byte N/N-1 boundaries passed
+for both implementations.
+
+Kafka Metadata has no pagination. The dedicated pure/native catalog clients
+therefore retain their independent 16 MiB receive-frame ceiling; this is a
+protocol memory bound, not a claim that the broker scans only N+1 topics. The
+Redpanda Docker live test created an auxiliary catalog-probe topic, passed the
+exact boundaries, and deleted all topics created by this run. One unrelated
+pre-existing `dbtool_it_kafka_topic_*` was deliberately not deleted.
+
+Verification: Kafka pure 18 unit + 1 integration PASS; native 26 unit PASS;
+strict Clippy for both feature sets, rustfmt and diff check PASS; Redpanda live
+exact catalog and cleanup PASS.
+
 Cleanup: PASS; every topic created by the exact lifecycle was deleted through
 the public API and bounded absence verification succeeded.
 

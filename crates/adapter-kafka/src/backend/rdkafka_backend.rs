@@ -6,7 +6,7 @@ use dbtool_core::{
     model::{
         AckMode, BoundedList, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
         DeleteResourceOutcome, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
-        MetadataBudget, PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
+        MetadataBudget, PartitionWatermark, ProduceOutcome, ReadBudget, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -32,8 +32,9 @@ use std::{
 };
 
 use super::{
-    kafka_messages_before, resolve_consume_position, validate_kafka_consume_options,
-    validate_kafka_delete_request, validate_produce_message,
+    budgeted_topic_catalog_plan, finish_budgeted_topic_catalog, kafka_messages_before,
+    resolve_consume_position, validate_kafka_consume_options, validate_kafka_delete_request,
+    validate_produce_message,
 };
 
 // Kafka metadata has no pagination. librdkafka enforces this receive-frame
@@ -126,6 +127,7 @@ fn native_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
+        CapabilityOperation::MessageAdminListTopicsBudgeted,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminConsumerLag,
@@ -226,6 +228,21 @@ impl AdminInspect for RdkafkaAdapter {
             .collect::<Vec<_>>();
         topics.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(limiter.finish(topics))
+    }
+
+    async fn list_topics_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<TopicInfo>> {
+        let (limiter, probe_items) = budgeted_topic_catalog_plan(budget)?;
+        // Kafka metadata is not pageable. librdkafka caps the raw metadata
+        // frame, and the lazy iterator converts at most N+1 portable topics.
+        let consumer = bounded_catalog_consumer(&self.consumer_config)?;
+        let metadata = consumer
+            .fetch_metadata(None, Timeout::After(Duration::from_secs(5)))
+            .map_err(kafka_connection_error)?;
+        finish_budgeted_topic_catalog(
+            limiter,
+            probe_items,
+            metadata.topics().iter().map(topic_info),
+        )
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -1231,6 +1248,7 @@ mod tests {
         assert!(operations.contains(&CapabilityOperation::MessageConsumeGroup));
         assert!(operations.contains(&CapabilityOperation::MessageConsumeAck));
         assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
         assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
         assert!(operations.contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
         assert!(!operations.contains(&CapabilityOperation::MessageConsumeDurable));

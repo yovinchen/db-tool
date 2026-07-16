@@ -2,10 +2,11 @@ use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
-        ConsumeCursor, ConsumeOptions, DeleteResourceOptions, Message, MessageResource,
-        MessageResourceKind, PartitionWatermark,
+        BoundedList, ConsumeCursor, ConsumeOptions, DeleteResourceOptions, Message,
+        MessageResource, MessageResourceKind, PartitionWatermark, ReadBudget, TopicInfo,
     },
     port::connector::Connector,
+    service::limiter::ReadLimiter,
 };
 use futures::future::BoxFuture;
 
@@ -24,6 +25,28 @@ pub fn connect(dsn: Dsn) -> BoxFuture<'static, Result<Box<dyn Connector>>> {
     {
         rskafka_backend::connect(dsn)
     }
+}
+
+fn budgeted_topic_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize)> {
+    let limiter = ReadLimiter::new(budget, "Kafka topic catalog response")?;
+    let probe_items = limiter.probe_items()?;
+    Ok((limiter, probe_items))
+}
+
+fn finish_budgeted_topic_catalog<I>(
+    mut limiter: ReadLimiter,
+    probe_items: usize,
+    topics: I,
+) -> Result<BoundedList<TopicInfo>>
+where
+    I: IntoIterator<Item = TopicInfo>,
+{
+    let mut retained = Vec::with_capacity(probe_items.saturating_sub(1).min(256));
+    for topic in topics.into_iter().take(probe_items) {
+        limiter.retain_item(topic, &mut retained)?;
+    }
+    retained.sort_by(|left, right| left.name.cmp(&right.name));
+    limiter.finish(retained)
 }
 
 /// Validate producer-only fields before the adapter creates a topic or sends
@@ -149,6 +172,88 @@ mod tests {
             cursor: None,
             metadata: None,
         }
+    }
+
+    fn topic(name: &str) -> TopicInfo {
+        TopicInfo {
+            name: name.to_owned(),
+            partitions: 1,
+            replicas: 1,
+        }
+    }
+
+    fn finish_topic_fixture(
+        names: &[&str],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Result<BoundedList<TopicInfo>> {
+        let (limiter, probe_items) =
+            budgeted_topic_catalog_plan(ReadBudget::new(max_items, max_bytes)?)?;
+        finish_budgeted_topic_catalog(limiter, probe_items, names.iter().map(|name| topic(name)))
+    }
+
+    #[test]
+    fn kafka_budgeted_topic_plan_rejects_zero_and_overflow() {
+        for budget in [
+            ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            },
+            ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            },
+        ] {
+            assert!(matches!(
+                budgeted_topic_catalog_plan(budget),
+                Err(Error::Config(_))
+            ));
+        }
+        let (_, probe_items) =
+            budgeted_topic_catalog_plan(ReadBudget::new(2, 1024).unwrap()).unwrap();
+        assert_eq!(probe_items, 3);
+    }
+
+    #[test]
+    fn kafka_budgeted_topic_catalog_distinguishes_n_and_n_plus_one() {
+        let exact = finish_topic_fixture(&["beta", "alpha"], 2, 4096).unwrap();
+        assert!(!exact.truncated);
+        assert_eq!(
+            exact
+                .items
+                .iter()
+                .map(|topic| topic.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+
+        let probed = finish_topic_fixture(&["beta", "alpha", "gamma", "ignored"], 2, 4096).unwrap();
+        assert!(probed.truncated);
+        assert_eq!(
+            probed
+                .items
+                .iter()
+                .map(|topic| topic.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn kafka_budgeted_topic_catalog_enforces_exact_complete_envelope_bytes() {
+        let expected = BoundedList::complete(vec![topic("alpha"), topic("beta")]);
+        let exact_bytes = serde_json::to_vec(&expected).unwrap().len();
+        let exact = finish_topic_fixture(&["alpha", "beta"], 2, exact_bytes).unwrap();
+        assert!(!exact.truncated);
+        assert_eq!(serde_json::to_vec(&exact).unwrap().len(), exact_bytes);
+        assert!(matches!(
+            finish_topic_fixture(&["alpha", "beta"], 2, exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use dbtool_core::{
     error::Error,
     model::{
         ConsumeOptions, DeleteResourceOptions, Message, MessageResource, MessageResourceKind,
-        MetadataBudget,
+        MetadataBudget, ReadBudget,
     },
     port::CapabilityOperation,
 };
@@ -34,6 +34,7 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
         .expect("clock should be after the Unix epoch")
         .as_nanos();
     let topic = format!("dbtool_it_pure_bounded_{}_{}", std::process::id(), unique);
+    let auxiliary_topic = format!("{topic}_catalog_probe");
 
     let fixture = ClientBuilder::new(vec![broker])
         .client_id("dbtool-bounded-live-fixture")
@@ -46,17 +47,60 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
         .create_topic(&topic, 2, 1, 5_000)
         .await
         .expect("two-partition fixture topic should be created");
+    fixture
+        .controller_client()
+        .expect("fixture controller should resolve")
+        .create_topic(&auxiliary_topic, 1, 1, 5_000)
+        .await
+        .expect("catalog probe topic should be created");
 
     let connector = factory(dsn).await.expect("Kafka adapter should connect");
     assert!(connector
         .operations()
         .contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
+    assert!(connector
+        .operations()
+        .contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
     assert!(!connector
         .operations()
         .contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
     let admin = connector
         .as_admin()
         .expect("Kafka adapter should expose admin inspection");
+    let full_catalog = admin
+        .list_topics()
+        .await
+        .expect("fixture topic catalog should list");
+    assert!(full_catalog.iter().any(|item| item.name == topic));
+    assert!(full_catalog.iter().any(|item| item.name == auxiliary_topic));
+    let total = full_catalog.len();
+    let complete = admin
+        .list_topics_budgeted(ReadBudget::with_default_bytes(total).unwrap())
+        .await
+        .expect("exact Kafka topic count should be complete");
+    assert!(!complete.truncated);
+    assert_eq!(complete.items.len(), total);
+    let exact_bytes = serde_json::to_vec(&complete).unwrap().len();
+    assert!(admin
+        .list_topics_budgeted(ReadBudget::new(total, exact_bytes).unwrap())
+        .await
+        .is_ok());
+    assert!(matches!(
+        admin
+            .list_topics_budgeted(ReadBudget::new(total, exact_bytes - 1).unwrap())
+            .await,
+        Err(Error::ReadBudgetExceeded {
+            unit: "bytes",
+            limit,
+            ..
+        }) if limit == exact_bytes - 1
+    ));
+    let truncated = admin
+        .list_topics_budgeted(ReadBudget::with_default_bytes(total - 1).unwrap())
+        .await
+        .expect("Kafka N+1 probe should return a bounded prefix");
+    assert!(truncated.truncated);
+    assert_eq!(truncated.items.len(), total - 1);
     assert!(matches!(
         admin
             .topic_detail_bounded(
@@ -150,4 +194,10 @@ async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
     assert!(deleted.acknowledged);
     assert!(deleted.verified_absent);
     assert_eq!(deleted.messages_before, Some(1));
+    fixture
+        .controller_client()
+        .expect("fixture controller should resolve for cleanup")
+        .delete_topic(auxiliary_topic, 5_000)
+        .await
+        .expect("catalog probe topic should be deleted");
 }

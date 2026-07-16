@@ -7,7 +7,7 @@ use dbtool_core::{
     model::{
         BoundedList, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, LagInfo,
         Message, MessageCursor, MessagePlacement, MessageResource, MetadataBudget,
-        PartitionWatermark, ProduceOutcome, TopicDetail, TopicInfo,
+        PartitionWatermark, ProduceOutcome, ReadBudget, TopicDetail, TopicInfo,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
@@ -29,8 +29,9 @@ use std::{
 };
 
 use super::{
-    kafka_messages_before, resolve_consume_position, validate_kafka_consume_options,
-    validate_kafka_delete_request, validate_produce_message,
+    budgeted_topic_catalog_plan, finish_budgeted_topic_catalog, kafka_messages_before,
+    resolve_consume_position, validate_kafka_consume_options, validate_kafka_delete_request,
+    validate_produce_message,
 };
 
 // Kafka's Metadata API does not paginate. Keep the unavoidable protocol frame
@@ -121,6 +122,7 @@ fn pure_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     operations.extend([
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
+        CapabilityOperation::MessageAdminListTopicsBudgeted,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminDelete,
@@ -308,6 +310,25 @@ impl AdminInspect for RskafkaAdapter {
             .collect::<Vec<_>>();
         topics.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(limiter.finish(topics))
+    }
+
+    async fn list_topics_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<TopicInfo>> {
+        let (limiter, probe_items) = budgeted_topic_catalog_plan(budget)?;
+        // Kafka metadata is not pageable. The dedicated client caps the raw
+        // response frame, and this lazy mapping constructs at most the N+1
+        // caller-visible TopicInfo values required for completeness.
+        let catalog_client = self.bounded_client().await?;
+        let topics = catalog_client
+            .list_topics()
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?
+            .into_iter()
+            .map(|topic| TopicInfo {
+                name: topic.name,
+                partitions: topic.partitions.len() as i32,
+                replicas: 1,
+            });
+        finish_budgeted_topic_catalog(limiter, probe_items, topics)
     }
 
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
@@ -712,6 +733,7 @@ mod tests {
         });
 
         assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBounded));
+        assert!(operations.contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
         assert!(operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
         assert!(!operations.contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
         assert!(!operations.contains(&CapabilityOperation::MessageConsumeGroup));
