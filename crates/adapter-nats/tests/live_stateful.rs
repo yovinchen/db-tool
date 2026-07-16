@@ -5,9 +5,10 @@ use dbtool_core::{
     error::Error,
     model::{
         AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, MessageCursor,
-        MessageResource, MessageResourceKind,
+        MessageResource, MessageResourceKind, MetadataBudget,
     },
 };
+use futures::TryStreamExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn live_dsn() -> Option<String> {
@@ -162,6 +163,42 @@ async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_suppor
         Duration::from_millis(250),
     )
     .await;
+    let sparse_stream_name = format!("DBTOOL_NATS_SPARSE_{suffix}").to_ascii_uppercase();
+    jetstream
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: sparse_stream_name.clone(),
+            subjects: vec![format!("dbtool.it.nats.sparse.{suffix}")],
+            max_messages: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("unrelated sparse JetStream should be created");
+
+    let admin = connector
+        .as_admin()
+        .expect("NATS adapter should expose admin");
+    let detail = admin
+        .topic_detail_bounded(
+            &stream_name,
+            MetadataBudget::with_default_bytes(11).expect("exact detail budget should be valid"),
+        )
+        .await
+        .expect("bounded stream detail should fit its exact nested-item budget");
+    assert_eq!(detail.info.name, stream_name);
+    assert_eq!(detail.config["subjects"], subject);
+    assert!(matches!(
+        admin
+            .topic_detail_bounded(
+                &stream_name,
+                MetadataBudget::with_default_bytes(10).unwrap(),
+            )
+            .await,
+        Err(Error::MetadataBudgetExceeded {
+            unit: "items",
+            limit: 10,
+            ..
+        })
+    ));
 
     for payload in [
         Bytes::from_static(b"\0first\xff"),
@@ -196,9 +233,7 @@ async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_suppor
         })
         .collect::<Vec<_>>();
 
-    let lag = connector
-        .as_admin()
-        .expect("NATS adapter should expose admin")
+    let lag = admin
         .consumer_lag(&durable_name)
         .await
         .expect("JetStream lag should load");
@@ -207,6 +242,44 @@ async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_suppor
         .find(|item| item.topic == stream_name)
         .expect("durable lag should include the fixture stream");
     assert_eq!((lag.committed, lag.latest, lag.lag), (0, 3, 3));
+    // Count the live catalog immediately before the bounded calls. Stale
+    // streams from earlier runs are therefore included in N, while the
+    // unrelated stream above guarantees N >= 2 for the N-1 assertion.
+    let stream_count = jetstream
+        .stream_names()
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("live stream names should enumerate")
+        .len();
+    assert!(stream_count >= 2);
+    let bounded_lag = admin
+        .consumer_lag_bounded(
+            &durable_name,
+            MetadataBudget::with_default_bytes(stream_count).unwrap(),
+        )
+        .await
+        .expect("bounded lag should query the named consumer without listing all consumers");
+    let bounded_lag = bounded_lag
+        .iter()
+        .find(|item| item.topic == stream_name)
+        .expect("bounded durable lag should include the fixture stream");
+    assert_eq!(
+        (bounded_lag.committed, bounded_lag.latest, bounded_lag.lag,),
+        (0, 3, 3)
+    );
+    assert!(matches!(
+        admin
+            .consumer_lag_bounded(
+                &durable_name,
+                MetadataBudget::with_default_bytes(stream_count - 1).unwrap(),
+            )
+            .await,
+        Err(Error::MetadataBudgetExceeded {
+            unit: "items",
+            limit,
+            ..
+        }) if limit == stream_count - 1
+    ));
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     let replayed = consumer
@@ -349,6 +422,7 @@ async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_suppor
     assert_eq!(incompatible_info.ack_floor.stream_sequence, 0);
 
     delete_stream(connector.as_ref(), &stream_name).await;
+    delete_stream(connector.as_ref(), &sparse_stream_name).await;
 }
 
 #[tokio::test]

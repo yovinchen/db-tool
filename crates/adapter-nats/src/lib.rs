@@ -1,17 +1,18 @@
+use bytes::Bytes;
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
     model::{
         AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
         DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message, MessageCursor,
-        MessageMetadata, MessageResource, MessageResourceKind, PartitionWatermark, ProduceOutcome,
-        TopicDetail, TopicInfo,
+        MessageMetadata, MessageResource, MessageResourceKind, MetadataBudget, PartitionWatermark,
+        ProduceOutcome, TopicDetail, TopicInfo, MAX_METADATA_BYTES,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::ListLimiter,
+    service::limiter::{ListLimiter, MetadataLimiter},
 };
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
@@ -218,6 +219,16 @@ impl AdminInspect for NatsAdapter {
         Ok(nats_topic_detail(stream.cached_info()))
     }
 
+    async fn topic_detail_bounded(
+        &self,
+        name: &str,
+        budget: MetadataBudget,
+    ) -> Result<TopicDetail> {
+        validate_jetstream_name("stream", name)?;
+        let info = self.bounded_stream_info(name).await?;
+        nats_topic_detail_bounded(&info, budget)
+    }
+
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>> {
         validate_jetstream_name("consumer", group)?;
         let mut streams = self.jetstream().streams();
@@ -269,6 +280,95 @@ impl AdminInspect for NatsAdapter {
             }
         }
 
+        Ok(lag)
+    }
+
+    async fn consumer_lag_bounded(
+        &self,
+        group: &str,
+        budget: MetadataBudget,
+    ) -> Result<Vec<LagInfo>> {
+        validate_jetstream_name("consumer", group)?;
+        let budget = budget.validate()?;
+        let mut response_limiter = MetadataLimiter::new(budget, "NATS consumer lag")?;
+        let mut inspected_streams = 0_usize;
+        let mut expected_total = None;
+        let mut offset = 0_usize;
+        let mut seen = HashSet::new();
+        let mut lag = Vec::new();
+
+        loop {
+            let page = self.bounded_stream_names_page(offset).await?;
+            match expected_total {
+                Some(total) if total != page.total => {
+                    return Err(Error::Serialization(format!(
+                        "NATS JetStream catalog changed total from {total} to {} during bounded lag scan",
+                        page.total
+                    )))
+                }
+                None => expected_total = Some(page.total),
+                _ => {}
+            }
+            if offset >= page.total {
+                if !page.names.is_empty() {
+                    return Err(Error::Serialization(
+                        "NATS JetStream names page returned entries beyond total".into(),
+                    ));
+                }
+                break;
+            }
+            if page.names.is_empty() {
+                return Err(Error::Serialization(
+                    "NATS JetStream names pagination returned an empty page before total".into(),
+                ));
+            }
+
+            for stream_name in page.names {
+                validate_jetstream_name("stream", &stream_name)?;
+                if !seen.insert(stream_name.clone()) {
+                    return Err(Error::Serialization(format!(
+                        "NATS JetStream names pagination repeated stream {stream_name:?}"
+                    )));
+                }
+                observe_nats_lag_work(&mut inspected_streams, budget)?;
+                let Some(consumer) = self.bounded_consumer_info(&stream_name, group).await? else {
+                    continue;
+                };
+                if consumer.stream_name != stream_name || consumer.name != group {
+                    return Err(Error::Serialization(format!(
+                        "NATS consumer info identity mismatch for {stream_name:?}/{group:?}"
+                    )));
+                }
+                let stream = self.bounded_stream_info(&stream_name).await?;
+                let (committed, latest, outstanding) = nats_lag_dimensions(
+                    consumer.ack_floor.stream_sequence,
+                    stream.state.last_sequence,
+                    consumer.num_ack_pending,
+                    consumer.num_pending,
+                )?;
+                let item = LagInfo {
+                    topic: stream_name,
+                    partition: 0,
+                    group: group.to_owned(),
+                    committed,
+                    latest,
+                    lag: outstanding,
+                };
+                response_limiter.observe(&item)?;
+                lag.push(item);
+            }
+
+            offset = seen.len();
+            if offset > page.total {
+                return Err(Error::Serialization(format!(
+                    "NATS JetStream names pagination returned {offset} unique streams for total {}",
+                    page.total
+                )));
+            }
+        }
+
+        lag.sort_by(|left, right| left.topic.cmp(&right.topic));
+        response_limiter.ensure_complete(&lag)?;
         Ok(lag)
     }
 }
@@ -324,6 +424,108 @@ impl AdminMutate for NatsAdapter {
 impl NatsAdapter {
     fn jetstream(&self) -> async_nats::jetstream::Context {
         async_nats::jetstream::new(self.client.clone())
+    }
+
+    async fn bounded_jetstream_payload(
+        &self,
+        api_subject: String,
+        request: Bytes,
+        response_subject: &str,
+    ) -> Result<Bytes> {
+        // async-nats exposes the server INFO max_payload negotiated for the
+        // current connection. Refuse bounded metadata on a connection whose
+        // protocol ceiling is larger than ours: otherwise the client codec
+        // could allocate an oversized MSG before this adapter sees it.
+        validate_nats_server_payload_ceiling(self.client.server_info().max_payload)?;
+        let message = self
+            .client
+            .request(format!("$JS.API.{api_subject}"), request)
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        if message.payload.len() > MAX_METADATA_BYTES {
+            return Err(Error::MetadataBudgetExceeded {
+                subject: response_subject.to_owned(),
+                unit: "bytes",
+                limit: MAX_METADATA_BYTES,
+            });
+        }
+        Ok(message.payload)
+    }
+
+    async fn bounded_stream_info(
+        &self,
+        stream: &str,
+    ) -> Result<async_nats::jetstream::stream::Info> {
+        let payload = self
+            .bounded_jetstream_payload(
+                format!("STREAM.INFO.{stream}"),
+                Bytes::from_static(b"{}"),
+                "NATS JetStream stream info response",
+            )
+            .await?;
+        let response: async_nats::jetstream::response::Response<
+            async_nats::jetstream::stream::Info,
+        > = serde_json::from_slice(&payload)
+            .map_err(|error| Error::Serialization(error.to_string()))?;
+        match response {
+            async_nats::jetstream::response::Response::Ok(info) => Ok(info),
+            async_nats::jetstream::response::Response::Err { error } => {
+                Err(Error::Query(error.to_string()))
+            }
+        }
+    }
+
+    async fn bounded_consumer_info(
+        &self,
+        stream: &str,
+        consumer: &str,
+    ) -> Result<Option<async_nats::jetstream::consumer::Info>> {
+        let payload = self
+            .bounded_jetstream_payload(
+                format!("CONSUMER.INFO.{stream}.{consumer}"),
+                Bytes::from_static(b"{}"),
+                "NATS JetStream consumer info response",
+            )
+            .await?;
+        let response: async_nats::jetstream::response::Response<
+            async_nats::jetstream::consumer::Info,
+        > = serde_json::from_slice(&payload)
+            .map_err(|error| Error::Serialization(error.to_string()))?;
+        match response {
+            async_nats::jetstream::response::Response::Ok(info) => Ok(Some(info)),
+            async_nats::jetstream::response::Response::Err { error }
+                if error.error_code() == async_nats::jetstream::ErrorCode::CONSUMER_NOT_FOUND =>
+            {
+                Ok(None)
+            }
+            async_nats::jetstream::response::Response::Err { error } => {
+                Err(Error::Query(error.to_string()))
+            }
+        }
+    }
+
+    async fn bounded_stream_names_page(&self, offset: usize) -> Result<NatsStreamNamesPage> {
+        let request = serde_json::to_vec(&serde_json::json!({ "offset": offset }))
+            .map(Bytes::from)
+            .map_err(|error| Error::Serialization(error.to_string()))?;
+        let payload = self
+            .bounded_jetstream_payload(
+                "STREAM.NAMES".to_owned(),
+                request,
+                "NATS JetStream names page response",
+            )
+            .await?;
+        let response: async_nats::jetstream::response::Response<serde_json::Value> =
+            serde_json::from_slice(&payload)
+                .map_err(|error| Error::Serialization(error.to_string()))?;
+        match response {
+            async_nats::jetstream::response::Response::Ok(value) => {
+                parse_nats_stream_names_page(&value, offset)
+            }
+            async_nats::jetstream::response::Response::Err { error } => {
+                Err(Error::Query(error.to_string()))
+            }
+        }
     }
 
     async fn consume_core_nats(
@@ -693,10 +895,102 @@ fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
         CapabilityOperation::MessageAdminTopicDetail,
+        CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminConsumerLag,
+        CapabilityOperation::MessageAdminConsumerLagBounded,
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
+}
+
+struct NatsStreamNamesPage {
+    total: usize,
+    names: Vec<String>,
+}
+
+fn parse_nats_stream_names_page(
+    value: &serde_json::Value,
+    requested_offset: usize,
+) -> Result<NatsStreamNamesPage> {
+    let total = value
+        .get("total")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            Error::Serialization(
+                "NATS JetStream names page is missing a platform-sized total".into(),
+            )
+        })?;
+    let offset = value
+        .get("offset")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            Error::Serialization(
+                "NATS JetStream names page is missing a platform-sized offset".into(),
+            )
+        })?;
+    if offset != requested_offset {
+        return Err(Error::Serialization(format!(
+            "NATS JetStream names page returned offset {offset} while {requested_offset} was requested"
+        )));
+    }
+    let names = match value.get("streams") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(names)) => names
+            .iter()
+            .map(|name| {
+                name.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    Error::Serialization(
+                        "NATS JetStream names page contains a non-string stream name".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => {
+            return Err(Error::Serialization(
+                "NATS JetStream names page streams field is not an array".into(),
+            ))
+        }
+    };
+    let page_end = requested_offset
+        .checked_add(names.len())
+        .ok_or_else(|| Error::Serialization("NATS stream names page offset overflow".into()))?;
+    if page_end > total {
+        return Err(Error::Serialization(format!(
+            "NATS JetStream names page ends at {page_end} beyond total {total}"
+        )));
+    }
+    Ok(NatsStreamNamesPage { total, names })
+}
+
+fn observe_nats_lag_work(observed: &mut usize, budget: MetadataBudget) -> Result<()> {
+    if *observed >= budget.max_items {
+        return Err(Error::MetadataBudgetExceeded {
+            subject: "NATS consumer lag scan".to_owned(),
+            unit: "items",
+            limit: budget.max_items,
+        });
+    }
+    *observed = observed
+        .checked_add(1)
+        .ok_or_else(|| Error::Query("NATS consumer lag scan item count overflow".into()))?;
+    Ok(())
+}
+
+fn validate_nats_server_payload_ceiling(max_payload: usize) -> Result<()> {
+    if max_payload == 0 {
+        return Err(Error::Config(
+            "NATS server INFO did not advertise a positive max_payload; bounded JetStream metadata is unavailable"
+                .into(),
+        ));
+    }
+    if max_payload > MAX_METADATA_BYTES {
+        return Err(Error::Config(format!(
+            "NATS server max_payload {max_payload} exceeds dbtool's hard {MAX_METADATA_BYTES}-byte metadata ceiling"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_nats_delete_request(
@@ -978,6 +1272,38 @@ fn nats_topic_detail(info: &async_nats::jetstream::stream::Info) -> TopicDetail 
             high: u64_to_i64(info.state.last_sequence),
         }],
     }
+}
+
+fn nats_topic_detail_bounded(
+    info: &async_nats::jetstream::stream::Info,
+    budget: MetadataBudget,
+) -> Result<TopicDetail> {
+    let budget = budget.validate()?;
+    let detail = nats_topic_detail(info);
+    let nested_items = info
+        .config
+        .subjects
+        .len()
+        .checked_add(detail.config.len())
+        .and_then(|items| items.checked_add(detail.watermarks.len()))
+        .ok_or_else(|| Error::Serialization("NATS topic detail item count overflow".into()))?;
+    if nested_items > budget.max_items {
+        return Err(Error::MetadataBudgetExceeded {
+            subject: format!("NATS topic detail {}", info.config.name),
+            unit: "items",
+            limit: budget.max_items,
+        });
+    }
+    let mut limiter =
+        MetadataLimiter::new(budget, format!("NATS topic detail {}", info.config.name))?;
+    for item in &detail.config {
+        limiter.observe(&item)?;
+    }
+    for watermark in &detail.watermarks {
+        limiter.observe(watermark)?;
+    }
+    limiter.ensure_complete(&detail)?;
+    Ok(detail)
 }
 
 fn u64_to_i64(value: u64) -> i64 {
@@ -1295,11 +1621,69 @@ mod tests {
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminListTopicsBounded,
             CapabilityOperation::MessageAdminTopicDetail,
+            CapabilityOperation::MessageAdminTopicDetailBounded,
             CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminConsumerLagBounded,
             CapabilityOperation::MessageAdminDelete,
         ] {
             assert!(operations.contains(&operation));
         }
+    }
+
+    #[test]
+    fn nats_stream_names_page_requires_exact_pagination_metadata() {
+        let page = serde_json::json!({
+            "total": 3,
+            "offset": 1,
+            "limit": 1024,
+            "streams": ["EVENTS", "ORDERS"]
+        });
+        let parsed = parse_nats_stream_names_page(&page, 1).unwrap();
+        assert_eq!(parsed.total, 3);
+        assert_eq!(parsed.names, vec!["EVENTS", "ORDERS"]);
+
+        assert!(matches!(
+            parse_nats_stream_names_page(&page, 0),
+            Err(Error::Serialization(message)) if message.contains("offset 1")
+        ));
+        let overflow = serde_json::json!({
+            "total": 1,
+            "offset": 0,
+            "streams": ["EVENTS", "ORDERS"]
+        });
+        assert!(matches!(
+            parse_nats_stream_names_page(&overflow, 0),
+            Err(Error::Serialization(message)) if message.contains("beyond total")
+        ));
+    }
+
+    #[test]
+    fn nats_lag_scan_budget_fails_on_the_probe_item() {
+        let budget = MetadataBudget::new(1, 1024).unwrap();
+        let mut observed = 0;
+        observe_nats_lag_work(&mut observed, budget).unwrap();
+        assert!(matches!(
+            observe_nats_lag_work(&mut observed, budget),
+            Err(Error::MetadataBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn nats_bounded_metadata_requires_a_server_protocol_payload_ceiling() {
+        validate_nats_server_payload_ceiling(MAX_METADATA_BYTES).unwrap();
+        assert!(matches!(
+            validate_nats_server_payload_ceiling(0),
+            Err(Error::Config(message)) if message.contains("positive max_payload")
+        ));
+        assert!(matches!(
+            validate_nats_server_payload_ceiling(MAX_METADATA_BYTES + 1),
+            Err(Error::Config(message))
+                if message.contains("max_payload") && message.contains("exceeds")
+        ));
     }
 
     #[test]
