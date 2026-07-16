@@ -112,6 +112,18 @@ mod tests {
     }
 
     #[test]
+    fn sql_execute_envelope_has_one_stable_wire_shape() {
+        let params = [Value::Int(1), Value::Text("note".to_owned())];
+        let encoded = serde_json::to_string(&SqlExecuteInput {
+            sql: "select ?, ?",
+            params: &params,
+        })
+        .unwrap();
+
+        assert_eq!(encoded, r#"{"sql":"select ?, ?","params":[1,"note"]}"#);
+    }
+
+    #[test]
     fn rejects_zero_and_above_ceiling_dimensions() {
         for budget in [
             InputBudget {

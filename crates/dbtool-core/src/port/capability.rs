@@ -21,6 +21,12 @@ pub trait SqlEngine: Connector {
     /// Interactive, export, and other user-controlled paths should prefer
     /// [`Self::query_budgeted`]. [`Self::query_bounded`] remains the compatible
     /// row-only contract for callers that have not adopted byte envelopes.
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::query_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet>;
     /// Execute a query while returning at most `max_rows` rows.
     ///
@@ -29,6 +35,12 @@ pub trait SqlEngine: Connector {
     /// row exists. This method is intentionally required: a default that calls
     /// `query` and truncates afterwards would silently reintroduce unbounded
     /// materialization in new adapters.
+    /// This row-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::query_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn query_bounded(
         &self,
         sql: &str,
@@ -53,6 +65,15 @@ pub trait SqlEngine: Connector {
             needed: "SqlEngine.query_budgeted",
         })
     }
+    /// Execute a mutation through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::execute_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::execute_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecOutcome>;
     /// Execute one fully input-budgeted SQL mutation.
     ///
@@ -82,6 +103,13 @@ pub trait SqlEngine: Connector {
     /// any error. Connectors that implement it must explicitly advertise
     /// `sql.insert_rows_atomic`; the coarse `sql=true` capability never implies
     /// this stronger transactional contract.
+    /// This legacy batch-write contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::insert_rows_atomic_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::insert_rows_atomic_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn insert_rows_atomic(
         &self,
         _table: &str,
@@ -119,12 +147,24 @@ pub trait SqlEngine: Connector {
     /// The current portable metadata API has no server-side page argument.
     /// Interactive callers must therefore apply their own result budget and
     /// report whether the returned list was truncated.
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::list_schemas_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_schemas(&self) -> Result<Vec<String>>;
     /// Return at most `max_items` schemas while probing one additional item.
     ///
     /// This optional method must apply its limit before or during backend
     /// iteration. The default intentionally does not call [`Self::list_schemas`]
     /// because truncating a fully materialized catalog is not bounded.
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::list_schemas_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_schemas_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -146,12 +186,24 @@ pub trait SqlEngine: Connector {
     ///
     /// Every returned [`TableInfo`] should carry its effective schema when the
     /// backend supports namespaces so portable unquoted names can be sent back
-    /// to [`Self::describe_table`] without ambiguity.
+    /// to [`Self::describe_table_bounded`] without ambiguity.
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::list_tables_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>>;
     /// Return at most `max_items` tables while probing one additional item.
     ///
     /// Implementations must bound backend work and explicitly advertise
     /// `sql.list_tables_bounded`; the legacy list method is never a fallback.
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::list_tables_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_tables_bounded(
         &self,
         _schema: Option<&str>,
@@ -173,6 +225,14 @@ pub trait SqlEngine: Connector {
             needed: "SqlEngine.list_tables_budgeted",
         })
     }
+    /// Describe a table through the legacy unbudgeted metadata contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SqlEngine::describe_table_bounded; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn describe_table(&self, table: &str) -> Result<TableSchema>;
     /// Return one complete table schema within caller item/byte budgets.
     ///
@@ -195,10 +255,23 @@ pub trait SqlEngine: Connector {
 #[async_trait]
 pub trait CqlEngine: Connector {
     /// Execute CQL without a client-side row or byte budget.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CqlEngine::query_cql_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn query_cql(&self, cql: &str) -> Result<ResultSet>;
     /// Execute CQL while returning at most `max_rows` rows and probing one
     /// additional row to report truncation accurately. New interactive paths
     /// should prefer [`Self::query_cql_budgeted`].
+    /// This row-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CqlEngine::query_cql_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn query_cql_bounded(&self, cql: &str, max_rows: usize) -> Result<ResultSet>;
     /// Execute CQL within a cumulative row-and-byte read envelope.
     ///
@@ -210,6 +283,15 @@ pub trait CqlEngine: Connector {
             needed: "CqlEngine.query_cql_budgeted",
         })
     }
+    /// Execute a mutation through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::execute_cql_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CqlEngine::execute_cql_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn execute_cql(&self, cql: &str) -> Result<ExecOutcome>;
     /// Execute one fully input-budgeted CQL mutation.
     ///
@@ -225,7 +307,19 @@ pub trait CqlEngine: Connector {
             needed: "CqlEngine.execute_cql_budgeted",
         })
     }
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_keyspaces_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CqlEngine::list_keyspaces_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_keyspaces(&self) -> Result<Vec<String>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CqlEngine::list_keyspaces_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_keyspaces_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -238,7 +332,19 @@ pub trait CqlEngine: Connector {
             needed: "CqlEngine.list_keyspaces_budgeted",
         })
     }
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_cql_tables_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CqlEngine::list_cql_tables_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CqlEngine::list_cql_tables_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_cql_tables_bounded(
         &self,
         _keyspace: Option<&str>,
@@ -259,6 +365,12 @@ pub trait CqlEngine: Connector {
             needed: "CqlEngine.list_cql_tables_budgeted",
         })
     }
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::describe_cql_table_bounded`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CqlEngine::describe_cql_table_bounded; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn describe_cql_table(&self, table: &str) -> Result<TableSchema>;
     /// Return a complete CQL table schema within caller item/byte budgets.
     async fn describe_cql_table_bounded(
@@ -275,6 +387,15 @@ pub trait CqlEngine: Connector {
 
 #[async_trait]
 pub trait KeyValueStore: Connector {
+    /// Read a value through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::get_bounded`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use KeyValueStore::get_bounded; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn get(&self, key: &str) -> Result<Option<bytes::Bytes>>;
     /// Check key existence without materializing its value.
     ///
@@ -308,6 +429,12 @@ pub trait KeyValueStore: Connector {
     /// calls: a concurrent write or the passage of time would make that pair
     /// an unsafe transfer snapshot. Connectors implementing it must explicitly
     /// advertise `kv.get_with_expiry`.
+    /// This compatibility method remains available throughout 0.1.x and will
+    /// not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use KeyValueStore::get_with_expiry_bounded; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn get_with_expiry(&self, _key: &str) -> Result<Option<KeyValueSnapshot>> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -329,6 +456,15 @@ pub trait KeyValueStore: Connector {
             needed: "KeyValueStore.get_with_expiry_bounded",
         })
     }
+    /// Set a value through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::set_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use KeyValueStore::set_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn set(&self, key: &str, value: &[u8], options: SetOptions) -> Result<()>;
     /// Set one key using a completely prevalidated input envelope.
     ///
@@ -358,6 +494,14 @@ pub trait KeyValueStore: Connector {
     /// an NX conflict returns [`KeyValueRestoreOutcome::ConditionNotMet`].
     /// Connectors implementing this method must explicitly advertise
     /// `kv.restore_with_expiry`.
+    ///
+    /// This legacy unbudgeted contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::restore_with_expiry_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use KeyValueStore::restore_with_expiry_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn restore_with_expiry(
         &self,
         _key: &str,
@@ -392,6 +536,15 @@ pub trait KeyValueStore: Connector {
             needed: "KeyValueStore.restore_with_expiry_budgeted",
         })
     }
+    /// Delete keys through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::delete_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use KeyValueStore::delete_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn delete(&self, keys: &[String]) -> Result<u64>;
     /// Delete one completely prevalidated, non-empty key batch.
     ///
@@ -408,6 +561,15 @@ pub trait KeyValueStore: Connector {
             needed: "KeyValueStore.delete_budgeted",
         })
     }
+    /// Scan through the legacy item-only compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::scan_bounded`] for item-and-byte bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use KeyValueStore::scan_bounded for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn scan(&self, pattern: &str, limit: usize) -> Result<Vec<String>>;
     /// Return an exact N/N+1 key page inside one caller-owned byte envelope.
     ///
@@ -426,6 +588,15 @@ pub trait KeyValueStore: Connector {
         })
     }
     /// Escape hatch for raw protocol commands (e.g. `XLEN mystream`).
+    ///
+    /// This legacy unbudgeted contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0. New callers must use
+    /// [`Self::raw_command_bounded`] for read-only commands or
+    /// [`Self::raw_command_io_budgeted`] for mutating commands.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use KeyValueStore::raw_command_bounded for reads or raw_command_io_budgeted for mutations; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn raw_command(&self, args: &[String]) -> Result<Value>;
     /// Execute an allowlisted raw command inside one complete response budget.
     ///
@@ -475,7 +646,19 @@ pub struct SetOptions {
 
 #[async_trait]
 pub trait DocumentStore: Connector {
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_collections_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::list_collections_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_collections(&self) -> Result<Vec<String>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::list_collections_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_collections_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -488,6 +671,14 @@ pub trait DocumentStore: Connector {
             needed: "DocumentStore.list_collections_budgeted",
         })
     }
+    /// Find through the legacy compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::find_budgeted`] for exact item-and-byte bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::find_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn find(
         &self,
         collection: &str,
@@ -513,6 +704,15 @@ pub trait DocumentStore: Connector {
             needed: "DocumentStore.find_budgeted",
         })
     }
+    /// Insert documents through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::insert_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::insert_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn insert(&self, collection: &str, docs: Vec<Document>) -> Result<InsertOutcome>;
     /// Insert one completely prevalidated, non-empty document batch.
     ///
@@ -538,21 +738,40 @@ pub trait DocumentStore: Connector {
     ///
     /// This method keeps the historical dbtool contract: every matching
     /// document may be updated. New callers should negotiate and invoke
-    /// [`Self::update_one`] or [`Self::update_many`] so cardinality is explicit.
+    /// [`Self::update_many_budgeted`] so cardinality and the complete input
+    /// envelope are explicit. It remains available throughout 0.1.x and will
+    /// not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::update_many_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn update(&self, collection: &str, filter: Value, update: Value)
         -> Result<UpdateOutcome>;
     /// Compatibility bulk-delete entry point retained for embedded callers.
     ///
     /// This method keeps the historical dbtool contract: every matching
     /// document may be deleted. New callers should negotiate and invoke
-    /// [`Self::delete_one`] or [`Self::delete_many`] so cardinality is explicit.
+    /// [`Self::delete_many_budgeted`] so cardinality and the complete input
+    /// envelope are explicit. It remains available throughout 0.1.x and will
+    /// not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::delete_many_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn delete(&self, collection: &str, filter: Value) -> Result<u64>;
 
     /// Update at most one matching document.
     ///
     /// This is optional and therefore is never inferred from the coarse
     /// `document=true` capability. Implementations must advertise
-    /// `document.update_one` before callers may rely on it.
+    /// `document.update_one` before callers may rely on it. This legacy
+    /// unbudgeted contract remains available throughout 0.1.x and will not be
+    /// removed before 0.2.0; new callers must use
+    /// [`Self::update_one_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::update_one_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn update_one(
         &self,
         _collection: &str,
@@ -592,6 +811,14 @@ pub trait DocumentStore: Connector {
     /// method so existing embedded implementations keep their old behavior.
     /// It is not advertised automatically; connectors must explicitly declare
     /// `document.update_many` once that legacy behavior has been verified.
+    /// This compatibility contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0; new callers must use
+    /// [`Self::update_many_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::update_many_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
+    #[allow(deprecated)]
     async fn update_many(
         &self,
         collection: &str,
@@ -626,7 +853,14 @@ pub trait DocumentStore: Connector {
     ///
     /// This is optional and therefore is never inferred from the coarse
     /// `document=true` capability. Implementations must advertise
-    /// `document.delete_one` before callers may rely on it.
+    /// `document.delete_one` before callers may rely on it. This legacy
+    /// unbudgeted contract remains available throughout 0.1.x and will not be
+    /// removed before 0.2.0; new callers must use
+    /// [`Self::delete_one_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::delete_one_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn delete_one(&self, _collection: &str, _filter: Value) -> Result<u64> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -658,7 +892,14 @@ pub trait DocumentStore: Connector {
     ///
     /// The default delegates to the historical bulk-delete method for embedded
     /// compatibility, but connectors must explicitly advertise
-    /// `document.delete_many` after verifying that behavior.
+    /// `document.delete_many` after verifying that behavior. This compatibility
+    /// contract remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; new callers must use [`Self::delete_many_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::delete_many_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
+    #[allow(deprecated)]
     async fn delete_many(&self, collection: &str, filter: Value) -> Result<u64> {
         self.delete(collection, filter).await
     }
@@ -682,6 +923,16 @@ pub trait DocumentStore: Connector {
             needed: "DocumentStore.delete_many_budgeted",
         })
     }
+    /// Run an aggregation through the legacy compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must use [`Self::aggregate_budgeted`] for
+    /// read-only pipelines or [`Self::aggregate_write_budgeted`] for pipelines
+    /// containing a mutating stage such as MongoDB `$out` or `$merge`.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::aggregate_budgeted for reads or aggregate_write_budgeted for mutations; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn aggregate(&self, collection: &str, pipeline: Vec<Value>) -> Result<Vec<Document>>;
 
     /// Run an aggregation while bounding the number of documents read and
@@ -690,6 +941,14 @@ pub trait DocumentStore: Connector {
     /// This method is deliberately required: a default implementation that
     /// calls [`Self::aggregate`] and truncates afterwards would claim bounded
     /// behavior while still materializing an unbounded remote cursor.
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0. New callers must use
+    /// [`Self::aggregate_budgeted`] for read-only pipelines or
+    /// [`Self::aggregate_write_budgeted`] for mutating pipelines.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::aggregate_budgeted for item-and-byte bounded reads or aggregate_write_budgeted for mutations; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn aggregate_bounded(
         &self,
         collection: &str,
@@ -744,7 +1003,14 @@ pub trait DocumentStore: Connector {
     /// This lifecycle method is optional and is never inferred from the coarse
     /// `document=true` capability. Implementations must advertise
     /// `document.drop_collection`; connectors that cannot manage collection
-    /// lifecycle retain this fail-closed default.
+    /// lifecycle retain this fail-closed default. This legacy unbudgeted
+    /// contract remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; new callers must use
+    /// [`Self::drop_collection_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use DocumentStore::drop_collection_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn drop_collection(&self, _collection: &str) -> Result<()> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -774,7 +1040,19 @@ pub trait DocumentStore: Connector {
 
 #[async_trait]
 pub trait TimeSeriesStore: Connector {
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_measurements_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use TimeSeriesStore::list_measurements_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_measurements(&self) -> Result<Vec<String>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use TimeSeriesStore::list_measurements_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_measurements_bounded(&self, _max_items: usize) -> Result<BoundedList<String>> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -787,6 +1065,15 @@ pub trait TimeSeriesStore: Connector {
             needed: "TimeSeriesStore.list_measurements_budgeted",
         })
     }
+    /// Write points through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::write_points_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use TimeSeriesStore::write_points_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn write_points(&self, points: Vec<Point>) -> Result<()>;
     /// Write one completely prevalidated, non-empty point batch.
     ///
@@ -803,6 +1090,14 @@ pub trait TimeSeriesStore: Connector {
             needed: "TimeSeriesStore.write_points_budgeted",
         })
     }
+    /// Query a range through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::query_range_bounded`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use TimeSeriesStore::query_range_bounded; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn query_range(&self, query: &str, range: TimeRange) -> Result<SeriesSet>;
 
     /// Run one range query inside caller-owned series, cumulative-sample, and
@@ -826,7 +1121,19 @@ pub trait TimeSeriesStore: Connector {
 
 #[async_trait]
 pub trait SearchEngine: Connector {
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_indices_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::list_indices_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_indices(&self) -> Result<Vec<crate::model::IndexInfo>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::list_indices_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_indices_bounded(
         &self,
         _max_items: usize,
@@ -845,6 +1152,14 @@ pub trait SearchEngine: Connector {
             needed: "SearchEngine.list_indices_budgeted",
         })
     }
+    /// Search through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::search_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::search_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn search(&self, index: &str, query: Value, options: SearchOptions)
         -> Result<SearchHits>;
     /// Search within a caller-owned hit-count and serialized-byte envelope.
@@ -869,6 +1184,14 @@ pub trait SearchEngine: Connector {
         })
     }
     /// Create a document using a backend-generated identifier.
+    ///
+    /// This legacy unbudgeted contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::index_doc_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::index_doc_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn index_doc(&self, index: &str, doc: Value) -> Result<SearchWriteOutcome>;
     /// Index one document using a completely prevalidated payload.
     ///
@@ -891,6 +1214,14 @@ pub trait SearchEngine: Connector {
         })
     }
     /// Create or replace a document using a caller-controlled stable identifier.
+    ///
+    /// This legacy unbudgeted contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::put_doc_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::put_doc_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn put_doc(&self, index: &str, id: &str, doc: Value) -> Result<SearchWriteOutcome>;
     /// Put one document using a completely prevalidated payload.
     ///
@@ -914,6 +1245,14 @@ pub trait SearchEngine: Connector {
         })
     }
     /// Get one document by stable identifier. A backend HTTP 404 maps to `None`.
+    ///
+    /// This legacy unbudgeted contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0; use [`Self::get_doc_budgeted`] for an
+    /// exact response envelope.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::get_doc_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn get_doc(&self, index: &str, id: &str) -> Result<Option<SearchDocument>>;
     /// Get one document within a caller-owned serialized-byte envelope.
     ///
@@ -934,6 +1273,14 @@ pub trait SearchEngine: Connector {
         })
     }
     /// Partially update one document by stable identifier.
+    ///
+    /// This legacy unbudgeted contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::update_doc_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::update_doc_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn update_doc(&self, index: &str, id: &str, patch: Value) -> Result<SearchWriteOutcome>;
     /// Update one document using a completely prevalidated patch.
     ///
@@ -957,6 +1304,14 @@ pub trait SearchEngine: Connector {
         })
     }
     /// Delete one document by stable identifier.
+    ///
+    /// This legacy unbudgeted contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::delete_doc_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::delete_doc_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn delete_doc(&self, index: &str, id: &str) -> Result<SearchWriteOutcome>;
     /// Delete one protocol-validated document through the exact write contract.
     ///
@@ -978,6 +1333,14 @@ pub trait SearchEngine: Connector {
         })
     }
     /// Delete one complete index.
+    ///
+    /// This legacy unbudgeted contract remains available throughout 0.1.x and
+    /// will not be removed before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::delete_index_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use SearchEngine::delete_index_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn delete_index(&self, index: &str) -> Result<SearchDeleteIndexOutcome>;
     /// Delete one protocol-validated index through the exact write contract.
     ///
@@ -1008,6 +1371,15 @@ pub struct SearchOptions {
 
 #[async_trait]
 pub trait MessageProducer: Connector {
+    /// Produce messages through the legacy unbudgeted compatibility contract.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0. New callers must negotiate and invoke
+    /// [`Self::produce_budgeted`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use MessageProducer::produce_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome>;
 
     /// Produce one completely prevalidated input batch.
@@ -1039,7 +1411,19 @@ pub trait MessageConsumer: Connector {
 
 #[async_trait]
 pub trait AdminInspect: Connector {
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_topics_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use AdminInspect::list_topics_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_topics(&self) -> Result<Vec<TopicInfo>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use AdminInspect::list_topics_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_topics_bounded(&self, _max_items: usize) -> Result<BoundedList<TopicInfo>> {
         Err(crate::Error::UnsupportedCapability {
             kind: self.kind().0,
@@ -1052,6 +1436,12 @@ pub trait AdminInspect: Connector {
             needed: "AdminInspect.list_topics_budgeted",
         })
     }
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::topic_detail_bounded`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use AdminInspect::topic_detail_bounded; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail>;
     /// Return complete topic config/watermarks within caller budgets.
     async fn topic_detail_bounded(
@@ -1064,6 +1454,12 @@ pub trait AdminInspect: Connector {
             needed: "AdminInspect.topic_detail_bounded",
         })
     }
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::consumer_lag_bounded`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use AdminInspect::consumer_lag_bounded; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn consumer_lag(&self, group: &str) -> Result<Vec<LagInfo>>;
     /// Return complete per-partition lag within caller budgets.
     async fn consumer_lag_bounded(
@@ -1099,7 +1495,20 @@ pub trait AdminMutate: Connector {
 #[async_trait]
 pub trait Db2Engine: Connector {
     /// List user-defined sequences in a schema (defaults to current schema).
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_sequences_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::list_sequences_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_sequences(&self, schema: Option<&str>) -> Result<Vec<SequenceInfo>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::list_sequences_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_sequences_bounded(
         &self,
         _schema: Option<&str>,
@@ -1121,7 +1530,20 @@ pub trait Db2Engine: Connector {
         })
     }
     /// List stored procedures and user-defined functions in a schema.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_routines_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::list_routines_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_routines(&self, schema: Option<&str>) -> Result<Vec<RoutineInfo>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::list_routines_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_routines_bounded(
         &self,
         _schema: Option<&str>,
@@ -1143,7 +1565,20 @@ pub trait Db2Engine: Connector {
         })
     }
     /// List all tablespaces visible in the current database.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_tablespaces_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::list_tablespaces_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_tablespaces(&self) -> Result<Vec<TablespaceInfo>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::list_tablespaces_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_tablespaces_bounded(
         &self,
         _max_items: usize,
@@ -1163,7 +1598,20 @@ pub trait Db2Engine: Connector {
         })
     }
     /// List foreign-key constraints for a table (schema.table or bare table name).
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::list_foreign_keys_budgeted`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::list_foreign_keys_budgeted; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_foreign_keys(&self, table: &str) -> Result<Vec<ForeignKeyInfo>>;
+    /// This item-only compatibility method remains available throughout 0.1.x
+    /// and will not be removed before 0.2.0.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::list_foreign_keys_budgeted for item-and-byte bounds; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn list_foreign_keys_bounded(
         &self,
         _table: &str,
@@ -1185,6 +1633,13 @@ pub trait Db2Engine: Connector {
         })
     }
     /// Generate a CREATE TABLE DDL statement from the Db2 catalog.
+    ///
+    /// This method remains available throughout 0.1.x and will not be removed
+    /// before 0.2.0; use [`Self::generate_ddl_bounded`] for exact bounds.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Db2Engine::generate_ddl_bounded; retained through 0.1.x and removable no earlier than 0.2.0"
+    )]
     async fn generate_ddl(&self, table: &str) -> Result<String>;
     /// Generate DDL only when every required nested catalog item fits the
     /// caller budget. Partial DDL is never returned.
@@ -1508,6 +1963,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // This test intentionally proves that retained 0.1.x compatibility defaults fail closed.
+    #[allow(deprecated)]
     async fn budgeted_read_and_metadata_defaults_never_materialize_legacy_methods() {
         let connector = LegacyCatalogs::new();
         let metadata_budget = MetadataBudget::with_default_bytes(10).unwrap();
@@ -1980,6 +2437,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // This test intentionally proves the retained 0.1.x SQL compatibility default.
+    #[allow(deprecated)]
     async fn legacy_sql_connectors_do_not_claim_or_inherit_atomic_import() {
         let connector = LegacySql;
         assert!(!connector
@@ -2079,6 +2538,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // This test intentionally locks the retained 0.1.x document-write mapping.
+    #[allow(deprecated)]
     async fn legacy_document_bulk_methods_keep_their_mapping_without_claiming_optional_modes() {
         let connector = LegacyDocument;
         for operation in [
