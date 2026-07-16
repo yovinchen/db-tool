@@ -120,6 +120,7 @@ capability_operations! {
     SearchDeleteDocument => "search.delete_doc",
     SearchDeleteIndex => "search.delete_index",
     MessageProduce => "message.produce",
+    MessageProduceBudgeted => "message.produce_budgeted",
     MessageConsume => "message.consume",
     MessageConsumeGroup => "message.consume_group",
     MessageConsumeDurable => "message.consume_durable",
@@ -248,6 +249,9 @@ impl CapabilityOperation {
     pub const SEARCH_BUDGETED_READS: &'static [Self] =
         &[Self::SearchSearchBudgeted, Self::SearchGetDocumentBudgeted];
     pub const MESSAGE_PRODUCER: &'static [Self] = &[Self::MessageProduce];
+    /// Exact producer input envelopes are optional. The legacy producer flag
+    /// and `message.produce` operation never imply this contract.
+    pub const MESSAGE_PRODUCER_BUDGETED: &'static [Self] = &[Self::MessageProduceBudgeted];
     pub const MESSAGE_CONSUMER: &'static [Self] = &[Self::MessageConsume];
     /// Stateful identity and acknowledgement operations are optional and must
     /// be declared by connector-specific overrides. A legacy `consumer=true`
@@ -466,7 +470,7 @@ pub trait Connector: Send + Sync {
 mod tests {
     use super::*;
     use crate::{
-        model::Value,
+        model::{Message, ProduceBudget, ProduceOutcome, Value},
         port::capability::{KeyValueStore, SetOptions},
     };
     use bytes::Bytes;
@@ -491,6 +495,16 @@ mod tests {
 
         async fn close(self: Box<Self>) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl MessageProducer for LegacyConnector {
+        async fn produce(&self, _target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
+            Ok(ProduceOutcome {
+                produced: messages.len() as u64,
+                placements: Vec::new(),
+            })
         }
     }
 
@@ -753,6 +767,10 @@ mod tests {
                 CapabilityOperation::MessageAdminListTopicsBudgeted,
                 "message.admin.list_topics_budgeted",
             ),
+            (
+                CapabilityOperation::MessageProduceBudgeted,
+                "message.produce_budgeted",
+            ),
         ] {
             assert_eq!(operation.as_str(), stable_name);
             assert_eq!(
@@ -925,6 +943,7 @@ mod tests {
                     ]
                     .contains(operation)
                     && !CapabilityOperation::MESSAGE_CONSUMER_EXTENSIONS.contains(operation)
+                    && !CapabilityOperation::MESSAGE_PRODUCER_BUDGETED.contains(operation)
             })
             .collect::<Vec<_>>();
 
@@ -945,6 +964,9 @@ mod tests {
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::MESSAGE_CONSUMER_EXTENSIONS
+            .iter()
+            .all(|operation| !connector.operations().contains(operation)));
+        assert!(CapabilityOperation::MESSAGE_PRODUCER_BUDGETED
             .iter()
             .all(|operation| !connector.operations().contains(operation)));
         assert!(CapabilityOperation::BOUNDED_CATALOGS
@@ -982,6 +1004,35 @@ mod tests {
             ..Default::default()
         });
         assert!(admin_only.operations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coarse_producer_neither_claims_nor_inherits_budgeted_produce() {
+        let connector = LegacyConnector(Capabilities {
+            producer: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            connector.operations(),
+            [CapabilityOperation::MessageProduce]
+        );
+        assert!(!connector
+            .operations()
+            .contains(&CapabilityOperation::MessageProduceBudgeted));
+
+        let error = MessageProducer::produce_budgeted(
+            &connector,
+            "events",
+            Vec::new(),
+            ProduceBudget::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::UnsupportedCapability { kind, needed }
+                if kind == "legacy" && needed == "MessageProducer.produce_budgeted"
+        ));
     }
 
     #[tokio::test]

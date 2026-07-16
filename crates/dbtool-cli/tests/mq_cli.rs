@@ -56,6 +56,9 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
     assert!(produce_help.contains("--header <KEY=VALUE>"));
     assert!(produce_help.contains("--partition <PARTITION>"));
     assert!(produce_help.contains("--timestamp-ms <EPOCH_MILLIS>"));
+    assert!(produce_help.contains("--max-message-bytes <MAX_MESSAGE_BYTES>"));
+    assert!(produce_help.contains("default: 8388608"));
+    assert!(produce_help.contains("complete message input"));
 
     let consume_help = stdout_text(dbtool(&["mq", "consume", "--help"]));
     assert!(consume_help.contains("AMQP/AMQPS rejects group/durable identities"));
@@ -94,6 +97,83 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
     }
     assert!(delete_help.contains("--if-empty"));
     assert!(delete_help.contains("--if-unused"));
+}
+
+#[test]
+fn produce_input_budgets_fail_before_connecting_with_stable_errors() {
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "--allow-write",
+            "mq",
+            "produce",
+            "events",
+            "payload",
+            "--max-message-bytes",
+            "0",
+        ],
+        "per-message byte budget must be greater than zero",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "--allow-write",
+            "mq",
+            "produce",
+            "events",
+            "payload",
+            "--max-message-bytes",
+            "16777217",
+        ],
+        "per-message byte budget exceeds the hard",
+    );
+    assert_config_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "--allow-write",
+            "--max-bytes",
+            "0",
+            "mq",
+            "produce",
+            "events",
+            "payload",
+        ],
+        "--max-bytes must be greater than zero",
+    );
+
+    assert_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "--allow-write",
+            "mq",
+            "produce",
+            "events",
+            "payload",
+            "--max-message-bytes",
+            "1",
+        ],
+        "INPUT_BUDGET_EXCEEDED",
+        "input bytes budget of 1",
+    );
+    assert_error(
+        &[
+            "--dsn",
+            UNREACHABLE_DSN,
+            "--allow-write",
+            "--max-bytes",
+            "1",
+            "mq",
+            "produce",
+            "events",
+            "payload",
+        ],
+        "INPUT_BUDGET_EXCEEDED",
+        "input bytes budget of 1",
+    );
 }
 
 #[test]
@@ -305,7 +385,7 @@ fn topic_catalog_limit_is_rejected_before_connecting() {
             "mq",
             "topics",
         ],
-        "too large to reserve a truncation probe item",
+        "read item budget is too large to reserve a probe item",
     );
 }
 

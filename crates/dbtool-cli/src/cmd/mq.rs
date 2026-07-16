@@ -5,10 +5,11 @@ use dbtool_core::{
     error::Error,
     model::{
         AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, Message,
-        MessageResource, MessageResourceKind, DEFAULT_CONSUME_MESSAGE_BYTES, MAX_READ_BYTES,
+        MessageResource, MessageResourceKind, ProduceBudget, DEFAULT_CONSUME_MESSAGE_BYTES,
+        DEFAULT_PRODUCE_MESSAGE_BYTES, MAX_READ_BYTES,
     },
     port::CapabilityOperation,
-    service::safety::SafetyGuard,
+    service::{safety::SafetyGuard, MessageWriteLimiter},
     Result,
 };
 use std::{
@@ -19,7 +20,7 @@ use std::{
 #[derive(Args)]
 #[command(
     about = "Produce, consume, and inspect bounded message queue workflows.",
-    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write. Stateful group/durable consumption and successful-delivery acknowledgement also require --allow-write. AMQP/AMQPS consume requires explicit --ack on-success because successful delivery is ACKed and removed from the queue. Persistent resource deletion requires both --allow-write and a target-bound --confirm token. Topic/stream/queue catalogs honor both the positive global --limit item budget and --max-bytes response budget and require an exact backend-budgeted operation; no unbounded fallback is attempted. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
+    long_about = "Message commands cover Kafka-compatible topics, AMQP/RabbitMQ queues, Redis Streams/PubSub, and NATS/JetStream where the selected connector exposes those capabilities. Produce requires --allow-write and the exact message.produce_budgeted operation; --max-message-bytes bounds its complete message and global --max-bytes bounds its complete batch before connection or send. Stateful group/durable consumption and successful-delivery acknowledgement also require --allow-write. AMQP/AMQPS consume requires explicit --ack on-success because successful delivery is ACKed and removed from the queue. Persistent resource deletion requires both --allow-write and a target-bound --confirm token. Topic/stream/queue catalogs honor both the positive global --limit item budget and --max-bytes response budget and require an exact backend-budgeted operation; no unbounded fallback is attempted. Consume is always bounded by positive --max and --timeout values. When a consume result contains exactly --max messages, JSON meta.truncated marks that the limit was reached; it does not prove that more messages exist."
 )]
 pub struct MqCmd {
     #[command(subcommand)]
@@ -46,6 +47,9 @@ pub enum MqAction {
         /// Optional message timestamp as Unix epoch milliseconds.
         #[arg(long = "timestamp-ms", value_name = "EPOCH_MILLIS")]
         timestamp_ms: Option<i64>,
+        /// Maximum bytes in the complete message input, including key, payload, headers, and portable metadata fields.
+        #[arg(long, default_value_t = DEFAULT_PRODUCE_MESSAGE_BYTES)]
+        max_message_bytes: usize,
     },
     /// Consume messages (always bounded)
     #[command(
@@ -160,6 +164,11 @@ struct ConsumeRequest {
     ack_explicit: bool,
 }
 
+struct ProduceRequest {
+    message: Message,
+    budget: ProduceBudget,
+}
+
 pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
     let topics_budget = match &cmd.action {
         MqAction::Topics => Some(ctx.read_budget()?),
@@ -173,20 +182,23 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
         _ => None,
     };
 
-    let produce_message = match &cmd.action {
+    let produce_request = match &cmd.action {
         MqAction::Produce {
             payload,
             key,
             header,
             partition,
             timestamp_ms,
+            max_message_bytes,
             ..
-        } => Some(build_message(
+        } => Some(build_produce_request(
             payload,
             key.as_deref(),
             header,
             *partition,
             *timestamp_ms,
+            *max_message_bytes,
+            ctx.max_bytes,
         )?),
         _ => None,
     };
@@ -266,18 +278,25 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             header: _,
             partition: _,
             timestamp_ms: _,
+            max_message_bytes: _,
         } => {
-            require_message_operation(&operations, CapabilityOperation::MessageProduce, &kind)?;
+            require_message_operation(
+                &operations,
+                CapabilityOperation::MessageProduceBudgeted,
+                &kind,
+            )?;
             let producer = conn
                 .as_producer()
                 .ok_or_else(|| Error::UnsupportedCapability {
                     kind: kind.clone(),
                     needed: "MessageProducer",
                 })?;
-            let msg = produce_message.ok_or_else(|| {
-                Error::Internal("validated message producer input is missing".into())
+            let request = produce_request.ok_or_else(|| {
+                Error::Internal("validated message producer request is missing".into())
             })?;
-            let outcome = producer.produce(&topic, vec![msg]).await?;
+            let outcome = producer
+                .produce_budgeted(&topic, vec![request.message], request.budget)
+                .await?;
             ctx.render_success(&kind, outcome, elapsed(), false)
         }
         MqAction::Consume {
@@ -468,6 +487,23 @@ fn build_message(
         cursor: None,
         metadata: None,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_produce_request(
+    payload: &str,
+    key: Option<&str>,
+    headers: &[String],
+    partition: Option<i32>,
+    timestamp_ms: Option<i64>,
+    max_message_bytes: usize,
+    max_batch_bytes: usize,
+) -> Result<ProduceRequest> {
+    let budget = ProduceBudget::new(1, max_message_bytes, max_batch_bytes)?;
+    let message = build_message(payload, key, headers, partition, timestamp_ms)?;
+    MessageWriteLimiter::new(budget, "CLI message produce")?
+        .validate(std::slice::from_ref(&message))?;
+    Ok(ProduceRequest { message, budget })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -719,6 +755,111 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn legacy_producer_never_satisfies_budgeted_produce_negotiation() {
+        let operations = [CapabilityOperation::MessageProduce];
+        assert!(matches!(
+            require_message_operation(
+                &operations,
+                CapabilityOperation::MessageProduceBudgeted,
+                "legacy-mq"
+            ),
+            Err(Error::UnsupportedCapability { kind, needed })
+                if kind == "legacy-mq"
+                    && needed == CapabilityOperation::MessageProduceBudgeted.as_str()
+        ));
+    }
+
+    #[tokio::test]
+    async fn produce_budget_is_rejected_before_dsn_resolution() {
+        let base = Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: dbtool_core::service::formatter::Format::Json,
+            limit: 1,
+            max_bytes: dbtool_core::model::DEFAULT_PRODUCE_BATCH_BYTES,
+            throttle_overrides: Default::default(),
+            allow_write: true,
+            confirm: None,
+        };
+
+        let invalid_budget = run(
+            &base,
+            MqCmd {
+                action: MqAction::Produce {
+                    topic: "events".to_owned(),
+                    payload: "payload".to_owned(),
+                    key: None,
+                    header: Vec::new(),
+                    partition: None,
+                    timestamp_ms: None,
+                    max_message_bytes: 0,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            invalid_budget,
+            Error::Config(message) if message.contains("per-message byte budget")
+        ));
+
+        let oversized_message = run(
+            &base,
+            MqCmd {
+                action: MqAction::Produce {
+                    topic: "events".to_owned(),
+                    payload: "payload".to_owned(),
+                    key: None,
+                    header: Vec::new(),
+                    partition: None,
+                    timestamp_ms: None,
+                    max_message_bytes: 1,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            oversized_message,
+            Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit: 1,
+                ..
+            }
+        ));
+
+        let batch_limited = Context {
+            max_bytes: 1,
+            ..base
+        };
+        let oversized_batch = run(
+            &batch_limited,
+            MqCmd {
+                action: MqAction::Produce {
+                    topic: "events".to_owned(),
+                    payload: "payload".to_owned(),
+                    key: None,
+                    header: Vec::new(),
+                    partition: None,
+                    timestamp_ms: None,
+                    max_message_bytes: DEFAULT_PRODUCE_MESSAGE_BYTES,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            oversized_batch,
+            Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit: 1,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn topic_catalog_byte_budget_is_rejected_before_dsn_resolution() {
         let ctx = Context {
@@ -859,6 +1000,54 @@ mod tests {
         assert_eq!(message.partition, Some(2));
         assert_eq!(message.offset, None);
         assert_eq!(message.timestamp, Some(1_710_000_000_123));
+    }
+
+    #[test]
+    fn produce_request_uses_one_message_and_exact_message_and_batch_bytes() {
+        let message = build_message("payload", Some("key"), &[], None, None).unwrap();
+        let message_bytes = serde_json::to_vec(&message).unwrap().len();
+        let batch_bytes = serde_json::to_vec(&vec![message]).unwrap().len();
+
+        let request = build_produce_request(
+            "payload",
+            Some("key"),
+            &[],
+            None,
+            None,
+            message_bytes,
+            batch_bytes,
+        )
+        .unwrap();
+        assert_eq!(request.budget.max_messages, 1);
+        assert_eq!(request.budget.max_message_bytes, message_bytes);
+        assert_eq!(request.budget.max_batch_bytes, batch_bytes);
+
+        assert!(matches!(
+            build_produce_request(
+                "payload",
+                Some("key"),
+                &[],
+                None,
+                None,
+                message_bytes - 1,
+                batch_bytes,
+            ),
+            Err(Error::InputBudgetExceeded { unit: "bytes", limit, .. })
+                if limit == message_bytes - 1
+        ));
+        assert!(matches!(
+            build_produce_request(
+                "payload",
+                Some("key"),
+                &[],
+                None,
+                None,
+                message_bytes,
+                batch_bytes - 1,
+            ),
+            Err(Error::InputBudgetExceeded { unit: "bytes", limit, .. })
+                if limit == batch_bytes - 1
+        ));
     }
 
     #[test]

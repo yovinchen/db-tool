@@ -108,7 +108,41 @@ impl FlowControl {
         self.run_once(deadline_at, op).await
     }
 
+    /// Run one non-replayed mutation with conservative timeout semantics.
+    ///
+    /// Rate and concurrency admission failures retain their normal errors.
+    /// After admission, however, a request/overall timeout cannot prove that
+    /// the broker did not apply the write, so it is reported as an
+    /// indeterminate non-retryable outcome.
+    pub async fn run_single_mutation<F, T>(&self, operation: &str, op: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        if operation.trim().is_empty() || operation.chars().any(char::is_control) {
+            return Err(Error::Config(
+                "mutation operation label must be non-empty and contain no control characters"
+                    .to_owned(),
+            ));
+        }
+        self.validate_durations()?;
+        let deadline_at = deadline_from_now(self.config.overall_deadline)?;
+        self.run_once_with_timeout(deadline_at, op, Some(operation))
+            .await
+    }
+
     async fn run_once<F, T>(&self, deadline_at: Option<Instant>, op: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        self.run_once_with_timeout(deadline_at, op, None).await
+    }
+
+    async fn run_once_with_timeout<F, T>(
+        &self,
+        deadline_at: Option<Instant>,
+        op: F,
+        indeterminate_operation: Option<&str>,
+    ) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,
     {
@@ -130,7 +164,12 @@ impl FlowControl {
         let budget = budget_with_deadline(self.config.request_timeout, deadline_at)?;
         tokio::time::timeout(budget, op)
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| match indeterminate_operation {
+                None => Error::Timeout,
+                Some(operation) => Error::OutcomeIndeterminate(format!(
+                    "{operation} timed out after execution began; inspect remote state before retrying"
+                )),
+            })?
     }
 
     fn validate_durations(&self) -> Result<()> {
@@ -233,6 +272,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_single_timeout_remains_retryable_but_mutation_is_indeterminate() {
+        let config = ThrottleConfig {
+            request_timeout: Duration::from_millis(10),
+            overall_deadline: Some(Duration::from_millis(100)),
+            max_retries: 0,
+            ..test_config()
+        };
+
+        let ordinary = FlowControl::new(config.clone())
+            .run_single(async {
+                sleep(Duration::from_millis(100)).await;
+                Ok::<_, Error>(())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(ordinary, Error::Timeout));
+        assert!(ordinary.is_retryable());
+
+        let mutation = FlowControl::new(config)
+            .run_single_mutation("message produce", async {
+                sleep(Duration::from_millis(100)).await;
+                Ok::<_, Error>(())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &mutation,
+            Error::OutcomeIndeterminate(message)
+                if message == "message produce timed out after execution began; inspect remote state before retrying"
+        ));
+        assert_eq!(mutation.code(), "OUTCOME_INDETERMINATE");
+        assert!(!mutation.is_retryable());
+    }
+
+    #[tokio::test]
     async fn concurrency_acquire_timeout_returns_overloaded() {
         let flow = Arc::new(FlowControl::new(ThrottleConfig {
             max_concurrency: 1,
@@ -277,6 +351,27 @@ mod tests {
         let err = flow.run(|| async { Ok::<_, Error>(()) }).await.unwrap_err();
 
         assert!(matches!(err, Error::RateLimited));
+    }
+
+    #[tokio::test]
+    async fn mutation_runner_preserves_rate_admission_errors() {
+        let flow = FlowControl::new(ThrottleConfig {
+            rate: Some(Rate::per_second(1).unwrap()),
+            acquire_timeout: Duration::from_millis(15),
+            request_timeout: Duration::from_millis(50),
+            overall_deadline: Some(Duration::from_millis(100)),
+            max_retries: 0,
+            ..ThrottleConfig::default()
+        });
+
+        flow.run_single_mutation("message produce", async { Ok::<_, Error>(()) })
+            .await
+            .unwrap();
+        let error = flow
+            .run_single_mutation("message produce", async { Ok::<_, Error>(()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RateLimited));
     }
 
     #[tokio::test]

@@ -2,10 +2,10 @@ use crate::{
     model::{
         BoundedList, ConsumeOptions, DeleteResourceOptions, DeleteResourceOutcome, Document,
         ExecOutcome, FindOptions, ForeignKeyInfo, InsertOutcome, KeyExpiry, KeyValueRestoreOutcome,
-        KeyValueSnapshot, LagInfo, Message, MessageResource, MetadataBudget, Point, ProduceOutcome,
-        ReadBudget, ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo, TableSchema,
-        TablespaceInfo, TimeRange, TimeSeriesReadBudget, TopicDetail, TopicInfo, UpdateOutcome,
-        Value,
+        KeyValueSnapshot, LagInfo, Message, MessageResource, MetadataBudget, Point, ProduceBudget,
+        ProduceOutcome, ReadBudget, ResultSet, RoutineInfo, SequenceInfo, SeriesSet, TableInfo,
+        TableSchema, TablespaceInfo, TimeRange, TimeSeriesReadBudget, TopicDetail, TopicInfo,
+        UpdateOutcome, Value,
     },
     Result,
 };
@@ -612,6 +612,26 @@ pub struct SearchOptions {
 #[async_trait]
 pub trait MessageProducer: Connector {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome>;
+
+    /// Produce one completely prevalidated input batch.
+    ///
+    /// Implementations must validate the portable budget, target/resource
+    /// name, every complete message, and any stricter protocol ceilings before
+    /// creating resources or attempting the first send. Once an attempt may have reached the
+    /// backend, later failures must be returned as
+    /// [`crate::Error::OutcomeIndeterminate`]. This optional exact contract is
+    /// never inferred from the legacy producer family flag.
+    async fn produce_budgeted(
+        &self,
+        _target: &str,
+        _messages: Vec<Message>,
+        _budget: ProduceBudget,
+    ) -> Result<ProduceOutcome> {
+        Err(crate::Error::UnsupportedCapability {
+            kind: self.kind().0,
+            needed: "MessageProducer.produce_budgeted",
+        })
+    }
 }
 
 #[async_trait]

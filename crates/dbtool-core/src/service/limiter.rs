@@ -1,7 +1,7 @@
 use crate::{
     model::{
-        series::Series, BoundedList, ConsumeOptions, Message, MetadataBudget, ReadBudget,
-        ResultSet, SearchDocument, SearchHits, SeriesSet, TimeSeriesReadBudget,
+        series::Series, BoundedList, ConsumeOptions, Message, MetadataBudget, ProduceBudget,
+        ReadBudget, ResultSet, SearchDocument, SearchHits, SeriesSet, TimeSeriesReadBudget,
     },
     Error, Result,
 };
@@ -638,6 +638,73 @@ impl MessageReadLimiter {
             debug_assert!(!truncated, "consume batches never retain a probe item");
             messages
         })
+    }
+}
+
+/// Prevalidates one complete message write batch before remote side effects.
+///
+/// Every message is measured independently so an oversized unit cannot hide
+/// inside an otherwise small batch. The complete `Vec<Message>` is then
+/// measured again to include array delimiters and all message fields in the
+/// caller's cumulative envelope. The counting writer uses checked arithmetic
+/// and never allocates a second encoded copy. The target/resource name is not
+/// a [`Message`] field and must be validated separately by each protocol
+/// adapter before it performs resource creation or send work.
+pub struct MessageWriteLimiter {
+    budget: ProduceBudget,
+    subject: String,
+}
+
+impl MessageWriteLimiter {
+    pub fn new(budget: ProduceBudget, subject: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            budget: budget.validate()?,
+            subject: subject.into(),
+        })
+    }
+
+    /// Validate the count, each complete message, and the complete batch.
+    /// This method performs no remote access and retains no partial result.
+    pub fn validate(&self, messages: &[Message]) -> Result<()> {
+        if messages.is_empty() {
+            return Err(Error::Config(
+                "message produce batch must contain at least one message".to_owned(),
+            ));
+        }
+        if messages.len() > self.budget.max_messages {
+            return Err(self.budget_error("batch", "messages", self.budget.max_messages));
+        }
+
+        for message in messages {
+            ReadLimiter::measure_serialized(message, self.budget.max_message_bytes)
+                .map_err(|error| self.map_counting_error(error, "message"))?;
+        }
+
+        ReadLimiter::measure_serialized(messages, self.budget.max_batch_bytes)
+            .map_err(|error| self.map_counting_error(error, "batch"))?;
+        Ok(())
+    }
+
+    fn map_counting_error(&self, error: CountingError, scope: &str) -> Error {
+        match error {
+            CountingError::BudgetExceeded => {
+                let limit = if scope == "message" {
+                    self.budget.max_message_bytes
+                } else {
+                    self.budget.max_batch_bytes
+                };
+                self.budget_error(scope, "bytes", limit)
+            }
+            CountingError::Serialization(error) => Error::Serialization(error.to_string()),
+        }
+    }
+
+    fn budget_error(&self, scope: &str, unit: &'static str, limit: usize) -> Error {
+        Error::InputBudgetExceeded {
+            subject: format!("{} {scope}", self.subject),
+            unit,
+            limit,
+        }
     }
 }
 
@@ -1661,6 +1728,93 @@ mod tests {
                 limit,
                 ..
             }) if limit == batch_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn message_write_limiter_charges_count_each_message_and_complete_batch() {
+        let message = Message {
+            key: Some(Bytes::from_static(b"key")),
+            payload: Bytes::from_static(b"payload"),
+            headers: HashMap::from([("trace".to_owned(), "abc".to_owned())]),
+            partition: Some(1),
+            offset: None,
+            timestamp: Some(3),
+            cursor: None,
+            metadata: None,
+        };
+        let message_bytes = serde_json::to_vec(&message).unwrap().len();
+        let messages = vec![message.clone(), message.clone()];
+        let batch_bytes = serde_json::to_vec(&messages).unwrap().len();
+        let exact = ProduceBudget::new(2, message_bytes, batch_bytes).unwrap();
+        MessageWriteLimiter::new(exact, "Kafka produce")
+            .unwrap()
+            .validate(&messages)
+            .unwrap();
+
+        let empty_error = MessageWriteLimiter::new(exact, "Kafka produce")
+            .unwrap()
+            .validate(&[])
+            .unwrap_err();
+        assert!(matches!(empty_error, Error::Config(message) if message.contains("at least one")));
+
+        assert!(matches!(
+            MessageWriteLimiter::new(
+                ProduceBudget {
+                    max_messages: 0,
+                    ..ProduceBudget::default()
+                },
+                "Kafka produce",
+            ),
+            Err(Error::Config(message)) if message.contains("greater than zero")
+        ));
+
+        let count_error = MessageWriteLimiter::new(
+            ProduceBudget::new(1, message_bytes, batch_bytes).unwrap(),
+            "Kafka produce",
+        )
+        .unwrap()
+        .validate(&messages)
+        .unwrap_err();
+        assert!(matches!(
+            count_error,
+            Error::InputBudgetExceeded {
+                unit: "messages",
+                limit: 1,
+                ..
+            }
+        ));
+
+        let message_error = MessageWriteLimiter::new(
+            ProduceBudget::new(2, message_bytes - 1, batch_bytes).unwrap(),
+            "Kafka produce",
+        )
+        .unwrap()
+        .validate(&messages)
+        .unwrap_err();
+        assert!(matches!(
+            message_error,
+            Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == message_bytes - 1
+        ));
+
+        let batch_error = MessageWriteLimiter::new(
+            ProduceBudget::new(2, message_bytes, batch_bytes - 1).unwrap(),
+            "Kafka produce",
+        )
+        .unwrap()
+        .validate(&messages)
+        .unwrap_err();
+        assert!(matches!(
+            batch_error,
+            Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            } if limit == batch_bytes - 1
         ));
     }
 }

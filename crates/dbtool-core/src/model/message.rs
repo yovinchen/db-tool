@@ -10,12 +10,102 @@ pub const DEFAULT_CONSUME_MESSAGE_BYTES: usize = DEFAULT_READ_BYTES;
 /// Default cumulative byte ceiling for one complete consumed message batch.
 pub const DEFAULT_CONSUME_BATCH_BYTES: usize = DEFAULT_READ_BYTES;
 
+/// Absolute number of messages accepted by one portable produce call.
+///
+/// The byte ceiling normally becomes the tighter bound, but a separate item
+/// ceiling prevents batches of tiny or empty messages from growing without a
+/// finite process-level limit.
+pub const MAX_PRODUCE_MESSAGES: usize = 100_000;
+
+/// Absolute byte ceiling for one message or one complete produce batch.
+pub const MAX_PRODUCE_BYTES: usize = MAX_READ_BYTES;
+
+/// Finite compatibility default used by legacy producer entry points.
+pub const DEFAULT_PRODUCE_MESSAGES: usize = 100;
+
+/// Default byte ceiling for one complete message submitted for production.
+pub const DEFAULT_PRODUCE_MESSAGE_BYTES: usize = DEFAULT_CONSUME_MESSAGE_BYTES;
+
+/// Default cumulative byte ceiling for one complete produce batch.
+pub const DEFAULT_PRODUCE_BATCH_BYTES: usize = DEFAULT_CONSUME_BATCH_BYTES;
+
 const fn default_consume_message_bytes() -> usize {
     DEFAULT_CONSUME_MESSAGE_BYTES
 }
 
 const fn default_consume_batch_bytes() -> usize {
     DEFAULT_CONSUME_BATCH_BYTES
+}
+
+/// Caller-owned input envelope for a message produce operation.
+///
+/// `max_message_bytes` charges the compact JSON representation of every
+/// complete [`Message`], including its key, payload, headers, placement fields,
+/// cursor, and metadata. `max_batch_bytes` independently charges the complete
+/// `Vec<Message>` envelope. Adapters must validate this budget and all messages
+/// before creating a remote resource or attempting the first send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProduceBudget {
+    pub max_messages: usize,
+    pub max_message_bytes: usize,
+    pub max_batch_bytes: usize,
+}
+
+impl ProduceBudget {
+    pub fn new(
+        max_messages: usize,
+        max_message_bytes: usize,
+        max_batch_bytes: usize,
+    ) -> crate::Result<Self> {
+        let budget = Self {
+            max_messages,
+            max_message_bytes,
+            max_batch_bytes,
+        };
+        budget.validate()
+    }
+
+    /// Revalidate deserialized or directly constructed budgets at a trust
+    /// boundary. No field may disable its process-level hard ceiling.
+    pub fn validate(self) -> crate::Result<Self> {
+        if self.max_messages == 0 {
+            return Err(crate::Error::Config(
+                "produce message budget must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_messages > MAX_PRODUCE_MESSAGES {
+            return Err(crate::Error::Config(format!(
+                "produce message budget exceeds the hard {MAX_PRODUCE_MESSAGES}-message ceiling"
+            )));
+        }
+        validate_produce_byte_budget("per-message", self.max_message_bytes)?;
+        validate_produce_byte_budget("batch", self.max_batch_bytes)?;
+        Ok(self)
+    }
+}
+
+impl Default for ProduceBudget {
+    fn default() -> Self {
+        Self {
+            max_messages: DEFAULT_PRODUCE_MESSAGES,
+            max_message_bytes: DEFAULT_PRODUCE_MESSAGE_BYTES,
+            max_batch_bytes: DEFAULT_PRODUCE_BATCH_BYTES,
+        }
+    }
+}
+
+fn validate_produce_byte_budget(label: &str, value: usize) -> crate::Result<()> {
+    if value == 0 {
+        return Err(crate::Error::Config(format!(
+            "produce {label} byte budget must be greater than zero"
+        )));
+    }
+    if value > MAX_PRODUCE_BYTES {
+        return Err(crate::Error::Config(format!(
+            "produce {label} byte budget exceeds the hard {MAX_PRODUCE_BYTES}-byte ceiling"
+        )));
+    }
+    Ok(())
 }
 
 /// A backend-native, lossless position for a consumed message.
@@ -591,6 +681,64 @@ mod tests {
             ConsumeOptions {
                 max: usize::MAX,
                 ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn produce_budgets_have_stable_wire_names_defaults_and_hard_bounds() {
+        let budget = ProduceBudget::new(7, 1024, 4096).unwrap();
+        assert_eq!(
+            serde_json::to_value(budget).unwrap(),
+            serde_json::json!({
+                "max_messages": 7,
+                "max_message_bytes": 1024,
+                "max_batch_bytes": 4096,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ProduceBudget>(serde_json::to_value(budget).unwrap()).unwrap(),
+            budget
+        );
+        assert_eq!(
+            ProduceBudget::default(),
+            ProduceBudget {
+                max_messages: DEFAULT_PRODUCE_MESSAGES,
+                max_message_bytes: DEFAULT_PRODUCE_MESSAGE_BYTES,
+                max_batch_bytes: DEFAULT_PRODUCE_BATCH_BYTES,
+            }
+        );
+
+        for invalid in [
+            ProduceBudget {
+                max_messages: 0,
+                ..ProduceBudget::default()
+            },
+            ProduceBudget {
+                max_messages: MAX_PRODUCE_MESSAGES + 1,
+                ..ProduceBudget::default()
+            },
+            ProduceBudget {
+                max_messages: usize::MAX,
+                ..ProduceBudget::default()
+            },
+            ProduceBudget {
+                max_message_bytes: 0,
+                ..ProduceBudget::default()
+            },
+            ProduceBudget {
+                max_message_bytes: MAX_PRODUCE_BYTES + 1,
+                ..ProduceBudget::default()
+            },
+            ProduceBudget {
+                max_batch_bytes: 0,
+                ..ProduceBudget::default()
+            },
+            ProduceBudget {
+                max_batch_bytes: usize::MAX,
+                ..ProduceBudget::default()
             },
         ] {
             assert!(invalid.validate().is_err(), "accepted {invalid:?}");

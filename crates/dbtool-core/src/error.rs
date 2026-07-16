@@ -42,6 +42,14 @@ pub enum Error {
         unit: &'static str,
         limit: usize,
     },
+    /// A complete caller-supplied write input exceeded its declared item or
+    /// byte envelope. The failure occurs before any remote mutation begins.
+    #[error("{subject} exceeds the input {unit} budget of {limit}")]
+    InputBudgetExceeded {
+        subject: String,
+        unit: &'static str,
+        limit: usize,
+    },
     /// The client submitted an irreversible protocol operation but could not
     /// prove whether the remote system applied it. Callers must inspect remote
     /// state before retrying instead of treating this as a normal transient
@@ -95,6 +103,7 @@ impl Error {
             Error::Query(_) => "QUERY_ERROR",
             Error::MetadataBudgetExceeded { .. } => "METADATA_BUDGET_EXCEEDED",
             Error::ReadBudgetExceeded { .. } => "READ_BUDGET_EXCEEDED",
+            Error::InputBudgetExceeded { .. } => "INPUT_BUDGET_EXCEEDED",
             Error::OutcomeIndeterminate(_) => "OUTCOME_INDETERMINATE",
             Error::ConfirmRequired { .. } => "CONFIRM_REQUIRED",
             Error::ReadOnly => "READ_ONLY",
@@ -148,6 +157,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "SQL query result exceeds the read bytes budget of 1024"
+        );
+    }
+
+    #[test]
+    fn input_budget_errors_have_a_stable_machine_code_and_are_not_retryable() {
+        let error = Error::InputBudgetExceeded {
+            subject: "Kafka produce message".to_owned(),
+            unit: "bytes",
+            limit: 1024,
+        };
+        assert_eq!(error.code(), "INPUT_BUDGET_EXCEEDED");
+        assert!(!error.is_retryable());
+        assert_eq!(
+            error.to_string(),
+            "Kafka produce message exceeds the input bytes budget of 1024"
         );
     }
 }

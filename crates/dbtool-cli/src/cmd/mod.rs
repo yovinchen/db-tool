@@ -43,8 +43,8 @@ impl Context {
         Ok(())
     }
 
-    /// Validate the global caller byte ceiling for every data command, even
-    /// when the selected action does not yet consume a structured read budget.
+    /// Validate the global caller byte ceiling for every data command, whether
+    /// it bounds a structured read response or a complete write input batch.
     pub fn ensure_read_byte_budget(&self) -> dbtool_core::Result<()> {
         if self.max_bytes == 0 {
             return Err(Error::Config(

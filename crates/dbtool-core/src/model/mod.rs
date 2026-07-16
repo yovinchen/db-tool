@@ -17,8 +17,10 @@ pub use kv::{KeyExpiry, KeyValueRestoreOutcome, KeyValueSnapshot};
 pub use message::{
     AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions,
     DeleteResourceOutcome, Message, MessageCursor, MessageMetadata, MessagePlacement,
-    MessageResource, MessageResourceKind, ProduceOutcome, DEFAULT_CONSUME_BATCH_BYTES,
-    DEFAULT_CONSUME_MESSAGE_BYTES,
+    MessageResource, MessageResourceKind, ProduceBudget, ProduceOutcome,
+    DEFAULT_CONSUME_BATCH_BYTES, DEFAULT_CONSUME_MESSAGE_BYTES, DEFAULT_PRODUCE_BATCH_BYTES,
+    DEFAULT_PRODUCE_MESSAGES, DEFAULT_PRODUCE_MESSAGE_BYTES, MAX_PRODUCE_BYTES,
+    MAX_PRODUCE_MESSAGES,
 };
 pub use meta::{
     ColumnMeta, ForeignKeyInfo, IndexInfo, LagInfo, PartitionWatermark, RoutineInfo, RoutineKind,

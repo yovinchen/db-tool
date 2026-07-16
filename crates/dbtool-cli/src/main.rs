@@ -34,7 +34,7 @@ struct Cli {
     #[arg(long, global = true, default_value = "100")]
     limit: usize,
 
-    /// Maximum cumulative bytes retained by one bounded read response
+    /// Maximum cumulative bytes in one bounded read response or write input batch
     #[arg(long, global = true, default_value_t = DEFAULT_READ_BYTES)]
     max_bytes: usize,
 
@@ -215,9 +215,14 @@ async fn main() {
         Commands::Conn(sub) => cmd::conn::run(&ctx, sub).await,
         command => match ctx.throttle_config() {
             Ok(config) => {
-                FlowControl::new(config)
-                    .run_single(run_data_command(&ctx, command))
-                    .await
+                let flow = FlowControl::new(config);
+                let indeterminate_timeout = uses_indeterminate_timeout(&command);
+                let operation = run_data_command(&ctx, command);
+                if indeterminate_timeout {
+                    flow.run_single_mutation("message produce", operation).await
+                } else {
+                    flow.run_single(operation).await
+                }
             }
             Err(err) => Err(err),
         },
@@ -231,6 +236,15 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn uses_indeterminate_timeout(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Mq(cmd::mq::MqCmd {
+            action: cmd::mq::MqAction::Produce { .. }
+        })
+    )
 }
 
 async fn run_data_command(ctx: &cmd::Context, command: Commands) -> dbtool_core::Result<String> {
@@ -255,5 +269,50 @@ async fn run_data_command(ctx: &cmd::Context, command: Commands) -> dbtool_core:
         Commands::Conn(_) => Err(dbtool_core::Error::Internal(
             "conn command is not a data operation".to_owned(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed_command(args: &[&str]) -> Commands {
+        Cli::try_parse_from(args)
+            .expect("test CLI should parse")
+            .command
+    }
+
+    #[test]
+    fn only_message_produce_uses_indeterminate_outer_timeout_semantics() {
+        let produce = parsed_command(&[
+            "dbtool",
+            "--dsn",
+            "kafka://127.0.0.1:9092",
+            "mq",
+            "produce",
+            "events",
+            "payload",
+        ]);
+        assert!(uses_indeterminate_timeout(&produce));
+
+        let consume = parsed_command(&[
+            "dbtool",
+            "--dsn",
+            "kafka://127.0.0.1:9092",
+            "mq",
+            "consume",
+            "events",
+        ]);
+        assert!(!uses_indeterminate_timeout(&consume));
+
+        let sql_write = parsed_command(&[
+            "dbtool",
+            "--dsn",
+            "sqlite::memory:",
+            "sql",
+            "exec",
+            "INSERT INTO events VALUES (1)",
+        ]);
+        assert!(!uses_indeterminate_timeout(&sql_write));
     }
 }
