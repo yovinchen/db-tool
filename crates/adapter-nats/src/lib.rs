@@ -6,13 +6,15 @@ use dbtool_core::{
         AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
         DeleteResourceOptions, DeleteResourceOutcome, LagInfo, Message, MessageCursor,
         MessageMetadata, MessageResource, MessageResourceKind, MetadataBudget, PartitionWatermark,
-        ProduceOutcome, ReadBudget, TopicDetail, TopicInfo, MAX_METADATA_BYTES,
+        ProduceBudget, ProduceOutcome, ReadBudget, TopicDetail, TopicInfo, MAX_METADATA_BYTES,
     },
     port::{
         capability::{AdminInspect, AdminMutate, MessageConsumer, MessageProducer},
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter, ReadLimiter},
+    service::limiter::{
+        ListLimiter, MessageReadLimiter, MessageWriteLimiter, MetadataLimiter, ReadLimiter,
+    },
 };
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
@@ -96,30 +98,44 @@ impl Connector for NatsAdapter {
 #[async_trait::async_trait]
 impl MessageProducer for NatsAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
-        validate_subject(target)?;
-        for message in &messages {
-            validate_produce_message(message)?;
-        }
+        self.produce_budgeted(target, messages, ProduceBudget::default())
+            .await
+    }
+
+    async fn produce_budgeted(
+        &self,
+        target: &str,
+        messages: Vec<Message>,
+        budget: ProduceBudget,
+    ) -> Result<ProduceOutcome> {
+        validate_publish_subject(target)?;
+        let server_info = self.client.server_info();
+        let prepared = prepare_nats_messages(
+            messages,
+            budget,
+            server_info.max_payload,
+            server_info.headers,
+        )?;
+
         let mut produced = 0;
-        for message in messages {
-            let headers = nats_headers_from_core(&message.headers)?;
-            if headers.is_empty() {
+        for message in prepared {
+            if message.headers.is_empty() {
                 self.client
                     .publish(target.to_owned(), message.payload)
                     .await
-                    .map_err(|e| Error::Query(e.to_string()))?;
+                    .map_err(|error| nats_produce_indeterminate("publish dispatch", error))?;
             } else {
                 self.client
-                    .publish_with_headers(target.to_owned(), headers, message.payload)
+                    .publish_with_headers(target.to_owned(), message.headers, message.payload)
                     .await
-                    .map_err(|e| Error::Query(e.to_string()))?;
+                    .map_err(|error| nats_produce_indeterminate("publish dispatch", error))?;
             }
             produced += 1;
         }
         self.client
             .flush()
             .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+            .map_err(|error| nats_produce_indeterminate("server flush", error))?;
 
         Ok(ProduceOutcome {
             produced,
@@ -922,6 +938,7 @@ fn jetstream_message_to_core(message: async_nats::jetstream::Message) -> Result<
 fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::MessageProduceBudgeted,
         CapabilityOperation::MessageConsumeGroup,
         CapabilityOperation::MessageConsumeDurable,
         CapabilityOperation::MessageConsumeAck,
@@ -935,6 +952,79 @@ fn nats_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
         CapabilityOperation::MessageAdminDelete,
     ]);
     operations
+}
+
+struct PreparedNatsMessage {
+    payload: Bytes,
+    headers: async_nats::HeaderMap,
+}
+
+fn prepare_nats_messages(
+    messages: Vec<Message>,
+    budget: ProduceBudget,
+    max_payload: usize,
+    server_supports_headers: bool,
+) -> Result<Vec<PreparedNatsMessage>> {
+    MessageWriteLimiter::new(budget, "NATS produce input")?.validate(&messages)?;
+    if max_payload == 0 {
+        return Err(Error::Config(
+            "NATS server INFO did not advertise a positive max_payload".into(),
+        ));
+    }
+
+    messages
+        .into_iter()
+        .map(|message| {
+            validate_produce_message(&message)?;
+            let headers = nats_headers_from_core(&message.headers)?;
+            if !headers.is_empty() && !server_supports_headers {
+                return Err(Error::Config(
+                    "NATS server does not advertise header support".into(),
+                ));
+            }
+            let wire_bytes = nats_wire_payload_bytes(&message.payload, &headers)?;
+            if wire_bytes > max_payload {
+                return Err(Error::InputBudgetExceeded {
+                    subject: "NATS server max_payload".to_owned(),
+                    unit: "bytes",
+                    limit: max_payload,
+                });
+            }
+            Ok(PreparedNatsMessage {
+                payload: message.payload,
+                headers,
+            })
+        })
+        .collect()
+}
+
+fn nats_wire_payload_bytes(payload: &Bytes, headers: &async_nats::HeaderMap) -> Result<usize> {
+    let header_bytes = if headers.is_empty() {
+        0
+    } else {
+        // async-nats encodes `NATS/1.0\r\n`, each `name: value\r\n`, and one
+        // final CRLF. Count that exact HPUB body before the client can queue it.
+        let mut bytes = b"NATS/1.0\r\n\r\n".len();
+        for (name, values) in headers.iter() {
+            for value in values {
+                bytes = bytes
+                    .checked_add(name.to_string().len())
+                    .and_then(|bytes| bytes.checked_add(b": \r\n".len()))
+                    .and_then(|bytes| bytes.checked_add(value.as_str().len()))
+                    .ok_or_else(|| Error::Config("NATS header wire size overflow".into()))?;
+            }
+        }
+        bytes
+    };
+    header_bytes
+        .checked_add(payload.len())
+        .ok_or_else(|| Error::Config("NATS message wire size overflow".into()))
+}
+
+fn nats_produce_indeterminate(stage: &str, error: impl std::fmt::Display) -> Error {
+    Error::OutcomeIndeterminate(format!(
+        "NATS produce failed during {stage} after a publish may have reached Core NATS or JetStream ({error}); inspect subscriber or stream state before retrying"
+    ))
 }
 
 fn nats_budgeted_topic_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize)> {
@@ -1071,6 +1161,16 @@ fn validate_subject(subject: &str) -> Result<()> {
         return Err(Error::Query(format!("invalid NATS subject: {subject:?}")));
     }
 
+    Ok(())
+}
+
+fn validate_publish_subject(subject: &str) -> Result<()> {
+    validate_subject(subject)?;
+    if subject.contains(['*', '>']) || subject.split('.').any(str::is_empty) {
+        return Err(Error::Query(format!(
+            "invalid fully specified NATS publish subject: {subject:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -1498,6 +1598,114 @@ mod tests {
     }
 
     #[test]
+    fn nats_produce_preflight_enforces_budget_and_server_wire_boundaries() {
+        let candidate = message();
+        let message_bytes = serde_json::to_vec(&candidate).unwrap().len();
+        let batch_bytes = serde_json::to_vec(&vec![candidate.clone()]).unwrap().len();
+        let mapped = nats_headers_from_core(&candidate.headers).unwrap();
+        let wire_bytes = nats_wire_payload_bytes(&candidate.payload, &mapped).unwrap();
+        let exact = ProduceBudget::new(1, message_bytes, batch_bytes).unwrap();
+
+        assert_eq!(
+            prepare_nats_messages(vec![candidate.clone()], exact, wire_bytes, true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            prepare_nats_messages(vec![candidate.clone()], exact, wire_bytes - 1, true),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == wire_bytes - 1
+        ));
+
+        let per_message_short = ProduceBudget::new(1, message_bytes - 1, batch_bytes).unwrap();
+        assert!(matches!(
+            prepare_nats_messages(
+                vec![candidate.clone()],
+                per_message_short,
+                usize::MAX,
+                true,
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == message_bytes - 1
+        ));
+
+        let batch_short = ProduceBudget::new(1, message_bytes, batch_bytes - 1).unwrap();
+        assert!(matches!(
+            prepare_nats_messages(
+                vec![candidate.clone()],
+                batch_short,
+                usize::MAX,
+                true,
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == batch_bytes - 1
+        ));
+
+        assert!(matches!(
+            prepare_nats_messages(
+                vec![candidate.clone(), candidate],
+                ProduceBudget::new(1, 4096, 4096).unwrap(),
+                usize::MAX,
+                true,
+            ),
+            Err(Error::InputBudgetExceeded {
+                unit: "messages",
+                limit: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn nats_prevalidates_protocol_fields_and_header_support_before_dispatch() {
+        let valid = message();
+        let mut invalid = message();
+        invalid.offset = Some(42);
+        assert!(matches!(
+            prepare_nats_messages(
+                vec![valid.clone(), invalid],
+                ProduceBudget::default(),
+                usize::MAX,
+                true,
+            ),
+            Err(Error::Config(message)) if message.contains("producer offsets")
+        ));
+        assert!(matches!(
+            prepare_nats_messages(
+                vec![valid],
+                ProduceBudget::default(),
+                usize::MAX,
+                false,
+            ),
+            Err(Error::Config(message)) if message.contains("header support")
+        ));
+        for subject in ["events.*", "events.>", ".events", "events.", "events..new"] {
+            assert!(validate_publish_subject(subject).is_err(), "{subject:?}");
+        }
+        assert!(validate_publish_subject("events.eu.new").is_ok());
+    }
+
+    #[test]
+    fn nats_failures_after_produce_starts_are_nonretryable() {
+        let error = nats_produce_indeterminate("server flush", "connection closed");
+        assert_eq!(error.code(), "OUTCOME_INDETERMINATE");
+        assert!(!error.is_retryable());
+        assert!(
+            matches!(error, Error::OutcomeIndeterminate(message) if message.contains("inspect subscriber or stream state"))
+        );
+    }
+
+    #[test]
     fn nats_stateful_identity_rules_do_not_invent_protocol_semantics() {
         let group = ConsumeOptions {
             identity: ConsumerIdentity::Group {
@@ -1654,6 +1862,7 @@ mod tests {
 
         for operation in [
             CapabilityOperation::MessageProduce,
+            CapabilityOperation::MessageProduceBudgeted,
             CapabilityOperation::MessageConsume,
             CapabilityOperation::MessageConsumeGroup,
             CapabilityOperation::MessageConsumeDurable,

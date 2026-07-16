@@ -4,8 +4,8 @@ use dbtool_core::{
     dsn::Dsn,
     error::Error,
     model::{
-        AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, MessageCursor,
-        MessageResource, MessageResourceKind, MetadataBudget, ReadBudget,
+        AckMode, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, Message, MessageCursor,
+        MessageResource, MessageResourceKind, MetadataBudget, ProduceBudget, ReadBudget,
     },
     port::CapabilityOperation,
 };
@@ -83,6 +83,102 @@ async fn delete_stream(connector: &dyn dbtool_core::port::connector::Connector, 
         .expect("JetStream cleanup should succeed");
     assert!(outcome.acknowledged);
     assert!(outcome.verified_absent);
+}
+
+#[tokio::test]
+async fn budgeted_core_nats_publish_rejects_before_jetstream_write_then_round_trips() {
+    let Some(dsn) = live_dsn() else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let stream_name = format!("DBTOOL_NATS_PRODUCE_{suffix}").to_ascii_uppercase();
+    let subject = format!("dbtool.it.nats.produce.{suffix}");
+    let connector = factory(Dsn::parse(&dsn).expect("NATS DSN should parse"))
+        .await
+        .expect("NATS adapter should connect");
+    assert!(connector
+        .operations()
+        .contains(&CapabilityOperation::MessageProduceBudgeted));
+    let direct = async_nats::connect(dsn)
+        .await
+        .expect("direct NATS fixture client should connect");
+    let jetstream = async_nats::jetstream::new(direct);
+    let mut stream = jetstream
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: stream_name.clone(),
+            subjects: vec![subject.clone()],
+            max_messages: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("isolated produce JetStream should be created");
+    let candidate = Message {
+        key: None,
+        payload: Bytes::from_static(b"budgeted-nats-round-trip"),
+        headers: std::collections::HashMap::from([("trace".to_owned(), "budgeted".to_owned())]),
+        partition: None,
+        offset: None,
+        timestamp: None,
+        cursor: None,
+        metadata: None,
+    };
+    let producer = connector
+        .as_producer()
+        .expect("NATS adapter should expose a producer");
+
+    assert!(matches!(
+        producer
+            .produce_budgeted(
+                &subject,
+                vec![candidate.clone()],
+                ProduceBudget::new(1, 1, 4096).unwrap(),
+            )
+            .await,
+        Err(Error::InputBudgetExceeded {
+            unit: "bytes",
+            limit: 1,
+            ..
+        })
+    ));
+    assert_eq!(
+        stream
+            .info()
+            .await
+            .expect("stream state should refresh after rejected input")
+            .state
+            .messages,
+        0,
+        "caller budget failure must dispatch no Core NATS message"
+    );
+
+    let message_bytes = serde_json::to_vec(&candidate).unwrap().len();
+    let batch_bytes = serde_json::to_vec(&vec![candidate.clone()]).unwrap().len();
+    let outcome = producer
+        .produce_budgeted(
+            &subject,
+            vec![candidate.clone()],
+            ProduceBudget::new(1, message_bytes, batch_bytes).unwrap(),
+        )
+        .await
+        .expect("exact budgeted Core NATS publish should succeed");
+    assert_eq!(outcome.produced, 1);
+    let info = stream
+        .info()
+        .await
+        .expect("stream state should refresh after successful input");
+    assert_eq!(info.state.messages, 1);
+    let first_sequence = info.state.first_sequence;
+    let stored = stream
+        .get_raw_message(first_sequence)
+        .await
+        .expect("JetStream should retain the Core NATS publish");
+    assert_eq!(stored.payload, candidate.payload);
+
+    delete_stream(connector.as_ref(), &stream_name).await;
+    connector
+        .close()
+        .await
+        .expect("adapter connection should close");
 }
 
 #[tokio::test]
