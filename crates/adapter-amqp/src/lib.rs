@@ -106,6 +106,16 @@ impl Connector for AmqpAdapter {
 #[async_trait::async_trait]
 impl MessageProducer for AmqpAdapter {
     async fn produce(&self, target: &str, messages: Vec<Message>) -> Result<ProduceOutcome> {
+        // Preserve the 0.x compatibility contract: an empty legacy batch is a
+        // validated no-op. The exact budgeted sibling intentionally rejects
+        // empty batches so new callers cannot mistake them for broker work.
+        validate_queue(target)?;
+        if messages.is_empty() {
+            return Ok(ProduceOutcome {
+                produced: 0,
+                placements: vec![],
+            });
+        }
         self.produce_budgeted(target, messages, ProduceBudget::default())
             .await
     }

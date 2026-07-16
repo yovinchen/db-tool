@@ -61,6 +61,12 @@ async fn budgeted_amqp_produce_rejects_before_queue_creation_then_round_trips() 
         .expect("AMQP adapter should expose a producer");
     let candidate = produce_message(b"budgeted-amqp-round-trip");
 
+    let legacy_empty = producer
+        .produce(&queue, vec![])
+        .await
+        .expect("legacy empty AMQP batch should remain a no-op");
+    assert_eq!(legacy_empty.produced, 0);
+
     assert!(matches!(
         producer
             .produce_budgeted(
