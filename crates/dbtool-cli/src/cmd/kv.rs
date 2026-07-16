@@ -671,6 +671,7 @@ mod tests {
             dsn: Some("redis://127.0.0.1:1/0".to_owned()),
             format: Format::Json,
             limit: 2,
+            max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,

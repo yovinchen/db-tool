@@ -132,13 +132,14 @@ the stated dbtool objective.
 
 ## Active Verification Work
 
-Top-level catalog bounds and exact method negotiation are complete. The current
+Top-level catalog item bounds and exact method negotiation are complete. The
 read-envelope audit is tracked as IF-T67 through IF-T75 in
-`docs/interface-completion-tasks.zh-CN.md`: nested schema/topic metadata,
-cross-platform artifact replacement, recursive SQL/CQL result bytes, KV reads,
-multi-document accumulation, message batch bytes before ACK, time-series
-structure, catalog scalar bytes, and the legacy unbounded API lifecycle. A
-bounded top-level name or row count is not evidence that these nested values are
+`docs/interface-completion-tasks.zh-CN.md`. Nested schema/topic metadata,
+recursive SQL/CQL result bytes, multi-document accumulation, and message batch
+bytes before ACK are complete. Cross-platform artifact replacement is implemented
+but still awaits current-SHA Windows CI evidence. KV reads, structured time-series
+budgets, catalog scalar bytes, and the legacy unbounded API lifecycle remain open.
+A bounded top-level name or row count is not evidence that nested values are
 bounded. IF-T51 remains open until the final all-feature compile, test, and
 packaging pass.
 

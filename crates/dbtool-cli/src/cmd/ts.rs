@@ -313,6 +313,7 @@ mod tests {
             dsn: None,
             format: Format::Json,
             limit: 100,
+            max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,

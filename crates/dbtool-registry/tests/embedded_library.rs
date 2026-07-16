@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use dbtool_core::{
     error::Error,
-    model::Value,
+    model::{ReadBudget, Value},
     port::CapabilityOperation,
     service::{safety::StatementKind, ConnectionManager, FlowControl, SafetyGuard, ThrottleConfig},
 };
@@ -20,7 +20,7 @@ async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior()
     let operations = conn.operations();
     for operation in [
         CapabilityOperation::SqlExecute,
-        CapabilityOperation::SqlQueryBounded,
+        CapabilityOperation::SqlQueryBudgeted,
     ] {
         assert!(
             operations.contains(&operation),
@@ -83,10 +83,10 @@ async fn embedded_registry_manager_safety_and_flow_control_share_core_behavior()
         ..ThrottleConfig::default()
     });
     let rows = flow
-        .run_single(sql.query_bounded(
+        .run_single(sql.query_budgeted(
             "select id, note from embedded_values where id = 1",
             &[],
-            100,
+            ReadBudget::new(100, 8 * 1024 * 1024).unwrap(),
         ))
         .await
         .unwrap();

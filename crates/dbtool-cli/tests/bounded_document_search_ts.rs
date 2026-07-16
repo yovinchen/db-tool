@@ -244,6 +244,65 @@ fn mongo_live_collection_catalog_distinguishes_n_from_n_plus_one_and_cleans_up()
 }
 
 #[test]
+fn mongo_live_find_and_aggregate_use_cumulative_document_budgets() {
+    if env::var("DBTOOL_RUN_INTEGRATION").as_deref() != Ok("1") {
+        return;
+    }
+
+    let base = env::var("DBTOOL_IT_MONGO_DSN").expect("DBTOOL_IT_MONGO_DSN is required");
+    let dsn = mongo_database_dsn(&base, &unique_name("dbtool_it_document_budget"));
+    let collection = "events";
+    let _cleanup = MongoCleanup {
+        dsn: dsn.clone(),
+        collections: vec![collection.to_owned()],
+    };
+    for sequence in [1, 2] {
+        let document = format!(
+            r#"{{"sequence":{sequence},"payload":"{}"}}"#,
+            "x".repeat(64)
+        );
+        let inserted = stdout_json(dbtool(&[
+            "--dsn",
+            &dsn,
+            "--allow-write",
+            "doc",
+            "insert",
+            collection,
+            &document,
+        ]));
+        assert_eq!(inserted["data"]["inserted"], 1);
+    }
+
+    for action in [
+        vec!["doc", "find", collection, "--filter", "{}"],
+        vec!["doc", "aggregate", collection, "[]"],
+    ] {
+        let mut args = vec!["--dsn", dsn.as_str(), "--limit", "1"];
+        args.extend(action);
+        let bounded = stdout_json(dbtool(&args));
+        assert_eq!(bounded["data"].as_array().map(Vec::len), Some(1));
+        assert_eq!(bounded["meta"]["truncated"], true);
+    }
+
+    let too_small = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--limit",
+        "2",
+        "--max-bytes",
+        "1",
+        "doc",
+        "find",
+        collection,
+        "--filter",
+        "{}",
+    ]));
+    assert_eq!(too_small["error"]["code"], "READ_BUDGET_EXCEEDED");
+    assert_operation(&dsn, "document.find_budgeted");
+    assert_operation(&dsn, "document.aggregate_budgeted");
+}
+
+#[test]
 fn opensearch_live_index_catalog_distinguishes_n_from_n_plus_one_and_cleans_up() {
     if env::var("DBTOOL_RUN_OBSERVABILITY_INTEGRATION").as_deref() != Ok("1") {
         return;

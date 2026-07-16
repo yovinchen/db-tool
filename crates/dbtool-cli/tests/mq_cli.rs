@@ -65,6 +65,12 @@ fn messaging_help_documents_raw_payload_and_existing_model_fields() {
     assert!(consume_help.contains("does not prove that another message exists"));
     assert!(consume_help.contains("--max <MAX>"));
     assert!(consume_help.contains("--timeout <TIMEOUT>"));
+    assert!(consume_help.contains("--max-message-bytes <MAX_MESSAGE_BYTES>"));
+    assert!(consume_help.contains("--max-bytes <MAX_BYTES>"));
+    assert!(consume_help.contains("default: 8388608"));
+    assert!(consume_help.contains("payload, key, headers, cursor"));
+    assert!(consume_help.contains("JetStream double-ACK"));
+    assert!(consume_help.contains("Core NATS and Redis Pub/Sub"));
     assert!(consume_help.contains("--partition <PARTITION>"));
     assert!(consume_help.contains("--offset <OFFSET>"));
     assert!(consume_help.contains("--cursor <CURSOR>"));
@@ -422,6 +428,49 @@ fn consume_bounds_and_positions_fail_as_json_before_connecting() {
         ],
         "--timeout must be greater than zero",
     );
+    for (option, value, expected_message) in [
+        (
+            "--max-message-bytes",
+            "0",
+            "--max-message-bytes must be greater than zero",
+        ),
+        ("--max-bytes", "0", "--max-bytes must be greater than zero"),
+        (
+            "--max-message-bytes",
+            "16777217",
+            "--max-message-bytes exceeds the hard",
+        ),
+        ("--max-bytes", "16777217", "--max-bytes exceeds the hard"),
+    ] {
+        assert_config_error(
+            &[
+                "--dsn",
+                UNREACHABLE_DSN,
+                "mq",
+                "consume",
+                "events",
+                option,
+                value,
+            ],
+            expected_message,
+        );
+    }
+
+    let exact_ceiling = stderr_json(dbtool(&[
+        "--dsn",
+        UNREACHABLE_DSN,
+        "--max-bytes",
+        "16777216",
+        "mq",
+        "consume",
+        "events",
+        "--max-message-bytes",
+        "16777216",
+    ]));
+    assert_ne!(exact_ceiling["error"]["code"], "CONFIG_ERROR");
+    assert!(!exact_ceiling["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("byte ceiling")));
     assert_config_error(
         &[
             "--dsn",

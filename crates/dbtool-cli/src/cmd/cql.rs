@@ -4,7 +4,7 @@ use dbtool_core::{
     error::Error,
     port::CapabilityOperation,
     service::{
-        limiter::{ListLimiter, ResultLimiter},
+        limiter::ListLimiter,
         safety::{SafetyGuard, StatementKind},
     },
     Result,
@@ -51,15 +51,19 @@ pub enum CqlAction {
 }
 
 pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
-    match &cmd.action {
-        CqlAction::Query { .. } => {
-            ResultLimiter::new(ctx.limit).probe_rows()?;
-        }
+    let read_budget = match &cmd.action {
+        CqlAction::Query { .. } => Some(ctx.read_budget()?),
+        _ => None,
+    };
+    let metadata_budget = match &cmd.action {
+        CqlAction::Query { .. } => None,
         CqlAction::Keyspaces | CqlAction::Tables { .. } => {
             ListLimiter::new(ctx.limit).probe_items()?;
+            None
         }
-        CqlAction::Exec { .. } | CqlAction::Schema { .. } => {}
-    }
+        CqlAction::Schema { .. } => Some(ctx.metadata_budget()?),
+        CqlAction::Exec { .. } => None,
+    };
     let dsn = ctx.resolve_dsn()?;
     let target = ctx.safety_target(&dsn);
 
@@ -84,7 +88,12 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
 
     Ok(match cmd.action {
         CqlAction::Query { cql: query } => {
-            let result = cql.query_cql_bounded(&query, ctx.limit).await?;
+            let result = cql
+                .query_cql_budgeted(
+                    &query,
+                    read_budget.expect("query actions construct a read budget"),
+                )
+                .await?;
             let truncated = result.truncated;
             ctx.render_success(&kind, result, elapsed(), truncated)
         }
@@ -106,7 +115,12 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
         }
         CqlAction::Schema { table, keyspace } => {
             let table = cql_table_ref(&table, keyspace.as_deref())?;
-            let schema = cql.describe_cql_table(&table).await?;
+            let schema = cql
+                .describe_cql_table_bounded(
+                    &table,
+                    metadata_budget.expect("schema actions construct a metadata budget"),
+                )
+                .await?;
             ctx.render_success(&kind, schema, elapsed(), false)
         }
     })
@@ -115,8 +129,8 @@ pub async fn run(ctx: &Context, cmd: CqlCmd) -> Result<String> {
 fn cql_operation_for_action(action: &CqlAction) -> Option<(CapabilityOperation, &'static str)> {
     match action {
         CqlAction::Query { .. } => Some((
-            CapabilityOperation::CqlQueryBounded,
-            "CqlEngine.query_cql_bounded",
+            CapabilityOperation::CqlQueryBudgeted,
+            "CqlEngine.query_cql_budgeted",
         )),
         CqlAction::Keyspaces => Some((
             CapabilityOperation::CqlListKeyspacesBounded,
@@ -128,8 +142,8 @@ fn cql_operation_for_action(action: &CqlAction) -> Option<(CapabilityOperation, 
         )),
         CqlAction::Exec { .. } => Some((CapabilityOperation::CqlExecute, "CqlEngine.execute_cql")),
         CqlAction::Schema { .. } => Some((
-            CapabilityOperation::CqlDescribeTable,
-            "CqlEngine.describe_cql_table",
+            CapabilityOperation::CqlDescribeTableBounded,
+            "CqlEngine.describe_cql_table_bounded",
         )),
     }
 }
@@ -189,6 +203,7 @@ mod tests {
             dsn: None,
             format: Format::Json,
             limit: 100,
+            max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,
@@ -281,29 +296,86 @@ mod tests {
             "CqlEngine.list_cql_tables_bounded",
         )
         .is_ok());
+
+        assert!(matches!(
+            require_cql_operation(
+                CapabilityOperation::CQL,
+                CapabilityOperation::CqlDescribeTableBounded,
+                "legacy-cql",
+                "CqlEngine.describe_cql_table_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "CqlEngine.describe_cql_table_bounded"
+        ));
+        assert_eq!(
+            cql_operation_for_action(&CqlAction::Schema {
+                table: "users".to_owned(),
+                keyspace: Some("app".to_owned()),
+            }),
+            Some((
+                CapabilityOperation::CqlDescribeTableBounded,
+                "CqlEngine.describe_cql_table_bounded",
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cql_schema_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(false);
+        ctx.limit = usize::MAX;
+        let error = run(
+            &ctx,
+            CqlCmd {
+                action: CqlAction::Schema {
+                    table: "users".to_owned(),
+                    keyspace: Some("app".to_owned()),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Config(message) if message.contains("too large")));
     }
 
     #[test]
-    fn bounded_cql_query_is_selected_before_engine_access() {
+    fn budgeted_cql_query_is_selected_before_engine_access() {
         let action = CqlAction::Query {
             cql: "select now() from system.local".to_owned(),
         };
         assert_eq!(
             cql_operation_for_action(&action),
             Some((
-                CapabilityOperation::CqlQueryBounded,
-                "CqlEngine.query_cql_bounded"
+                CapabilityOperation::CqlQueryBudgeted,
+                "CqlEngine.query_cql_budgeted"
             ))
         );
         assert!(matches!(
             require_cql_operation(
                 &[CapabilityOperation::CqlQuery],
-                CapabilityOperation::CqlQueryBounded,
+                CapabilityOperation::CqlQueryBudgeted,
                 "legacy-cql",
-                "CqlEngine.query_cql_bounded",
+                "CqlEngine.query_cql_budgeted",
             ),
             Err(Error::UnsupportedCapability { needed, .. })
-                if needed == "CqlEngine.query_cql_bounded"
+                if needed == "CqlEngine.query_cql_budgeted"
         ));
+    }
+
+    #[tokio::test]
+    async fn cql_query_budget_is_rejected_before_dsn_resolution() {
+        let mut ctx = test_context(false);
+        ctx.max_bytes = 0;
+        let error = run(
+            &ctx,
+            CqlCmd {
+                action: CqlAction::Query {
+                    cql: "select now() from system.local".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
     }
 }

@@ -5,7 +5,7 @@ use dbtool_core::{
     error::Error,
     model::{
         AckMode, ConsumeCursor, ConsumeOptions, ConsumerIdentity, DeleteResourceOptions, Message,
-        MessageResource, MessageResourceKind,
+        MessageResource, MessageResourceKind, DEFAULT_CONSUME_MESSAGE_BYTES, MAX_READ_BYTES,
     },
     port::CapabilityOperation,
     service::{limiter::ListLimiter, safety::SafetyGuard},
@@ -49,7 +49,7 @@ pub enum MqAction {
     },
     /// Consume messages (always bounded)
     #[command(
-        long_about = "Consume a bounded batch of messages. Both --max and --timeout must be greater than zero. Stateless --ack none is the compatibility default. --group and --durable select broker-owned state, require an explicit --ack choice, and require the global --allow-write flag even with --ack none. --consumer names a member only when --group is present. AMQP/AMQPS rejects group/durable identities and requires explicit --ack on-success plus --allow-write because each successful delivery is ACKed and removed from the queue. Stateful identities cannot yet be combined with --partition, --offset, or --cursor. A JSON meta.truncated value of true means the returned count reached --max; it does not prove that another message exists in the backend. Optional --partition and --offset values must be non-negative. --cursor is an inclusive backend-native starting position: replaying a returned Kafka, Redis Stream, or NATS JetStream cursor returns that retained message again without compressing its native identity into the legacy offset field."
+        long_about = "Consume a bounded batch of messages. --max-message-bytes limits each complete portable message and the global --max-bytes limits the complete batch before ACK/XACK/commit/JetStream double-ACK. Core NATS and Redis Pub/Sub have no acknowledgement or replay guarantee; they still reject an oversized response before returning it. Both --max and --timeout must be greater than zero. Stateless --ack none is the compatibility default. --group and --durable select broker-owned state, require an explicit --ack choice, and require the global --allow-write flag even with --ack none. --consumer names a member only when --group is present. AMQP/AMQPS rejects group/durable identities and requires explicit --ack on-success plus --allow-write because each successful delivery is ACKed and removed from the queue. Stateful identities cannot yet be combined with --partition, --offset, or --cursor. A JSON meta.truncated value of true means the returned count reached --max; it does not prove that another message exists in the backend. Optional --partition and --offset values must be non-negative. --cursor is an inclusive backend-native starting position: replaying a returned Kafka, Redis Stream, or NATS JetStream cursor returns that retained message again without compressing its native identity into the legacy offset field."
     )]
     Consume {
         /// Topic, stream, subject, or queue name.
@@ -60,6 +60,9 @@ pub enum MqAction {
         /// Maximum time to wait, in seconds.
         #[arg(long, default_value = "5")]
         timeout: u64,
+        /// Maximum bytes in one complete portable message: payload, key, headers, cursor, placement, timestamps, and metadata.
+        #[arg(long, default_value_t = DEFAULT_CONSUME_MESSAGE_BYTES)]
+        max_message_bytes: usize,
         /// Non-negative source partition for backends that support partitions.
         #[arg(long)]
         partition: Option<i32>,
@@ -164,6 +167,10 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
     if matches!(cmd.action, MqAction::Produce { .. }) {
         ensure_write_allowed(ctx)?;
     }
+    let metadata_budget = match &cmd.action {
+        MqAction::Detail { .. } | MqAction::Lag { .. } => Some(ctx.metadata_budget()?),
+        _ => None,
+    };
 
     let produce_message = match &cmd.action {
         MqAction::Produce {
@@ -186,6 +193,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
         MqAction::Consume {
             max,
             timeout,
+            max_message_bytes,
             partition,
             offset,
             cursor,
@@ -194,9 +202,11 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             durable,
             ack,
             ..
-        } => Some(build_consume_request(
+        } => Some(build_consume_request_with_budgets(
             *max,
             *timeout,
+            *max_message_bytes,
+            ctx.max_bytes,
             *partition,
             *offset,
             cursor.as_deref(),
@@ -273,6 +283,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
             topic,
             max: _,
             timeout: _,
+            max_message_bytes: _,
             partition: _,
             offset: _,
             cursor: _,
@@ -319,7 +330,7 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
         MqAction::Detail { topic } => {
             require_message_operation(
                 &operations,
-                CapabilityOperation::MessageAdminTopicDetail,
+                CapabilityOperation::MessageAdminTopicDetailBounded,
                 &kind,
             )?;
             let admin = conn
@@ -328,13 +339,18 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                     kind: kind.clone(),
                     needed: "AdminInspect",
                 })?;
-            let detail = admin.topic_detail(&topic).await?;
+            let detail = admin
+                .topic_detail_bounded(
+                    &topic,
+                    metadata_budget.expect("detail actions construct a metadata budget"),
+                )
+                .await?;
             ctx.render_success(&kind, detail, elapsed(), false)
         }
         MqAction::Lag { group } => {
             require_message_operation(
                 &operations,
-                CapabilityOperation::MessageAdminConsumerLag,
+                CapabilityOperation::MessageAdminConsumerLagBounded,
                 &kind,
             )?;
             let admin = conn
@@ -343,7 +359,12 @@ pub async fn run(ctx: &Context, cmd: MqCmd) -> Result<String> {
                     kind: kind.clone(),
                     needed: "AdminInspect",
                 })?;
-            let lag = admin.consumer_lag(&group).await?;
+            let lag = admin
+                .consumer_lag_bounded(
+                    &group,
+                    metadata_budget.expect("lag actions construct a metadata budget"),
+                )
+                .await?;
             ctx.render_success(&kind, lag, elapsed(), false)
         }
         MqAction::Delete { .. } => {
@@ -445,9 +466,39 @@ fn build_message(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn build_consume_request(
     max: usize,
     timeout_secs: u64,
+    partition: Option<i32>,
+    offset: Option<i64>,
+    cursor: Option<&str>,
+    group: Option<&str>,
+    consumer: Option<&str>,
+    durable: Option<&str>,
+    ack: Option<MqAckMode>,
+) -> Result<ConsumeRequest> {
+    build_consume_request_with_budgets(
+        max,
+        timeout_secs,
+        DEFAULT_CONSUME_MESSAGE_BYTES,
+        dbtool_core::model::DEFAULT_CONSUME_BATCH_BYTES,
+        partition,
+        offset,
+        cursor,
+        group,
+        consumer,
+        durable,
+        ack,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_consume_request_with_budgets(
+    max: usize,
+    timeout_secs: u64,
+    max_message_bytes: usize,
+    max_batch_bytes: usize,
     partition: Option<i32>,
     offset: Option<i64>,
     cursor: Option<&str>,
@@ -466,6 +517,8 @@ fn build_consume_request(
             "mq consume --timeout must be greater than zero".into(),
         ));
     }
+    validate_consume_byte_budget("--max-message-bytes", max_message_bytes)?;
+    validate_consume_byte_budget("--max-bytes", max_batch_bytes)?;
     validate_partition(partition)?;
     if offset.is_some_and(|value| value < 0) {
         return Err(Error::Config(
@@ -515,6 +568,8 @@ fn build_consume_request(
     let options = ConsumeOptions {
         max,
         timeout,
+        max_message_bytes,
+        max_batch_bytes,
         partition,
         offset,
         cursor,
@@ -528,6 +583,20 @@ fn build_consume_request(
         options,
         ack_explicit,
     })
+}
+
+fn validate_consume_byte_budget(option: &str, value: usize) -> Result<()> {
+    if value == 0 {
+        return Err(Error::Config(format!(
+            "mq consume {option} must be greater than zero"
+        )));
+    }
+    if value > MAX_READ_BYTES {
+        return Err(Error::Config(format!(
+            "mq consume {option} exceeds the hard {MAX_READ_BYTES}-byte ceiling"
+        )));
+    }
+    Ok(())
 }
 
 fn require_consume_operations(
@@ -650,8 +719,8 @@ mod tests {
         let legacy_admin_without_operations = [];
         for operation in [
             CapabilityOperation::MessageAdminListTopicsBounded,
-            CapabilityOperation::MessageAdminTopicDetail,
-            CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminTopicDetailBounded,
+            CapabilityOperation::MessageAdminConsumerLagBounded,
             CapabilityOperation::MessageAdminDelete,
         ] {
             assert!(matches!(
@@ -665,17 +734,28 @@ mod tests {
             ));
         }
 
-        let topic_only = [CapabilityOperation::MessageAdminTopicDetail];
+        let legacy_topic_only = [CapabilityOperation::MessageAdminTopicDetail];
+        assert!(matches!(
+            require_message_operation(
+                &legacy_topic_only,
+                CapabilityOperation::MessageAdminTopicDetailBounded,
+                "legacy-amqp"
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == CapabilityOperation::MessageAdminTopicDetailBounded.as_str()
+        ));
+
+        let topic_only = [CapabilityOperation::MessageAdminTopicDetailBounded];
         assert!(require_message_operation(
             &topic_only,
-            CapabilityOperation::MessageAdminTopicDetail,
+            CapabilityOperation::MessageAdminTopicDetailBounded,
             "amqp"
         )
         .is_ok());
 
         for operation in [
             CapabilityOperation::MessageAdminListTopicsBounded,
-            CapabilityOperation::MessageAdminConsumerLag,
+            CapabilityOperation::MessageAdminConsumerLagBounded,
             CapabilityOperation::MessageAdminDelete,
         ] {
             assert!(matches!(
@@ -695,13 +775,40 @@ mod tests {
         assert!(matches!(
             require_message_operation(
                 &list_only,
-                CapabilityOperation::MessageAdminTopicDetail,
+                CapabilityOperation::MessageAdminTopicDetailBounded,
                 "list-only"
             ),
             Err(Error::UnsupportedCapability { kind, needed })
                 if kind == "list-only"
-                    && needed == CapabilityOperation::MessageAdminTopicDetail.as_str()
+                    && needed == CapabilityOperation::MessageAdminTopicDetailBounded.as_str()
         ));
+    }
+
+    #[tokio::test]
+    async fn detail_and_lag_budgets_are_rejected_before_dsn_resolution() {
+        let ctx = Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: dbtool_core::service::formatter::Format::Json,
+            limit: usize::MAX,
+            max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            throttle_overrides: Default::default(),
+            allow_write: false,
+            confirm: None,
+        };
+
+        for action in [
+            MqAction::Detail {
+                topic: "events".to_owned(),
+            },
+            MqAction::Lag {
+                group: "workers".to_owned(),
+            },
+        ] {
+            let error = run(&ctx, MqCmd { action }).await.unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message.contains("too large")));
+        }
     }
 
     #[test]
@@ -779,6 +886,26 @@ mod tests {
         assert_eq!(options.offset, Some(99));
         assert_eq!(options.identity, ConsumerIdentity::Stateless);
         assert_eq!(options.ack, AckMode::None);
+
+        let byte_bounded = build_consume_request_with_budgets(
+            2, 1, 1024, 4096, None, None, None, None, None, None, None,
+        )
+        .unwrap()
+        .options;
+        assert_eq!(byte_bounded.max_message_bytes, 1024);
+        assert_eq!(byte_bounded.max_batch_bytes, 4096);
+        assert!(matches!(
+            build_consume_request_with_budgets(
+                2, 1, 0, 4096, None, None, None, None, None, None, None,
+            ),
+            Err(Error::Config(message)) if message.contains("--max-message-bytes")
+        ));
+        assert!(matches!(
+            build_consume_request_with_budgets(
+                2, 1, 1024, 0, None, None, None, None, None, None, None,
+            ),
+            Err(Error::Config(message)) if message.contains("--max-bytes")
+        ));
 
         let exact =
             build_stateless_consume(1, 1, None, None, Some("redis-stream:1710000000000-42"))

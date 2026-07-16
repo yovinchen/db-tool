@@ -285,6 +285,38 @@ fn global_limit_rejects_zero_before_connecting() {
 }
 
 #[test]
+fn global_max_bytes_enforces_zero_exact_and_hard_ceiling_before_dispatch() {
+    for (value, expected) in [
+        ("0", "global --max-bytes must be greater than zero"),
+        (
+            "16777217",
+            "global --max-bytes exceeds the hard 16777216-byte ceiling",
+        ),
+    ] {
+        let error = stderr_json(&dbtool(&[
+            "--dsn",
+            "sqlite::memory:",
+            "--max-bytes",
+            value,
+            "ping",
+        ]));
+        assert_eq!(error["error"]["code"], "CONFIG_ERROR");
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(expected)));
+    }
+
+    let exact = stdout_json(&dbtool(&[
+        "--dsn",
+        "sqlite::memory:",
+        "--max-bytes",
+        "16777216",
+        "ping",
+    ]));
+    assert_eq!(exact["ok"], true);
+}
+
+#[test]
 fn sql_catalog_limit_rejects_zero_and_probe_overflow_before_connecting() {
     for (limit, expected) in [
         ("0".to_owned(), "global --limit"),

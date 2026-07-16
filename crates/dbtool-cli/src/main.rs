@@ -3,6 +3,7 @@ mod cmd;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use dbtool_core::config::LimitsConfig;
+use dbtool_core::model::DEFAULT_READ_BYTES;
 use dbtool_core::service::{formatter::Format, FlowControl};
 use dbtool_registry::build_registry;
 use std::path::PathBuf;
@@ -32,6 +33,10 @@ struct Cli {
     /// Maximum rows/messages to return (must be greater than zero)
     #[arg(long, global = true, default_value = "100")]
     limit: usize,
+
+    /// Maximum cumulative bytes retained by one bounded read response
+    #[arg(long, global = true, default_value_t = DEFAULT_READ_BYTES)]
+    max_bytes: usize,
 
     /// Maximum in-process concurrent operations for this command
     #[arg(long, global = true)]
@@ -193,6 +198,7 @@ async fn main() {
         dsn: cli.dsn,
         format: cli.format.into(),
         limit: cli.limit,
+        max_bytes: cli.max_bytes,
         throttle_overrides: LimitsConfig {
             max_concurrency: cli.max_concurrency,
             rate: cli.rate,
@@ -229,6 +235,7 @@ async fn main() {
 
 async fn run_data_command(ctx: &cmd::Context, command: Commands) -> dbtool_core::Result<String> {
     ctx.ensure_positive_limit()?;
+    ctx.ensure_read_byte_budget()?;
     match command {
         Commands::Ping => cmd::ping::run(ctx).await,
         Commands::Caps => cmd::caps::run(ctx).await,

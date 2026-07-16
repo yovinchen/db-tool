@@ -15,6 +15,7 @@ use dbtool_core::service::{formatter::Format, ThrottleConfig};
 use dbtool_core::{
     config::{ConnectionConfig, LimitsConfig},
     error::Error,
+    model::{MetadataBudget, ReadBudget, MAX_READ_BYTES},
     service::ConnectionResolver,
 };
 use serde::Serialize;
@@ -25,6 +26,7 @@ pub struct Context {
     pub dsn: Option<String>,
     pub format: Format,
     pub limit: usize,
+    pub max_bytes: usize,
     pub throttle_overrides: LimitsConfig,
     pub allow_write: bool,
     pub confirm: Option<String>,
@@ -38,6 +40,34 @@ impl Context {
             ));
         }
         Ok(())
+    }
+
+    /// Validate the global caller byte ceiling for every data command, even
+    /// when the selected action does not yet consume a structured read budget.
+    pub fn ensure_read_byte_budget(&self) -> dbtool_core::Result<()> {
+        if self.max_bytes == 0 {
+            return Err(Error::Config(
+                "global --max-bytes must be greater than zero".to_owned(),
+            ));
+        }
+        if self.max_bytes > MAX_READ_BYTES {
+            return Err(Error::Config(format!(
+                "global --max-bytes exceeds the hard {MAX_READ_BYTES}-byte ceiling"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build the caller-owned envelope used by row, document, KV, and
+    /// time-series reads. Validation happens before a connector is opened.
+    pub fn read_budget(&self) -> dbtool_core::Result<ReadBudget> {
+        ReadBudget::new(self.limit, self.max_bytes)
+    }
+
+    /// Build the caller-owned envelope used by complete schema and messaging
+    /// administration responses. Validation happens before backend access.
+    pub fn metadata_budget(&self) -> dbtool_core::Result<MetadataBudget> {
+        MetadataBudget::new(self.limit, self.max_bytes)
     }
 
     pub fn ensure_write_allowed(&self) -> dbtool_core::Result<()> {

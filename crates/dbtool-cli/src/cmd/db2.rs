@@ -57,7 +57,7 @@ pub enum Db2Action {
 }
 
 pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
-    match &cmd.action {
+    let metadata_budget = match &cmd.action {
         Db2Action::Sequences { .. }
         | Db2Action::Routines { .. }
         | Db2Action::Tablespaces
@@ -65,9 +65,10 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
         | Db2Action::Schemas
         | Db2Action::Tables { .. } => {
             ListLimiter::new(ctx.limit).probe_items()?;
+            None
         }
-        Db2Action::Ddl { .. } | Db2Action::Schema { .. } => {}
-    }
+        Db2Action::Ddl { .. } | Db2Action::Schema { .. } => Some(ctx.metadata_budget()?),
+    };
     let dsn = ctx.resolve_dsn()?;
     let conn = ctx.registry.connect(&dsn).await?;
     let operations = conn.operations();
@@ -105,7 +106,12 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
         }
         Db2Action::Ddl { table } => {
             let db2 = require_db2(&*conn)?;
-            let ddl = db2.generate_ddl(&table).await?;
+            let ddl = db2
+                .generate_ddl_bounded(
+                    &table,
+                    metadata_budget.expect("DDL actions construct a metadata budget"),
+                )
+                .await?;
             // Return DDL as a JSON string so the output is valid JSON.
             Ok(ctx.render_success(&kind, ddl, elapsed(), false))
         }
@@ -125,7 +131,12 @@ pub async fn run(ctx: &Context, cmd: Db2Cmd) -> Result<String> {
         }
         Db2Action::Schema { table } => {
             let sql = require_sql(&*conn)?;
-            let schema = sql.describe_table(&table).await?;
+            let schema = sql
+                .describe_table_bounded(
+                    &table,
+                    metadata_budget.expect("schema actions construct a metadata budget"),
+                )
+                .await?;
             Ok(ctx.render_success(&kind, schema, elapsed(), false))
         }
     }
@@ -150,8 +161,8 @@ fn db2_operation_for_action(action: &Db2Action) -> (CapabilityOperation, &'stati
             "Db2Engine.list_foreign_keys_bounded",
         ),
         Db2Action::Ddl { .. } => (
-            CapabilityOperation::Db2GenerateDdl,
-            "Db2Engine.generate_ddl",
+            CapabilityOperation::Db2GenerateDdlBounded,
+            "Db2Engine.generate_ddl_bounded",
         ),
         Db2Action::Schemas => (
             CapabilityOperation::SqlListSchemasBounded,
@@ -162,8 +173,8 @@ fn db2_operation_for_action(action: &Db2Action) -> (CapabilityOperation, &'stati
             "SqlEngine.list_tables_bounded",
         ),
         Db2Action::Schema { .. } => (
-            CapabilityOperation::SqlDescribeTable,
-            "SqlEngine.describe_table",
+            CapabilityOperation::SqlDescribeTableBounded,
+            "SqlEngine.describe_table_bounded",
         ),
     }
 }
@@ -215,6 +226,7 @@ mod tests {
             dsn: None,
             format: Format::Json,
             limit: 100,
+            max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
             throttle_overrides: Default::default(),
             allow_write: false,
             confirm: None,
@@ -257,8 +269,8 @@ mod tests {
                 table: "APP.USERS".to_owned(),
             }),
             (
-                CapabilityOperation::Db2GenerateDdl,
-                "Db2Engine.generate_ddl"
+                CapabilityOperation::Db2GenerateDdlBounded,
+                "Db2Engine.generate_ddl_bounded"
             )
         );
         assert_eq!(
@@ -266,10 +278,26 @@ mod tests {
                 table: "APP.USERS".to_owned(),
             }),
             (
-                CapabilityOperation::SqlDescribeTable,
-                "SqlEngine.describe_table"
+                CapabilityOperation::SqlDescribeTableBounded,
+                "SqlEngine.describe_table_bounded"
             )
         );
+
+        for (operation, needed) in [
+            (
+                CapabilityOperation::Db2GenerateDdlBounded,
+                "Db2Engine.generate_ddl_bounded",
+            ),
+            (
+                CapabilityOperation::SqlDescribeTableBounded,
+                "SqlEngine.describe_table_bounded",
+            ),
+        ] {
+            assert!(matches!(
+                require_operation(CapabilityOperation::DB2, operation, "legacy-db2", needed),
+                Err(Error::UnsupportedCapability { needed: actual, .. }) if actual == needed
+            ));
+        }
     }
 
     #[tokio::test]
@@ -286,5 +314,17 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, Error::Config(message) if message.contains("too large")));
+
+        for action in [
+            Db2Action::Ddl {
+                table: "APP.USERS".to_owned(),
+            },
+            Db2Action::Schema {
+                table: "APP.USERS".to_owned(),
+            },
+        ] {
+            let error = run(&ctx, Db2Cmd { action }).await.unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message.contains("too large")));
+        }
     }
 }

@@ -2,7 +2,9 @@ use super::Context;
 use clap::{Args, Subcommand};
 use dbtool_core::{
     error::Error,
-    model::{Document, FindOptions, KeyExpiry, KeyValueRestoreOutcome, ResultSet, Value},
+    model::{
+        Document, FindOptions, KeyExpiry, KeyValueRestoreOutcome, ReadBudget, ResultSet, Value,
+    },
     port::CapabilityOperation,
     service::{
         limiter::ResultLimiter,
@@ -220,7 +222,14 @@ enum PreparedImport {
 }
 
 pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
-    let probe_limit = ResultLimiter::new(ctx.limit).probe_rows()?;
+    let read_budget = match &cmd.action {
+        ExportAction::Sql { .. } | ExportAction::Doc { .. } => Some(ctx.read_budget()?),
+        ExportAction::Kv { .. } => None,
+    };
+    let kv_probe_limit = match &cmd.action {
+        ExportAction::Kv { .. } => Some(ResultLimiter::new(ctx.limit).probe_rows()?),
+        ExportAction::Sql { .. } | ExportAction::Doc { .. } => None,
+    };
     if let ExportAction::Sql { query, .. } = &cmd.action {
         ensure_readonly_export_query(query)?;
     }
@@ -238,15 +247,21 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
 
     Ok(match cmd.action {
         ExportAction::Sql { query, out } => {
-            require_transfer_operation(&operations, CapabilityOperation::SqlQueryBounded, &kind)?;
+            require_transfer_operation(&operations, CapabilityOperation::SqlQueryBudgeted, &kind)?;
             let sql = conn.as_sql().ok_or_else(|| Error::UnsupportedCapability {
                 kind: kind.clone(),
                 needed: "SqlEngine",
             })?;
-            let result = sql.query_bounded(&query, &[], ctx.limit).await?;
+            let result = sql
+                .query_budgeted(
+                    &query,
+                    &[],
+                    read_budget.expect("SQL export constructs a read budget"),
+                )
+                .await?;
             let count = result.rows.len();
             let truncated = result.truncated;
-            write_artifact(&out, sql_rows_artifact(result))?;
+            write_artifact_with_limit(&out, sql_rows_artifact(result), ctx.max_bytes)?;
             ctx.render_success(
                 &kind,
                 serde_json::json!({
@@ -269,7 +284,12 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 kind: kind.clone(),
                 needed: "KeyValueStore",
             })?;
-            let mut keys = kv.scan(&pattern, probe_limit).await?;
+            let mut keys = kv
+                .scan(
+                    &pattern,
+                    kv_probe_limit.expect("KV export constructs a probe limit"),
+                )
+                .await?;
             ensure_unique_strings(&keys, "key returned by the source scan")?;
             let truncated = keys.len() > ctx.limit;
             keys.truncate(ctx.limit);
@@ -327,7 +347,11 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
             filter: _,
             out,
         } => {
-            require_transfer_operation(&operations, CapabilityOperation::DocumentFind, &kind)?;
+            require_transfer_operation(
+                &operations,
+                CapabilityOperation::DocumentFindBudgeted,
+                &kind,
+            )?;
             let docs = conn
                 .as_document()
                 .ok_or_else(|| Error::UnsupportedCapability {
@@ -338,18 +362,25 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                 Error::Internal("validated document export filter is missing".into())
             })?;
             let options = FindOptions {
-                limit: Some(probe_limit),
+                limit: None,
                 ..Default::default()
             };
-            let mut documents = docs.find(&collection, filter.clone(), options).await?;
-            let truncated = documents.len() > ctx.limit;
-            documents.truncate(ctx.limit);
+            let result = docs
+                .find_budgeted(
+                    &collection,
+                    filter.clone(),
+                    options,
+                    read_budget.expect("document export constructs a read budget"),
+                )
+                .await?;
+            let documents = result.items;
+            let truncated = result.truncated;
             let count = documents.len();
             let exported_items = usize_to_u64(count, "exported document count")?;
             let integrity =
                 artifact_integrity(ctx.limit, exported_items, exported_items, truncated, false);
             let complete = integrity.complete;
-            write_artifact(
+            write_artifact_with_limit(
                 &out,
                 TransferArtifact::Documents {
                     version: DOCUMENT_TRANSFER_VERSION,
@@ -363,6 +394,7 @@ pub async fn run_export(ctx: &Context, cmd: ExportCmd) -> Result<String> {
                     collection,
                     documents,
                 },
+                ctx.max_bytes,
             )?;
             ctx.render_success(
                 &kind,
@@ -384,6 +416,16 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
     let artifact = read_artifact(import_input(&cmd.action))?;
     validate_import_artifact(&cmd.action, &artifact)?;
     let prepared = prepare_import(cmd.action, artifact, ctx.limit)?;
+    let document_id_probe_budget = match &prepared {
+        PreparedImport::Doc { documents, .. }
+            if documents
+                .iter()
+                .any(|document| document.contains_key("_id")) =>
+        {
+            Some(ReadBudget::new(1, ctx.max_bytes)?)
+        }
+        _ => None,
+    };
 
     let dsn = ctx.resolve_dsn()?;
     let safety_target = ctx.safety_target(&dsn);
@@ -523,7 +565,9 @@ pub async fn run_import(ctx: &Context, cmd: ImportCmd) -> Result<String> {
                     kind: kind.clone(),
                     needed: "DocumentStore",
                 })?;
-            ensure_document_ids_are_available(docs, &collection, &documents).await?;
+            if let Some(budget) = document_id_probe_budget {
+                ensure_document_ids_are_available(docs, &collection, &documents, budget).await?;
+            }
             let count = usize_to_u64(documents.len(), "imported document count")?;
             if count > 0 {
                 docs.insert(&collection, documents).await?;
@@ -552,7 +596,7 @@ fn document_import_operations(documents: &[Document]) -> Vec<CapabilityOperation
         .iter()
         .any(|document| document.contains_key("_id"))
     {
-        operations.push(CapabilityOperation::DocumentFind);
+        operations.push(CapabilityOperation::DocumentFindBudgeted);
     }
     operations.push(CapabilityOperation::DocumentInsert);
     operations
@@ -904,13 +948,27 @@ fn parse_json_value(raw: &str) -> Result<Value> {
 
 fn write_artifact(path: &Path, artifact: TransferArtifact) -> Result<()> {
     let bytes = serialize_artifact_bounded(&artifact, MAX_TRANSFER_ARTIFACT_BYTES)?;
-    write_file_atomically(path, &bytes)
+    publish_artifact(path, &bytes)
+}
+
+fn write_artifact_with_limit(
+    path: &Path,
+    artifact: TransferArtifact,
+    max_bytes: usize,
+) -> Result<()> {
+    let bytes = serialize_artifact_with_read_budget(&artifact, max_bytes)?;
+    publish_artifact(path, &bytes)
+}
+
+fn publish_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_file_atomically(path, bytes)
         .map_err(|error| Error::Config(format!("publish transfer artifact atomically: {error}")))
 }
 
 struct BoundedVecWriter {
     bytes: Vec<u8>,
     max_bytes: usize,
+    exceeded: bool,
 }
 
 impl Write for BoundedVecWriter {
@@ -921,6 +979,7 @@ impl Write for BoundedVecWriter {
             .checked_add(buffer.len())
             .ok_or_else(|| std::io::Error::other("transfer artifact size overflow"))?;
         if next_len > self.max_bytes {
+            self.exceeded = true;
             return Err(std::io::Error::other(format!(
                 "transfer artifact exceeds the {}-byte safety limit",
                 self.max_bytes
@@ -939,6 +998,7 @@ fn serialize_artifact_bounded(artifact: &TransferArtifact, max_bytes: usize) -> 
     let mut writer = BoundedVecWriter {
         bytes: Vec::new(),
         max_bytes,
+        exceeded: false,
     };
     serde_json::to_writer_pretty(&mut writer, artifact).map_err(|error| {
         Error::Serialization(format!(
@@ -946,6 +1006,28 @@ fn serialize_artifact_bounded(artifact: &TransferArtifact, max_bytes: usize) -> 
         ))
     })?;
     Ok(writer.bytes)
+}
+
+fn serialize_artifact_with_read_budget(
+    artifact: &TransferArtifact,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut writer = BoundedVecWriter {
+        bytes: Vec::new(),
+        max_bytes,
+        exceeded: false,
+    };
+    match serde_json::to_writer_pretty(&mut writer, artifact) {
+        Ok(()) => Ok(writer.bytes),
+        Err(_) if writer.exceeded => Err(Error::ReadBudgetExceeded {
+            subject: "transfer artifact".to_owned(),
+            unit: "bytes",
+            limit: max_bytes,
+        }),
+        Err(error) => Err(Error::Serialization(format!(
+            "serialize transfer artifact within caller read budget: {error}"
+        ))),
+    }
 }
 
 fn read_artifact(path: &Path) -> Result<TransferArtifact> {
@@ -1230,6 +1312,7 @@ async fn ensure_document_ids_are_available(
     store: &dyn dbtool_core::port::capability::DocumentStore,
     collection: &str,
     documents: &[Document],
+    budget: ReadBudget,
 ) -> Result<()> {
     for document in documents {
         let Some(id) = document.get("_id") else {
@@ -1237,16 +1320,17 @@ async fn ensure_document_ids_are_available(
         };
         let filter = Value::Map(BTreeMap::from([("_id".to_owned(), id.clone())]));
         let matches = store
-            .find(
+            .find_budgeted(
                 collection,
                 filter,
                 FindOptions {
                     limit: Some(1),
                     ..Default::default()
                 },
+                budget,
             )
             .await?;
-        if !matches.is_empty() {
+        if !matches.items.is_empty() {
             return Err(Error::Config(
                 "target collection already contains an exported _id; choose an empty target or retry with --drop-id"
                     .into(),
@@ -1323,6 +1407,7 @@ mod tests {
             dsn: None,
             format: Format::Json,
             limit: 100,
+            max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,
@@ -1352,10 +1437,70 @@ mod tests {
         assert_eq!(
             document_import_operations(&[Document::from([("_id".to_owned(), Value::Int(1),)])]),
             [
-                CapabilityOperation::DocumentFind,
+                CapabilityOperation::DocumentFindBudgeted,
                 CapabilityOperation::DocumentInsert
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn row_and_document_export_budgets_fail_before_connection_resolution() {
+        for action in [
+            ExportAction::Sql {
+                query: "select 1".to_owned(),
+                out: PathBuf::from("unused-sql.json"),
+            },
+            ExportAction::Doc {
+                collection: "users".to_owned(),
+                filter: "{}".to_owned(),
+                out: PathBuf::from("unused-doc.json"),
+            },
+        ] {
+            let mut ctx = test_context(false);
+            ctx.max_bytes = 0;
+            let error = run_export(&ctx, ExportCmd { action }).await.unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
+        }
+    }
+
+    #[tokio::test]
+    async fn document_id_probe_budget_is_built_before_dsn_resolution() {
+        let path = std::env::temp_dir().join(format!(
+            "dbtool-document-probe-budget-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_artifact(
+            &path,
+            TransferArtifact::Documents {
+                version: DOCUMENT_TRANSFER_VERSION,
+                source: source("users", Value::Json(serde_json::json!({}))),
+                integrity: complete_integrity(1),
+                collection: "users".to_owned(),
+                documents: vec![Document::from([("_id".to_owned(), Value::Int(1))])],
+            },
+        )
+        .unwrap();
+
+        let mut ctx = test_context(true);
+        ctx.max_bytes = 0;
+        let error = run_import(
+            &ctx,
+            ImportCmd {
+                action: ImportAction::Doc {
+                    collection: "users-copy".to_owned(),
+                    input: path.clone(),
+                    drop_id: false,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
+        fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -1806,7 +1951,46 @@ mod tests {
             entries: vec![],
         };
         assert!(serialize_artifact_bounded(&artifact, 8).is_err());
-        assert!(serialize_artifact_bounded(&artifact, 4096).is_ok());
+        let serialized = serialize_artifact_bounded(&artifact, 4096).unwrap();
+        let exact_bytes = serialized.len();
+        assert_eq!(
+            serialize_artifact_with_read_budget(&artifact, exact_bytes).unwrap(),
+            serialized
+        );
+        assert!(matches!(
+            serialize_artifact_with_read_budget(&artifact, exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                subject,
+                unit: "bytes",
+                limit,
+            }) if subject == "transfer artifact" && limit == exact_bytes - 1
+        ));
+
+        let rejected_path = std::env::temp_dir().join(format!(
+            "dbtool-rejected-artifact-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let error = write_artifact_with_limit(&rejected_path, artifact, exact_bytes - 1)
+            .expect_err("oversized caller artifact must fail before publication");
+        assert!(matches!(error, Error::ReadBudgetExceeded { .. }));
+        assert!(!rejected_path.exists());
+
+        fs::write(&rejected_path, b"existing artifact").unwrap();
+        let replacement = TransferArtifact::KvPairs {
+            version: KV_TRANSFER_VERSION,
+            source: source("key-pattern", Value::Text("*".to_owned())),
+            integrity: complete_integrity(0),
+            entries: vec![],
+        };
+        let error = write_artifact_with_limit(&rejected_path, replacement, exact_bytes - 1)
+            .expect_err("caller budget failure must precede replacement");
+        assert!(matches!(error, Error::ReadBudgetExceeded { .. }));
+        assert_eq!(fs::read(&rejected_path).unwrap(), b"existing artifact");
+        fs::remove_file(rejected_path).unwrap();
     }
 
     #[test]

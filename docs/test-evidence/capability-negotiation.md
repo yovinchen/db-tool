@@ -70,7 +70,7 @@ connect -> operations contains exact method -> capability accessor -> invoke
   connector-level `ping` 不需要 operation，`ping.capabilities` 与 `caps` 输出同一
   `CapabilityReport`。
 - Embedded registry smoke 在 `as_sql()` 前检查 `sql.execute` 与
-  `sql.query_bounded`，展示可复制的调用范式。
+  `sql.query_budgeted`，并传入显式 `ReadBudget`，展示可复制的调用范式。
 
 ## 自动化结果
 

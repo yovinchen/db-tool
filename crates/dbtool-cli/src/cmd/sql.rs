@@ -5,7 +5,7 @@ use dbtool_core::{
     model::Value,
     port::CapabilityOperation,
     service::{
-        limiter::{ListLimiter, ResultLimiter},
+        limiter::ListLimiter,
         safety::{SafetyGuard, StatementKind},
     },
     Result,
@@ -57,15 +57,19 @@ pub enum SqlAction {
 }
 
 pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
-    match &cmd.action {
-        SqlAction::Query { .. } => {
-            ResultLimiter::new(ctx.limit).probe_rows()?;
-        }
+    let read_budget = match &cmd.action {
+        SqlAction::Query { .. } => Some(ctx.read_budget()?),
+        _ => None,
+    };
+    let metadata_budget = match &cmd.action {
+        SqlAction::Query { .. } => None,
         SqlAction::Tables { .. } | SqlAction::Schemas => {
             ListLimiter::new(ctx.limit).probe_items()?;
+            None
         }
-        SqlAction::Exec { .. } | SqlAction::Schema { .. } => {}
-    }
+        SqlAction::Schema { .. } => Some(ctx.metadata_budget()?),
+        SqlAction::Exec { .. } => None,
+    };
     let dsn = ctx.resolve_dsn()?;
     let target = ctx.safety_target(&dsn);
 
@@ -108,10 +112,10 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
     let output = match cmd.action {
         SqlAction::Query { sql, .. } => {
             let rs = sql_engine
-                .query_bounded(
+                .query_budgeted(
                     &sql,
                     parsed_params.as_deref().unwrap_or_default(),
-                    ctx.limit,
+                    read_budget.expect("query actions construct a read budget"),
                 )
                 .await?;
             let truncated = rs.truncated;
@@ -146,7 +150,12 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
             )
         }
         SqlAction::Schema { table } => {
-            let schema = sql_engine.describe_table(&table).await?;
+            let schema = sql_engine
+                .describe_table_bounded(
+                    &table,
+                    metadata_budget.expect("schema actions construct a metadata budget"),
+                )
+                .await?;
             ctx.render_success(
                 conn.kind().0.as_str(),
                 schema,
@@ -172,8 +181,8 @@ pub async fn run(ctx: &Context, cmd: SqlCmd) -> Result<String> {
 fn sql_operation_for_action(action: &SqlAction) -> Option<(CapabilityOperation, &'static str)> {
     match action {
         SqlAction::Query { .. } => Some((
-            CapabilityOperation::SqlQueryBounded,
-            "SqlEngine.query_bounded",
+            CapabilityOperation::SqlQueryBudgeted,
+            "SqlEngine.query_budgeted",
         )),
         SqlAction::Tables { .. } => Some((
             CapabilityOperation::SqlListTablesBounded,
@@ -185,8 +194,8 @@ fn sql_operation_for_action(action: &SqlAction) -> Option<(CapabilityOperation, 
         )),
         SqlAction::Exec { .. } => Some((CapabilityOperation::SqlExecute, "SqlEngine.execute")),
         SqlAction::Schema { .. } => Some((
-            CapabilityOperation::SqlDescribeTable,
-            "SqlEngine.describe_table",
+            CapabilityOperation::SqlDescribeTableBounded,
+            "SqlEngine.describe_table_bounded",
         )),
     }
 }
@@ -367,10 +376,30 @@ mod tests {
             "SqlEngine.list_schemas_bounded",
         )
         .is_ok());
+
+        assert!(matches!(
+            require_sql_operation(
+                legacy_only,
+                CapabilityOperation::SqlDescribeTableBounded,
+                "legacy-sql",
+                "SqlEngine.describe_table_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "SqlEngine.describe_table_bounded"
+        ));
+        assert_eq!(
+            sql_operation_for_action(&SqlAction::Schema {
+                table: "app.users".to_owned(),
+            }),
+            Some((
+                CapabilityOperation::SqlDescribeTableBounded,
+                "SqlEngine.describe_table_bounded",
+            ))
+        );
     }
 
     #[test]
-    fn bounded_sql_query_is_selected_before_engine_access() {
+    fn budgeted_sql_query_is_selected_before_engine_access() {
         let action = SqlAction::Query {
             sql: "select 1".to_owned(),
             params: "[]".to_owned(),
@@ -378,19 +407,73 @@ mod tests {
         assert_eq!(
             sql_operation_for_action(&action),
             Some((
-                CapabilityOperation::SqlQueryBounded,
-                "SqlEngine.query_bounded"
+                CapabilityOperation::SqlQueryBudgeted,
+                "SqlEngine.query_budgeted"
             ))
         );
         assert!(matches!(
             require_sql_operation(
                 &[CapabilityOperation::SqlQuery],
-                CapabilityOperation::SqlQueryBounded,
+                CapabilityOperation::SqlQueryBudgeted,
                 "legacy-sql",
-                "SqlEngine.query_bounded",
+                "SqlEngine.query_budgeted",
             ),
             Err(Error::UnsupportedCapability { needed, .. })
-                if needed == "SqlEngine.query_bounded"
+                if needed == "SqlEngine.query_budgeted"
         ));
+    }
+
+    #[tokio::test]
+    async fn sql_query_budget_is_rejected_before_dsn_resolution() {
+        let ctx = Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: dbtool_core::service::formatter::Format::Json,
+            limit: 1,
+            max_bytes: 0,
+            throttle_overrides: Default::default(),
+            allow_write: false,
+            confirm: None,
+        };
+        let error = run(
+            &ctx,
+            SqlCmd {
+                action: SqlAction::Query {
+                    sql: "select 1".to_owned(),
+                    params: "[]".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
+    }
+
+    #[tokio::test]
+    async fn sql_schema_budget_is_rejected_before_dsn_resolution() {
+        let ctx = Context {
+            registry: dbtool_core::registry::Registry::default(),
+            conn: None,
+            dsn: None,
+            format: dbtool_core::service::formatter::Format::Json,
+            limit: usize::MAX,
+            max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
+            throttle_overrides: Default::default(),
+            allow_write: false,
+            confirm: None,
+        };
+        let error = run(
+            &ctx,
+            SqlCmd {
+                action: SqlAction::Schema {
+                    table: "app.users".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::Config(message) if message.contains("too large")));
     }
 }

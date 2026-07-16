@@ -28,6 +28,7 @@ fn caps_preserves_legacy_booleans_and_adds_sorted_sql_operations() {
         value["data"]["operations"],
         serde_json::json!([
             "sql.describe_table",
+            "sql.describe_table_bounded",
             "sql.execute",
             "sql.insert_rows_atomic",
             "sql.list_schemas",
@@ -35,7 +36,8 @@ fn caps_preserves_legacy_booleans_and_adds_sorted_sql_operations() {
             "sql.list_tables",
             "sql.list_tables_bounded",
             "sql.query",
-            "sql.query_bounded"
+            "sql.query_bounded",
+            "sql.query_budgeted"
         ])
     );
 }

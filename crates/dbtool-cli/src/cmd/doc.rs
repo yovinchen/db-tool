@@ -89,6 +89,10 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
     if matches!(cmd.action, DocAction::Collections) {
         ListLimiter::new(ctx.limit).probe_items()?;
     }
+    let read_budget = match &cmd.action {
+        DocAction::Find { .. } | DocAction::Aggregate { .. } => Some(ctx.read_budget()?),
+        _ => None,
+    };
     let dsn = ctx.resolve_dsn()?;
     match &cmd.action {
         DocAction::Insert { .. } => ensure_write_allowed(ctx)?,
@@ -153,16 +157,21 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
         } => {
             let f: serde_json::Value =
                 serde_json::from_str(&filter).map_err(|e| Error::Serialization(e.to_string()))?;
-            let fetch_limit = limit_plus_one(ctx.limit)?;
             let opts = FindOptions {
-                limit: Some(fetch_limit),
+                limit: None,
                 skip,
                 sort: parse_optional_json_object(sort.as_deref(), "--sort")?,
                 projection: parse_optional_json_object(projection.as_deref(), "--projection")?,
             };
-            let docs = doc.find(&collection, f.into(), opts).await?;
-            let (docs, truncated) = truncate_documents(docs, ctx.limit);
-            ctx.render_success(&kind, docs, elapsed(), truncated)
+            let result = doc
+                .find_budgeted(
+                    &collection,
+                    f.into(),
+                    opts,
+                    read_budget.expect("find actions construct a read budget"),
+                )
+                .await?;
+            ctx.render_success(&kind, result.items, elapsed(), result.truncated)
         }
         DocAction::Insert {
             collection,
@@ -219,11 +228,14 @@ pub async fn run(ctx: &Context, cmd: DocCmd) -> Result<String> {
             pipeline,
         } => {
             let pipeline = parse_pipeline(&pipeline)?;
-            let docs = doc
-                .aggregate_bounded(&collection, pipeline, limit_plus_one(ctx.limit)?)
+            let result = doc
+                .aggregate_budgeted(
+                    &collection,
+                    pipeline,
+                    read_budget.expect("aggregate actions construct a read budget"),
+                )
                 .await?;
-            let (docs, truncated) = truncate_documents(docs, ctx.limit);
-            ctx.render_success(&kind, docs, elapsed(), truncated)
+            ctx.render_success(&kind, result.items, elapsed(), result.truncated)
         }
     })
 }
@@ -257,10 +269,13 @@ fn document_operation_for_action(
             "DocumentStore.drop_collection",
         )),
         DocAction::Aggregate { .. } => Some((
-            CapabilityOperation::DocumentAggregateBounded,
-            "DocumentStore.aggregate_bounded",
+            CapabilityOperation::DocumentAggregateBudgeted,
+            "DocumentStore.aggregate_budgeted",
         )),
-        DocAction::Find { .. } => Some((CapabilityOperation::DocumentFind, "DocumentStore.find")),
+        DocAction::Find { .. } => Some((
+            CapabilityOperation::DocumentFindBudgeted,
+            "DocumentStore.find_budgeted",
+        )),
         DocAction::Insert { .. } => {
             Some((CapabilityOperation::DocumentInsert, "DocumentStore.insert"))
         }
@@ -413,21 +428,6 @@ fn parse_optional_json_object(raw: Option<&str>, option: &str) -> Result<Option<
         )));
     }
     Ok(Some(Value::Json(value)))
-}
-
-fn limit_plus_one(limit: usize) -> Result<usize> {
-    if limit == 0 {
-        return Err(Error::Config("--limit must be greater than zero".into()));
-    }
-    limit
-        .checked_add(1)
-        .ok_or_else(|| Error::Config("--limit is too large".into()))
-}
-
-fn truncate_documents(mut documents: Vec<Document>, limit: usize) -> (Vec<Document>, bool) {
-    let truncated = documents.len() > limit;
-    documents.truncate(limit);
-    (documents, truncated)
 }
 
 fn parse_document(raw: &str) -> Result<Document> {
@@ -856,6 +856,7 @@ mod tests {
             dsn: Some(dsn.to_owned()),
             format: Format::Json,
             limit: 100,
+            max_bytes: dbtool_core::model::DEFAULT_READ_BYTES,
             throttle_overrides: Default::default(),
             allow_write,
             confirm: None,
@@ -1056,10 +1057,30 @@ mod tests {
         assert_eq!(
             document_operation_for_action(&aggregate),
             Some((
-                CapabilityOperation::DocumentAggregateBounded,
-                "DocumentStore.aggregate_bounded"
+                CapabilityOperation::DocumentAggregateBudgeted,
+                "DocumentStore.aggregate_budgeted"
             ))
         );
+        assert!(matches!(
+            require_document_operation(
+                coarse,
+                CapabilityOperation::DocumentFindBudgeted,
+                "legacy-document",
+                "DocumentStore.find_budgeted",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "DocumentStore.find_budgeted"
+        ));
+        assert!(matches!(
+            require_document_operation(
+                coarse,
+                CapabilityOperation::DocumentAggregateBudgeted,
+                "legacy-document",
+                "DocumentStore.aggregate_budgeted",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "DocumentStore.aggregate_budgeted"
+        ));
     }
 
     #[test]
@@ -1313,29 +1334,26 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn exact_limit_is_not_reported_as_truncated_without_a_probe_row() {
-        let documents = vec![Document::new(), Document::new()];
-        let (documents, truncated) = truncate_documents(documents, 2);
-
-        assert_eq!(documents.len(), 2);
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn probe_row_is_removed_and_marks_results_truncated() {
-        let documents = vec![Document::new(), Document::new(), Document::new()];
-        let (documents, truncated) = truncate_documents(documents, 2);
-
-        assert_eq!(documents.len(), 2);
-        assert!(truncated);
-    }
-
-    #[test]
-    fn zero_limit_is_rejected_before_connecting() {
-        assert!(matches!(
-            limit_plus_one(0),
-            Err(Error::Config(message)) if message.contains("greater than zero")
-        ));
+    #[tokio::test]
+    async fn document_read_budget_is_rejected_before_dsn_resolution() {
+        for action in [
+            DocAction::Find {
+                collection: "events".to_owned(),
+                filter: "{}".to_owned(),
+                skip: None,
+                sort: None,
+                projection: None,
+            },
+            DocAction::Aggregate {
+                collection: "events".to_owned(),
+                pipeline: "[]".to_owned(),
+            },
+        ] {
+            let mut ctx = test_context(false, "mongodb://127.0.0.1:1/app");
+            ctx.dsn = None;
+            ctx.max_bytes = 0;
+            let error = run(&ctx, DocCmd { action }).await.unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message.contains("byte budget")));
+        }
     }
 }

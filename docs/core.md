@@ -50,9 +50,11 @@ Use `ConnectionResolver` instead of duplicating lookup logic. The resolver accep
 ## Safety And Limits
 
 `SafetyGuard` classifies SQL before execution. `ResultLimiter` and `ListLimiter`
-validate caller budgets and N+1 probes; public user-query and top-level name
-catalog paths push the bound into adapters or enforce an explicit protocol
-response-size ceiling. Nested metadata collections remain tracked by IF-T67.
+validate legacy item budgets and N+1 probes. New first-party row/document paths use
+`ReadBudget`; complete schema, DDL, topic detail, and lag paths use `MetadataBudget`.
+Both pair item accounting with a caller byte ceiling and exact negotiated operations.
+Top-level catalog item bounds are complete; caller-owned scalar byte accounting remains
+tracked by IF-T74.
 
 These services are intentionally adapter-agnostic so the CLI, TUI, and embedded library paths can share the same behavior.
 

@@ -132,11 +132,23 @@ fn sqlite_full_crud() {
     assert_eq!(all_rows["data"]["rows"].as_array().unwrap().len(), 3);
     assert_eq!(
         all_rows["data"]["rows"][0],
-        serde_json::json!([1, "alice", true, 3.5, [104, 105]])
+        serde_json::json!([
+            1,
+            "alice",
+            true,
+            3.5,
+            {"$dbtool":{"type":"bytes","codec":"dbtool-value-v2","value":"aGk="}}
+        ])
     );
     assert_eq!(
         all_rows["data"]["rows"][1],
-        serde_json::json!([2, "bob", false, null, [0, 255]])
+        serde_json::json!([
+            2,
+            "bob",
+            false,
+            null,
+            {"$dbtool":{"type":"bytes","codec":"dbtool-value-v2","value":"AP8="}}
+        ])
     );
     assert_eq!(
         all_rows["data"]["rows"][2],

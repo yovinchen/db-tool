@@ -8,7 +8,7 @@ use dbtool_core::{
     config::{env::discover_env_connections, ConnectionConfig},
     dsn::Dsn,
     error::Error,
-    model::{BoundedList, FindOptions, Point, TimeRange, Value},
+    model::{BoundedList, FindOptions, MetadataBudget, Point, ReadBudget, TimeRange, Value},
     port::{CapabilityOperation, CapabilityReport},
     registry::Registry,
     service::{
@@ -321,13 +321,16 @@ async fn execute_tui_command(
                 .ok_or_else(|| Error::Config("schema requires a table name".into()))?;
             require_operation(
                 connector,
-                CapabilityOperation::SqlDescribeTable,
-                "SqlEngine.describe_table",
+                CapabilityOperation::SqlDescribeTableBounded,
+                "SqlEngine.describe_table_bounded",
             )?;
             let sql = connector
                 .as_sql()
                 .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
-            render_json(sql.describe_table(table).await?)
+            render_json(
+                sql.describe_table_bounded(table, MetadataBudget::with_default_bytes(limit)?)
+                    .await?,
+            )
         }
         "sql" => {
             let rest = command
@@ -393,13 +396,15 @@ async fn run_sql_query(
     authorize_sql_statement(connection, sql_text, confirmed_write)?;
     require_operation(
         connector,
-        CapabilityOperation::SqlQueryBounded,
-        "SqlEngine.query_bounded",
+        CapabilityOperation::SqlQueryBudgeted,
+        "SqlEngine.query_budgeted",
     )?;
     let sql = connector
         .as_sql()
         .ok_or_else(|| unsupported(connector, "SqlEngine"))?;
-    let result = sql.query_bounded(sql_text, &[], limit).await?;
+    let result = sql
+        .query_budgeted(sql_text, &[], ReadBudget::with_default_bytes(limit)?)
+        .await?;
     render_json(result)
 }
 
@@ -519,8 +524,8 @@ async fn run_doc_command(
     if let Some(rest) = command.strip_prefix("find ").map(str::trim) {
         require_operation(
             connector,
-            CapabilityOperation::DocumentFind,
-            "DocumentStore.find",
+            CapabilityOperation::DocumentFindBudgeted,
+            "DocumentStore.find_budgeted",
         )?;
         let doc = connector
             .as_document()
@@ -531,16 +536,17 @@ async fn run_doc_command(
             .unwrap_or((rest, "{}"));
         let filter = parse_json_value(filter)?;
         let result = doc
-            .find(
+            .find_budgeted(
                 collection,
                 filter,
                 FindOptions {
-                    limit: Some(limit),
+                    limit: None,
                     ..Default::default()
                 },
+                ReadBudget::with_default_bytes(limit)?,
             )
             .await?;
-        return render_json(result);
+        return render_bounded_list(result);
     }
     Err(Error::Config(
         "doc command must be collections or find <collection> [filter]".into(),
@@ -690,9 +696,21 @@ fn validate_bounded_catalog_limit(command: &str, limit: usize) -> Result<()> {
     let parts = command.split_whitespace().collect::<Vec<_>>();
     if matches!(
         parts.as_slice(),
-        ["doc", "collections"] | ["search", "indices"] | ["ts", "measurements"]
+        ["schemas"]
+            | ["tables"]
+            | ["tables", _]
+            | ["doc", "collections"]
+            | ["search", "indices"]
+            | ["ts", "measurements"]
     ) {
         ListLimiter::new(limit).probe_items()?;
+    }
+    if matches!(parts.as_slice(), ["schema", _]) {
+        MetadataBudget::with_default_bytes(limit)?;
+    }
+    let is_sql_read = parts.first() == Some(&"sql") && parts.get(1) != Some(&"exec");
+    if is_sql_read || matches!(parts.as_slice(), ["doc", "find", ..]) {
+        ReadBudget::with_default_bytes(limit)?;
     }
     Ok(())
 }
@@ -925,12 +943,22 @@ mod tests {
         assert!(matches!(
             require_declared_operation(
                 &[CapabilityOperation::SqlQuery],
-                CapabilityOperation::SqlQueryBounded,
+                CapabilityOperation::SqlQueryBudgeted,
                 "legacy-sql".into(),
-                "SqlEngine.query_bounded",
+                "SqlEngine.query_budgeted",
             ),
             Err(Error::UnsupportedCapability { needed, .. })
-                if needed == "SqlEngine.query_bounded"
+                if needed == "SqlEngine.query_budgeted"
+        ));
+        assert!(matches!(
+            require_declared_operation(
+                CapabilityOperation::SQL,
+                CapabilityOperation::SqlDescribeTableBounded,
+                "legacy-sql".into(),
+                "SqlEngine.describe_table_bounded",
+            ),
+            Err(Error::UnsupportedCapability { needed, .. })
+                if needed == "SqlEngine.describe_table_bounded"
         ));
         assert!(matches!(
             require_declared_operation(
@@ -1019,6 +1047,7 @@ readonli = true
             ping["capabilities"]["operations"],
             serde_json::json!([
                 "sql.describe_table",
+                "sql.describe_table_bounded",
                 "sql.execute",
                 "sql.insert_rows_atomic",
                 "sql.list_schemas",
@@ -1026,7 +1055,8 @@ readonli = true
                 "sql.list_tables",
                 "sql.list_tables_bounded",
                 "sql.query",
-                "sql.query_bounded"
+                "sql.query_bounded",
+                "sql.query_budgeted"
             ])
         );
 
@@ -1110,6 +1140,12 @@ readonli = true
                 "DocumentStore.list_collections_bounded",
             ),
             (
+                CapabilityOperation::DOCUMENT,
+                CapabilityOperation::DocumentFindBudgeted,
+                "legacy-document",
+                "DocumentStore.find_budgeted",
+            ),
+            (
                 CapabilityOperation::SEARCH,
                 CapabilityOperation::SearchListIndicesBounded,
                 "legacy-search",
@@ -1140,12 +1176,23 @@ readonli = true
             readonly: false,
         };
 
-        for command in ["doc collections", "search indices", "ts measurements"] {
+        for command in [
+            "tables main",
+            "schemas",
+            "schema users",
+            "sql query select 1",
+            "doc collections",
+            "doc find users {}",
+            "search indices",
+            "ts measurements",
+        ] {
             assert!(matches!(
                 execute_tui_command(&manager, &connection, command, 0, false).await,
                 Err(Error::Config(message)) if message.contains("greater than zero")
             ));
         }
+
+        assert!(validate_bounded_catalog_limit("sql exec create table t(id int)", 0).is_ok());
     }
 
     #[tokio::test]

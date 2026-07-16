@@ -121,6 +121,19 @@ fn assert_live_sql_bounding(dsn: &str, large_query: &str) {
     );
     assert_eq!(exact["data"]["truncated"], false);
     assert_eq!(exact["meta"]["truncated"], false);
+
+    let too_small = stderr_json(dbtool(&[
+        "--dsn",
+        dsn,
+        "--limit",
+        "3",
+        "--max-bytes",
+        "1",
+        "sql",
+        "query",
+        "select 1 as value",
+    ]));
+    assert_eq!(too_small["error"]["code"], "READ_BUDGET_EXCEEDED");
 }
 
 #[test]
@@ -196,6 +209,19 @@ fn cassandra_live_streams_one_probe_row_for_paged_results() {
     );
     assert_eq!(exact["data"]["truncated"], false);
     assert_eq!(exact["meta"]["truncated"], false);
+
+    let too_small = stderr_json(dbtool(&[
+        "--dsn",
+        &dsn,
+        "--limit",
+        "3",
+        "--max-bytes",
+        "1",
+        "cql",
+        "query",
+        "select keyspace_name from system_schema.keyspaces limit 1",
+    ]));
+    assert_eq!(too_small["error"]["code"], "READ_BUDGET_EXCEEDED");
 }
 
 #[test]
@@ -214,7 +240,7 @@ fn sql_query_rejects_probe_overflow_before_connecting() {
     assert_eq!(error["error"]["code"], "CONFIG_ERROR");
     assert!(error["error"]["message"]
         .as_str()
-        .is_some_and(|message| message.contains("truncation probe row")));
+        .is_some_and(|message| message.contains("probe item")));
 }
 
 #[test]
