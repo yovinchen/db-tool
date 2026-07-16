@@ -1074,6 +1074,10 @@ impl AdminInspect for RedisAdapter {
         Ok(limiter.finish(topics))
     }
 
+    async fn list_topics_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<TopicInfo>> {
+        self.scan_stream_topics_budgeted(budget).await
+    }
+
     async fn topic_detail(&self, name: &str) -> Result<TopicDetail> {
         match parse_message_target(name)? {
             RedisMessageTarget::Stream(stream) => self.stream_detail(stream).await,
@@ -1220,15 +1224,43 @@ impl AdminInspect for RedisAdapter {
 
 impl RedisAdapter {
     async fn scan_stream_topics(&self, probe_items: Option<usize>) -> Result<Vec<TopicInfo>> {
-        let mut cursor = 0_u64;
         let mut topics = Vec::new();
+        self.visit_stream_topics(probe_items, |topic| {
+            topics.push(topic);
+            Ok(())
+        })
+        .await?;
+        topics.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(topics)
+    }
+
+    async fn scan_stream_topics_budgeted(
+        &self,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TopicInfo>> {
+        let (mut limiter, probe_items) = redis_budgeted_topic_catalog_plan(budget)?;
+        let mut topics = Vec::with_capacity(budget.max_items.min(REDIS_STREAM_SCAN_COUNT));
+        self.visit_stream_topics(Some(probe_items), |topic| {
+            limiter.retain_item(topic, &mut topics)
+        })
+        .await?;
+        topics.sort_by(|left, right| left.name.cmp(&right.name));
+        limiter.finish(topics)
+    }
+
+    async fn visit_stream_topics<F>(&self, probe_items: Option<usize>, mut visit: F) -> Result<()>
+    where
+        F: FnMut(TopicInfo) -> Result<()>,
+    {
+        let mut cursor = 0_u64;
+        let mut observed = 0_usize;
         let mut names = HashSet::new();
         let mut cursors = HashSet::new();
         let mut c = self.conn.lock().await;
 
         loop {
             let requested_count = probe_items
-                .map(|limit| limit.saturating_sub(topics.len()))
+                .map(|limit| limit.saturating_sub(observed))
                 .unwrap_or(REDIS_STREAM_SCAN_COUNT)
                 .clamp(1, REDIS_STREAM_SCAN_COUNT);
             // Wrap one SCAN page in a read-only Lua call so the server returns
@@ -1257,18 +1289,19 @@ impl RedisAdapter {
 
             for name in keys {
                 if names.insert(name.clone()) {
-                    topics.push(TopicInfo {
+                    visit(TopicInfo {
                         name,
                         partitions: 1,
                         replicas: 1,
-                    });
-                    if probe_items.is_some_and(|limit| topics.len() >= limit) {
+                    })?;
+                    observed += 1;
+                    if probe_items.is_some_and(|limit| observed >= limit) {
                         break;
                     }
                 }
             }
 
-            if next_cursor == 0 || probe_items.is_some_and(|limit| topics.len() >= limit) {
+            if next_cursor == 0 || probe_items.is_some_and(|limit| observed >= limit) {
                 break;
             }
             if !cursors.insert(next_cursor) {
@@ -1279,9 +1312,7 @@ impl RedisAdapter {
             }
             cursor = next_cursor;
         }
-
-        topics.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(topics)
+        Ok(())
     }
 
     async fn stream_detail_bounded(&self, stream: &str) -> Result<TopicDetail> {
@@ -2570,6 +2601,7 @@ fn redis_operations(
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
         CapabilityOperation::MessageAdminListTopicsBounded,
+        CapabilityOperation::MessageAdminListTopicsBudgeted,
         CapabilityOperation::MessageAdminTopicDetail,
         CapabilityOperation::MessageAdminTopicDetailBounded,
         CapabilityOperation::MessageAdminDelete,
@@ -2579,6 +2611,12 @@ fn redis_operations(
         operations.push(CapabilityOperation::MessageAdminConsumerLagBounded);
     }
     operations
+}
+
+fn redis_budgeted_topic_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize)> {
+    let limiter = ReadLimiter::new(budget, "Redis Stream catalog response")?;
+    let probe_items = limiter.probe_items()?;
+    Ok((limiter, probe_items))
 }
 
 fn enforce_redis_topic_detail_budget(
@@ -3438,6 +3476,71 @@ mod tests {
             .unwrap();
         let expiring_set_position = RESTORE_WITH_EXPIRY_SCRIPT.find("'PX', remaining").unwrap();
         assert!(time_position < expired_position && expired_position < expiring_set_position);
+    }
+
+    #[tokio::test]
+    async fn redis_live_budgeted_stream_catalog_is_exact_and_leaves_no_keys() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        let isolated_dsn = redis_dsn_for_database(&raw_dsn, 14);
+        let dsn = Dsn::parse(&isolated_dsn).unwrap();
+        let client = Client::open(dsn.raw_with_scheme("redis").unwrap()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut direct)
+            .await
+            .unwrap();
+        for stream in ["dbtool_it_catalog_alpha", "dbtool_it_catalog_beta"] {
+            redis::cmd("XADD")
+                .arg(stream)
+                .arg("*")
+                .arg("payload")
+                .arg("fixture")
+                .query_async::<String>(&mut direct)
+                .await
+                .unwrap();
+        }
+
+        let connector = factory(dsn).await.unwrap();
+        assert!(connector
+            .operations()
+            .contains(&CapabilityOperation::MessageAdminListTopicsBudgeted));
+        let admin = connector.as_admin().unwrap();
+        let complete = admin
+            .list_topics_budgeted(ReadBudget::with_default_bytes(2).unwrap())
+            .await
+            .expect("two isolated Redis Streams should be complete");
+        assert!(!complete.truncated);
+        assert_eq!(complete.items.len(), 2);
+        let exact_bytes = serde_json::to_vec(&complete).unwrap().len();
+        assert!(admin
+            .list_topics_budgeted(ReadBudget::new(2, exact_bytes).unwrap())
+            .await
+            .is_ok());
+        assert!(matches!(
+            admin
+                .list_topics_budgeted(ReadBudget::new(2, exact_bytes - 1).unwrap())
+                .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
+        let truncated = admin
+            .list_topics_budgeted(ReadBudget::with_default_bytes(1).unwrap())
+            .await
+            .expect("second Redis Stream should be the N+1 probe");
+        assert!(truncated.truncated);
+        assert_eq!(truncated.items.len(), 1);
+
+        redis::cmd("FLUSHDB")
+            .query_async::<()>(&mut direct)
+            .await
+            .unwrap();
+        let remaining: usize = redis::cmd("DBSIZE").query_async(&mut direct).await.unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[tokio::test]
@@ -5027,6 +5130,7 @@ mod tests {
             CapabilityOperation::MessageConsumeAck,
             CapabilityOperation::MessageAdminListTopics,
             CapabilityOperation::MessageAdminListTopicsBounded,
+            CapabilityOperation::MessageAdminListTopicsBudgeted,
             CapabilityOperation::MessageAdminTopicDetail,
             CapabilityOperation::MessageAdminTopicDetailBounded,
             CapabilityOperation::MessageAdminConsumerLag,
@@ -5045,6 +5149,90 @@ mod tests {
         assert!(keydb_operations.contains(&CapabilityOperation::MessageAdminTopicDetailBounded));
         assert!(!keydb_operations.contains(&CapabilityOperation::MessageAdminConsumerLag));
         assert!(!keydb_operations.contains(&CapabilityOperation::MessageAdminConsumerLagBounded));
+    }
+
+    fn redis_topic(name: &str) -> TopicInfo {
+        TopicInfo {
+            name: name.to_owned(),
+            partitions: 1,
+            replicas: 1,
+        }
+    }
+
+    fn finish_redis_topic_fixture(
+        names: &[&str],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Result<BoundedList<TopicInfo>> {
+        let (mut limiter, probe_items) =
+            redis_budgeted_topic_catalog_plan(ReadBudget::new(max_items, max_bytes)?)?;
+        let mut retained = Vec::new();
+        for topic in names.iter().take(probe_items).map(|name| redis_topic(name)) {
+            limiter.retain_item(topic, &mut retained)?;
+        }
+        retained.sort_by(|left, right| left.name.cmp(&right.name));
+        limiter.finish(retained)
+    }
+
+    #[test]
+    fn redis_budgeted_stream_catalog_rejects_invalid_budgets_before_scan() {
+        for budget in [
+            ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            },
+            ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            },
+        ] {
+            assert!(matches!(
+                redis_budgeted_topic_catalog_plan(budget),
+                Err(Error::Config(_))
+            ));
+        }
+        let (_, probe_items) =
+            redis_budgeted_topic_catalog_plan(ReadBudget::new(2, 1024).unwrap()).unwrap();
+        assert_eq!(probe_items, 3);
+    }
+
+    #[test]
+    fn redis_budgeted_stream_catalog_covers_item_and_byte_boundaries() {
+        let exact = finish_redis_topic_fixture(&["stream-b", "stream-a"], 2, 4096).unwrap();
+        assert!(!exact.truncated);
+        assert_eq!(
+            exact
+                .items
+                .iter()
+                .map(|topic| topic.name.as_str())
+                .collect::<Vec<_>>(),
+            ["stream-a", "stream-b"]
+        );
+
+        let probed =
+            finish_redis_topic_fixture(&["stream-b", "stream-a", "stream-c", "ignored"], 2, 4096)
+                .unwrap();
+        assert!(probed.truncated);
+        assert_eq!(probed.items.len(), 2);
+
+        let expected =
+            BoundedList::complete(vec![redis_topic("stream-a"), redis_topic("stream-b")]);
+        let exact_bytes = serde_json::to_vec(&expected).unwrap().len();
+        assert!(finish_redis_topic_fixture(&["stream-a", "stream-b"], 2, exact_bytes).is_ok());
+        assert!(matches!(
+            finish_redis_topic_fixture(&["stream-a", "stream-b"], 2, exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn redis_admin_catalog_is_stream_only_and_never_claims_pubsub_discovery() {
+        assert!(REDIS_STREAM_SCAN_PAGE_SCRIPT.contains("'TYPE', 'stream'"));
+        assert!(!REDIS_STREAM_SCAN_PAGE_SCRIPT.contains("PUBSUB"));
     }
 
     #[test]

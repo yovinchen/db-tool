@@ -61,6 +61,27 @@ Pub/Sub produce/consume/admin/delete behavior under pure and full-native
 feature bundles. This run specifically closes the Redis consumer-group, PEL,
 explicit-ACK, and complete-lag semantics that those profiles did not prove.
 
+## IF-T74 Stream scalar-byte envelope refresh
+
+Run at (UTC): 2026-07-16T03:24:39Z
+
+Redis Streams admin now advertises and implements exact
+`message.admin.list_topics_budgeted`. The read budget is validated before the
+first command. A read-only Lua `SCAN TYPE stream` page keeps its existing hard
+item/key-byte response limits, while a visitor accounts each complete
+`TopicInfo` before retention and validates the final `BoundedList` plus N+1
+probe. Redis Pub/Sub channels remain ephemeral subscriptions and are not
+reported as durable topics.
+
+Redis 7 Docker validation used isolated DB 14, passed item N/N+1 and exact byte
+N/N-1 boundaries, deleted both Streams, and confirmed `DBSIZE=0`. The same
+adapter code serves Valkey, KeyDB, and Dragonfly; their prior compatibility
+catalog checks remain valid, but this exact-byte live rerun was Redis-only and
+is not overstated as four new product runs.
+
+Verification: adapter-redis 47 tests PASS; strict all-target Clippy, rustfmt and
+diff check PASS; Redis 7 live exact catalog and zero-key cleanup PASS.
+
 Cleanup: PASS; all `dbtool_it_stream_group_*` and
 `dbtool_it_redis_stream_*` scans were empty on Redis, Valkey, KeyDB, and
 Dragonfly after the matrix.
