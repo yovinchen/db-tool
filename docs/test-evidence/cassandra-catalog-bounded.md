@@ -1,6 +1,6 @@
 # Cassandra CQL Bounded Catalog Evidence
 
-Task ID: IF-T66-CQL
+Task ID: IF-T66-CQL / IF-T74-CQL
 
 Result: LIVE_PASS
 
@@ -58,3 +58,17 @@ The live service was Apache Cassandra 5.0. The `scylla://` alias was exercised
 against the same Cassandra-compatible protocol endpoint; a native ScyllaDB
 product image was not started in this slice and is not represented as a
 separate vendor LIVE_PASS.
+
+## IF-T74 scalar-byte extension（2026-07-16）
+
+- SQL alias 与 CQL surface 现在都独立广告并调用
+  `list_schemas/list_keyspaces_budgeted`、`list_tables_budgeted`；CQL exact
+  方法直接委托同一个 SQL exact 实现，避免两个入口产生不同计费语义。
+- `ReadLimiter` 在 retention 前对完整 String/TableInfo 计费，最终再对
+  `BoundedList` envelope 与唯一 N+1 probe 计费；任一 byte 超限都不返回部分值。
+- page size 仍为 `min(N+1,256)`。无指定 keyspace 时，为过滤 system keyspace，
+  驱动可能跨越更多原始系统行，但 caller-visible item 最多观察 N+1。
+
+本轮 adapter 12/12 与 all-target Clippy PASS。Cassandra 5 Docker 同时比较 SQL/CQL
+两入口：table exact bytes=103、keyspace exact bytes=160，N 成功、N-1 返回
+`READ_BUDGET_EXCEEDED`、N+1 `truncated=true`；临时 keyspace 最终残留 0。

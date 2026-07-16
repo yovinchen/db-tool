@@ -1,6 +1,6 @@
 # Db2 Bounded Catalog Evidence
 
-Task ID: IF-T66-DB2
+Task ID: IF-T66-DB2 / IF-T74-DB2
 
 Result: COMPILE_PASS / EXTERNAL_BLOCKED
 
@@ -52,3 +52,14 @@ Server Driver for ODBC and CLI or a supplied Db2 endpoint. A future live run
 must provide both the registered IBM driver and `DBTOOL_IT_DB2_DSN`; until then,
 the product remains the explicit IF-T52 external blocker rather than a false
 `LIVE_PASS`.
+
+## IF-T74 scalar-byte extension（2026-07-16）
+
+Db2 现在独立广告 SQL schemas/tables 以及 Db2 sequences/routines/tablespaces/
+foreign-keys 共六个 budgeted operations。前五类以 `FETCH FIRST N+1` 在服务端限制
+逻辑项；foreign key 先选 N+1 个 constraint identity，再以 Db2 64-column 产品上限把
+成员行界定为 `(N+1)*64`，完整聚合一个 ForeignKeyInfo 后才交给 ReadLimiter 计费。
+
+当前 adapter 22/22 与 all-target Clippy PASS，覆盖 item N/N+1、byte N/N-1、
+zero/overflow 和复合 foreign-key 完整性。本机仍无 IBM ODBC runtime/Db2 endpoint，
+因此真实 Db2 byte envelope 未标为 PASS，继续归 IF-T52。

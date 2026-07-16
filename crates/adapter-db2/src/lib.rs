@@ -343,6 +343,25 @@ impl SqlEngine for Db2Adapter {
         Ok(limiter.finish(schemas))
     }
 
+    async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        let (mut limiter, fetch_first) = db2_budgeted_catalog_limit(budget)?;
+        let result = self
+            .query(
+                &format!(
+                    "SELECT SCHEMANAME FROM SYSCAT.SCHEMATA \
+                     WHERE SCHEMANAME NOT LIKE 'SYS%' ORDER BY SCHEMANAME \
+                     FETCH FIRST {fetch_first} ROWS ONLY"
+                ),
+                &[],
+            )
+            .await?;
+        let mut schemas = Vec::with_capacity(result.rows.len().min(budget.max_items));
+        for row in result.rows {
+            limiter.retain_item(required_catalog_text(&row, 0, "schema name")?, &mut schemas)?;
+        }
+        limiter.finish(schemas)
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
         let sql = format!(
@@ -404,6 +423,41 @@ impl SqlEngine for Db2Adapter {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(limiter.finish(tables))
+    }
+
+    async fn list_tables_budgeted(
+        &self,
+        schema: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (mut limiter, fetch_first) = db2_budgeted_catalog_limit(budget)?;
+        let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
+        let sql = format!(
+            "SELECT TABSCHEMA, TABNAME, TYPE FROM SYSCAT.TABLES \
+             WHERE TABSCHEMA = '{}' AND TYPE IN ('T','V') ORDER BY TABNAME \
+             FETCH FIRST {fetch_first} ROWS ONLY",
+            schema.to_uppercase()
+        );
+        let result = self.query(&sql, &[]).await?;
+        let mut tables = Vec::with_capacity(result.rows.len().min(budget.max_items));
+        for row in result.rows {
+            let schema = required_catalog_text(&row, 0, "table schema")?;
+            let name = required_catalog_text(&row, 1, "table name")?;
+            let kind = required_catalog_text(&row, 2, "table type")?;
+            limiter.retain_item(
+                TableInfo {
+                    schema: Some(schema),
+                    name,
+                    kind: if kind == "V" {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                },
+                &mut tables,
+            )?;
+        }
+        limiter.finish(tables)
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -492,6 +546,29 @@ impl Db2Engine for Db2Adapter {
         Ok(limiter.finish(sequences))
     }
 
+    async fn list_sequences_budgeted(
+        &self,
+        schema: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<SequenceInfo>> {
+        let (mut limiter, fetch_first) = db2_budgeted_catalog_limit(budget)?;
+        let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
+        let sql = format!(
+            "SELECT SEQSCHEMA, SEQNAME, DATATYPEID, START, INCREMENT, \
+                    MINVALUE, MAXVALUE, CYCLE, CACHE \
+             FROM SYSCAT.SEQUENCES \
+             WHERE SEQSCHEMA = '{}' AND SEQTYPE = 'S' \
+             ORDER BY SEQNAME FETCH FIRST {fetch_first} ROWS ONLY",
+            schema.to_uppercase()
+        );
+        let result = self.query(&sql, &[]).await?;
+        let mut sequences = Vec::with_capacity(result.rows.len().min(budget.max_items));
+        for row in result.rows {
+            limiter.retain_item(parse_sequence_row(row)?, &mut sequences)?;
+        }
+        limiter.finish(sequences)
+    }
+
     async fn list_routines(&self, schema: Option<&str>) -> Result<Vec<RoutineInfo>> {
         let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
         let sql = format!(
@@ -554,6 +631,28 @@ impl Db2Engine for Db2Adapter {
         Ok(limiter.finish(routines))
     }
 
+    async fn list_routines_budgeted(
+        &self,
+        schema: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<RoutineInfo>> {
+        let (mut limiter, fetch_first) = db2_budgeted_catalog_limit(budget)?;
+        let schema = validate_opt_schema(schema)?.unwrap_or("DB2INST1");
+        let sql = format!(
+            "SELECT ROUTINESCHEMA, ROUTINENAME, ROUTINETYPE, LANGUAGE, PARMS \
+             FROM SYSCAT.ROUTINES \
+             WHERE ROUTINESCHEMA = '{}' AND ROUTINETYPE IN ('P','F') \
+             ORDER BY ROUTINENAME FETCH FIRST {fetch_first} ROWS ONLY",
+            schema.to_uppercase()
+        );
+        let result = self.query(&sql, &[]).await?;
+        let mut routines = Vec::with_capacity(result.rows.len().min(budget.max_items));
+        for row in result.rows {
+            limiter.retain_item(parse_routine_row(row)?, &mut routines)?;
+        }
+        limiter.finish(routines)
+    }
+
     async fn list_tablespaces(&self) -> Result<Vec<TablespaceInfo>> {
         let sql = "SELECT TBSPACE, TBSPACETYPE, PAGESIZE, EXTENTSIZE, PREFETCHSIZE \
                    FROM SYSCAT.TABLESPACES \
@@ -603,6 +702,24 @@ impl Db2Engine for Db2Adapter {
             .map(parse_tablespace_row)
             .collect::<Result<Vec<_>>>()?;
         Ok(limiter.finish(tablespaces))
+    }
+
+    async fn list_tablespaces_budgeted(
+        &self,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TablespaceInfo>> {
+        let (mut limiter, fetch_first) = db2_budgeted_catalog_limit(budget)?;
+        let sql = format!(
+            "SELECT TBSPACE, TBSPACETYPE, PAGESIZE, EXTENTSIZE, PREFETCHSIZE \
+             FROM SYSCAT.TABLESPACES \
+             ORDER BY TBSPACE FETCH FIRST {fetch_first} ROWS ONLY"
+        );
+        let result = self.query(&sql, &[]).await?;
+        let mut tablespaces = Vec::with_capacity(result.rows.len().min(budget.max_items));
+        for row in result.rows {
+            limiter.retain_item(parse_tablespace_row(row)?, &mut tablespaces)?;
+        }
+        limiter.finish(tablespaces)
     }
 
     async fn list_foreign_keys(&self, table: &str) -> Result<Vec<ForeignKeyInfo>> {
@@ -709,6 +826,27 @@ impl Db2Engine for Db2Adapter {
         let result = self.query(&sql, &[]).await?;
         let foreign_keys = group_foreign_key_rows(result.rows)?;
         Ok(limiter.finish(foreign_keys))
+    }
+
+    async fn list_foreign_keys_budgeted(
+        &self,
+        table: &str,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<ForeignKeyInfo>> {
+        let (mut limiter, fetch_first) = db2_budgeted_catalog_limit(budget)?;
+        let member_row_envelope = db2_foreign_key_row_envelope(fetch_first)?;
+        let tref = parse_table_ref(table)?;
+        let schema_uc = tref.schema.as_deref().unwrap_or("DB2INST1").to_uppercase();
+        let name_uc = tref.name.to_uppercase();
+        let sql =
+            db2_bounded_foreign_keys_sql(&schema_uc, &name_uc, fetch_first, member_row_envelope);
+        let result = self.query(&sql, &[]).await?;
+        let observed = group_foreign_key_rows(result.rows)?;
+        let mut foreign_keys = Vec::with_capacity(observed.len().min(budget.max_items));
+        for foreign_key in observed {
+            limiter.retain_item(foreign_key, &mut foreign_keys)?;
+        }
+        limiter.finish(foreign_keys)
     }
 
     async fn generate_ddl(&self, table: &str) -> Result<String> {
@@ -1851,12 +1989,18 @@ fn db2_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     operations.extend([
         CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::SqlListTablesBudgeted,
         CapabilityOperation::SqlDescribeTableBounded,
         CapabilityOperation::Db2ListSequencesBounded,
+        CapabilityOperation::Db2ListSequencesBudgeted,
         CapabilityOperation::Db2ListRoutinesBounded,
+        CapabilityOperation::Db2ListRoutinesBudgeted,
         CapabilityOperation::Db2ListTablespacesBounded,
+        CapabilityOperation::Db2ListTablespacesBudgeted,
         CapabilityOperation::Db2ListForeignKeysBounded,
+        CapabilityOperation::Db2ListForeignKeysBudgeted,
         CapabilityOperation::Db2GenerateDdlBounded,
     ]);
     operations
@@ -1867,6 +2011,14 @@ fn db2_catalog_limit(max_items: usize) -> Result<(ListLimiter, i64)> {
     let probe_items = limiter.probe_items()?;
     let fetch_first = i64::try_from(probe_items).map_err(|_| {
         Error::Config("Db2 catalog limit exceeds the FETCH FIRST integer range".to_owned())
+    })?;
+    Ok((limiter, fetch_first))
+}
+
+fn db2_budgeted_catalog_limit(budget: ReadBudget) -> Result<(ReadLimiter, i64)> {
+    let limiter = ReadLimiter::new(budget, "Db2 catalog response")?;
+    let fetch_first = i64::try_from(limiter.probe_items()?).map_err(|_| {
+        Error::Config("Db2 catalog item budget exceeds the FETCH FIRST integer range".to_owned())
     })?;
     Ok((limiter, fetch_first))
 }
@@ -2156,12 +2308,18 @@ mod tests {
         for operation in [
             CapabilityOperation::SqlQueryBudgeted,
             CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListSchemasBudgeted,
             CapabilityOperation::SqlListTablesBounded,
+            CapabilityOperation::SqlListTablesBudgeted,
             CapabilityOperation::SqlDescribeTableBounded,
             CapabilityOperation::Db2ListSequencesBounded,
+            CapabilityOperation::Db2ListSequencesBudgeted,
             CapabilityOperation::Db2ListRoutinesBounded,
+            CapabilityOperation::Db2ListRoutinesBudgeted,
             CapabilityOperation::Db2ListTablespacesBounded,
+            CapabilityOperation::Db2ListTablespacesBudgeted,
             CapabilityOperation::Db2ListForeignKeysBounded,
+            CapabilityOperation::Db2ListForeignKeysBudgeted,
             CapabilityOperation::Db2GenerateDdlBounded,
         ] {
             assert!(operations.contains(&operation), "missing {operation:?}");
@@ -2204,6 +2362,44 @@ mod tests {
         assert!(build(1, minimum_complete_bytes, &["payload"]).is_ok());
         let short = build(1, minimum_complete_bytes - 1, &["payload"]).unwrap_err();
         assert_eq!(short.code(), "READ_BUDGET_EXCEEDED");
+    }
+
+    #[test]
+    fn budgeted_catalog_retains_n_probes_n_plus_one_and_enforces_exact_bytes() {
+        let finish = |max_bytes: usize| -> Result<BoundedList<String>> {
+            let (mut limiter, fetch_first) =
+                db2_budgeted_catalog_limit(ReadBudget::new(2, max_bytes)?)?;
+            assert_eq!(fetch_first, 3);
+            let mut retained = Vec::new();
+            for item in ["alpha", "beta", "gamma"] {
+                limiter.retain_item(item.to_owned(), &mut retained)?;
+            }
+            limiter.finish(retained)
+        };
+        let exact_bytes = (1..=4096)
+            .find(|max_bytes| finish(*max_bytes).is_ok())
+            .expect("the Db2 catalog fixture must fit");
+        let exact = finish(exact_bytes).unwrap();
+        assert_eq!(exact.items, ["alpha", "beta"]);
+        assert!(exact.truncated);
+        assert!(matches!(
+            finish(exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
+
+        let (mut limiter, _) =
+            db2_budgeted_catalog_limit(ReadBudget::new(2, 4096).unwrap()).unwrap();
+        let mut retained = Vec::new();
+        for item in ["alpha", "beta"] {
+            limiter.retain_item(item.to_owned(), &mut retained).unwrap();
+        }
+        let complete = limiter.finish(retained).unwrap();
+        assert_eq!(complete.items, ["alpha", "beta"]);
+        assert!(!complete.truncated);
     }
 
     #[test]
@@ -2251,6 +2447,26 @@ mod tests {
             Err(Error::Config(_))
         ));
         assert_eq!(db2_catalog_limit(2).unwrap().1, 3);
+        assert!(matches!(
+            db2_budgeted_catalog_limit(ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            db2_budgeted_catalog_limit(ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        assert_eq!(
+            db2_budgeted_catalog_limit(ReadBudget::new(2, 1024).unwrap())
+                .unwrap()
+                .1,
+            3
+        );
 
         let budget = MetadataBudget::new(3, DEFAULT_METADATA_BYTES).unwrap();
         let mut limiter = MetadataLimiter::new(budget, "test Db2 schema").unwrap();

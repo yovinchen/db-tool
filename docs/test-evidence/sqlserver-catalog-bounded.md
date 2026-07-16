@@ -1,6 +1,6 @@
 # SQL Server Bounded Catalog Evidence
 
-Task ID: IF-T66-SQLSERVER
+Task ID: IF-T66-SQLSERVER / IF-T74-SQLSERVER
 
 Result: COMPILE_PASS / EXTERNAL_BLOCKED
 
@@ -41,3 +41,13 @@ a SQL Server endpoint is supplied. A live run was not claimed here: the local
 macOS arm64 Docker environment has no supported SQL Server product image. This
 remains the explicit IF-T52 external-product blocker rather than being reported
 as a false LIVE_PASS.
+
+## IF-T74 scalar-byte extension（2026-07-16）
+
+`sql.list_schemas_budgeted` 与 `sql.list_tables_budgeted` 已作为独立 exact
+operations 广告。adapter 在建连/查询前验证 `ReadBudget`，用 `TOP (N+1)` 约束服务端，
+再在 retention 前计费完整 schema String 或 TableInfo，最后校验完整 BoundedList envelope。
+
+当前 adapter 8/8 与 all-target Clippy PASS，包含 item N/N+1、byte N/N-1 和
+zero/overflow。macOS arm64 当前仍没有可运行的 SQL Server 产品容器；本项只记录
+COMPILE_PASS，真实产品 byte envelope 仍是 IF-T52 解除条件。

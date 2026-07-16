@@ -158,6 +158,40 @@ impl CassandraAdapter {
         Ok(limiter.finish(items))
     }
 
+    async fn query_catalog_budgeted<T, F, C>(
+        &self,
+        cql: &str,
+        budget: ReadBudget,
+        mut convert: F,
+        complete: C,
+    ) -> Result<BoundedList<T>>
+    where
+        F: FnMut(Vec<Value>, &mut ReadLimiter, &mut Vec<T>) -> Result<()>,
+        C: FnOnce(ReadLimiter, Vec<T>) -> Result<BoundedList<T>>,
+    {
+        let (mut limiter, probe_items, page_size) = budgeted_catalog_plan(budget)?;
+        let statement = Statement::new(cql).with_page_size(page_size);
+        let pager = self
+            .session
+            .query_iter(statement, &[])
+            .await
+            .map_err(|error| Error::Query(error.to_string()))?;
+        let mut rows = pager
+            .rows_stream::<Row>()
+            .map_err(|error| Error::Query(error.to_string()))?;
+
+        let mut items = Vec::with_capacity(budget.max_items.min(256));
+        while limiter.observed_items() < probe_items {
+            let Some(row) = rows.next().await else {
+                break;
+            };
+            let row = row.map_err(|error| Error::Query(error.to_string()))?;
+            convert(cql_row_values(row), &mut limiter, &mut items)?;
+        }
+        drop(rows);
+        complete(limiter, items)
+    }
+
     async fn query_metadata_rows(
         &self,
         cql: &str,
@@ -278,9 +312,13 @@ fn cassandra_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> 
         CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::CqlQueryBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::SqlListTablesBudgeted,
         CapabilityOperation::CqlListKeyspacesBounded,
+        CapabilityOperation::CqlListKeyspacesBudgeted,
         CapabilityOperation::CqlListTablesBounded,
+        CapabilityOperation::CqlListTablesBudgeted,
         CapabilityOperation::SqlDescribeTableBounded,
         CapabilityOperation::CqlDescribeTableBounded,
     ]);
@@ -297,6 +335,14 @@ fn bounded_catalog_plan(max_items: usize) -> Result<(ListLimiter, usize, i32)> {
     let probe_items = limiter.probe_items()?;
     let page_size = i32::try_from(probe_items.min(256))
         .map_err(|_| Error::Internal("bounded CQL catalog page size overflow".to_owned()))?;
+    Ok((limiter, probe_items, page_size))
+}
+
+fn budgeted_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize, i32)> {
+    let limiter = ReadLimiter::new(budget, "Cassandra catalog response")?;
+    let probe_items = limiter.probe_items()?;
+    let page_size = i32::try_from(probe_items.min(256))
+        .map_err(|_| Error::Internal("budgeted CQL catalog page size overflow".to_owned()))?;
     Ok((limiter, probe_items, page_size))
 }
 
@@ -471,6 +517,27 @@ impl SqlEngine for CassandraAdapter {
         .await
     }
 
+    async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        self.query_catalog_budgeted(
+            "SELECT keyspace_name FROM system_schema.keyspaces",
+            budget,
+            |row, limiter, keyspaces| {
+                let keyspace = row
+                    .first()
+                    .and_then(value_text)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        Error::Serialization(
+                            "Cassandra catalog keyspace_name is not text".to_owned(),
+                        )
+                    })?;
+                limiter.retain_item(keyspace, keyspaces)
+            },
+            |limiter, keyspaces| limiter.finish(keyspaces),
+        )
+        .await
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let result = if let Some(keyspace) = optional_keyspace(schema)? {
             self.query(
@@ -562,6 +629,53 @@ impl SqlEngine for CassandraAdapter {
         .await
     }
 
+    async fn list_tables_budgeted(
+        &self,
+        schema: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        let selected_keyspace = optional_keyspace(schema)?
+            .map(str::to_owned)
+            .or_else(|| self.keyspace.clone());
+        let cql = match selected_keyspace.as_deref() {
+            Some(keyspace) => format!(
+                "SELECT keyspace_name, table_name FROM system_schema.tables WHERE keyspace_name = '{}'",
+                validate_identifier(keyspace, "keyspace")?
+            ),
+            None => "SELECT keyspace_name, table_name FROM system_schema.tables".to_owned(),
+        };
+
+        self.query_catalog_budgeted(
+            &cql,
+            budget,
+            |row, limiter, tables| {
+                let Some(keyspace) = row.first().and_then(value_text) else {
+                    return Err(Error::Serialization(
+                        "Cassandra catalog keyspace_name is not text".to_owned(),
+                    ));
+                };
+                if selected_keyspace.is_none() && is_system_keyspace(keyspace) {
+                    return Ok(());
+                }
+                let Some(name) = row.get(1).and_then(value_text) else {
+                    return Err(Error::Serialization(
+                        "Cassandra catalog table_name is not text".to_owned(),
+                    ));
+                };
+                limiter.retain_item(
+                    TableInfo {
+                        schema: Some(keyspace.to_owned()),
+                        name: name.to_owned(),
+                        kind: TableKind::Table,
+                    },
+                    tables,
+                )
+            },
+            |limiter, tables| limiter.finish(tables),
+        )
+        .await
+    }
+
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
         self.describe_table_complete(
             table,
@@ -605,6 +719,10 @@ impl CqlEngine for CassandraAdapter {
         <Self as SqlEngine>::list_schemas_bounded(self, max_items).await
     }
 
+    async fn list_keyspaces_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        <Self as SqlEngine>::list_schemas_budgeted(self, budget).await
+    }
+
     async fn list_cql_tables(&self, keyspace: Option<&str>) -> Result<Vec<TableInfo>> {
         <Self as SqlEngine>::list_tables(self, keyspace).await
     }
@@ -615,6 +733,14 @@ impl CqlEngine for CassandraAdapter {
         max_items: usize,
     ) -> Result<BoundedList<TableInfo>> {
         <Self as SqlEngine>::list_tables_bounded(self, keyspace, max_items).await
+    }
+
+    async fn list_cql_tables_budgeted(
+        &self,
+        keyspace: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        <Self as SqlEngine>::list_tables_budgeted(self, keyspace, budget).await
     }
 
     async fn describe_cql_table(&self, table: &str) -> Result<TableSchema> {
@@ -1086,9 +1212,13 @@ mod tests {
             CapabilityOperation::SqlQueryBudgeted,
             CapabilityOperation::CqlQueryBudgeted,
             CapabilityOperation::SqlListSchemasBounded,
+            CapabilityOperation::SqlListSchemasBudgeted,
             CapabilityOperation::SqlListTablesBounded,
+            CapabilityOperation::SqlListTablesBudgeted,
             CapabilityOperation::CqlListKeyspacesBounded,
+            CapabilityOperation::CqlListKeyspacesBudgeted,
             CapabilityOperation::CqlListTablesBounded,
+            CapabilityOperation::CqlListTablesBudgeted,
             CapabilityOperation::SqlDescribeTableBounded,
             CapabilityOperation::CqlDescribeTableBounded,
         ] {
@@ -1104,9 +1234,72 @@ mod tests {
         assert_eq!((probe_items, page_size), (3, 3));
         let (_, probe_items, page_size) = bounded_catalog_plan(1_000).unwrap();
         assert_eq!((probe_items, page_size), (1_001, 256));
+        assert!(matches!(
+            budgeted_catalog_plan(ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            budgeted_catalog_plan(ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        let (_, probe_items, page_size) =
+            budgeted_catalog_plan(ReadBudget::new(2, 1024).unwrap()).unwrap();
+        assert_eq!((probe_items, page_size), (3, 3));
         let statement = Statement::new("SELECT now() FROM system.local")
             .with_page_size(budgeted_query_page_size());
         assert_eq!(statement.get_page_size(), 1);
+    }
+
+    #[test]
+    fn budgeted_catalog_retains_n_probes_n_plus_one_and_enforces_exact_bytes() {
+        let expected = BoundedList {
+            items: vec!["alpha".to_owned(), "beta".to_owned()],
+            truncated: true,
+        };
+
+        let finish = |max_bytes: usize| -> Result<BoundedList<String>> {
+            let (mut limiter, probe_items, _) =
+                budgeted_catalog_plan(ReadBudget::new(2, max_bytes)?)?;
+            assert_eq!(probe_items, 3);
+            let mut retained = Vec::new();
+            for item in ["alpha", "beta", "gamma"] {
+                limiter.retain_item(item.to_owned(), &mut retained)?;
+            }
+            limiter.finish(retained)
+        };
+
+        let exact_bytes = (1..=4096)
+            .find(|max_bytes| finish(*max_bytes).is_ok())
+            .expect("the small Cassandra catalog fixture must fit");
+        assert_eq!(finish(exact_bytes).unwrap(), expected);
+        assert!(matches!(
+            finish(exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
+
+        let complete = BoundedList::complete(vec!["alpha".to_owned(), "beta".to_owned()]);
+        let complete_finish = |max_bytes: usize| -> Result<BoundedList<String>> {
+            let (mut limiter, _, _) = budgeted_catalog_plan(ReadBudget::new(2, max_bytes)?)?;
+            let mut retained = Vec::new();
+            for item in ["alpha", "beta"] {
+                limiter.retain_item(item.to_owned(), &mut retained)?;
+            }
+            limiter.finish(retained)
+        };
+        let complete_bytes = (1..=4096)
+            .find(|max_bytes| complete_finish(*max_bytes).is_ok())
+            .expect("the complete Cassandra catalog fixture must fit");
+        assert_eq!(complete_finish(complete_bytes).unwrap(), complete);
     }
 
     #[test]

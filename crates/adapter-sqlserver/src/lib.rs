@@ -347,6 +347,29 @@ impl SqlEngine for SqlServerAdapter {
         Ok(limiter.finish(schemas))
     }
 
+    async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        let (mut limiter, top) = sqlserver_budgeted_catalog_limit(budget)?;
+        let result = self
+            .query(
+                &format!("SELECT TOP ({top}) name FROM sys.schemas ORDER BY name"),
+                &[],
+            )
+            .await?;
+        let mut schemas = Vec::with_capacity(result.rows.len().min(budget.max_items));
+        for row in result.rows {
+            let schema = match row.first() {
+                Some(Value::Text(value)) => value.clone(),
+                _ => {
+                    return Err(Error::Serialization(
+                        "SQL Server catalog schema name is not text".to_owned(),
+                    ));
+                }
+            };
+            limiter.retain_item(schema, &mut schemas)?;
+        }
+        limiter.finish(schemas)
+    }
+
     async fn list_tables(&self, schema: Option<&str>) -> Result<Vec<TableInfo>> {
         let schema = validate_optional_schema(schema)?.unwrap_or("dbo");
         let sql = format!(
@@ -417,6 +440,47 @@ impl SqlEngine for SqlServerAdapter {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(limiter.finish(tables))
+    }
+
+    async fn list_tables_budgeted(
+        &self,
+        schema: Option<&str>,
+        budget: ReadBudget,
+    ) -> Result<BoundedList<TableInfo>> {
+        let (mut limiter, top) = sqlserver_budgeted_catalog_limit(budget)?;
+        let schema = validate_optional_schema(schema)?.unwrap_or("dbo");
+        let sql = format!(
+            "SELECT TOP ({top}) TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+             FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_SCHEMA = '{schema}' \
+             ORDER BY TABLE_NAME"
+        );
+        let result = self.query(&sql, &[]).await?;
+        let mut tables = Vec::with_capacity(result.rows.len().min(budget.max_items));
+        for row in result.rows {
+            let schema = row.first().and_then(value_text).ok_or_else(|| {
+                Error::Serialization("SQL Server catalog table schema is not text".to_owned())
+            })?;
+            let name = row.get(1).and_then(value_text).ok_or_else(|| {
+                Error::Serialization("SQL Server catalog table name is not text".to_owned())
+            })?;
+            let table_type = row.get(2).and_then(value_text).ok_or_else(|| {
+                Error::Serialization("SQL Server catalog table type is not text".to_owned())
+            })?;
+            limiter.retain_item(
+                TableInfo {
+                    schema: Some(schema.to_owned()),
+                    name: name.to_owned(),
+                    kind: if table_type.contains("VIEW") {
+                        TableKind::View
+                    } else {
+                        TableKind::Table
+                    },
+                },
+                &mut tables,
+            )?;
+        }
+        limiter.finish(tables)
     }
 
     async fn describe_table(&self, table: &str) -> Result<TableSchema> {
@@ -559,7 +623,9 @@ fn sqlserver_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> 
     operations.extend([
         CapabilityOperation::SqlQueryBudgeted,
         CapabilityOperation::SqlListSchemasBounded,
+        CapabilityOperation::SqlListSchemasBudgeted,
         CapabilityOperation::SqlListTablesBounded,
+        CapabilityOperation::SqlListTablesBudgeted,
         CapabilityOperation::SqlDescribeTableBounded,
     ]);
     operations
@@ -717,6 +783,14 @@ fn sqlserver_catalog_limit(max_items: usize) -> Result<(ListLimiter, i64)> {
     Ok((limiter, top))
 }
 
+fn sqlserver_budgeted_catalog_limit(budget: ReadBudget) -> Result<(ReadLimiter, i64)> {
+    let limiter = ReadLimiter::new(budget, "SQL Server catalog response")?;
+    let top = i64::try_from(limiter.probe_items()?).map_err(|_| {
+        Error::Config("SQL Server catalog item budget exceeds the TOP integer range".to_owned())
+    })?;
+    Ok((limiter, top))
+}
+
 #[derive(Debug)]
 struct TableRef {
     schema: Option<String>,
@@ -805,7 +879,9 @@ mod tests {
             ..Default::default()
         });
         assert!(operations.contains(&CapabilityOperation::SqlListSchemasBounded));
+        assert!(operations.contains(&CapabilityOperation::SqlListSchemasBudgeted));
         assert!(operations.contains(&CapabilityOperation::SqlListTablesBounded));
+        assert!(operations.contains(&CapabilityOperation::SqlListTablesBudgeted));
         assert!(operations.contains(&CapabilityOperation::SqlDescribeTableBounded));
         assert!(operations.contains(&CapabilityOperation::SqlQueryBudgeted));
         assert!(matches!(sqlserver_catalog_limit(0), Err(Error::Config(_))));
@@ -814,6 +890,64 @@ mod tests {
             Err(Error::Config(_))
         ));
         assert_eq!(sqlserver_catalog_limit(2).unwrap().1, 3);
+        assert!(matches!(
+            sqlserver_budgeted_catalog_limit(ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            sqlserver_budgeted_catalog_limit(ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        assert_eq!(
+            sqlserver_budgeted_catalog_limit(ReadBudget::new(2, 1024).unwrap())
+                .unwrap()
+                .1,
+            3
+        );
+    }
+
+    #[test]
+    fn budgeted_catalog_retains_n_probes_n_plus_one_and_enforces_exact_bytes() {
+        let finish = |max_bytes: usize| -> Result<BoundedList<String>> {
+            let (mut limiter, top) =
+                sqlserver_budgeted_catalog_limit(ReadBudget::new(2, max_bytes)?)?;
+            assert_eq!(top, 3);
+            let mut retained = Vec::new();
+            for item in ["alpha", "beta", "gamma"] {
+                limiter.retain_item(item.to_owned(), &mut retained)?;
+            }
+            limiter.finish(retained)
+        };
+        let exact_bytes = (1..=4096)
+            .find(|max_bytes| finish(*max_bytes).is_ok())
+            .expect("the SQL Server catalog fixture must fit");
+        let exact = finish(exact_bytes).unwrap();
+        assert_eq!(exact.items, ["alpha", "beta"]);
+        assert!(exact.truncated);
+        assert!(matches!(
+            finish(exact_bytes - 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == exact_bytes - 1
+        ));
+
+        let (mut limiter, _) =
+            sqlserver_budgeted_catalog_limit(ReadBudget::new(2, 4096).unwrap()).unwrap();
+        let mut retained = Vec::new();
+        for item in ["alpha", "beta"] {
+            limiter.retain_item(item.to_owned(), &mut retained).unwrap();
+        }
+        let complete = limiter.finish(retained).unwrap();
+        assert_eq!(complete.items, ["alpha", "beta"]);
+        assert!(!complete.truncated);
     }
 
     #[test]
