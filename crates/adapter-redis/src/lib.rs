@@ -5,8 +5,8 @@ use dbtool_core::{
         AckMode, BoundedList, ConsumeCursor, ConsumeOptions, ConsumerIdentity,
         DeleteResourceOptions, DeleteResourceOutcome, KeyExpiry, KeyValueRestoreOutcome,
         KeyValueSnapshot, LagInfo, Message, MessageCursor, MessagePlacement, MessageResource,
-        MessageResourceKind, MetadataBudget, PartitionWatermark, ProduceOutcome, TopicDetail,
-        TopicInfo, Value,
+        MessageResourceKind, MetadataBudget, PartitionWatermark, ProduceOutcome, ReadBudget,
+        TopicDetail, TopicInfo, Value,
     },
     port::{
         capability::{
@@ -14,7 +14,7 @@ use dbtool_core::{
         },
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter},
+    service::limiter::{ListLimiter, MessageReadLimiter, MetadataLimiter, ReadLimiter},
 };
 use futures::{future::BoxFuture, StreamExt};
 use redis::{
@@ -26,6 +26,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::time::{timeout, Instant};
 
 const REDIS_SCAN_COUNT: usize = 10;
+const REDIS_KV_SCAN_ITEM_LIMIT: usize = 10_000;
+const REDIS_KV_SCAN_PAGE_MAX: usize = 4096;
+const REDIS_KV_SCAN_REQUEST_BYTES_MAX: usize = 18 * 1024 * 1024;
 const REDIS_STREAM_SCAN_COUNT: usize = 100;
 const REDIS_STREAM_SCAN_PAGE_MAX: usize = 4096;
 const REDIS_STREAM_SCAN_KEY_BYTES_MAX: usize = 896 * 1024;
@@ -136,6 +139,193 @@ if value == false or pttl == -2 then
   return {0, '', server_time[1], server_time[2], pttl}
 end
 return {1, value, server_time[1], server_time[2], pttl}
+"#;
+
+// These wrappers inspect complete values inside Redis and return a small
+// status-only response on overflow. The redis client therefore never decodes
+// an oversized bulk value before dbtool can enforce the caller budget.
+const GET_BOUNDED_SCRIPT: &str = r#"
+local max_bytes = tonumber(ARGV[1])
+if max_bytes == nil or max_bytes < 1 then
+  return redis.error_reply('dbtool invalid GET byte budget')
+end
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return {0, ''}
+end
+if redis.call('STRLEN', KEYS[1]) > max_bytes then
+  return {2, ''}
+end
+local value = redis.call('GET', KEYS[1])
+return {1, value}
+"#;
+
+const GET_WITH_EXPIRY_BOUNDED_SCRIPT: &str = r#"
+local max_bytes = tonumber(ARGV[1])
+if max_bytes == nil or max_bytes < 1 then
+  return redis.error_reply('dbtool invalid lifetime byte budget')
+end
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  local server_time = redis.call('TIME')
+  local pttl = redis.call('PTTL', KEYS[1])
+  return {0, '', server_time[1], server_time[2], pttl}
+end
+if redis.call('STRLEN', KEYS[1]) > max_bytes then
+  return {2, '', 0, 0, 0}
+end
+local value = redis.call('GET', KEYS[1])
+local server_time = redis.call('TIME')
+local pttl = redis.call('PTTL', KEYS[1])
+if value == false or pttl == -2 then
+  return {0, '', server_time[1], server_time[2], pttl}
+end
+return {1, value, server_time[1], server_time[2], pttl}
+"#;
+
+// SCAN COUNT is a hint and may return an arbitrarily larger page. Filter
+// previously observed keys and cap the page inside Lua before RESP encoding.
+// Status: 0 = success, 2 = raw key bytes exceeded the caller envelope.
+const KV_SCAN_BOUNDED_PAGE_SCRIPT: &str = r#"
+local cursor = ARGV[1]
+local pattern = ARGV[2]
+local requested_count = tonumber(ARGV[3])
+local max_items = tonumber(ARGV[4])
+local max_bytes = tonumber(ARGV[5])
+if requested_count == nil or requested_count < 1 or max_items == nil or max_items < 1 or max_bytes == nil or max_bytes < 1 then
+  return redis.error_reply('dbtool invalid bounded SCAN arguments')
+end
+
+local seen = {}
+for index = 6, #ARGV do
+  seen[ARGV[index]] = true
+end
+
+local page = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', requested_count)
+local selected = {}
+local selected_bytes = 0
+local overflow = 0
+for _, key in ipairs(page[2]) do
+  if not seen[key] then
+    seen[key] = true
+    if #selected >= max_items then
+      overflow = 1
+      break
+    end
+    selected_bytes = selected_bytes + string.len(key)
+    if selected_bytes > max_bytes then
+      return {2, '0', {}, 0}
+    end
+    selected[#selected + 1] = key
+  end
+end
+return {0, page[1], selected, overflow}
+"#;
+
+// Bounded raw is intentionally read-only. The command is validated again in
+// Rust before this script is sent. Lua recursively accounts the complete
+// native response and substitutes a tiny status reply on overflow, preventing
+// client-side RESP allocation of the rejected value.
+// Status: 0 = success, 1 = logical item overflow, 2 = byte overflow,
+// 3 = recursive node hard-limit overflow.
+const RAW_COMMAND_BOUNDED_SCRIPT: &str = r#"
+local max_items = tonumber(ARGV[1])
+local max_bytes = tonumber(ARGV[2])
+local max_nodes = tonumber(ARGV[3])
+if max_items == nil or max_items < 1 or max_bytes == nil or max_bytes < 1 or max_nodes == nil or max_nodes < 1 or #ARGV < 4 then
+  return redis.error_reply('dbtool invalid bounded raw arguments')
+end
+
+local command = {}
+for index = 4, #ARGV do
+  command[#command + 1] = ARGV[index]
+end
+local response = redis.call(unpack(command))
+local nodes = 0
+local bytes = 0
+local overflow = 0
+
+local function add_node()
+  nodes = nodes + 1
+  if nodes > max_nodes then
+    overflow = 3
+    return false
+  end
+  return true
+end
+
+local function add_bytes(value)
+  bytes = bytes + string.len(value)
+  if bytes > max_bytes then
+    overflow = 2
+    return false
+  end
+  return true
+end
+
+local function visit(value)
+  if not add_node() then
+    return false
+  end
+  local value_type = type(value)
+  if value_type == 'string' then
+    return add_bytes(value)
+  end
+  if value_type ~= 'table' then
+    return true
+  end
+  if value.ok ~= nil then
+    return add_bytes(value.ok)
+  end
+  if value.err ~= nil then
+    return add_bytes(value.err)
+  end
+  if value.map ~= nil then
+    for key, child in pairs(value.map) do
+      if not visit(key) or not visit(child) then
+        return false
+      end
+    end
+    return true
+  end
+  if value.set ~= nil then
+    for _, child in ipairs(value.set) do
+      if not visit(child) then
+        return false
+      end
+    end
+    return true
+  end
+  for _, child in ipairs(value) do
+    if not visit(child) then
+      return false
+    end
+  end
+  return true
+end
+
+local name = string.upper(command[1])
+local logical_items = 1
+if name == 'MGET' or name == 'HMGET' or name == 'LRANGE' then
+  logical_items = #response
+elseif name == 'ZRANGE' or name == 'ZREVRANGE' then
+  logical_items = #response
+  if string.upper(command[#command]) == 'WITHSCORES' then
+    if logical_items % 2 ~= 0 then
+      return redis.error_reply('dbtool Redis sorted-set response has an odd WITHSCORES shape')
+    end
+    logical_items = logical_items / 2
+  end
+elseif name == 'SRANDMEMBER' and #command == 3 then
+  logical_items = #response
+elseif name == 'XRANGE' or name == 'XREVRANGE' then
+  logical_items = #response
+end
+if logical_items > max_items then
+  return {1, false}
+end
+if not visit(response) then
+  return {overflow, false}
+end
+return {0, response}
 "#;
 
 // Status values: 1 = stored, 0 = NX condition not met, 2 = expired,
@@ -288,6 +478,53 @@ impl KeyValueStore for RedisAdapter {
         Ok(val.map(bytes::Bytes::from))
     }
 
+    async fn exists(&self, key: &str) -> Result<bool> {
+        let mut c = self.conn.lock().await;
+        let count: i64 = redis::cmd("EXISTS")
+            .arg(key)
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        match count {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(Error::Serialization(format!(
+                "Redis EXISTS returned unexpected single-key count {other}"
+            ))),
+        }
+    }
+
+    async fn get_bounded(&self, key: &str, budget: ReadBudget) -> Result<Option<bytes::Bytes>> {
+        let limiter = ReadLimiter::new(budget, "Redis GET response")?;
+        let mut c = self.conn.lock().await;
+        let (status, value): (i64, Vec<u8>) = redis::cmd("EVAL")
+            .arg(GET_BOUNDED_SCRIPT)
+            .arg(1)
+            .arg(key)
+            .arg(budget.max_bytes)
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        let value = match status {
+            0 if value.is_empty() => None,
+            1 => Some(bytes::Bytes::from(value)),
+            2 if value.is_empty() => {
+                return Err(redis_read_budget_error(
+                    "Redis GET value",
+                    "bytes",
+                    budget.max_bytes,
+                ))
+            }
+            other => {
+                return Err(Error::Serialization(format!(
+                    "Redis bounded GET returned inconsistent status {other} with {} value bytes",
+                    value.len()
+                )))
+            }
+        };
+        limiter.finish_optional(value)
+    }
+
     async fn get_with_expiry(&self, key: &str) -> Result<Option<KeyValueSnapshot>> {
         let mut c = self.conn.lock().await;
         let response: (i64, Vec<u8>, i64, i64, i64) = redis::cmd("EVAL")
@@ -298,6 +535,36 @@ impl KeyValueStore for RedisAdapter {
             .await
             .map_err(|e| Error::Query(e.to_string()))?;
         decode_get_with_expiry_response(response)
+    }
+
+    async fn get_with_expiry_bounded(
+        &self,
+        key: &str,
+        budget: ReadBudget,
+    ) -> Result<Option<KeyValueSnapshot>> {
+        let limiter = ReadLimiter::new(budget, "Redis lifetime response")?;
+        let mut c = self.conn.lock().await;
+        let response: (i64, Vec<u8>, i64, i64, i64) = redis::cmd("EVAL")
+            .arg(GET_WITH_EXPIRY_BOUNDED_SCRIPT)
+            .arg(1)
+            .arg(key)
+            .arg(budget.max_bytes)
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        if response.0 == 2 {
+            if !response.1.is_empty() || response.2 != 0 || response.3 != 0 || response.4 != 0 {
+                return Err(Error::Serialization(
+                    "Redis bounded lifetime read returned an inconsistent overflow sentinel".into(),
+                ));
+            }
+            return Err(redis_read_budget_error(
+                "Redis lifetime value",
+                "bytes",
+                budget.max_bytes,
+            ));
+        }
+        limiter.finish_optional(decode_get_with_expiry_response(response)?)
     }
 
     async fn set(&self, key: &str, value: &[u8], options: SetOptions) -> Result<()> {
@@ -375,6 +642,91 @@ impl KeyValueStore for RedisAdapter {
         }
     }
 
+    async fn scan_bounded(&self, pattern: &str, budget: ReadBudget) -> Result<BoundedList<String>> {
+        let mut limiter = ReadLimiter::new(budget, "Redis SCAN result")?;
+        validate_bounded_scan_budget(pattern, budget)?;
+        let probe_items = limiter.probe_items()?;
+        let mut collector = ScanCollector::new(probe_items)?;
+        let mut cursor = 0_u64;
+        let mut c = self.conn.lock().await;
+
+        loop {
+            let remaining_items = probe_items
+                .checked_sub(collector.keys.len())
+                .ok_or_else(|| Error::Internal("Redis SCAN probe accounting underflow".into()))?;
+            let remaining_bytes = budget
+                .max_bytes
+                .checked_sub(limiter.observed_bytes())
+                .ok_or_else(|| {
+                    redis_read_budget_error("Redis SCAN result", "bytes", budget.max_bytes)
+                })?;
+            if remaining_bytes == 0 {
+                return Err(redis_read_budget_error(
+                    "Redis SCAN result",
+                    "bytes",
+                    budget.max_bytes,
+                ));
+            }
+            validate_bounded_scan_request(pattern, &collector.seen_keys)?;
+            let page_items = remaining_items.min(REDIS_KV_SCAN_PAGE_MAX);
+            let requested_count = redis_scan_count(remaining_items)?;
+            let mut command = redis::cmd("EVAL");
+            command
+                .arg(KV_SCAN_BOUNDED_PAGE_SCRIPT)
+                .arg(0)
+                .arg(cursor)
+                .arg(pattern)
+                .arg(requested_count)
+                .arg(page_items)
+                .arg(remaining_bytes);
+            for seen in &collector.seen_keys {
+                command.arg(seen);
+            }
+            let (status, next_cursor, page, overflow): (i64, u64, Vec<Vec<u8>>, i64) = command
+                .query_async(&mut *c)
+                .await
+                .map_err(|e| Error::Query(e.to_string()))?;
+            match status {
+                0 => {}
+                2 if page.is_empty() && next_cursor == 0 && overflow == 0 => {
+                    return Err(redis_read_budget_error(
+                        "Redis SCAN key page",
+                        "bytes",
+                        budget.max_bytes,
+                    ))
+                }
+                other => {
+                    return Err(Error::Serialization(format!(
+                        "Redis bounded SCAN returned inconsistent status {other}"
+                    )))
+                }
+            }
+            if !matches!(overflow, 0 | 1) {
+                return Err(Error::Serialization(format!(
+                    "Redis bounded SCAN returned invalid overflow flag {overflow}"
+                )));
+            }
+
+            let progress = collector.push_page_with(next_cursor, page, |key| {
+                limiter.observe_item(key).map(|_| ())
+            })?;
+            if overflow == 1 && collector.keys.len() < probe_items {
+                return Err(Error::Serialization(format!(
+                    "Redis SCAN page exceeded the adapter hard limit of {REDIS_KV_SCAN_PAGE_MAX} unique keys"
+                )));
+            }
+            if progress == ScanProgress::Complete {
+                let mut keys = collector.into_keys();
+                keys.truncate(budget.max_items);
+                return limiter.finish(keys);
+            }
+            let ScanProgress::Continue(next_cursor) = progress else {
+                unreachable!("complete Redis SCAN progress returned above")
+            };
+            cursor = next_cursor;
+        }
+    }
+
     async fn raw_command(&self, args: &[String]) -> Result<Value> {
         validate_raw_command(args)?;
         let mut cmd = redis::cmd(args[0].as_str());
@@ -388,6 +740,71 @@ impl KeyValueStore for RedisAdapter {
             .map_err(|e| Error::Query(e.to_string()))?;
         validate_raw_response_budget(&val)?;
         redis_value_to_core(val)
+    }
+
+    async fn raw_command_bounded(&self, args: &[String], budget: ReadBudget) -> Result<Value> {
+        let limiter = ReadLimiter::new(budget, "Redis raw response")?;
+        validate_bounded_raw_command(args)?;
+        let script_keys = bounded_raw_script_keys(args)?;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(RAW_COMMAND_BOUNDED_SCRIPT)
+            .arg(script_keys.len());
+        for key in script_keys {
+            command.arg(key);
+        }
+        command
+            .arg(budget.max_items.min(RAW_ADAPTER_ITEM_LIMIT))
+            .arg(budget.max_bytes)
+            .arg(RAW_BOUNDED_NODE_LIMIT);
+        for arg in args {
+            command.arg(arg);
+        }
+        let mut c = self.conn.lock().await;
+        let (status, response): (i64, redis::Value) = command
+            .query_async(&mut *c)
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+        match status {
+            0 => {}
+            1 => {
+                return Err(redis_read_budget_error(
+                    "Redis raw logical response",
+                    "items",
+                    budget.max_items,
+                ))
+            }
+            2 => {
+                return Err(redis_read_budget_error(
+                    "Redis raw response",
+                    "bytes",
+                    budget.max_bytes,
+                ))
+            }
+            3 => {
+                return Err(redis_read_budget_error(
+                    "Redis raw recursive response",
+                    "items",
+                    RAW_BOUNDED_NODE_LIMIT,
+                ))
+            }
+            other => {
+                return Err(Error::Serialization(format!(
+                    "Redis bounded raw command returned unexpected status {other}"
+                )))
+            }
+        }
+        let value = redis_value_to_core(response)?;
+        validate_bounded_raw_core_response(args, &value, budget.max_items)?;
+        limiter.finish_single(value)
+    }
+}
+
+fn redis_read_budget_error(subject: &str, unit: &'static str, limit: usize) -> Error {
+    Error::ReadBudgetExceeded {
+        subject: subject.to_owned(),
+        unit,
+        limit,
     }
 }
 
@@ -483,6 +900,41 @@ fn redis_scan_count(limit: usize) -> Result<u64> {
         .map_err(|_| Error::Config("Redis SCAN page size exceeds the u64 range".to_owned()))
 }
 
+fn validate_bounded_scan_budget(pattern: &str, budget: ReadBudget) -> Result<()> {
+    if budget.max_items > REDIS_KV_SCAN_ITEM_LIMIT {
+        return Err(Error::Config(format!(
+            "Redis bounded SCAN item budget {} exceeds the adapter limit {REDIS_KV_SCAN_ITEM_LIMIT}",
+            budget.max_items
+        )));
+    }
+    if pattern.len() > RAW_MAX_ARGUMENT_BYTES {
+        return Err(Error::Config(
+            "Redis bounded SCAN pattern exceeds the 1 MiB adapter budget".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bounded_scan_request(pattern: &str, seen_keys: &HashSet<String>) -> Result<()> {
+    let mut bytes = KV_SCAN_BOUNDED_PAGE_SCRIPT
+        .len()
+        .checked_add(pattern.len())
+        .and_then(|value| value.checked_add(6 * 32))
+        .ok_or_else(|| Error::Config("Redis bounded SCAN request size overflow".into()))?;
+    for key in seen_keys {
+        bytes = bytes
+            .checked_add(key.len())
+            .and_then(|value| value.checked_add(32))
+            .ok_or_else(|| Error::Config("Redis bounded SCAN request size overflow".into()))?;
+    }
+    if bytes > REDIS_KV_SCAN_REQUEST_BYTES_MAX {
+        return Err(Error::Config(format!(
+            "Redis bounded SCAN request exceeds the adapter limit of {REDIS_KV_SCAN_REQUEST_BYTES_MAX} bytes"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ScanProgress {
     Complete,
@@ -508,6 +960,18 @@ impl ScanCollector {
     }
 
     fn push_page(&mut self, next_cursor: u64, raw_keys: Vec<Vec<u8>>) -> Result<ScanProgress> {
+        self.push_page_with(next_cursor, raw_keys, |_| Ok(()))
+    }
+
+    fn push_page_with<F>(
+        &mut self,
+        next_cursor: u64,
+        raw_keys: Vec<Vec<u8>>,
+        mut observe: F,
+    ) -> Result<ScanProgress>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         let page = raw_keys
             .into_iter()
             .map(|key| {
@@ -521,11 +985,14 @@ impl ScanCollector {
             .collect::<Result<Vec<_>>>()?;
 
         for key in page {
-            if self.seen_keys.insert(key.clone()) {
-                self.keys.push(key);
-                if self.keys.len() == self.limit {
-                    return Ok(ScanProgress::Complete);
-                }
+            if self.seen_keys.contains(&key) {
+                continue;
+            }
+            observe(&key)?;
+            self.seen_keys.insert(key.clone());
+            self.keys.push(key);
+            if self.keys.len() == self.limit {
+                return Ok(ScanProgress::Complete);
             }
         }
 
@@ -1233,6 +1700,7 @@ impl RedisAdapter {
 }
 
 const RAW_ADAPTER_ITEM_LIMIT: usize = 10_000;
+const RAW_BOUNDED_NODE_LIMIT: usize = 100_000;
 const RAW_MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
 const RAW_MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
@@ -1302,12 +1770,21 @@ fn validate_raw_command(args: &[String]) -> Result<()> {
             check_raw_item_budget(&command, count)
         }
 
-        "SET" => expect_raw_min_arity(args, 3, &command),
+        "SET" => {
+            expect_raw_min_arity(args, 3, &command)?;
+            if args[3..].iter().any(|arg| arg.eq_ignore_ascii_case("GET")) {
+                return Err(Error::Config(
+                    "Redis raw SET GET is rejected because it mutates before returning the old value"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
         "DEL" | "UNLINK" => {
             expect_raw_min_arity(args, 2, &command)?;
             check_raw_item_budget(&command, args.len() - 1)
         }
-        "INCR" | "DECR" | "PERSIST" | "GETDEL" => expect_raw_arity(args, &[2], &command),
+        "INCR" | "DECR" | "PERSIST" => expect_raw_arity(args, &[2], &command),
         "APPEND" | "INCRBY" | "INCRBYFLOAT" | "DECRBY" => expect_raw_arity(args, &[3], &command),
         "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
             expect_raw_arity(args, &[3, 4], &command)?;
@@ -1342,19 +1819,187 @@ fn validate_raw_command(args: &[String]) -> Result<()> {
             expect_raw_arity(args, &[4], &command)?;
             check_raw_index_range(args, 2, 3, &command)
         }
-        "LPOP" | "RPOP" | "SPOP" => {
-            expect_raw_arity(args, &[2, 3], &command)?;
-            if args.len() == 3 {
-                let count = parse_raw_positive_usize(args, 2, &command)?;
-                check_raw_item_budget(&command, count)?;
-            }
-            Ok(())
-        }
+        "GETDEL" | "LPOP" | "RPOP" | "SPOP" => Err(Error::Config(format!(
+            "Redis raw {command} is rejected because it mutates before returning remote data"
+        ))),
         "ZADD" => validate_raw_simple_zadd(args, &command),
         _ => Err(Error::Config(format!(
             "Redis raw command {command} is not in the adapter allowlist"
         ))),
     }
+}
+
+fn validate_bounded_raw_command(args: &[String]) -> Result<()> {
+    validate_raw_command(args)?;
+    let command = normalized_raw_command(args)?;
+    if matches!(
+        command.as_str(),
+        "PING"
+            | "ECHO"
+            | "GET"
+            | "TTL"
+            | "PTTL"
+            | "TYPE"
+            | "STRLEN"
+            | "HLEN"
+            | "LLEN"
+            | "SCARD"
+            | "ZCARD"
+            | "XLEN"
+            | "DBSIZE"
+            | "TIME"
+            | "LASTSAVE"
+            | "HGET"
+            | "HEXISTS"
+            | "SISMEMBER"
+            | "ZSCORE"
+            | "LINDEX"
+            | "MGET"
+            | "EXISTS"
+            | "HMGET"
+            | "LRANGE"
+            | "ZRANGE"
+            | "ZREVRANGE"
+            | "SRANDMEMBER"
+            | "XRANGE"
+            | "XREVRANGE"
+    ) {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "Redis bounded raw command {command} is read-only; mutations must use the separately authorized legacy raw path"
+        )))
+    }
+}
+
+fn bounded_raw_script_keys(args: &[String]) -> Result<Vec<&str>> {
+    let command = normalized_raw_command(args)?;
+    match command.as_str() {
+        "PING" | "ECHO" | "DBSIZE" | "TIME" | "LASTSAVE" => Ok(vec![]),
+        "MGET" | "EXISTS" => Ok(args[1..].iter().map(String::as_str).collect()),
+        "GET" | "TTL" | "PTTL" | "TYPE" | "STRLEN" | "HLEN" | "LLEN" | "SCARD" | "ZCARD"
+        | "XLEN" | "HGET" | "HEXISTS" | "SISMEMBER" | "ZSCORE" | "LINDEX" | "HMGET" | "LRANGE"
+        | "ZRANGE" | "ZREVRANGE" | "SRANDMEMBER" | "XRANGE" | "XREVRANGE" => {
+            Ok(vec![args[1].as_str()])
+        }
+        _ => Err(Error::Internal(format!(
+            "Redis bounded raw command {command} has no declared Lua key mapping"
+        ))),
+    }
+}
+
+fn validate_bounded_raw_core_response(
+    args: &[String],
+    value: &Value,
+    max_items: usize,
+) -> Result<()> {
+    let command = normalized_raw_command(args)?;
+    let logical_items = match command.as_str() {
+        "MGET" | "HMGET" | "LRANGE" => raw_array_len(value, &command)?,
+        "ZRANGE" | "ZREVRANGE" => {
+            let items = raw_array_len(value, &command)?;
+            if args
+                .last()
+                .is_some_and(|arg| arg.eq_ignore_ascii_case("WITHSCORES"))
+            {
+                if !items.is_multiple_of(2) {
+                    return Err(Error::Serialization(format!(
+                        "Redis raw {command} WITHSCORES returned an odd element count {items}"
+                    )));
+                }
+                items / 2
+            } else {
+                items
+            }
+        }
+        "SRANDMEMBER" if args.len() == 3 => raw_array_len(value, &command)?,
+        "XRANGE" | "XREVRANGE" => raw_array_len(value, &command)?,
+        _ => 1,
+    };
+    if logical_items > max_items {
+        return Err(redis_read_budget_error(
+            "Redis raw logical response",
+            "items",
+            max_items,
+        ));
+    }
+
+    let nodes = count_core_value_nodes(value)?;
+    if nodes > RAW_BOUNDED_NODE_LIMIT {
+        return Err(redis_read_budget_error(
+            "Redis raw recursive response",
+            "items",
+            RAW_BOUNDED_NODE_LIMIT,
+        ));
+    }
+    Ok(())
+}
+
+fn raw_array_len(value: &Value, command: &str) -> Result<usize> {
+    match value {
+        Value::Array(values) => Ok(values.len()),
+        _ => Err(Error::Serialization(format!(
+            "Redis raw {command} expected an array response"
+        ))),
+    }
+}
+
+fn count_core_value_nodes(value: &Value) -> Result<usize> {
+    fn add(total: &mut usize, count: usize) -> Result<()> {
+        *total = total.checked_add(count).ok_or_else(|| {
+            Error::Serialization("Redis raw recursive node count overflow".into())
+        })?;
+        Ok(())
+    }
+
+    fn visit_json_children(value: &serde_json::Value, total: &mut usize) -> Result<()> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    add(total, 1)?;
+                    visit_json_children(value, total)?;
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    add(total, 2)?;
+                    visit_json_children(value, total)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn visit(value: &Value, total: &mut usize) -> Result<()> {
+        add(total, 1)?;
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, total)?;
+                }
+            }
+            Value::Map(values) => {
+                for value in values.values() {
+                    add(total, 1)?;
+                    visit(value, total)?;
+                }
+            }
+            Value::Json(value) => visit_json_children(value, total)?,
+            Value::Null
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Text(_)
+            | Value::Bytes(_)
+            | Value::Timestamp(_) => {}
+        }
+        Ok(())
+    }
+
+    let mut total = 0;
+    visit(value, &mut total)?;
+    Ok(total)
 }
 
 fn normalized_raw_command(args: &[String]) -> Result<String> {
@@ -1914,8 +2559,13 @@ fn redis_operations(
 ) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.extend([
+        CapabilityOperation::KeyValueExists,
+        CapabilityOperation::KeyValueGetBounded,
         CapabilityOperation::KeyValueGetWithExpiry,
+        CapabilityOperation::KeyValueGetWithExpiryBounded,
         CapabilityOperation::KeyValueRestoreWithExpiry,
+        CapabilityOperation::KeyValueScanBounded,
+        CapabilityOperation::KeyValueRawCommandBounded,
         CapabilityOperation::MessageConsumeGroup,
         CapabilityOperation::MessageConsumeAck,
         CapabilityOperation::MessageAdminListTopics,
@@ -2556,6 +3206,114 @@ mod tests {
     }
 
     #[test]
+    fn bounded_raw_is_read_only_and_legacy_rejects_mutating_value_returns() {
+        for args in [
+            vec!["SET", "key", "replacement"],
+            vec!["DEL", "key"],
+            vec!["INCR", "key"],
+            vec!["EXPIRE", "key", "30"],
+            vec!["HSET", "hash", "field", "value"],
+            vec!["LPUSH", "list", "value"],
+            vec!["SADD", "set", "value"],
+            vec!["ZADD", "sorted", "1", "value"],
+            vec!["XDEL", "stream", "1-0"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(validate_raw_command(&args).is_ok(), "{args:?}");
+            assert!(matches!(
+                validate_bounded_raw_command(&args),
+                Err(Error::Config(message)) if message.contains("read-only")
+            ));
+        }
+
+        for args in [
+            vec!["SET", "key", "replacement", "GET"],
+            vec!["GETDEL", "key"],
+            vec!["LPOP", "list"],
+            vec!["RPOP", "list", "2"],
+            vec!["SPOP", "set"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(matches!(validate_raw_command(&args), Err(Error::Config(_))));
+            assert!(matches!(
+                validate_bounded_raw_command(&args),
+                Err(Error::Config(_))
+            ));
+        }
+
+        for args in [
+            vec!["GET", "key"],
+            vec!["MGET", "one", "two"],
+            vec!["TIME"],
+            vec!["XRANGE", "stream", "-", "+", "COUNT", "2"],
+        ] {
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(validate_bounded_raw_command(&args).is_ok(), "{args:?}");
+        }
+
+        let mget = ["MGET", "one", "two"].map(str::to_owned);
+        assert_eq!(bounded_raw_script_keys(&mget).unwrap(), ["one", "two"]);
+        let get = ["GET", "one"].map(str::to_owned);
+        assert_eq!(bounded_raw_script_keys(&get).unwrap(), ["one"]);
+        let time = ["TIME"].map(str::to_owned);
+        assert!(bounded_raw_script_keys(&time).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bounded_raw_counts_command_items_without_charging_the_root_envelope() {
+        let mget_args = ["MGET", "one", "two"].map(str::to_owned);
+        let mget = Value::Array(vec![Value::Text("one".into()), Value::Null]);
+        assert!(validate_bounded_raw_core_response(&mget_args, &mget, 2).is_ok());
+        assert!(matches!(
+            validate_bounded_raw_core_response(&mget_args, &mget, 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+
+        let with_scores_args = ["ZRANGE", "scores", "0", "1", "WITHSCORES"].map(str::to_owned);
+        let with_scores = Value::Array(vec![
+            Value::Text("one".into()),
+            Value::Text("1".into()),
+            Value::Text("two".into()),
+            Value::Text("2".into()),
+        ]);
+        assert!(validate_bounded_raw_core_response(&with_scores_args, &with_scores, 2).is_ok());
+        assert!(validate_bounded_raw_core_response(&with_scores_args, &with_scores, 1).is_err());
+
+        let xrange_args = ["XRANGE", "stream", "-", "+", "COUNT", "1"].map(str::to_owned);
+        let xrange = Value::Array(vec![Value::Array(vec![
+            Value::Text("1-0".into()),
+            Value::Array(vec![
+                Value::Text("field".into()),
+                Value::Text("value".into()),
+            ]),
+        ])]);
+        assert!(validate_bounded_raw_core_response(&xrange_args, &xrange, 1).is_ok());
+
+        let time_args = ["TIME"].map(str::to_owned);
+        let time = Value::Array(vec![Value::Text("1".into()), Value::Text("2".into())]);
+        assert!(validate_bounded_raw_core_response(&time_args, &time, 1).is_ok());
+    }
+
+    #[test]
+    fn bounded_raw_keeps_an_independent_recursive_node_hard_limit() {
+        let args = ["TIME"].map(str::to_owned);
+        let value = Value::Array(vec![Value::Null; RAW_BOUNDED_NODE_LIMIT]);
+        assert!(matches!(
+            validate_bounded_raw_core_response(&args, &value, 1),
+            Err(Error::ReadBudgetExceeded {
+                unit: "items",
+                limit: RAW_BOUNDED_NODE_LIMIT,
+                ..
+            })
+        ));
+        assert!(RAW_COMMAND_BOUNDED_SCRIPT.contains("local max_nodes = tonumber(ARGV[3])"));
+    }
+
+    #[test]
     fn set_command_combines_expiry_and_nx_atomically() {
         let command = redis_set_command(
             "user:1",
@@ -2598,6 +3356,34 @@ mod tests {
                 expiry: KeyExpiry::ExpiresAtUnixMs(1_523),
             })
         );
+    }
+
+    #[test]
+    fn bounded_get_scripts_check_length_before_reading_the_value() {
+        let get_exists = GET_BOUNDED_SCRIPT.find("redis.call('EXISTS'").unwrap();
+        let get_length = GET_BOUNDED_SCRIPT.find("redis.call('STRLEN'").unwrap();
+        let get_value = GET_BOUNDED_SCRIPT
+            .find("local value = redis.call('GET'")
+            .unwrap();
+        assert!(get_exists < get_length && get_length < get_value);
+
+        let lifetime_exists = GET_WITH_EXPIRY_BOUNDED_SCRIPT
+            .find("redis.call('EXISTS'")
+            .unwrap();
+        let lifetime_length = GET_WITH_EXPIRY_BOUNDED_SCRIPT
+            .find("redis.call('STRLEN'")
+            .unwrap();
+        let lifetime_get = GET_WITH_EXPIRY_BOUNDED_SCRIPT
+            .find("local value = redis.call('GET'")
+            .unwrap();
+        let lifetime_time = GET_WITH_EXPIRY_BOUNDED_SCRIPT
+            .rfind("redis.call('TIME'")
+            .unwrap();
+        let lifetime_pttl = GET_WITH_EXPIRY_BOUNDED_SCRIPT
+            .rfind("redis.call('PTTL'")
+            .unwrap();
+        assert!(lifetime_exists < lifetime_length && lifetime_length < lifetime_get);
+        assert!(lifetime_get < lifetime_time && lifetime_time < lifetime_pttl);
     }
 
     #[test]
@@ -2953,6 +3739,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redis_live_bounded_kv_envelopes_and_raw_mutation_safety() {
+        let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("dbtool_it_bounded_{suffix}");
+        let missing = format!("{prefix}:missing");
+        let empty = format!("{prefix}:empty");
+        let small = format!("{prefix}:small");
+        let large = format!("{prefix}:large");
+        let scan_keys = (1..=3)
+            .map(|index| format!("{prefix}:scan:{index}"))
+            .collect::<Vec<_>>();
+        let long_scan_key = format!("{prefix}:long:{}", "x".repeat(128));
+        let guarded = format!("{prefix}:guarded");
+        let list = format!("{prefix}:list");
+        let set = format!("{prefix}:set");
+        let mut cleanup = vec![
+            empty.clone(),
+            small.clone(),
+            large.clone(),
+            long_scan_key.clone(),
+            guarded.clone(),
+            list.clone(),
+            set.clone(),
+        ];
+        cleanup.extend(scan_keys.iter().cloned());
+
+        let dsn = Dsn::parse(&raw_dsn).unwrap();
+        let client = Client::open(dsn.raw_with_scheme("redis").unwrap()).unwrap();
+        let mut direct = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("DEL")
+            .arg(&cleanup)
+            .query_async::<u64>(&mut direct)
+            .await
+            .unwrap();
+        for (key, value) in [
+            (&empty, Vec::new()),
+            (&small, b"ok".to_vec()),
+            (&large, vec![b'L'; 128]),
+            (&long_scan_key, b"long-key".to_vec()),
+            (&guarded, b"original".to_vec()),
+        ] {
+            redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .query_async::<()>(&mut direct)
+                .await
+                .unwrap();
+        }
+        for key in &scan_keys {
+            redis::cmd("SET")
+                .arg(key)
+                .arg("scan")
+                .query_async::<()>(&mut direct)
+                .await
+                .unwrap();
+        }
+        redis::cmd("RPUSH")
+            .arg(&list)
+            .arg("one")
+            .arg("two")
+            .query_async::<usize>(&mut direct)
+            .await
+            .unwrap();
+        redis::cmd("SADD")
+            .arg(&set)
+            .arg("member")
+            .query_async::<usize>(&mut direct)
+            .await
+            .unwrap();
+
+        let connector = factory(dsn).await.unwrap();
+        let kv = connector.as_kv().unwrap();
+        assert!(!kv.exists(&missing).await.unwrap());
+        assert!(kv.exists(&large).await.unwrap());
+        assert_eq!(
+            kv.get_bounded(&empty, ReadBudget::new(1, 4096).unwrap())
+                .await
+                .unwrap(),
+            Some(bytes::Bytes::new())
+        );
+        assert_eq!(
+            kv.get_bounded(&missing, ReadBudget::new(1, 4096).unwrap())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            kv.get_bounded(&large, ReadBudget::new(1, 64).unwrap())
+                .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit: 64,
+                ..
+            })
+        ));
+        assert!(matches!(
+            kv.get_with_expiry_bounded(&large, ReadBudget::new(1, 64).unwrap())
+                .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit: 64,
+                ..
+            })
+        ));
+        assert_eq!(
+            kv.get_with_expiry_bounded(&small, ReadBudget::new(1, 4096).unwrap())
+                .await
+                .unwrap(),
+            Some(KeyValueSnapshot {
+                value: bytes::Bytes::from_static(b"ok"),
+                expiry: KeyExpiry::Persistent,
+            })
+        );
+
+        let mut exact = kv
+            .scan_bounded(
+                &format!("{prefix}:scan:*"),
+                ReadBudget::new(3, 4096).unwrap(),
+            )
+            .await
+            .unwrap();
+        exact.items.sort();
+        assert_eq!(exact.items, scan_keys);
+        assert!(!exact.truncated);
+        let truncated = kv
+            .scan_bounded(
+                &format!("{prefix}:scan:*"),
+                ReadBudget::new(2, 4096).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(truncated.items.len(), 2);
+        assert!(truncated.truncated);
+        assert!(matches!(
+            kv.scan_bounded(&long_scan_key, ReadBudget::new(1, 32).unwrap())
+                .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit: 32,
+                ..
+            })
+        ));
+
+        let mget = ["MGET".to_owned(), small.clone(), empty.clone()];
+        assert!(matches!(
+            kv.raw_command_bounded(&mget, ReadBudget::new(2, 4096).unwrap())
+                .await
+                .unwrap(),
+            Value::Array(values) if values.len() == 2
+        ));
+        assert!(matches!(
+            kv.raw_command_bounded(&mget, ReadBudget::new(1, 4096).unwrap())
+                .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "items",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            kv.raw_command_bounded(
+                &["GET".to_owned(), large.clone()],
+                ReadBudget::new(1, 64).unwrap(),
+            )
+            .await,
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit: 64,
+                ..
+            })
+        ));
+
+        assert!(kv
+            .raw_command_bounded(
+                &["SET".to_owned(), guarded.clone(), "replacement".to_owned()],
+                ReadBudget::new(1, 4096).unwrap(),
+            )
+            .await
+            .is_err());
+        for args in [
+            vec![
+                "SET".to_owned(),
+                guarded.clone(),
+                "replacement".to_owned(),
+                "GET".to_owned(),
+            ],
+            vec!["GETDEL".to_owned(), guarded.clone()],
+            vec!["LPOP".to_owned(), list.clone()],
+            vec!["RPOP".to_owned(), list.clone()],
+            vec!["SPOP".to_owned(), set.clone()],
+        ] {
+            assert!(kv.raw_command(&args).await.is_err(), "{args:?}");
+        }
+        let guarded_value: Vec<u8> = redis::cmd("GET")
+            .arg(&guarded)
+            .query_async(&mut direct)
+            .await
+            .unwrap();
+        assert_eq!(guarded_value, b"original");
+        assert_eq!(
+            redis::cmd("LLEN")
+                .arg(&list)
+                .query_async::<usize>(&mut direct)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            redis::cmd("SCARD")
+                .arg(&set)
+                .query_async::<usize>(&mut direct)
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            redis::cmd("DEL")
+                .arg(&cleanup)
+                .query_async::<u64>(&mut direct)
+                .await
+                .unwrap(),
+            cleanup.len() as u64
+        );
+        connector.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn redis_live_stream_groups_replay_ack_and_report_complete_lag() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_REDIS_DSN") else {
             return;
@@ -3294,6 +4313,46 @@ mod tests {
     }
 
     #[test]
+    fn bounded_scan_charges_unique_keys_and_preserves_exact_n_plus_one() {
+        let budget = ReadBudget::new(2, 4096).unwrap();
+        let mut limiter = ReadLimiter::new(budget, "test Redis SCAN").unwrap();
+        let mut collector = ScanCollector::new(limiter.probe_items().unwrap()).unwrap();
+        let progress = collector
+            .push_page_with(
+                0,
+                vec![
+                    b"one".to_vec(),
+                    b"one".to_vec(),
+                    b"two".to_vec(),
+                    b"probe".to_vec(),
+                ],
+                |key| limiter.observe_item(key).map(|_| ()),
+            )
+            .unwrap();
+        assert_eq!(progress, ScanProgress::Complete);
+        let mut keys = collector.into_keys();
+        keys.truncate(budget.max_items);
+        let result = limiter.finish(keys).unwrap();
+        assert_eq!(result.items, ["one", "two"]);
+        assert!(result.truncated);
+
+        let tiny_budget = ReadBudget::new(1, 1).unwrap();
+        let mut limiter = ReadLimiter::new(tiny_budget, "test Redis SCAN").unwrap();
+        let mut collector = ScanCollector::new(limiter.probe_items().unwrap()).unwrap();
+        assert!(matches!(
+            collector.push_page_with(0, vec![b"too-large".to_vec()], |key| {
+                limiter.observe_item(key).map(|_| ())
+            }),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit: 1,
+                ..
+            })
+        ));
+        assert!(collector.keys.is_empty());
+    }
+
+    #[test]
     fn scan_collector_rejects_non_utf8_without_returning_a_partial_page() {
         let mut collector = ScanCollector::new(3).unwrap();
         assert!(matches!(
@@ -3324,6 +4383,13 @@ mod tests {
             redis_scan_count(usize::MAX).unwrap(),
             u64::try_from(REDIS_SCAN_COUNT).unwrap()
         );
+        assert!(matches!(
+            validate_bounded_scan_budget(
+                "*",
+                ReadBudget::with_default_bytes(REDIS_KV_SCAN_ITEM_LIMIT + 1).unwrap()
+            ),
+            Err(Error::Config(message)) if message.contains("adapter limit")
+        ));
     }
 
     #[tokio::test]
@@ -3950,8 +5016,13 @@ mod tests {
         let operations = redis_operations(capabilities, true);
 
         for operation in [
+            CapabilityOperation::KeyValueExists,
+            CapabilityOperation::KeyValueGetBounded,
             CapabilityOperation::KeyValueGetWithExpiry,
+            CapabilityOperation::KeyValueGetWithExpiryBounded,
             CapabilityOperation::KeyValueRestoreWithExpiry,
+            CapabilityOperation::KeyValueScanBounded,
+            CapabilityOperation::KeyValueRawCommandBounded,
             CapabilityOperation::MessageConsumeGroup,
             CapabilityOperation::MessageConsumeAck,
             CapabilityOperation::MessageAdminListTopics,
