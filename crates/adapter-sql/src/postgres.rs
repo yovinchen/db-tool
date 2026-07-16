@@ -1065,6 +1065,81 @@ fn postgres_table_kind(relkind: &str) -> Result<TableKind> {
 mod tests {
     use super::*;
 
+    const FIXTURE_MAX_ITEMS: usize = 100_000;
+
+    async fn execute_fixture(
+        sql: &dyn SqlEngine,
+        statement: &str,
+        params: &[Value],
+    ) -> Result<ExecOutcome> {
+        sql.execute_budgeted(statement, params, InputBudget::default())
+            .await
+    }
+
+    async fn query_fixture(
+        sql: &dyn SqlEngine,
+        statement: &str,
+        params: &[Value],
+    ) -> Result<ResultSet> {
+        let result = sql
+            .query_budgeted(
+                statement,
+                params,
+                ReadBudget::new(FIXTURE_MAX_ITEMS, dbtool_core::model::DEFAULT_READ_BYTES)?,
+            )
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "PostgreSQL test fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn list_schemas_fixture(sql: &dyn SqlEngine) -> Result<Vec<String>> {
+        let result = sql
+            .list_schemas_budgeted(ReadBudget::new(
+                FIXTURE_MAX_ITEMS,
+                dbtool_core::model::DEFAULT_READ_BYTES,
+            )?)
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "PostgreSQL schema fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result.items)
+    }
+
+    async fn list_tables_fixture(
+        sql: &dyn SqlEngine,
+        schema: Option<&str>,
+    ) -> Result<Vec<TableInfo>> {
+        let result = sql
+            .list_tables_budgeted(
+                schema,
+                ReadBudget::new(FIXTURE_MAX_ITEMS, dbtool_core::model::DEFAULT_READ_BYTES)?,
+            )
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "PostgreSQL table fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result.items)
+    }
+
+    async fn describe_fixture(sql: &dyn SqlEngine, table: &str) -> Result<TableSchema> {
+        sql.describe_table_bounded(
+            table,
+            MetadataBudget::new(
+                FIXTURE_MAX_ITEMS,
+                dbtool_core::model::DEFAULT_METADATA_BYTES,
+            )?,
+        )
+        .await
+    }
+
     #[test]
     fn postgres_parameter_builder_accepts_all_portable_values() {
         let params = vec![
@@ -1171,7 +1246,8 @@ mod tests {
             .unwrap();
         let sql = connector.as_sql().unwrap();
 
-        sql.execute(
+        execute_fixture(
+            sql,
             &format!(
                 "CREATE TABLE {table} (\
                     id bigint, base integer, payload text, \
@@ -1182,7 +1258,8 @@ mod tests {
         )
         .await
         .unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             &format!("CREATE MATERIALIZED VIEW {view} AS SELECT id, generated FROM {table}"),
             &[],
         )
@@ -1191,17 +1268,16 @@ mod tests {
 
         let metadata = async {
             Ok::<_, Error>((
-                sql.describe_table(&table).await?,
-                sql.describe_table(&view).await?,
-                sql.list_tables(Some("public")).await?,
+                describe_fixture(sql, &table).await?,
+                describe_fixture(sql, &view).await?,
+                list_tables_fixture(sql, Some("public")).await?,
             ))
         }
         .await;
 
-        let view_cleanup = sql
-            .execute(&format!("DROP MATERIALIZED VIEW {view}"), &[])
-            .await;
-        let table_cleanup = sql.execute(&format!("DROP TABLE {table}"), &[]).await;
+        let view_cleanup =
+            execute_fixture(sql, &format!("DROP MATERIALIZED VIEW {view}"), &[]).await;
+        let table_cleanup = execute_fixture(sql, &format!("DROP TABLE {table}"), &[]).await;
         view_cleanup.unwrap();
         table_cleanup.unwrap();
 
@@ -1238,6 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies the retained 0.1.x item-only catalog contract.
     async fn postgres_live_bounded_catalog_is_schema_scoped_and_exact() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_POSTGRES_DSN") else {
             return;
@@ -1263,14 +1340,18 @@ mod tests {
             .operations()
             .contains(&CapabilityOperation::SqlListTablesBudgeted));
         let sql = connector.as_sql().unwrap();
-        sql.execute(&format!("CREATE SCHEMA {schema}"), &[])
+        execute_fixture(sql, &format!("CREATE SCHEMA {schema}"), &[])
             .await
             .unwrap();
 
         let exercise = async {
             for table in ["alpha", "beta", "gamma"] {
-                sql.execute(&format!("CREATE TABLE {schema}.{table} (id integer)"), &[])
-                    .await?;
+                execute_fixture(
+                    sql,
+                    &format!("CREATE TABLE {schema}.{table} (id integer)"),
+                    &[],
+                )
+                .await?;
             }
 
             let limited = sql.list_tables_bounded(Some(&schema), 2).await?;
@@ -1311,7 +1392,7 @@ mod tests {
                 }) if limit == table_bytes - 1
             ));
 
-            let all_schemas = sql.list_schemas().await?;
+            let all_schemas = list_schemas_fixture(sql).await?;
             let expected_schemas = BoundedList::complete(all_schemas);
             let schema_bytes = serde_json::to_vec(&expected_schemas).unwrap().len();
             let budgeted_schemas = sql
@@ -1331,8 +1412,7 @@ mod tests {
                 }) if limit == schema_bytes - 1
             ));
 
-            sql.execute(&format!("DROP TABLE {schema}.gamma"), &[])
-                .await?;
+            execute_fixture(sql, &format!("DROP TABLE {schema}.gamma"), &[]).await?;
             let exact = sql.list_tables_bounded(Some(&schema), 2).await?;
             assert_eq!(exact.items.len(), 2);
             assert!(exact
@@ -1344,13 +1424,14 @@ mod tests {
         }
         .await;
 
-        sql.execute(&format!("DROP SCHEMA {schema} CASCADE"), &[])
+        execute_fixture(sql, &format!("DROP SCHEMA {schema} CASCADE"), &[])
             .await
             .unwrap();
         exercise.unwrap();
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies the retained 0.1.x atomic-insert contract.
     async fn postgres_live_atomic_insert_rolls_back_and_preserves_typed_values() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_POSTGRES_DSN") else {
             return;
@@ -1367,7 +1448,8 @@ mod tests {
             .operations()
             .contains(&CapabilityOperation::SqlInsertRowsAtomic));
         let sql = connector.as_sql().unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             &format!(
                 "CREATE TABLE {table} (\
                     id bigint PRIMARY KEY, note text NOT NULL, payload bytea NOT NULL, \
@@ -1412,9 +1494,8 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(error, Error::Query(_)));
-            let empty = sql
-                .query(&format!("SELECT count(*) AS total FROM {table}"), &[])
-                .await?;
+            let empty =
+                query_fixture(sql, &format!("SELECT count(*) AS total FROM {table}"), &[]).await?;
             assert_eq!(empty.rows[0][0], Value::Int(0));
 
             assert_eq!(
@@ -1432,14 +1513,12 @@ mod tests {
                 .await?,
                 1
             );
-            let row = sql
-                .query(
-                    &format!(
-                        "SELECT note, payload, happened_at, metadata FROM {table} WHERE id = 2"
-                    ),
-                    &[],
-                )
-                .await?;
+            let row = query_fixture(
+                sql,
+                &format!("SELECT note, payload, happened_at, metadata FROM {table} WHERE id = 2"),
+                &[],
+            )
+            .await?;
             assert_eq!(row.rows[0][0], Value::Text(injection.into()));
             assert_eq!(row.rows[0][1], Value::Bytes(vec![0, 127, 255]));
             assert_eq!(row.rows[0][2], Value::Timestamp(timestamp));
@@ -1451,7 +1530,7 @@ mod tests {
         }
         .await;
 
-        let cleanup = sql.execute(&format!("DROP TABLE {table}"), &[]).await;
+        let cleanup = execute_fixture(sql, &format!("DROP TABLE {table}"), &[]).await;
         cleanup.unwrap();
         exercise.unwrap();
     }
@@ -1487,13 +1566,13 @@ mod tests {
             .await,
             Err(Error::InputBudgetExceeded { .. })
         ));
-        let absent = sql
-            .query(
-                "SELECT count(*) FROM information_schema.tables WHERE table_name = $1",
-                &[Value::Text(rejected_table)],
-            )
-            .await
-            .unwrap();
+        let absent = query_fixture(
+            sql,
+            "SELECT count(*) FROM information_schema.tables WHERE table_name = $1",
+            &[Value::Text(rejected_table)],
+        )
+        .await
+        .unwrap();
         assert_eq!(absent.rows[0][0], Value::Int(0));
 
         sql.execute_budgeted(
@@ -1530,9 +1609,8 @@ mod tests {
                 .await,
                 Err(Error::InputBudgetExceeded { .. })
             ));
-            let unchanged = sql
-                .query(&format!("SELECT count(*) FROM {table}"), &[])
-                .await?;
+            let unchanged =
+                query_fixture(sql, &format!("SELECT count(*) FROM {table}"), &[]).await?;
             assert_eq!(unchanged.rows[0][0], Value::Int(1));
 
             assert_eq!(
@@ -1560,9 +1638,12 @@ mod tests {
                 InputBudget::default(),
             )
             .await?;
-            let readback = sql
-                .query(&format!("SELECT id, note FROM {table} ORDER BY id"), &[])
-                .await?;
+            let readback = query_fixture(
+                sql,
+                &format!("SELECT id, note FROM {table} ORDER BY id"),
+                &[],
+            )
+            .await?;
             assert_eq!(readback.rows.len(), 2);
             assert_eq!(readback.rows[0][1], Value::Text("updated".into()));
             Ok::<_, Error>(())

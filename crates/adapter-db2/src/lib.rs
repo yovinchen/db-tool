@@ -113,6 +113,19 @@ impl Db2TableDefinition {
 }
 
 impl Db2Adapter {
+    async fn query_backend(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
+        reject_params(params)?;
+        let conn_str = self.conn_str.clone();
+        let sql = sql.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let env = get_env()?;
+            let conn = open(env, &conn_str)?;
+            query_result_set(&conn, &sql)
+        })
+        .await
+        .map_err(|e| Error::Query(e.to_string()))?
+    }
+
     async fn describe_table_complete(
         &self,
         table: &str,
@@ -129,13 +142,13 @@ impl Db2Adapter {
             MetadataLimiter::new(budget, format!("Db2 table schema {schema}.{name}"))?;
 
         let kind_result = self
-            .query(&db2_object_kind_sql(&schema, &name), &[])
+            .query_backend(&db2_object_kind_sql(&schema, &name), &[])
             .await?;
         let kind = parse_db2_object_kind(kind_result.rows)?;
 
         let column_limit = db2_metadata_fetch_first(&limiter)?;
         let column_result = self
-            .query(&db2_columns_sql(&schema, &name, column_limit), &[])
+            .query_backend(&db2_columns_sql(&schema, &name, column_limit), &[])
             .await?;
         if column_result.rows.is_empty() {
             return Err(Error::Query(format!(
@@ -152,7 +165,7 @@ impl Db2Adapter {
 
         let index_limit = db2_metadata_fetch_first(&limiter)?;
         let index_result = self
-            .query(&db2_indexes_sql(&schema, &name, index_limit), &[])
+            .query_backend(&db2_indexes_sql(&schema, &name, index_limit), &[])
             .await?;
         let mut indexes = Vec::new();
         for row in index_result.rows {
@@ -241,16 +254,7 @@ impl Connector for Db2Adapter {
 #[async_trait::async_trait]
 impl SqlEngine for Db2Adapter {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
-        reject_params(params)?;
-        let conn_str = self.conn_str.clone();
-        let sql = sql.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let env = get_env()?;
-            let conn = open(env, &conn_str)?;
-            query_result_set(&conn, &sql)
-        })
-        .await
-        .map_err(|e| Error::Query(e.to_string()))?
+        self.query_backend(sql, params).await
     }
 
     async fn query_bounded(
@@ -331,7 +335,7 @@ impl SqlEngine for Db2Adapter {
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
         let result = self
-            .query(
+            .query_backend(
                 "SELECT SCHEMANAME FROM SYSCAT.SCHEMATA \
                  WHERE SCHEMANAME NOT LIKE 'SYS%' ORDER BY SCHEMANAME",
                 &[],
@@ -347,7 +351,7 @@ impl SqlEngine for Db2Adapter {
     async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
         let (limiter, fetch_first) = db2_catalog_limit(max_items)?;
         let result = self
-            .query(
+            .query_backend(
                 &format!(
                     "SELECT SCHEMANAME FROM SYSCAT.SCHEMATA \
                      WHERE SCHEMANAME NOT LIKE 'SYS%' ORDER BY SCHEMANAME \
@@ -367,7 +371,7 @@ impl SqlEngine for Db2Adapter {
     async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
         let (mut limiter, fetch_first) = db2_budgeted_catalog_limit(budget)?;
         let result = self
-            .query(
+            .query_backend(
                 &format!(
                     "SELECT SCHEMANAME FROM SYSCAT.SCHEMATA \
                      WHERE SCHEMANAME NOT LIKE 'SYS%' ORDER BY SCHEMANAME \
@@ -390,7 +394,7 @@ impl SqlEngine for Db2Adapter {
              WHERE TABSCHEMA = '{}' AND TYPE IN ('T','V') ORDER BY TABNAME",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         Ok(result
             .rows
             .into_iter()
@@ -424,7 +428,7 @@ impl SqlEngine for Db2Adapter {
              FETCH FIRST {fetch_first} ROWS ONLY",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let tables = result
             .rows
             .into_iter()
@@ -459,7 +463,7 @@ impl SqlEngine for Db2Adapter {
              FETCH FIRST {fetch_first} ROWS ONLY",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let mut tables = Vec::with_capacity(result.rows.len().min(budget.max_items));
         for row in result.rows {
             let schema = required_catalog_text(&row, 0, "table schema")?;
@@ -519,7 +523,7 @@ impl Db2Engine for Db2Adapter {
              ORDER BY SEQNAME",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         Ok(result
             .rows
             .into_iter()
@@ -558,7 +562,7 @@ impl Db2Engine for Db2Adapter {
              ORDER BY SEQNAME FETCH FIRST {fetch_first} ROWS ONLY",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let sequences = result
             .rows
             .into_iter()
@@ -582,7 +586,7 @@ impl Db2Engine for Db2Adapter {
              ORDER BY SEQNAME FETCH FIRST {fetch_first} ROWS ONLY",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let mut sequences = Vec::with_capacity(result.rows.len().min(budget.max_items));
         for row in result.rows {
             limiter.retain_item(parse_sequence_row(row)?, &mut sequences)?;
@@ -599,7 +603,7 @@ impl Db2Engine for Db2Adapter {
              ORDER BY ROUTINENAME",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         Ok(result
             .rows
             .into_iter()
@@ -643,7 +647,7 @@ impl Db2Engine for Db2Adapter {
              ORDER BY ROUTINENAME FETCH FIRST {fetch_first} ROWS ONLY",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let routines = result
             .rows
             .into_iter()
@@ -666,7 +670,7 @@ impl Db2Engine for Db2Adapter {
              ORDER BY ROUTINENAME FETCH FIRST {fetch_first} ROWS ONLY",
             schema.to_uppercase()
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let mut routines = Vec::with_capacity(result.rows.len().min(budget.max_items));
         for row in result.rows {
             limiter.retain_item(parse_routine_row(row)?, &mut routines)?;
@@ -678,7 +682,7 @@ impl Db2Engine for Db2Adapter {
         let sql = "SELECT TBSPACE, TBSPACETYPE, PAGESIZE, EXTENTSIZE, PREFETCHSIZE \
                    FROM SYSCAT.TABLESPACES \
                    ORDER BY TBSPACE";
-        let result = self.query(sql, &[]).await?;
+        let result = self.query_backend(sql, &[]).await?;
         Ok(result
             .rows
             .into_iter()
@@ -716,7 +720,7 @@ impl Db2Engine for Db2Adapter {
              FROM SYSCAT.TABLESPACES \
              ORDER BY TBSPACE FETCH FIRST {fetch_first} ROWS ONLY"
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let tablespaces = result
             .rows
             .into_iter()
@@ -735,7 +739,7 @@ impl Db2Engine for Db2Adapter {
              FROM SYSCAT.TABLESPACES \
              ORDER BY TBSPACE FETCH FIRST {fetch_first} ROWS ONLY"
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let mut tablespaces = Vec::with_capacity(result.rows.len().min(budget.max_items));
         for row in result.rows {
             limiter.retain_item(parse_tablespace_row(row)?, &mut tablespaces)?;
@@ -766,7 +770,7 @@ impl Db2Engine for Db2Adapter {
                AND r.TABNAME   = '{name_uc}' \
              ORDER BY r.CONSTNAME, kc.COLSEQ"
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
 
         let mut fk_map: Vec<ForeignKeyInfo> = Vec::new();
         for row in result.rows {
@@ -844,7 +848,7 @@ impl Db2Engine for Db2Adapter {
 
         let sql =
             db2_bounded_foreign_keys_sql(&schema_uc, &name_uc, fetch_first, member_row_envelope);
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let foreign_keys = group_foreign_key_rows(result.rows)?;
         Ok(limiter.finish(foreign_keys))
     }
@@ -861,7 +865,7 @@ impl Db2Engine for Db2Adapter {
         let name_uc = tref.name.to_uppercase();
         let sql =
             db2_bounded_foreign_keys_sql(&schema_uc, &name_uc, fetch_first, member_row_envelope);
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let observed = group_foreign_key_rows(result.rows)?;
         let mut foreign_keys = Vec::with_capacity(observed.len().min(budget.max_items));
         for foreign_key in observed {

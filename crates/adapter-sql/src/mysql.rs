@@ -880,6 +880,81 @@ fn mysql_optional_text(row: &MySqlRow, index: usize) -> Result<Option<String>> {
 mod tests {
     use super::*;
 
+    const FIXTURE_MAX_ITEMS: usize = 100_000;
+
+    async fn execute_fixture(
+        sql: &dyn SqlEngine,
+        statement: &str,
+        params: &[Value],
+    ) -> Result<ExecOutcome> {
+        sql.execute_budgeted(statement, params, InputBudget::default())
+            .await
+    }
+
+    async fn query_fixture(
+        sql: &dyn SqlEngine,
+        statement: &str,
+        params: &[Value],
+    ) -> Result<ResultSet> {
+        let result = sql
+            .query_budgeted(
+                statement,
+                params,
+                ReadBudget::new(FIXTURE_MAX_ITEMS, dbtool_core::model::DEFAULT_READ_BYTES)?,
+            )
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "MySQL test fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn list_schemas_fixture(sql: &dyn SqlEngine) -> Result<Vec<String>> {
+        let result = sql
+            .list_schemas_budgeted(ReadBudget::new(
+                FIXTURE_MAX_ITEMS,
+                dbtool_core::model::DEFAULT_READ_BYTES,
+            )?)
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "MySQL schema fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result.items)
+    }
+
+    async fn list_tables_fixture(
+        sql: &dyn SqlEngine,
+        schema: Option<&str>,
+    ) -> Result<Vec<TableInfo>> {
+        let result = sql
+            .list_tables_budgeted(
+                schema,
+                ReadBudget::new(FIXTURE_MAX_ITEMS, dbtool_core::model::DEFAULT_READ_BYTES)?,
+            )
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "MySQL table fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result.items)
+    }
+
+    async fn describe_fixture(sql: &dyn SqlEngine, table: &str) -> Result<TableSchema> {
+        sql.describe_table_bounded(
+            table,
+            MetadataBudget::new(
+                FIXTURE_MAX_ITEMS,
+                dbtool_core::model::DEFAULT_METADATA_BYTES,
+            )?,
+        )
+        .await
+    }
+
     #[test]
     fn mysql_parameter_builder_accepts_all_portable_values() {
         let params = vec![
@@ -966,7 +1041,8 @@ mod tests {
         let connector = mysql_factory(Dsn::parse(&raw_dsn).unwrap()).await.unwrap();
         let sql = connector.as_sql().unwrap();
 
-        sql.execute(
+        execute_fixture(
+            sql,
             &format!(
                 "CREATE TABLE {table} (\
                     id bigint PRIMARY KEY, \
@@ -978,7 +1054,7 @@ mod tests {
         .unwrap();
 
         let metadata = async {
-            let default_tables = sql.list_tables(None).await?;
+            let default_tables = list_tables_fixture(sql, None).await?;
             let item = default_tables
                 .iter()
                 .find(|item| item.name == table)
@@ -987,13 +1063,13 @@ mod tests {
                 .schema
                 .clone()
                 .ok_or_else(|| Error::Query("MySQL table omitted its effective schema".into()))?;
-            let explicit_tables = sql.list_tables(Some(&schema)).await?;
-            let described = sql.describe_table(&item.qualified_name()).await?;
+            let explicit_tables = list_tables_fixture(sql, Some(&schema)).await?;
+            let described = describe_fixture(sql, &item.qualified_name()).await?;
             Ok::<_, Error>((schema, explicit_tables, described))
         }
         .await;
 
-        sql.execute(&format!("DROP TABLE {table}"), &[])
+        execute_fixture(sql, &format!("DROP TABLE {table}"), &[])
             .await
             .unwrap();
 
@@ -1007,6 +1083,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies the retained 0.1.x item-only catalog contract.
     async fn mysql_live_bounded_catalog_distinguishes_n_from_n_plus_one() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MYSQL_DSN") else {
             return;
@@ -1034,9 +1111,9 @@ mod tests {
             .operations()
             .contains(&CapabilityOperation::SqlListTablesBudgeted));
         let sql = connector.as_sql().unwrap();
-        let existing_count = sql.list_tables(None).await.unwrap().len();
+        let existing_count = list_tables_fixture(sql, None).await.unwrap().len();
         for table in &tables {
-            sql.execute(&format!("CREATE TABLE {table} (id integer)"), &[])
+            execute_fixture(sql, &format!("CREATE TABLE {table} (id integer)"), &[])
                 .await
                 .unwrap();
         }
@@ -1055,7 +1132,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|schema| !schema.is_empty())));
 
-            let all_tables = sql.list_tables(None).await?;
+            let all_tables = list_tables_fixture(sql, None).await?;
             let probe = all_tables
                 .get(total - 1)
                 .cloned()
@@ -1092,7 +1169,7 @@ mod tests {
                 serde_json::to_value(&complete).unwrap()
             );
 
-            let all_schemas = sql.list_schemas().await?;
+            let all_schemas = list_schemas_fixture(sql).await?;
             let exact_schemas = sql.list_schemas_bounded(all_schemas.len()).await?;
             assert_eq!(exact_schemas.items, all_schemas);
             assert!(!exact_schemas.truncated);
@@ -1151,7 +1228,7 @@ mod tests {
         .await;
 
         for table in &tables {
-            sql.execute(&format!("DROP TABLE {table}"), &[])
+            execute_fixture(sql, &format!("DROP TABLE {table}"), &[])
                 .await
                 .unwrap();
         }
@@ -1159,6 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies the retained 0.1.x atomic-insert contract.
     async fn mysql_live_atomic_insert_rolls_back_typed_rows_and_rejects_myisam() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MYSQL_DSN") else {
             return;
@@ -1174,7 +1252,8 @@ mod tests {
             .operations()
             .contains(&CapabilityOperation::SqlInsertRowsAtomic));
         let sql = connector.as_sql().unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             &format!(
                 "CREATE TABLE {table} (\
                     id bigint PRIMARY KEY, note text NOT NULL, payload blob NOT NULL, \
@@ -1184,7 +1263,8 @@ mod tests {
         )
         .await
         .unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             &format!("CREATE TABLE {myisam} (id bigint PRIMARY KEY) ENGINE=MyISAM"),
             &[],
         )
@@ -1225,9 +1305,8 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(error, Error::Query(_)));
-            let empty = sql
-                .query(&format!("SELECT count(*) AS total FROM {table}"), &[])
-                .await?;
+            let empty =
+                query_fixture(sql, &format!("SELECT count(*) AS total FROM {table}"), &[]).await?;
             assert_eq!(empty.rows[0][0], Value::Int(0));
 
             assert_eq!(
@@ -1245,14 +1324,12 @@ mod tests {
                 .await?,
                 1
             );
-            let row = sql
-                .query(
-                    &format!(
-                        "SELECT note, payload, happened_at, metadata FROM {table} WHERE id = 2"
-                    ),
-                    &[],
-                )
-                .await?;
+            let row = query_fixture(
+                sql,
+                &format!("SELECT note, payload, happened_at, metadata FROM {table} WHERE id = 2"),
+                &[],
+            )
+            .await?;
             assert_eq!(row.rows[0][0], Value::Text(injection.into()));
             assert_eq!(row.rows[0][1], Value::Bytes(vec![0, 127, 255]));
             assert_eq!(row.rows[0][2], Value::Timestamp(timestamp));
@@ -1276,16 +1353,15 @@ mod tests {
                 Err(Error::Query(message))
                     if message.contains("does not guarantee transactions")
             ));
-            let myisam_empty = sql
-                .query(&format!("SELECT count(*) AS total FROM {myisam}"), &[])
-                .await?;
+            let myisam_empty =
+                query_fixture(sql, &format!("SELECT count(*) AS total FROM {myisam}"), &[]).await?;
             assert_eq!(myisam_empty.rows[0][0], Value::Int(0));
             Ok::<(), Error>(())
         }
         .await;
 
-        let cleanup_myisam = sql.execute(&format!("DROP TABLE {myisam}"), &[]).await;
-        let cleanup_table = sql.execute(&format!("DROP TABLE {table}"), &[]).await;
+        let cleanup_myisam = execute_fixture(sql, &format!("DROP TABLE {myisam}"), &[]).await;
+        let cleanup_table = execute_fixture(sql, &format!("DROP TABLE {table}"), &[]).await;
         cleanup_myisam.unwrap();
         cleanup_table.unwrap();
         exercise.unwrap();
@@ -1320,14 +1396,14 @@ mod tests {
             .await,
             Err(Error::InputBudgetExceeded { .. })
         ));
-        let absent = sql
-            .query(
-                "SELECT count(*) FROM information_schema.tables \
-                 WHERE table_schema = database() AND table_name = ?",
-                &[Value::Text(rejected_table)],
-            )
-            .await
-            .unwrap();
+        let absent = query_fixture(
+            sql,
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = database() AND table_name = ?",
+            &[Value::Text(rejected_table)],
+        )
+        .await
+        .unwrap();
         assert_eq!(absent.rows[0][0], Value::Int(0));
 
         sql.execute_budgeted(
@@ -1366,9 +1442,8 @@ mod tests {
                 .await,
                 Err(Error::InputBudgetExceeded { .. })
             ));
-            let unchanged = sql
-                .query(&format!("SELECT count(*) FROM {table}"), &[])
-                .await?;
+            let unchanged =
+                query_fixture(sql, &format!("SELECT count(*) FROM {table}"), &[]).await?;
             assert_eq!(unchanged.rows[0][0], Value::Int(1));
 
             assert_eq!(
@@ -1396,9 +1471,12 @@ mod tests {
                 InputBudget::default(),
             )
             .await?;
-            let readback = sql
-                .query(&format!("SELECT id, note FROM {table} ORDER BY id"), &[])
-                .await?;
+            let readback = query_fixture(
+                sql,
+                &format!("SELECT id, note FROM {table} ORDER BY id"),
+                &[],
+            )
+            .await?;
             assert_eq!(readback.rows.len(), 2);
             assert_eq!(readback.rows[0][1], Value::Text("updated".into()));
             Ok::<_, Error>(())

@@ -29,6 +29,24 @@ pub struct SqlServerAdapter {
 }
 
 impl SqlServerAdapter {
+    async fn query_backend(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
+        reject_dynamic_params(params)?;
+        let mut guard = self.client.lock().await;
+        let client = guard
+            .as_mut()
+            .ok_or_else(|| Error::Connection("SQL Server connection is closed".to_owned()))?;
+
+        let rows = client
+            .query(sql, &[])
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?
+            .into_first_result()
+            .await
+            .map_err(|e| Error::Query(e.to_string()))?;
+
+        rows_to_result_set(rows)
+    }
+
     async fn describe_table_complete(
         &self,
         table: &str,
@@ -40,7 +58,7 @@ impl SqlServerAdapter {
 
         let column_top = metadata_top(&limiter)?;
         let col_result = self
-            .query(
+            .query_backend(
                 &sqlserver_columns_sql(schema, &table_ref.name, column_top),
                 &[],
             )
@@ -60,7 +78,7 @@ impl SqlServerAdapter {
 
         let index_top = metadata_top(&limiter)?;
         let idx_result = self
-            .query(
+            .query_backend(
                 &sqlserver_indexes_sql(schema, &table_ref.name, index_top),
                 &[],
             )
@@ -160,21 +178,7 @@ impl Connector for SqlServerAdapter {
 #[async_trait::async_trait]
 impl SqlEngine for SqlServerAdapter {
     async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet> {
-        reject_dynamic_params(params)?;
-        let mut guard = self.client.lock().await;
-        let client = guard
-            .as_mut()
-            .ok_or_else(|| Error::Connection("SQL Server connection is closed".to_owned()))?;
-
-        let rows = client
-            .query(sql, &[])
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?
-            .into_first_result()
-            .await
-            .map_err(|e| Error::Query(e.to_string()))?;
-
-        rows_to_result_set(rows)
+        self.query_backend(sql, params).await
     }
 
     async fn query_bounded(
@@ -330,7 +334,7 @@ impl SqlEngine for SqlServerAdapter {
 
     async fn list_schemas(&self) -> Result<Vec<String>> {
         let result = self
-            .query("SELECT name FROM sys.schemas ORDER BY name", &[])
+            .query_backend("SELECT name FROM sys.schemas ORDER BY name", &[])
             .await?;
 
         Ok(result
@@ -346,7 +350,7 @@ impl SqlEngine for SqlServerAdapter {
     async fn list_schemas_bounded(&self, max_items: usize) -> Result<BoundedList<String>> {
         let (limiter, top) = sqlserver_catalog_limit(max_items)?;
         let result = self
-            .query(
+            .query_backend(
                 &format!("SELECT TOP ({top}) name FROM sys.schemas ORDER BY name"),
                 &[],
             )
@@ -367,7 +371,7 @@ impl SqlEngine for SqlServerAdapter {
     async fn list_schemas_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
         let (mut limiter, top) = sqlserver_budgeted_catalog_limit(budget)?;
         let result = self
-            .query(
+            .query_backend(
                 &format!("SELECT TOP ({top}) name FROM sys.schemas ORDER BY name"),
                 &[],
             )
@@ -396,7 +400,7 @@ impl SqlEngine for SqlServerAdapter {
              ORDER BY TABLE_NAME",
             schema
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
 
         Ok(result
             .rows
@@ -431,7 +435,7 @@ impl SqlEngine for SqlServerAdapter {
              WHERE TABLE_SCHEMA = '{schema}' \
              ORDER BY TABLE_NAME"
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let tables = result
             .rows
             .into_iter()
@@ -472,7 +476,7 @@ impl SqlEngine for SqlServerAdapter {
              WHERE TABLE_SCHEMA = '{schema}' \
              ORDER BY TABLE_NAME"
         );
-        let result = self.query(&sql, &[]).await?;
+        let result = self.query_backend(&sql, &[]).await?;
         let mut tables = Vec::with_capacity(result.rows.len().min(budget.max_items));
         for row in result.rows {
             let schema = row.first().and_then(value_text).ok_or_else(|| {

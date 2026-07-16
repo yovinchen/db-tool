@@ -856,6 +856,75 @@ mod tests {
         MetadataBudget, ReadBudget, TableKind, Value, DEFAULT_METADATA_BYTES, DEFAULT_READ_BYTES,
     };
 
+    const FIXTURE_MAX_ITEMS: usize = 100_000;
+
+    async fn execute_fixture(
+        sql: &dyn SqlEngine,
+        statement: &str,
+        params: &[Value],
+    ) -> Result<ExecOutcome> {
+        sql.execute_budgeted(statement, params, InputBudget::default())
+            .await
+    }
+
+    async fn query_fixture(
+        sql: &dyn SqlEngine,
+        statement: &str,
+        params: &[Value],
+    ) -> Result<ResultSet> {
+        let result = sql
+            .query_budgeted(
+                statement,
+                params,
+                ReadBudget::new(FIXTURE_MAX_ITEMS, DEFAULT_READ_BYTES)?,
+            )
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "SQLite test fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn list_schemas_fixture(sql: &dyn SqlEngine) -> Result<Vec<String>> {
+        let result = sql
+            .list_schemas_budgeted(ReadBudget::new(FIXTURE_MAX_ITEMS, DEFAULT_READ_BYTES)?)
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "SQLite schema fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result.items)
+    }
+
+    async fn list_tables_fixture(
+        sql: &dyn SqlEngine,
+        schema: Option<&str>,
+    ) -> Result<Vec<TableInfo>> {
+        let result = sql
+            .list_tables_budgeted(
+                schema,
+                ReadBudget::new(FIXTURE_MAX_ITEMS, DEFAULT_READ_BYTES)?,
+            )
+            .await?;
+        if result.truncated {
+            return Err(Error::Query(
+                "SQLite table fixture exceeded its exact read budget".to_owned(),
+            ));
+        }
+        Ok(result.items)
+    }
+
+    async fn describe_fixture(sql: &dyn SqlEngine, table: &str) -> Result<TableSchema> {
+        sql.describe_table_bounded(
+            table,
+            MetadataBudget::new(FIXTURE_MAX_ITEMS, DEFAULT_METADATA_BYTES)?,
+        )
+        .await
+    }
+
     async fn memory_sqlite() -> Box<dyn Connector> {
         sqlite_factory(Dsn::parse("sqlite::memory:").unwrap())
             .await
@@ -869,7 +938,8 @@ mod tests {
             .operations()
             .contains(&CapabilityOperation::SqlDescribeTableBounded));
         let sql = connector.as_sql().unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             "create table bounded_schema (
                 tenant text,
                 id integer,
@@ -880,7 +950,8 @@ mod tests {
         )
         .await
         .unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             "create index bounded_schema_note_id on bounded_schema(note, id)",
             &[],
         )
@@ -926,9 +997,13 @@ mod tests {
     async fn bounded_schema_enforces_bytes_and_missing_table_before_returning_data() {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
-        sql.execute("create table byte_budget (id integer primary key)", &[])
-            .await
-            .unwrap();
+        execute_fixture(
+            sql,
+            "create table byte_budget (id integer primary key)",
+            &[],
+        )
+        .await
+        .unwrap();
 
         let byte_error = sql
             .describe_table_bounded("byte_budget", MetadataBudget::new(10, 1).unwrap())
@@ -939,7 +1014,7 @@ mod tests {
             Error::MetadataBudgetExceeded { unit: "bytes", .. }
         ));
 
-        let complete = sql.describe_table("byte_budget").await.unwrap();
+        let complete = describe_fixture(sql, "byte_budget").await.unwrap();
         let primary = complete.indexes.first().unwrap();
         let observed_item_bytes = complete
             .columns
@@ -986,7 +1061,8 @@ mod tests {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
 
-        sql.execute(
+        execute_fixture(
+            sql,
             "create table users (
                 id integer primary key,
                 active boolean not null,
@@ -998,7 +1074,8 @@ mod tests {
         )
         .await
         .unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             "insert into users (id, active, score, name, payload)
              values (1, true, 42.5, 'alice', x'CAFE')",
             &[],
@@ -1006,13 +1083,13 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = sql
-            .query(
-                "select id, active, score, name, payload from users where id = 1",
-                &[],
-            )
-            .await
-            .unwrap();
+        let rows = query_fixture(
+            sql,
+            "select id, active, score, name, payload from users where id = 1",
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.row_count(), 1);
         assert_eq!(rows.rows[0][0], Value::Int(1));
@@ -1021,14 +1098,14 @@ mod tests {
         assert_eq!(rows.rows[0][3], Value::Text("alice".to_owned()));
         assert_eq!(rows.rows[0][4], Value::Bytes(vec![0xCA, 0xFE]));
 
-        let tables = sql.list_tables(None).await.unwrap();
+        let tables = list_tables_fixture(sql, None).await.unwrap();
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].schema.as_deref(), Some("main"));
         assert_eq!(tables[0].qualified_name(), "main.users");
         assert_eq!(tables[0].name, "users");
         assert!(matches!(tables[0].kind, TableKind::Table));
 
-        let schema = sql.describe_table("users").await.unwrap();
+        let schema = describe_fixture(sql, "users").await.unwrap();
         assert_eq!(schema.name, "users");
         assert_eq!(schema.columns.len(), 5);
         assert_eq!(schema.columns[0].name, "id");
@@ -1055,8 +1132,7 @@ mod tests {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
 
-        let err = sql
-            .describe_table("users;drop table users")
+        let err = describe_fixture(sql, "users;drop table users")
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Query(_)));
@@ -1067,30 +1143,32 @@ mod tests {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
 
-        sql.execute("attach database ':memory:' as aux", &[])
+        execute_fixture(sql, "attach database ':memory:' as aux", &[])
             .await
             .unwrap();
-        sql.execute("create table main.users (main_id integer)", &[])
+        execute_fixture(sql, "create table main.users (main_id integer)", &[])
             .await
             .unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             "create table aux.users (aux_id integer primary key, note text not null)",
             &[],
         )
         .await
         .unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             "create view aux.user_notes as select aux_id, note from users",
             &[],
         )
         .await
         .unwrap();
 
-        let schemas = sql.list_schemas().await.unwrap();
+        let schemas = list_schemas_fixture(sql).await.unwrap();
         assert!(schemas.iter().any(|schema| schema == "main"));
         assert!(schemas.iter().any(|schema| schema == "aux"));
 
-        let aux_tables = sql.list_tables(Some("aux")).await.unwrap();
+        let aux_tables = list_tables_fixture(sql, Some("aux")).await.unwrap();
         assert_eq!(aux_tables.len(), 2);
         assert!(aux_tables
             .iter()
@@ -1102,19 +1180,19 @@ mod tests {
             table.qualified_name() == "aux.user_notes" && table.kind == TableKind::View
         }));
 
-        let main = sql.describe_table("main.users").await.unwrap();
+        let main = describe_fixture(sql, "main.users").await.unwrap();
         assert_eq!(main.columns[0].name, "main_id");
 
-        let aux = sql.describe_table("aux.users").await.unwrap();
+        let aux = describe_fixture(sql, "aux.users").await.unwrap();
         assert_eq!(aux.columns[0].name, "aux_id");
         assert_eq!(aux.columns[1].name, "note");
 
         assert!(matches!(
-            sql.list_tables(Some("missing")).await,
+            list_tables_fixture(sql, Some("missing")).await,
             Err(Error::Query(_))
         ));
         assert!(matches!(
-            sql.describe_table("missing.users").await,
+            describe_fixture(sql, "missing.users").await,
             Err(Error::Query(_))
         ));
     }
@@ -1124,7 +1202,8 @@ mod tests {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
 
-        sql.execute(
+        execute_fixture(
+            sql,
             "create table inventory (
                 id integer primary key,
                 code text not null default 'new',
@@ -1135,14 +1214,15 @@ mod tests {
         )
         .await
         .unwrap();
-        sql.execute(
+        execute_fixture(
+            sql,
             "create unique index inventory_code_lower on inventory(lower(code))",
             &[],
         )
         .await
         .unwrap();
 
-        let inventory = sql.describe_table("main.inventory").await.unwrap();
+        let inventory = describe_fixture(sql, "main.inventory").await.unwrap();
         assert_eq!(
             inventory.columns.len(),
             4,
@@ -1169,7 +1249,8 @@ mod tests {
                 && index.columns == ["<expression:0>"]
         }));
 
-        sql.execute(
+        execute_fixture(
+            sql,
             "create table composite (
                 tenant text,
                 id integer,
@@ -1179,7 +1260,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let composite = sql.describe_table("composite").await.unwrap();
+        let composite = describe_fixture(sql, "composite").await.unwrap();
         let primary = composite
             .indexes
             .iter()
@@ -1196,10 +1277,10 @@ mod tests {
             "ordinary SQLite rowid tables permit NULL in non-INTEGER primary keys"
         );
 
-        sql.execute("create table MixedCase (id integer primary key)", &[])
+        execute_fixture(sql, "create table MixedCase (id integer primary key)", &[])
             .await
             .unwrap();
-        let mixed = sql.describe_table("mixedcase").await.unwrap();
+        let mixed = describe_fixture(sql, "mixedcase").await.unwrap();
         assert_eq!(mixed.name, "MixedCase");
         assert_eq!(mixed.columns[0].name, "id");
     }
@@ -1209,7 +1290,8 @@ mod tests {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
 
-        sql.execute(
+        execute_fixture(
+            sql,
             "create table bound_values (
                 id integer primary key,
                 note text not null,
@@ -1224,31 +1306,31 @@ mod tests {
         .unwrap();
 
         let injection = "O'Reilly'); drop table bound_values; --";
-        let outcome = sql
-            .execute(
-                "insert into bound_values (id, note, score, enabled, payload, optional)
-                 values (?, ?, ?, ?, ?, ?)",
-                &[
-                    Value::Int(7),
-                    Value::Text(injection.into()),
-                    Value::Float(12.75),
-                    Value::Bool(true),
-                    Value::Bytes(vec![0, 0x7f, 0xff]),
-                    Value::Null,
-                ],
-            )
-            .await
-            .unwrap();
+        let outcome = execute_fixture(
+            sql,
+            "insert into bound_values (id, note, score, enabled, payload, optional)
+             values (?, ?, ?, ?, ?, ?)",
+            &[
+                Value::Int(7),
+                Value::Text(injection.into()),
+                Value::Float(12.75),
+                Value::Bool(true),
+                Value::Bytes(vec![0, 0x7f, 0xff]),
+                Value::Null,
+            ],
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.rows_affected, 1);
 
-        let rows = sql
-            .query(
-                "select id, note, score, enabled, payload, optional
-                 from bound_values where id = ? and note = ?",
-                &[Value::Int(7), Value::Text(injection.into())],
-            )
-            .await
-            .unwrap();
+        let rows = query_fixture(
+            sql,
+            "select id, note, score, enabled, payload, optional
+             from bound_values where id = ? and note = ?",
+            &[Value::Int(7), Value::Text(injection.into())],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.row_count(), 1);
         assert_eq!(rows.rows[0][0], Value::Int(7));
@@ -1258,8 +1340,7 @@ mod tests {
         assert_eq!(rows.rows[0][4], Value::Bytes(vec![0, 0x7f, 0xff]));
         assert_eq!(rows.rows[0][5], Value::Null);
 
-        let table_survived = sql
-            .query("select count(*) as total from bound_values", &[])
+        let table_survived = query_fixture(sql, "select count(*) as total from bound_values", &[])
             .await
             .unwrap();
         assert_eq!(table_survived.rows[0][0], Value::Int(1));
@@ -1270,23 +1351,24 @@ mod tests {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
 
-        let rows = sql
-            .query(
-                "select CAST(strftime('%s', ?) AS INTEGER) * 1000 as timestamp_ms,
-                        json_extract(?, '$.id') as json_id",
-                &[
-                    Value::Timestamp(1_700_000_000_123),
-                    Value::Json(serde_json::json!({"id": 7})),
-                ],
-            )
-            .await
-            .unwrap();
+        let rows = query_fixture(
+            sql,
+            "select CAST(strftime('%s', ?) AS INTEGER) * 1000 as timestamp_ms,
+                    json_extract(?, '$.id') as json_id",
+            &[
+                Value::Timestamp(1_700_000_000_123),
+                Value::Json(serde_json::json!({"id": 7})),
+            ],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(rows.rows[0][0], Value::Int(1_700_000_000_000));
         assert_eq!(rows.rows[0][1], Value::Int(7));
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies the retained 0.1.x atomic-insert contract.
     async fn sqlite_atomic_insert_binds_injection_text_and_rolls_back_every_row() {
         let connector = memory_sqlite().await;
         assert!(connector
@@ -1294,7 +1376,8 @@ mod tests {
             .contains(&CapabilityOperation::SqlInsertRowsAtomic));
         let sql = connector.as_sql().unwrap();
 
-        sql.execute(
+        execute_fixture(
+            sql,
             "create table atomic_rows (id integer primary key, note text not null)",
             &[],
         )
@@ -1314,8 +1397,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::Query(_)));
 
-        let empty = sql
-            .query("select count(*) as total from atomic_rows", &[])
+        let empty = query_fixture(sql, "select count(*) as total from atomic_rows", &[])
             .await
             .unwrap();
         assert_eq!(empty.rows[0][0], Value::Int(0));
@@ -1330,8 +1412,7 @@ mod tests {
             .unwrap(),
             1
         );
-        let preserved = sql
-            .query("select note from atomic_rows where id = 2", &[])
+        let preserved = query_fixture(sql, "select note from atomic_rows where id = 2", &[])
             .await
             .unwrap();
         assert_eq!(preserved.rows[0][0], Value::Text(injection.into()));
@@ -1377,13 +1458,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(rejected, Error::InputBudgetExceeded { .. }));
-        let absent = sql
-            .query(
-                "select count(*) from sqlite_master where name = 'rejected_budget'",
-                &[],
-            )
-            .await
-            .unwrap();
+        let absent = query_fixture(
+            sql,
+            "select count(*) from sqlite_master where name = 'rejected_budget'",
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(absent.rows[0][0], Value::Int(0));
 
         sql.execute_budgeted(
@@ -1437,8 +1518,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(late_error, Error::InputBudgetExceeded { .. }));
-        let unchanged = sql
-            .query("select count(*) from exact_crud", &[])
+        let unchanged = query_fixture(sql, "select count(*) from exact_crud", &[])
             .await
             .unwrap();
         assert_eq!(unchanged.rows[0][0], Value::Int(1));
@@ -1457,8 +1537,7 @@ mod tests {
             .unwrap(),
             2
         );
-        let readback = sql
-            .query("select id, note from exact_crud order by id", &[])
+        let readback = query_fixture(sql, "select id, note from exact_crud order by id", &[])
             .await
             .unwrap();
         assert_eq!(readback.rows.len(), 3);
@@ -1471,8 +1550,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let after_delete = sql
-            .query("select count(*) from exact_crud", &[])
+        let after_delete = query_fixture(sql, "select count(*) from exact_crud", &[])
             .await
             .unwrap();
         assert_eq!(after_delete.rows[0][0], Value::Int(2));
@@ -1480,17 +1558,18 @@ mod tests {
         sql.execute_budgeted("drop table exact_crud", &[], InputBudget::default())
             .await
             .unwrap();
-        let cleaned = sql
-            .query(
-                "select count(*) from sqlite_master where name = 'exact_crud'",
-                &[],
-            )
-            .await
-            .unwrap();
+        let cleaned = query_fixture(
+            sql,
+            "select count(*) from sqlite_master where name = 'exact_crud'",
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(cleaned.rows[0][0], Value::Int(0));
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies the retained 0.1.x row-only query contract.
     async fn sqlite_bounded_query_streams_one_probe_row_and_preserves_params() {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
@@ -1545,6 +1624,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies validation order on the 0.1.x row-only query contract.
     async fn sqlite_bounded_query_rejects_invalid_limits_before_sql() {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
@@ -1680,6 +1760,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies the retained 0.1.x item-only catalog contract.
     async fn sqlite_bounded_catalogs_distinguish_exact_n_from_probe_rows() {
         let connector = memory_sqlite().await;
         assert!(connector
@@ -1696,14 +1777,14 @@ mod tests {
             .contains(&CapabilityOperation::SqlListTablesBudgeted));
         let sql = connector.as_sql().unwrap();
 
-        sql.execute("attach database ':memory:' as aux", &[])
+        execute_fixture(sql, "attach database ':memory:' as aux", &[])
             .await
             .unwrap();
         let exact_schemas = sql.list_schemas_bounded(2).await.unwrap();
         assert_eq!(exact_schemas.items, ["main", "aux"]);
         assert!(!exact_schemas.truncated);
 
-        sql.execute("attach database ':memory:' as extra", &[])
+        execute_fixture(sql, "attach database ':memory:' as extra", &[])
             .await
             .unwrap();
         let limited_schemas = sql.list_schemas_bounded(2).await.unwrap();
@@ -1732,10 +1813,10 @@ mod tests {
             }) if limit == schema_bytes - 1
         ));
 
-        sql.execute("create table alpha (id integer)", &[])
+        execute_fixture(sql, "create table alpha (id integer)", &[])
             .await
             .unwrap();
-        sql.execute("create view beta as select id from alpha", &[])
+        execute_fixture(sql, "create view beta as select id from alpha", &[])
             .await
             .unwrap();
         let exact_tables = sql.list_tables_bounded(Some("main"), 2).await.unwrap();
@@ -1750,7 +1831,7 @@ mod tests {
         assert_eq!(exact_tables.items[1].kind, TableKind::View);
         assert!(!exact_tables.truncated);
 
-        sql.execute("create table gamma (id integer)", &[])
+        execute_fixture(sql, "create table gamma (id integer)", &[])
             .await
             .unwrap();
         let limited_tables = sql.list_tables_bounded(Some("main"), 2).await.unwrap();
@@ -1794,6 +1875,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)] // Verifies validation order on 0.1.x item-only catalog contracts.
     async fn sqlite_bounded_catalogs_reject_limits_before_schema_or_sql_access() {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
