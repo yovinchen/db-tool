@@ -31,6 +31,28 @@ bound the complete portable result; Docker CLI revalidation passed a one-series
 truncation and a one-byte `READ_BUDGET_EXCEEDED` failure without weakening the
 independent 16 MiB HTTP transport ceiling.
 
+## IF-T74 measurement scalar-byte envelope refresh
+
+Run at (UTC): 2026-07-16T03:19:08Z
+
+`TimeSeriesStore.list_measurements_budgeted` and the exact
+`time_series.list_measurements_budgeted` operation now validate caller item and
+byte budgets before HTTP dispatch. The adapter requests
+`/api/v1/label/__name__/values?limit=N+1`, limits portable parsing and
+construction to N+1 names, then charges every complete name plus the returned
+`BoundedList` and probe. Unit coverage includes item N/N+1, exact byte N/N-1,
+zero budgets and probe overflow.
+
+Prometheus 2.55.1 Docker validation passed exact measurement item/byte
+boundaries and operation declaration. The measurement fixture is written under
+a unique per-run metric name; Prometheus exposes no generic immediate series
+delete API, so cleanup is the disposable Compose TSDB volume with one-hour
+retention. The independent raw HTTP JSON transport ceiling remains 16 MiB
+because its protocol wrapper is not the caller-visible catalog envelope.
+
+Verification: `cargo test -p adapter-timeseries` 26/26 PASS; strict all-target
+Clippy, rustfmt and diff check PASS; Prometheus live exact catalog 1/1 PASS.
+
 Cleanup: PASS by disposable Docker teardown; public series deletion is N/A
 
 Commits: `7a6bbdd`, `932655d`, `b9dd9fd`, `167f89f`, `73b8180`, IF-T73 caller/docs commit

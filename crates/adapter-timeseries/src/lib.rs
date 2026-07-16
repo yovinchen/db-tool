@@ -1,12 +1,14 @@
 use dbtool_core::{
     dsn::Dsn,
     error::{Error, Result},
-    model::{series::Series, BoundedList, Point, SeriesSet, TimeRange, TimeSeriesReadBudget},
+    model::{
+        series::Series, BoundedList, Point, ReadBudget, SeriesSet, TimeRange, TimeSeriesReadBudget,
+    },
     port::{
         capability::TimeSeriesStore,
         connector::{Capabilities, CapabilityOperation, Connector, ConnectorKind},
     },
-    service::{ListLimiter, TimeSeriesReadLimiter},
+    service::{ListLimiter, ReadLimiter, TimeSeriesReadLimiter},
 };
 use futures::future::BoxFuture;
 use serde_json::{Map, Value as JsonValue};
@@ -84,6 +86,17 @@ impl TimeSeriesStore for PrometheusAdapter {
         let path = format!("/api/v1/label/__name__/values?limit={probe_items}");
         let response = self.client.request_json("GET", &path, None).await?;
         measurement_names_from_response_bounded(&response, limiter, probe_items)
+    }
+
+    async fn list_measurements_budgeted(&self, budget: ReadBudget) -> Result<BoundedList<String>> {
+        // Prometheus applies this limit before serializing the label-values
+        // response. The independent HTTP transport ceiling remains fixed at
+        // MAX_HTTP_RESPONSE_BODY_BYTES because the JSON envelope itself is not
+        // part of the caller-visible catalog byte budget.
+        let (limiter, probe_items) = prometheus_budgeted_catalog_plan(budget)?;
+        let path = format!("/api/v1/label/__name__/values?limit={probe_items}");
+        let response = self.client.request_json("GET", &path, None).await?;
+        measurement_names_from_response_budgeted(&response, limiter, probe_items)
     }
 
     async fn write_points(&self, points: Vec<Point>) -> Result<()> {
@@ -388,9 +401,47 @@ fn measurement_names_from_response_bounded(
     Ok(limiter.finish(names))
 }
 
+fn prometheus_budgeted_catalog_plan(budget: ReadBudget) -> Result<(ReadLimiter, usize)> {
+    let limiter = ReadLimiter::new(budget, "Prometheus measurement catalog response")?;
+    let probe_items = limiter.probe_items()?;
+    Ok((limiter, probe_items))
+}
+
+fn measurement_names_from_response_budgeted(
+    response: &JsonValue,
+    mut limiter: ReadLimiter,
+    probe_items: usize,
+) -> Result<BoundedList<String>> {
+    ensure_success(response)?;
+    let values = response
+        .get("data")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            Error::Serialization("prometheus label response data is not an array".into())
+        })?;
+
+    // The HTTP request already asks Prometheus for exactly N+1 values. Keep a
+    // defensive take here for servers that ignore the query parameter, then
+    // sort the bounded probe set to preserve the legacy catalog ordering.
+    let mut observed = Vec::with_capacity(probe_items.min(256));
+    for value in values.iter().take(probe_items) {
+        observed.push(value.as_str().map(str::to_owned).ok_or_else(|| {
+            Error::Serialization("prometheus metric name is not a string".into())
+        })?);
+    }
+    observed.sort();
+
+    let mut retained = Vec::with_capacity(observed.len().min(probe_items.saturating_sub(1)));
+    for name in observed {
+        limiter.retain_item(name, &mut retained)?;
+    }
+    limiter.finish(retained)
+}
+
 fn time_series_operations(capabilities: Capabilities) -> Vec<CapabilityOperation> {
     let mut operations = capabilities.operations();
     operations.push(CapabilityOperation::TimeSeriesListMeasurementsBounded);
+    operations.push(CapabilityOperation::TimeSeriesListMeasurementsBudgeted);
     operations.push(CapabilityOperation::TimeSeriesQueryRangeBounded);
     operations
 }
@@ -1057,7 +1108,74 @@ mod tests {
     }
 
     #[test]
-    fn prometheus_declares_only_its_verified_bounded_extensions() {
+    fn budgeted_measurement_names_count_items_probe_and_complete_envelope() {
+        let response = json!({
+            "status": "success",
+            "data": ["z_metric", "a_metric", "m_metric"]
+        });
+        let complete = BoundedList::complete(vec![
+            "a_metric".to_owned(),
+            "m_metric".to_owned(),
+            "z_metric".to_owned(),
+        ]);
+        let complete_bytes = serde_json::to_vec(&complete).unwrap().len();
+        let (limiter, probe_items) =
+            prometheus_budgeted_catalog_plan(ReadBudget::new(3, complete_bytes).unwrap()).unwrap();
+        assert_eq!(probe_items, 4);
+        assert_eq!(
+            measurement_names_from_response_budgeted(&response, limiter, probe_items).unwrap(),
+            complete
+        );
+
+        let (limiter, probe_items) =
+            prometheus_budgeted_catalog_plan(ReadBudget::new(3, complete_bytes - 1).unwrap())
+                .unwrap();
+        assert!(matches!(
+            measurement_names_from_response_budgeted(&response, limiter, probe_items),
+            Err(Error::ReadBudgetExceeded {
+                unit: "bytes",
+                limit,
+                ..
+            }) if limit == complete_bytes - 1
+        ));
+
+        let visible = BoundedList {
+            items: vec!["a_metric".to_owned(), "m_metric".to_owned()],
+            truncated: true,
+        };
+        let probe = "z_metric".to_owned();
+        let exact_truncated_bytes =
+            serde_json::to_vec(&visible).unwrap().len() + serde_json::to_vec(&probe).unwrap().len();
+        let (limiter, probe_items) =
+            prometheus_budgeted_catalog_plan(ReadBudget::new(2, exact_truncated_bytes).unwrap())
+                .unwrap();
+        assert_eq!(probe_items, 3);
+        assert_eq!(
+            measurement_names_from_response_budgeted(&response, limiter, probe_items).unwrap(),
+            visible
+        );
+    }
+
+    #[test]
+    fn budgeted_measurement_catalog_rejects_zero_and_overflow() {
+        assert!(matches!(
+            prometheus_budgeted_catalog_plan(ReadBudget {
+                max_items: 0,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            prometheus_budgeted_catalog_plan(ReadBudget {
+                max_items: usize::MAX,
+                max_bytes: 1,
+            }),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn prometheus_declares_only_its_verified_catalog_and_query_extensions() {
         let operations = time_series_operations(Capabilities {
             time_series: true,
             ..Default::default()
@@ -1065,6 +1183,7 @@ mod tests {
 
         assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurements));
         assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurementsBounded));
+        assert!(operations.contains(&CapabilityOperation::TimeSeriesListMeasurementsBudgeted));
         assert!(operations.contains(&CapabilityOperation::TimeSeriesQueryRangeBounded));
         assert!(!operations.contains(&CapabilityOperation::SearchListIndicesBounded));
     }
@@ -1298,6 +1417,9 @@ mod tests {
         assert!(adapter
             .operations()
             .contains(&CapabilityOperation::TimeSeriesQueryRangeBounded));
+        assert!(adapter
+            .operations()
+            .contains(&CapabilityOperation::TimeSeriesListMeasurementsBudgeted));
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1349,6 +1471,40 @@ mod tests {
             panic!("Prometheus did not expose the remote-write fixture: {last_observation}")
         });
         assert!(!complete.truncated);
+
+        let all_measurements = adapter.list_measurements().await.unwrap();
+        assert!(all_measurements.contains(&metric));
+        let measurement_count = all_measurements.len();
+        let expected_measurements = BoundedList::complete(all_measurements);
+        let measurement_bytes = serde_json::to_vec(&expected_measurements).unwrap().len();
+        let exact_measurements = adapter
+            .list_measurements_budgeted(
+                ReadBudget::new(measurement_count, measurement_bytes).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_measurements, expected_measurements);
+
+        let measurement_byte_error = adapter
+            .list_measurements_budgeted(
+                ReadBudget::new(measurement_count, measurement_bytes - 1).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            measurement_byte_error,
+            Error::ReadBudgetExceeded { unit, limit, .. }
+                if unit == "bytes" && limit == measurement_bytes - 1
+        ));
+
+        let measurement_probe = adapter
+            .list_measurements_budgeted(
+                ReadBudget::with_default_bytes(measurement_count - 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(measurement_probe.items.len(), measurement_count - 1);
+        assert!(measurement_probe.truncated);
 
         let series_probe = adapter
             .query_range_bounded(
