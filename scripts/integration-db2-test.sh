@@ -15,4 +15,4 @@ export DBTOOL_RUN_DB2_INTEGRATION=1
 # The IBM Data Server Driver for ODBC and CLI must be installed and the driver
 # must be registered in /etc/odbcinst.ini (Linux) or the system registry
 # (Windows) before running this test.
-cargo test -p dbtool-cli --features full --test live_services db2_live -- --nocapture
+cargo test -p dbtool-cli --no-default-features --features db2 --test live_services db2_live -- --nocapture

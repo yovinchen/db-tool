@@ -10,7 +10,7 @@ cassandra_table="$DBTOOL_IT_CASSANDRA_KEYSPACE.$cassandra_table_name"
 fixture_touched=0
 
 run_dbtool() {
-  cargo run -q -p dbtool-cli --features full -- "$@"
+  cargo run -q -p dbtool-cli --no-default-features --features cassandra -- "$@"
 }
 
 json_field() {

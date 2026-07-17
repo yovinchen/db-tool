@@ -12,6 +12,6 @@ fi
 
 export DBTOOL_RUN_CASSANDRA_INTEGRATION=1
 
-cargo test -p dbtool-cli --features full --test live_services cql_live -- --nocapture
-cargo test -p dbtool-cli --features full --test bounded_sql cql_live_streams_one_probe_row_for_paged_results -- --exact --nocapture
-cargo test -p dbtool-cli --features full --test live_bounded_cql -- --nocapture
+cargo test -p dbtool-cli --no-default-features --features cassandra --test live_services cql_live -- --nocapture
+cargo test -p dbtool-cli --no-default-features --features cassandra --test bounded_sql cql_live_streams_one_probe_row_for_paged_results -- --exact --nocapture
+cargo test -p dbtool-cli --no-default-features --features cassandra --test live_bounded_cql -- --nocapture

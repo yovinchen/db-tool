@@ -26,4 +26,4 @@ fi
 
 export DBTOOL_RUN_VENDOR_KAFKA_INTEGRATION=1
 
-cargo test -p dbtool-cli --no-default-features --features full-native --test live_messaging vendor_kafka_compatible_smoke_profiles -- --nocapture
+cargo test -p dbtool-cli --no-default-features --features messaging-native --test live_messaging vendor_kafka_compatible_smoke_profiles -- --nocapture

@@ -16,4 +16,4 @@ printf '%s\n' "==> sqlserver adapter budgets, catalog bounds, and protocol mappi
 cargo test -p adapter-sqlserver --lib -- --nocapture
 
 printf '%s\n' "==> sqlserver product lifecycle, typed values, bounded reads, and catalog metadata (live)"
-cargo test -p dbtool-cli --features full --test live_services sqlserver_live -- --nocapture
+cargo test -p dbtool-cli --no-default-features --features sqlserver --test live_services sqlserver_live -- --nocapture

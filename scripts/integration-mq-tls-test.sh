@@ -12,4 +12,4 @@ fi
 
 export DBTOOL_RUN_MQ_TLS_INTEGRATION=1
 
-cargo test -p dbtool-cli --features full --test live_messaging mq_tls_live -- --nocapture
+cargo test -p dbtool-cli --no-default-features --features messaging --test live_messaging mq_tls_live -- --nocapture

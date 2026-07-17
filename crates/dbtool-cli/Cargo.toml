@@ -19,6 +19,8 @@ portable = ["dbtool-registry/portable"]
 sqlserver = ["dbtool-registry/sqlserver"]
 cassandra = ["dbtool-registry/cassandra"]
 db2       = ["dbtool-registry/db2"]
+messaging = ["dbtool-registry/mq", "dbtool-registry/kafka"]
+messaging-native = ["dbtool-registry/mq", "dbtool-registry/kafka-native"]
 
 [dependencies]
 dbtool-core     = { path = "../dbtool-core" }
