@@ -12,4 +12,8 @@ fi
 
 export DBTOOL_RUN_SQLSERVER_INTEGRATION=1
 
+printf '%s\n' "==> sqlserver adapter budgets, catalog bounds, and protocol mapping (service-free)"
+cargo test -p adapter-sqlserver --lib -- --nocapture
+
+printf '%s\n' "==> sqlserver product lifecycle, typed values, bounded reads, and catalog metadata (live)"
 cargo test -p dbtool-cli --features full --test live_services sqlserver_live -- --nocapture
