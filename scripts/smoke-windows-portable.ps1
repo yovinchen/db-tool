@@ -43,3 +43,7 @@ if ($writeError.error.code -ne "WRITE_NOT_ALLOWED") {
 }
 
 Write-Output "dbtool portable Windows core smoke passed"
+
+# The expected rejected write above leaves PowerShell's native-command status
+# at a non-zero value. Return success explicitly after every assertion passes.
+exit 0
