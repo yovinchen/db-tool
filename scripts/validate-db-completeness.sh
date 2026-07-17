@@ -150,8 +150,26 @@ while IFS='|' read -r id family product schemes feature environment runner statu
   esac
 
   if [[ "$runner" == ./* ]]; then
-    runner_path="${runner%% *}"
-    [[ -x "$ROOT/${runner_path#./}" ]] || fail "$id runner is not executable: $runner_path"
+    IFS=',' read -r -a runner_paths <<<"$runner"
+    for runner_path in "${runner_paths[@]}"; do
+      [[ "$runner_path" == ./* ]] || fail "$id has an invalid runner path: $runner_path"
+      [[ -x "$ROOT/${runner_path#./}" ]] || fail "$id runner is not executable: $runner_path"
+    done
+  fi
+
+  if [[ "$feature" != "default" && "$runner" == ./* ]]; then
+    IFS=',' read -r -a feature_names <<<"$feature"
+    for feature_name in "${feature_names[@]}"; do
+      feature_found=0
+      for runner_path in "${runner_paths[@]}"; do
+        if grep -Fq -- "--features $feature_name" "$ROOT/${runner_path#./}"; then
+          feature_found=1
+          break
+        fi
+      done
+      ((feature_found == 1)) \
+        || fail "$id feature $feature_name is not used by its declared runner(s)"
+    done
   fi
 
   case "$status" in

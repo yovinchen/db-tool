@@ -95,4 +95,13 @@ awk '
 mv "$ledger_duplicate/tasks.next" "$ledger_duplicate/tasks.md"
 expect_fail ledger-duplicate-id "$ledger_duplicate" "duplicate task id DB-SQLITE-001 in task ledger"
 
+feature_mismatch="$(new_fixture feature-mismatch)"
+awk -F'|' '
+  BEGIN { OFS = "|" }
+  /^DB-DB2-001\|/ { $5 = "full" }
+  { print }
+' "$feature_mismatch/manifest" >"$feature_mismatch/manifest.next"
+mv "$feature_mismatch/manifest.next" "$feature_mismatch/manifest"
+expect_fail feature-mismatch "$feature_mismatch" "DB-DB2-001 feature full is not used by its declared runner(s)"
+
 echo "db completeness validator fixture tests passed"
