@@ -20,3 +20,5 @@ if [[ "${DBTOOL_IT_COMPAT_EXTRA:-0}" == "1" ]]; then
 fi
 
 cargo test -p dbtool-cli --test live_services compat_live -- --nocapture
+cargo test -p dbtool-cli --test kv_binary_raw \
+  redis_compatible_products_enforce_strict_scan_and_raw_contracts -- --exact --nocapture
