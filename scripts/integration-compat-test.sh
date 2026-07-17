@@ -22,3 +22,4 @@ fi
 cargo test -p dbtool-cli --test live_services compat_live -- --nocapture
 cargo test -p dbtool-cli --test kv_binary_raw \
   redis_compatible_products_enforce_strict_scan_and_raw_contracts -- --exact --nocapture
+cargo test -p dbtool-cli --test named_sql_atomic mariadb_named_product -- --nocapture

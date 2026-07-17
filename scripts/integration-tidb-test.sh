@@ -13,3 +13,4 @@ fi
 export DBTOOL_RUN_TIDB_INTEGRATION=1
 
 cargo test -p dbtool-cli --test live_services tidb_compat -- --nocapture
+cargo test -p dbtool-cli --test named_sql_atomic tidb_named_product -- --nocapture

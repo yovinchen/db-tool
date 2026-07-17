@@ -15,3 +15,4 @@ export DBTOOL_RUN_COCKROACH_COMPAT=1
 export DBTOOL_RUN_TIMESCALE_COMPAT=1
 
 cargo test -p dbtool-cli --test live_services pg_compat_live -- --nocapture
+cargo test -p dbtool-cli --test named_sql_atomic pg_compat_named_product -- --nocapture
