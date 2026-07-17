@@ -132,7 +132,7 @@ services:
 
   sqlserver:
     profiles: ["sqlserver"]
-    image: mcr.microsoft.com/mssql/server:${DBTOOL_IT_SQLSERVER_VERSION:-2022-latest}
+    image: mcr.microsoft.com/mssql/server:${DBTOOL_IT_SQLSERVER_VERSION:-2022-CU26-ubuntu-22.04}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-sqlserver
     platform: ${DBTOOL_IT_SQLSERVER_PLATFORM:-linux/amd64}
     hostname: dbtool-it-sqlserver
