@@ -12,6 +12,8 @@ fail() {
 cargo check -p dbtool-cli --no-default-features
 cargo check -p dbtool-cli
 cargo check -p dbtool-cli --no-default-features --features portable
+cargo check -p dbtool-cli --no-default-features --features messaging
+cargo check -p dbtool-cli --no-default-features --features messaging-native
 cargo check -p dbtool-cli --no-default-features --features full
 cargo check -p dbtool-cli --no-default-features --features full-native
 cargo check -p dbtool-tui --no-default-features
@@ -36,6 +38,24 @@ grep -Fq 'adapter-kafka feature "backend-native"' <<<"$native_tree" \
   || fail "full-native does not activate the native Kafka backend"
 if grep -Fq 'adapter-kafka feature "backend-pure"' <<<"$native_tree"; then
   fail "full-native unexpectedly activates the pure Kafka backend"
+fi
+
+messaging_tree="$(cargo tree -p dbtool-cli --no-default-features --features messaging -e features -i adapter-kafka)"
+grep -Fq 'adapter-kafka feature "backend-pure"' <<<"$messaging_tree" \
+  || fail "messaging does not activate the pure Kafka backend"
+messaging_normal_tree="$(cargo tree -p dbtool-cli --no-default-features --features messaging -e normal)"
+if grep -Fq 'adapter-kafka feature "backend-native"' <<<"$messaging_tree" \
+  || grep -Fq 'adapter-db2' <<<"$messaging_normal_tree"; then
+  fail "messaging unexpectedly activates Db2 or native Kafka"
+fi
+
+messaging_native_tree="$(cargo tree -p dbtool-cli --no-default-features --features messaging-native -e features -i adapter-kafka)"
+grep -Fq 'adapter-kafka feature "backend-native"' <<<"$messaging_native_tree" \
+  || fail "messaging-native does not activate the native Kafka backend"
+messaging_native_normal_tree="$(cargo tree -p dbtool-cli --no-default-features --features messaging-native -e normal)"
+if grep -Fq 'adapter-kafka feature "backend-pure"' <<<"$messaging_native_tree" \
+  || grep -Fq 'adapter-db2' <<<"$messaging_native_normal_tree"; then
+  fail "messaging-native unexpectedly activates Db2 or pure Kafka"
 fi
 
 portable_tree="$(cargo tree -p dbtool-cli --no-default-features --features portable -e normal)"
