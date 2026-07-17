@@ -84,9 +84,28 @@ Command: `./scripts/package-macos-arm64.sh`
 | macOS arm64 release binary | PASS | 34 portable schemes; version exact PASS | direct `--version` PASS |
 | `dbtool-v1.0.0-aarch64-apple-darwin.tar.gz` | PASS, 11,117,865 bytes | executable + completions + manpage | extracted runtime and SQLite core smoke PASS |
 | checksum sidecar | PASS | SHA-256 `e70dd45a6465a5ce3dad9c60ca1ab2594c4dbff9267ebe74b9c9f9bbe3b27447` | independent `shasum -a 256 -c` PASS |
-| official release workflow | YAML/validator PASS | native `macos-latest` ARM64 build, one archive and its SHA-256 sidecar | tag run remains the publication event |
+| official release workflow | PASS ([run 29556274392](https://github.com/yovinchen/db-tool/actions/runs/29556274392)) | native `macos-latest` ARM64 build, one archive and its SHA-256 sidecar | published as GitHub Pre-release `v1.0.0` |
 
 Release boundary: the current product decision intentionally publishes only
 Apple Silicon macOS. Linux, Windows, Intel Mac, npm, and Python generators remain
 available as optional tooling, but their absence from the official Release is
 intentional and no longer an incomplete release claim.
+
+## Published pre-release verification
+
+GitHub Pre-release [`v1.0.0`](https://github.com/yovinchen/db-tool/releases/tag/v1.0.0)
+was published from source commit `193d32e5b38a4dfd6c11342809497d7df79d52fd`
+after CI run `29556079528` completed all 11 required jobs successfully. Release
+run `29556274392` passed tag validation, native ARM64 build/runtime smoke,
+archive packaging/runtime smoke, checksum generation, and publication.
+
+The published assets were downloaded again from GitHub and verified independently:
+
+| Published asset check | Result |
+| --- | --- |
+| attached asset set | exactly one `.tar.gz` and one `.sha256`; no other platform or package asset |
+| archive size/digest | 10,912,066 bytes; SHA-256 `cc6831e788c518f7af5701478cc11698dc3d0c199daeeed3eb9a42ed3b45f44f` |
+| sidecar verification | `shasum -a 256 -c` PASS against the downloaded archive |
+| executable identity | Mach-O 64-bit `arm64` only; `lipo -archs` returned `arm64` |
+| executable version | exact `dbtool 1.0.0` PASS |
+| downloaded runtime | extracted archive passed the SQLite core flow |
