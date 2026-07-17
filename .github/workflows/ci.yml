@@ -594,6 +594,7 @@ jobs:
     env:
       DBTOOL_IT_PROJECT: dbtool-it-ci-db2
       DBTOOL_IT_DB2_PORT: 50000
+      LD_LIBRARY_PATH: /opt/ibm/db2odbc/lib
     steps:
       - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
@@ -613,11 +614,16 @@ jobs:
             -o /tmp/db2odbc.tar.gz
           mkdir -p /opt/ibm/db2odbc
           tar -xzf /tmp/db2odbc.tar.gz -C /opt/ibm/db2odbc --strip-components=1
+          test -r /opt/ibm/db2odbc/lib/libdb2.so
+          if ldd /opt/ibm/db2odbc/lib/libdb2.so | grep -q 'not found'; then
+            ldd /opt/ibm/db2odbc/lib/libdb2.so
+            exit 1
+          fi
           # Register driver with the system ODBC driver manager
           sudo tee -a /etc/odbcinst.ini >/dev/null <<EOF
           [IBM DB2 ODBC DRIVER]
           Description = IBM DB2 ODBC Driver
-          Driver      = /opt/ibm/db2odbc/lib/libdb2o.so
+          Driver      = /opt/ibm/db2odbc/lib/libdb2.so
           FileUsage   = 1
           EOF
           odbcinst -q -d
