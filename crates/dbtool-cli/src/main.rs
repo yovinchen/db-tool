@@ -1,11 +1,12 @@
 mod artifacts;
 mod cmd;
 
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use dbtool_core::config::LimitsConfig;
 use dbtool_core::model::{DEFAULT_INPUT_ITEM_BYTES, DEFAULT_READ_BYTES};
 use dbtool_core::service::{formatter::Format, FlowControl};
 use dbtool_registry::build_registry;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -29,6 +30,10 @@ struct Cli {
     /// Output format: json | table | ndjson
     #[arg(long, global = true, default_value = "json", value_enum)]
     format: OutputFormat,
+
+    /// Render command-line argument errors as one JSON object
+    #[arg(long, global = true)]
+    json_errors: bool,
 
     /// Maximum rows/messages to return (must be greater than zero)
     #[arg(long, global = true, default_value = "100")]
@@ -169,7 +174,7 @@ enum Commands {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
 
     if let Commands::GenerateArtifacts(cmd) = &cli.command {
         if let Err(err) = artifacts::write_cli_artifacts(Cli::command(), &cmd.out_dir) {
@@ -241,6 +246,42 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn parse_cli() -> Cli {
+    let json_errors = json_errors_requested(std::env::args_os().skip(1));
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if json_errors
+                && !matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
+        {
+            let exit_code = error.exit_code();
+            eprintln!("{}", render_cli_argument_error(&error));
+            std::process::exit(exit_code);
+        }
+        Err(error) => error.exit(),
+    }
+}
+
+fn json_errors_requested(args: impl IntoIterator<Item = OsString>) -> bool {
+    args.into_iter()
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--json-errors")
+}
+
+fn render_cli_argument_error(error: &clap::Error) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "CLI_ARGUMENT_ERROR",
+            "message": error.to_string().trim_end(),
+        }
+    })
+    .to_string()
 }
 
 fn mutation_timeout_subject(command: &Commands) -> Option<&'static str> {
