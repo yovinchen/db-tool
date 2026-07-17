@@ -599,8 +599,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install unixODBC (compile-time dependency for adapter-db2)
-        run: sudo apt-get install -y unixodbc-dev
+      - name: Install unixODBC (compile-time and driver-registration dependency)
+        run: sudo apt-get install -y libaio1t64 odbcinst unixodbc unixodbc-dev
 
       - name: Install IBM Data Server Driver for ODBC and CLI
         # Download the clidriver from IBM and register it with unixODBC.
