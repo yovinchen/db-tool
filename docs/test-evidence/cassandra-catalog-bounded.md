@@ -57,7 +57,8 @@ cargo clippy -p adapter-cassandra --all-targets -- -D warnings
 The live service was Apache Cassandra 5.0. The `scylla://` alias was exercised
 against the same Cassandra-compatible protocol endpoint; a native ScyllaDB
 product image was not started in this slice and is not represented as a
-separate vendor LIVE_PASS.
+separate vendor LIVE_PASS here. A later product-native run is recorded in
+[`scylladb.md`](scylladb.md).
 
 ## IF-T74 scalar-byte extension（2026-07-16）
 

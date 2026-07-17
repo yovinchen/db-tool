@@ -9,7 +9,7 @@ DB-TIMESCALE-001|sql|TimescaleDB|timescale|default|docker-pg-compat|./scripts/in
 DB-SQLSERVER-001|sql|SQL Server|sqlserver,mssql|full|docker-sqlserver|./scripts/integration-sqlserver-test.sh|BLOCKED|-|arm64 host; local image gate requires x86_64
 DB-REDSHIFT-001|sql|Amazon Redshift|redshift|default|external|./scripts/integration-redshift-test.sh|EXTERNAL|-|DBTOOL_IT_REDSHIFT_DSN is not supplied
 DB-CASSANDRA-001|cql|Apache Cassandra|cassandra|full|docker-cassandra|./scripts/integration-cassandra-test.sh + fixture|COMPLETE|docs/test-evidence/cassandra.md|Cassandra 5.0 single-node RF1; Scylla remains a separate alias-only task
-DB-SCYLLA-001|cql|ScyllaDB|scylla|full|alias-only|cargo test -p dbtool-core registry::alias|PARTIAL|-|no real ScyllaDB product profile
+DB-SCYLLA-001|cql|ScyllaDB|scylla|full|docker-scylla|./scripts/integration-scylla-test.sh|COMPLETE|docs/test-evidence/scylladb.md|ScyllaDB 2026.1.8 single-node developer-mode RF1 on arm64 Docker
 DB-DB2-001|sql|IBM Db2|db2,ibmdb2,as400|full|docker-db2-and-host-odbc|./scripts/integration-db2-test.sh|BLOCKED|-|IBM Db2 ODBC driver is not registered on the host
 DB-REDIS-001|kv|Redis|redis|default|docker-base|./scripts/integration-test.sh + roundtrip|COMPLETE|docs/test-evidence/redis.md|Redis 7.4.9 arm64 including atomic NX+TTL
 DB-VALKEY-001|kv|Valkey|valkey|default|docker-compat|./scripts/integration-compat-test.sh|COMPLETE|docs/test-evidence/valkey.md|Valkey 8.1.8 arm64 including atomic NX+TTL

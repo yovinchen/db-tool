@@ -251,6 +251,21 @@ the first connection can create it safely. It also uses
 `address-translator=contact-point` so the Rust CQL driver translates
 Docker-internal broadcast addresses back to the published host port.
 
+ScyllaDB has a separate product-native profile; it is not inferred from the
+Cassandra alias probe:
+
+```bash
+./scripts/integration-scylla-test.sh
+```
+
+The Scylla script starts the official multi-architecture
+`scylladb/scylla:2026.1.8` image in a bounded one-shard developer topology,
+uses `scylla://`, runs the complete shared SQL-compatible/CQL CRUD and typed
+value lifecycle, result/catalog budgets, exact mutation input budget, and then
+removes the container and network. It defaults the database process to 384 MiB
+so it remains runnable in constrained local Docker VMs; override
+`DBTOOL_IT_SCYLLA_DB_MEMORY` for a larger test environment.
+
 Run the Cassandra fixture-data smoke when you need reusable file-backed CQL
 seed data instead of only lifecycle-generated rows:
 
@@ -528,6 +543,16 @@ DBTOOL_IT_CASSANDRA_PORT=39042 \
 ./scripts/integration-cassandra-test.sh
 ```
 
+ScyllaDB settings are independent from Cassandra:
+
+```bash
+DBTOOL_IT_PROJECT=my-dbtool-scylla-run \
+DBTOOL_IT_SCYLLA_KEYSPACE=my_scylla_ks \
+DBTOOL_IT_SCYLLA_PORT=49042 \
+DBTOOL_IT_SCYLLA_DB_MEMORY=768M \
+./scripts/integration-scylla-test.sh
+```
+
 TiDB service settings follow the same pattern:
 
 ```bash
@@ -714,6 +739,7 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_redshift` can run `./scripts/integration-redshift-test.sh` when a Redshift DSN is supplied through repository secrets.
 - `run_live_sqlserver` runs `./scripts/integration-sqlserver-test.sh` for SQL Server/TDS coverage.
 - `run_live_cassandra` runs `./scripts/integration-cassandra-test.sh` for Cassandra/CQL coverage.
+- `run_live_scylla` runs `./scripts/integration-scylla-test.sh` against the product-native ScyllaDB image.
 - `run_live_tidb` runs `./scripts/integration-tidb-test.sh` for TiDB through a local PD/TiKV/TiDB topology.
 - `run_live_tidb_secure` runs `./scripts/integration-tidb-secure-test.sh` for TiDB auth/TLS/HA coverage.
 - `run_live_tidb_ha_drill` runs `./scripts/integration-tidb-ha-drill.sh` for SQL-node failover on the secure HA topology.

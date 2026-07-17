@@ -58,7 +58,7 @@ and test-hardening commits remain listed inside each evidence file.
 | DB-SQLSERVER-001 | SQL | SQL Server `sqlserver://` | Docker sqlserver | Ready | BLOCKED | - | `325aa3c` exact execute service-free PASS; local host is arm64 and image gate requires x86_64 |
 | DB-REDSHIFT-001 | SQL | Redshift `redshift://` | external | Ready | EXTERNAL | - | `DBTOOL_IT_REDSHIFT_DSN` is not supplied |
 | DB-CASSANDRA-001 | CQL | Cassandra `cassandra://` | Docker cassandra | Ready | COMPLETE | `docs/test-evidence/cassandra.md` | `6fcd23c`, `94f3ffb`, IF-T78 exact CQL + SQL-compatible write/keyspace cleanup refresh |
-| DB-SCYLLA-001 | CQL | ScyllaDB `scylla://` | compatible alias only | Ready | PARTIAL | - | no real ScyllaDB product profile |
+| DB-SCYLLA-001 | CQL | ScyllaDB `scylla://` | Docker scylla | Ready | COMPLETE | `docs/test-evidence/scylladb.md` | `336f4bd`; real ScyllaDB 2026.1.8 arm64 CRUD/types/bounds/input-budget/cleanup |
 | DB-DB2-001 | SQL/Db2 | IBM Db2 `db2://` | Docker db2 + host ODBC | Ready | BLOCKED | - | `b89f222` exact execute service-free PASS; IBM Db2 ODBC driver is not registered on the host |
 | DB-REDIS-001 | KV/cache | Redis `redis://` | Docker base | Ready | COMPLETE | `docs/test-evidence/redis.md` | `cfbb998`, IF-T78 exact SET/restore/DEL/raw mutation refresh |
 | DB-VALKEY-001 | KV/cache | Valkey `valkey://` | Docker compat | Ready | COMPLETE | `docs/test-evidence/valkey.md` | `1ceffc8`, `29b3126`, IF-T64; atomic NX+TTL and v3 absolute-expiry artifact lifecycle refreshed |

@@ -13,6 +13,7 @@ namespace. Credentials were read inside their containers and were not printed.
 | PostgreSQL 16 | public tables matching `^dbtool_it_` | 0 |
 | MySQL 8 | current-database tables matching `^dbtool_it_` | 0 |
 | Cassandra 5 | `dbtool_it_cassandra` harness keyspace | keyspace retained intentionally; 0 tables |
+| ScyllaDB 2026.1.8 | per-run `dbtool_it_*` keyspaces/tables | all dropped; container and network removed |
 | Redis 7 | keys matching `dbtool_it_*` | 0 |
 | MongoDB 7 | collections matching `dbtool_it_*` | 0 |
 | OpenSearch 2.17.1 | indices matching `dbtool-it-*` | 0 |
@@ -36,5 +37,11 @@ tests verified table absence before removing those files.
 Valkey, KeyDB, Dragonfly, MariaDB, TiDB, CockroachDB, TimescaleDB, TLS profiles,
 and fixture-image profiles were not restarted solely for this final inventory;
 their product-specific cleanup evidence remains in their existing evidence
-files. SQL Server, Db2, Redshift, real ScyllaDB, and vendor Kafka endpoints keep
+files. SQL Server, Db2, Redshift, and vendor Kafka endpoints keep
 their declared external/runtime boundaries.
+
+ScyllaDB addendum (2026-07-17T16:31:05Z): the product-native ARM64 run created
+SQL-compatible, native CQL, typed-value, bounded-catalog, and exact-mutation
+resources only in disposable `dbtool_it_*` namespaces. Each test asserted
+table/keyspace absence after cleanup, and the shared down path removed the
+ScyllaDB container and Compose network. Evidence: [`scylladb.md`](scylladb.md).

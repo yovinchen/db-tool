@@ -69,6 +69,8 @@ require_executable "scripts/integration-opensearch-security-test.sh"
 require_executable "scripts/integration-kafka-vendor-test.sh"
 require_executable "scripts/integration-redshift-test.sh"
 require_executable "scripts/integration-db2-test.sh"
+require_executable "scripts/integration-scylla-up.sh"
+require_executable "scripts/integration-scylla-test.sh"
 require_executable "scripts/integration-mq-test.sh"
 require_executable "scripts/integration-mq-native-test.sh"
 require_executable "scripts/integration-mq-tls-test.sh"
@@ -177,7 +179,7 @@ require_pattern "crates/dbtool-registry/tests/embedded_library.rs" "FlowControl"
 require_pattern "crates/dbtool-tui/src/state.rs" "CommandFormState"
 require_pattern "crates/dbtool-tui/src/app.rs" "pending_write"
 
-if grep -Ev '^\| IF-T43–IF-T79 Interface completion campaign ' "$ROOT/docs/tasks.md" \
+if grep -Ev '^\| IF-T43–IF-T80 Interface completion campaign ' "$ROOT/docs/tasks.md" \
   | grep -Eq 'Pending|In progress|Deferred|\[ \]'; then
   fail "docs/tasks.md still contains an unfinished implementation task marker"
 fi
@@ -201,8 +203,8 @@ require_no_pattern "docs/extended-backends.md" 'A future `CqlEngine` can be adde
 require_pattern "docs/final-goal-audit.md" "The repo satisfies the original dbtool baseline objective"
 require_pattern "docs/final-goal-audit.md" "Product-specific production-readiness exercises remain explicit boundaries"
 require_pattern "docs/final-goal-audit.md" "Active Interface Completion Campaign"
-require_pattern "docs/final-goal-audit.md" "22 tasks are"
-require_pattern "docs/tasks.md" "IF-T43–IF-T79 Interface completion campaign"
+require_pattern "docs/final-goal-audit.md" "23 tasks are"
+require_pattern "docs/tasks.md" "IF-T43–IF-T80 Interface completion campaign"
 require_pattern "docs/interface-completion-tasks.zh-CN.md" "IF-T43 SQL 参数绑定"
 require_pattern "docs/interface-completion-tasks.zh-CN.md" "IF-T55 CLI/发布严格性"
 require_pattern "docs/implementation-status.md" "export sql"

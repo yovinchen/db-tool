@@ -39,10 +39,11 @@ Defects found and fixed:
 - Commit `8ca3908` makes the live and fixture suites validate every resource and
   every expected stored value, then prove explicit removal.
 
-Scylla boundary: the `scylla://` scheme was routed against the same Cassandra
-server as an alias compatibility probe. No ScyllaDB image or real ScyllaDB node
-was used, so task `DB-SCYLLA-001` remains PARTIAL and is not included in this
-Cassandra completion claim.
+Scylla boundary for this historical Cassandra run: the `scylla://` scheme was
+routed against the same Cassandra server as an alias compatibility probe. No
+ScyllaDB image was used in this slice, so it is not included in the Cassandra
+claim. Product-native ScyllaDB was subsequently completed separately in
+[`scylladb.md`](scylladb.md).
 
 Other boundaries: the adapter currently uses an unpaged driver query before
 the legacy unlimited result path, while exact `query_cql_budgeted` uses a
@@ -66,7 +67,8 @@ post-dispatch error is `OUTCOME_INDETERMINATE`.
 
 Verification: adapter-cassandra 14/14 PASS; Docker exact CQL lifecycle 1/1
 PASS; strict Clippy, rustfmt, and diff check PASS. Implementation commit:
-`6fcd23c`. Real ScyllaDB remains a separate PARTIAL boundary.
+`6fcd23c`. Real ScyllaDB remains a separate product claim; its later LIVE_PASS
+is recorded in [`scylladb.md`](scylladb.md).
 
 SQL-compatible exact follow-up run (UTC): 2026-07-16T12:22:19Z. Cassandra now
 also advertises `sql.execute_budgeted`; both public SQL compatibility and native

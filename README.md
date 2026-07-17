@@ -5,10 +5,11 @@ dbtool is a Rust workspace for a unified data and message connection tool. The c
 ## Current Status
 
 The core, CLI, independent TUI, registered adapters, Docker integration paths,
-and release packaging are implemented. Method-level capability negotiation and
-top-level bounded catalogs are complete. Current work is limited to nested
-metadata bounds, cross-platform artifact replacement, external-product
-evidence, and final full-feature packaging verification.
+and macOS ARM64 release packaging are implemented. Method-level capability
+negotiation, nested metadata bounds, and bounded catalogs are complete. Current
+work is limited to current-SHA Windows ARM64 evidence, externally supplied
+product environments, and distribution targets beyond the selected macOS ARM64
+release.
 
 - `dbtool-core` owns stable models, ports, exact operation names, DSN/config,
   safety, limits, formatting, and connection management.
@@ -472,7 +473,7 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
 - Prometheus HTTP time-series adapter: implemented for bounded metric listing,
   range queries, and remote write; Prometheus still has no portable row-style
   update/delete contract.
-- SQL Server and Cassandra/ScyllaDB adapters: implemented and registered, with service-free adapter coverage plus opt-in Docker integration profiles; Cassandra has passed local live coverage, and SQL Server has passed live coverage on GitHub Actions x86_64 runners.
+- SQL Server and Cassandra/ScyllaDB adapters: implemented and registered, with service-free adapter coverage plus opt-in Docker integration profiles; Cassandra 5 and product-native ScyllaDB 2026.1.8 have passed local live coverage, and SQL Server has passed live coverage on GitHub Actions x86_64 runners.
 - Kafka adapter: pure Rust ping/list/detail/produce/consume is included by
   `portable` and `full`; native librdkafka is selected by `full-native`.
 - Redis Streams/PubSub, AMQP, and NATS adapters: real bounded producer/consumer paths implemented; AMQPS and NATS TLS live paths, NATS JetStream admin, and RabbitMQ management-backed queue discovery are implemented.
@@ -485,5 +486,5 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
 The detailed current matrix is in
 [docs/implementation-status.md](docs/implementation-status.md). The Chinese
 [interface task table](docs/interface-completion-tasks.zh-CN.md) distinguishes
-completed top-level catalogs from remaining nested-metadata bounds and external
-runtime blockers.
+completed interface contracts from current-SHA cross-platform evidence and
+external runtime blockers.

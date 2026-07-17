@@ -35,7 +35,8 @@ usable.
 | IBM Db2 | `db2://` | Db2 ODBC | `ping`, `sql query`, `sql exec`, `sql tables`, `sql schema`, `db2 schemas`, `db2 tables`, `db2 schema`, `db2 sequences`, `db2 routines`, `db2 tablespaces`, `db2 foreign-keys`, `db2 ddl` | Service-free adapter tests; live integration guarded by `DBTOOL_RUN_DB2_INTEGRATION=1` |
 | IBM Db2 alias | `ibmdb2://`, `as400://` | Db2 ODBC | Same as Db2 adapter | Registry alias test only |
 | SQL Server | `sqlserver://`, `mssql://` | SQL Server/TDS | SQL query/exec/tables/schema, typed scalar values, result limiting | Service-free adapter tests plus real SQL Server Docker live test on GitHub Actions x86_64 runner |
-| Cassandra/ScyllaDB | `cassandra://`, `scylla://` | CQL | `ping`, page-bounded `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema`, SQL-compatible CQL path, primitive/collection typed values | Cassandra 5.0.8 Docker paged limit+1/exact-limit tests plus lifecycle |
+| Cassandra | `cassandra://` | CQL | `ping`, page-bounded `cql query`, `cql exec`, `cql keyspaces`, `cql tables`, `cql schema`, SQL-compatible CQL path, primitive/collection typed values | Cassandra 5.0.8 Docker paged limit+1/exact-limit tests plus lifecycle |
+| ScyllaDB | `scylla://` | CQL | Same bounded CQL and SQL-compatible surface through the shared adapter | Product-native ScyllaDB 2026.1.8 ARM64 Docker CRUD, 12 typed values, catalog/result budgets, exact mutation budget, and cleanup |
 | MySQL | `mysql://` | SQL | adapter-bounded parameterized query, exec/tables/schema; scalar/bytes/datetime/json binding; transactional-engine atomic artifact import | MySQL 8.4.9 Docker recursive large-result bound, full parameter/rollback lifecycle, and zero-write MyISAM rejection |
 | MariaDB | `mariadb://` | SQL | MySQL-family SQL lifecycle, typed values, result limiting | Real MariaDB compatibility live test |
 | TiDB | `tidb://` | SQL | MySQL-family SQL lifecycle, typed values, table listing, schema-qualified tables | Real PD/TiKV/TiDB live test |
@@ -82,6 +83,7 @@ usable.
 | `./scripts/integration-redshift-test.sh` | Externally supplied Redshift endpoint | Env-gated SQL lifecycle, typed values, result limiting, table listing, and schema inspection; no secrets are committed | Skips when `DBTOOL_IT_REDSHIFT_DSN` is not supplied |
 | `./scripts/integration-sqlserver-test.sh` | SQL Server | TDS SQL lifecycle, typed values, limiting, tables, and schema | Passed on GitHub Actions x86_64 runner; requires amd64-capable Docker locally; roughly 2 GiB container memory |
 | `./scripts/integration-cassandra-test.sh` | Cassandra | CQL lifecycle, keyspace-qualified tables, schema inspection, typed values, paged limit+1 and exact-limit reads | Roughly 2 GiB container memory; startup can be slow |
+| `./scripts/integration-scylla-test.sh` | ScyllaDB | Product-native CQL/SQL-compatible CRUD, typed values, result/catalog bounds, exact mutation budget, and cleanup | Official multi-arch image; defaults to one shard and 384 MiB database memory for bounded local runs |
 | `./scripts/integration-cassandra-fixture-data-test.sh` | Cassandra | File-backed reusable CQL fixture loading, seeded row readback, table listing, and schema inspection | Roughly 2 GiB container memory; heavy/local-only while CI budget is frozen |
 | `./scripts/integration-tidb-test.sh` | PD, TiKV, TiDB | Real TiDB compatibility | Roughly 1.75 GiB container memory |
 | `./scripts/integration-tidb-secure-test.sh` | 3 PD, 2 TiKV, 2 TiDB SQL | TiDB auth/TLS/local HA | Roughly 3.75 GiB container memory |
