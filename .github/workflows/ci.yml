@@ -112,6 +112,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Db2 link dependency
+        run: sudo apt-get install -y unixodbc-dev
+
       - name: Verify
         run: ./scripts/verify.sh
 
