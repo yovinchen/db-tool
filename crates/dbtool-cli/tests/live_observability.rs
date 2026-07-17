@@ -424,6 +424,27 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str, full_crud:
         }
     }
 
+    let expected_fixture_rows = vec![
+        (
+            "alice".to_owned(),
+            "search-reader".to_owned(),
+            "dbtool-live-fixture".to_owned(),
+        ),
+        (
+            "bob".to_owned(),
+            if full_crud {
+                "search-editor".to_owned()
+            } else {
+                "search-writer".to_owned()
+            },
+            "dbtool-live-fixture".to_owned(),
+        ),
+        (
+            "carol".to_owned(),
+            "search-reviewer".to_owned(),
+            "dbtool-live-fixture".to_owned(),
+        ),
+    ];
     let hits = stdout_json_retry(
         &[
             "--dsn",
@@ -442,6 +463,7 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str, full_crud:
                 && value["data"]["hits"]
                     .as_array()
                     .is_some_and(|hits| hits.len() == 3)
+                && search_fixture_rows(value) == expected_fixture_rows
         },
     );
     assert_eq!(hits["data"]["total"], 3);
@@ -460,30 +482,7 @@ fn run_search_lifecycle(dsn: &str, expected_kind: &str, prefix: &str, full_crud:
             3
         );
     }
-    assert_eq!(
-        search_fixture_rows(&hits),
-        vec![
-            (
-                "alice".to_owned(),
-                "search-reader".to_owned(),
-                "dbtool-live-fixture".to_owned()
-            ),
-            (
-                "bob".to_owned(),
-                if full_crud {
-                    "search-editor".to_owned()
-                } else {
-                    "search-writer".to_owned()
-                },
-                "dbtool-live-fixture".to_owned()
-            ),
-            (
-                "carol".to_owned(),
-                "search-reviewer".to_owned(),
-                "dbtool-live-fixture".to_owned()
-            ),
-        ]
-    );
+    assert_eq!(search_fixture_rows(&hits), expected_fixture_rows);
 
     let byte_limited_search = stderr_json(dbtool(&[
         "--dsn",
