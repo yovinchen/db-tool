@@ -125,8 +125,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install unixODBC (needed by adapter-db2)
-        run: sudo apt-get install -y unixodbc-dev
+      - name: Install native adapter build dependencies
+        run: sudo apt-get install -y libcurl4-openssl-dev unixodbc-dev
 
       - name: Format check
         run: cargo fmt --all -- --check
