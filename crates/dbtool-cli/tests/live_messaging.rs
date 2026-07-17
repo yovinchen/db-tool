@@ -723,7 +723,15 @@ fn run_kafka_smoke(
         produced_offset.parse::<i64>().unwrap()
     );
 
-    if cfg!(feature = "full-native") {
+    let caps = stdout_json(dbtool(&["--dsn", dsn, "caps"]));
+    let supports_consumer_lag = caps["data"]["operations"]
+        .as_array()
+        .is_some_and(|operations| {
+            operations
+                .iter()
+                .any(|value| value == "message.admin.consumer_lag_bounded")
+        });
+    if supports_consumer_lag {
         let lag = stdout_json(dbtool(&["--dsn", dsn, "mq", "lag", "dbtool"]));
         assert!(lag["data"].is_array());
     } else {
