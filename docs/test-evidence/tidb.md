@@ -17,6 +17,7 @@ Resource operations:
 | Resource | Create | Insert/write | Read all fixture data | Update | Targeted delete | Metadata | Guard | Limit | Cleanup |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `dbtool_it_tidb.dbtool_it_tidb_users_37569_1784056703875` | database-qualified table + PK PASS | rows `(1,alice)`, `(2,bob)` 2/2 PASS | IDs `1,2`, names exact 2/2 PASS | ID 1 became `alice-updated` PASS | ID 2 removed; ID 1 remained PASS | schemas, table, columns, non-null PK and primary index PASS | INSERT without write permission blocked; CREATE/DROP and unbounded DELETE required confirmation PASS | typed int/float/binary/null and limit 2/truncated PASS | table absent after DROP; database and volume removed PASS |
+| `dbtool_it_tidb.dbtool_it_tidb_atomic_*` | InnoDB table + PK PASS | public bound-parameter import inserted 2/2 with `atomic=true` PASS | SQL-like text and both rows exact PASS | late duplicate key rejected and entire attempted batch rolled back PASS | N/A | atomic import exact operation advertised PASS | import required write permission PASS | row set stayed exactly 2 after failure PASS | table and artifacts removed PASS |
 | `dbtool_it_tidb_secure.dbtool_it_tidb_secure_node1_51191_1784057225492` | TLS node-1 table + PK PASS | 2/2 rows PASS | all rows exact PASS | ID 1 updated PASS | ID 2 removed PASS | schema/PK/index PASS | wrong/no TLS rejected; write and confirmation guards PASS | typed values and truncation PASS | table absent; secure volume removed PASS |
 | `dbtool_it_tidb_secure.dbtool_it_tidb_secure_node2_51191_1784057226283` | TLS node-2 table + PK PASS | 2/2 rows PASS | all rows exact PASS | ID 1 updated PASS | ID 2 removed PASS | schema/PK/index PASS | password-authenticated TLS; write/confirmation guards PASS | typed values and truncation PASS | table absent; secure volume removed PASS |
 | `dbtool_it_tidb_secure.dbtool_it_tidb_x509_51191_1784057227836` | X.509 user table + PK PASS | 2/2 rows PASS | all rows exact PASS | ID 1 updated PASS | ID 2 removed PASS | schema/PK/index PASS | client certificate required; write/confirmation guards PASS | typed values and truncation PASS | table absent; secure volume removed PASS |
@@ -77,4 +78,4 @@ load behavior, or online certificate rotation.
 
 Cleanup: PASS
 
-Commits: `974886f`, `c2fc4ec`, `5edf95a`, `b8fa88c`, `0aae9a3`, `5469d52`, `a8388ae`, `d7b18cc`, `2e38e41`, `961b173`, `4c2faa8`
+Commits: `974886f`, `c2fc4ec`, `5edf95a`, `b8fa88c`, `0aae9a3`, `5469d52`, `a8388ae`, `d7b18cc`, `2e38e41`, `961b173`, `4c2faa8`, `152dc18`

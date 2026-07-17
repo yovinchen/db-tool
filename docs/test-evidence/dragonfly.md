@@ -21,6 +21,7 @@ Resource operations:
 | `dbtool_it_dragonfly_39084_1784059954924:nx` | atomic NX+TTL SET `created-once` PASS | GET exact PASS | second NX rejected; value unchanged PASS | TTL 1..30 PASS | unmet condition returned explicit error | included in DEL 4/4 PASS | GET null PASS |
 | `dbtool_it_dragonfly_39084_1784059954924:raw` | raw SET `raw-value` PASS | GET exact PASS | N/A | raw command PASS | raw SET without write permission blocked; limit 2/truncated PASS | included in DEL 4/4 PASS | GET null and prefix SCAN empty PASS |
 | `dbtool_it_artifact_*:{source,target}:*` | v3 source/target persistent, binary, empty, long and expired keys PASS | exact bytes plus persistent/absolute expiry PASS | expiry-bound confirmed replacement PASS | long deadline not extended; expired entry skipped without SET PASS | integer-array `TIME` handled without string coercion; v2/missing expiry rejected before DSN PASS | bounded explicit cleanup PASS | source and target scans both `[]` PASS |
+| `dbtool_it_kv_strict_dragonfly_*` | 25 scan keys, binary-key fixture and two-entry binary Stream PASS | full 25-key multi-page SCAN and recursive XRANGE bytes exact PASS | N/A | unknown plus KEYS/SCAN/HGETALL RAW rejected; non-UTF8 key returned serialization error PASS | limit 24 returned 24 + truncated; XRANGE over global limit rejected PASS | DEL reported 26/26 PASS | prefix SCAN empty PASS |
 
 Assertions: real Dragonfly product connection/capability, every value,
 overwrite, atomic NX+TTL and conflict retention, raw read/write policy, bounded
@@ -30,4 +31,4 @@ restore, and no expired-key revival.
 
 Cleanup: PASS
 
-Commits: `f1be977`, `74a4907`, `19a3527`, `1ceffc8`, `29b3126`, IF-T64
+Commits: `f1be977`, `74a4907`, `19a3527`, `1ceffc8`, `29b3126`, `1e82951`, IF-T64

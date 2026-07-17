@@ -17,15 +17,16 @@ Resource operations:
 | Resource | Create | Insert/write | Read all fixture data | Update | Targeted delete | Metadata | Guard | Limit | Cleanup |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `dbtool_it_timescale_users_27514_1784056484633` | table + PK PASS | rows `(1,alice)`, `(2,bob)` 2/2 PASS | IDs `1,2`, names exact 2/2 PASS | ID 1 became `alice-updated` PASS | ID 2 removed; ID 1 remained PASS | schemas, table, columns, non-null PK and primary index PASS | INSERT without write permission blocked; CREATE/DROP and unbounded DELETE required confirmation PASS | typed int/float/bool/text/null and limit 2/truncated PASS | table absent after DROP; volume removed PASS |
+| `dbtool_it_timescale_atomic_*` | table + PK PASS | public bound-parameter import inserted 2/2 with `atomic=true` PASS | SQL-like text and both rows exact PASS | late duplicate key rejected and entire attempted batch rolled back PASS | N/A | atomic import exact operation advertised PASS | import required write permission PASS | row set stayed exactly 2 after failure PASS | table and artifacts removed PASS |
 
 Assertions: the real TimescaleDB image accepted the `timescale://` scheme via
 the PostgreSQL protocol adapter and passed every advertised SQL checklist item.
 
 Product boundary: dbtool currently exposes generic SQL, not a TimescaleDB
 hypertable or continuous-aggregate capability. Extension-specific DDL, time
-bucket queries, retention policies, TLS, and a product-specific export/import
-rerun are therefore not claimed by this completion record.
+bucket queries, retention policies, and TLS are therefore not claimed. Generic
+SQL atomic import and late-failure rollback are now product-tested.
 
 Cleanup: PASS
 
-Commits: `642bfd9`, `974886f`, `c2a77fe`
+Commits: `642bfd9`, `974886f`, `c2a77fe`, `152dc18`
