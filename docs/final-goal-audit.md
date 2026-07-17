@@ -1,6 +1,6 @@
 # dbtool Final Goal Audit
 
-Last updated: 2026-07-16
+Last updated: 2026-07-17
 
 This audit maps the final objective to current, repo-verifiable evidence. It is
 not a replacement for optional live Docker drills, but it proves the codebase has
@@ -14,8 +14,9 @@ The repo satisfies the original dbtool baseline objective at the project level:
 - one shared Rust core supports CLI/Claude Skill, TUI, and embedded-library use;
 - adapters are registered by protocol family and reuse aliases for compatible
   products;
-- release packaging targets Linux, macOS, and Windows on x64 and arm64;
-- npm, pip/uv, and mise install paths are present;
+- the official release packages one native Apple Silicon macOS ARM64 archive;
+- generic npm, pip/uv, mise, and multi-target package generators remain present
+  as optional tooling;
 - connection resolution supports raw DSNs, named connections, and
   `DBTOOL_CONN_*`;
 - default safety is read-first with explicit write gates, destructive confirm
@@ -37,13 +38,13 @@ board is [interface-completion-tasks.zh-CN.md](interface-completion-tasks.zh-CN.
 It tracks declared-interface gaps, Cargo feature correctness, TUI safety, CLI
 strictness, packaging/install smoke, and explicit external boundaries.
 
-Current interface result: IF-T43–50, IF-T53–67, and IF-T69–79 are complete
-(34 tasks). The declared read, write, catalog, configuration, CLI/TUI, and
-legacy-API contracts are implemented. The remaining three tasks are release or
-external evidence gates rather than hidden adapter fallbacks: IF-T51's final
-macOS arm64 gate passed and only the six-platform CI matrix remains; IF-T52
-requires unavailable product runtimes/DSNs; IF-T68 requires current-SHA Windows
-x64 runtime plus arm64 compile/link evidence.
+Current interface result: IF-T43–51, IF-T53–67, and IF-T69–79 are complete
+(35 tasks). The declared read, write, catalog, configuration, CLI/TUI, and
+legacy-API contracts are implemented. The remaining two tasks are release or
+external evidence gates rather than hidden adapter fallbacks: IF-T52 requires
+unavailable product runtimes/DSNs; IF-T68 requires current-SHA Windows x64
+runtime plus arm64 compile/link evidence but does not block the macOS-only
+release.
 
 ## Requirement Evidence
 
@@ -56,10 +57,10 @@ x64 runtime plus arm64 compile/link evidence.
 | Protocol-family reuse | `crates/dbtool-core/src/registry/alias.rs` maps compatible schemes to canonical families including MySQL/MariaDB/TiDB, PostgreSQL/Cockroach/Timescale/Redshift, Redis/Valkey/KeyDB/Dragonfly, Kafka/AutoMQ/Redpanda/WarpStream/Confluent, and OpenSearch/Elasticsearch; external Redshift and Kafka vendor smokes verify supplied non-local endpoints without committing secrets. |
 | SQL, CQL, NoSQL, search, time-series coverage | SQL, Cassandra/ScyllaDB CQL, Redis-compatible KV, MongoDB documents, OpenSearch/Elasticsearch search, and Prometheus time-series adapters are implemented and listed in `docs/implementation-status.md`; public export/import commands cover logical SQL row, KV, and document transfers, while OpenSearch security-plugin TLS and product-native Elasticsearch have opt-in live profiles. |
 | Messaging coverage | Kafka/Redpanda-compatible, env-gated AutoMQ/WarpStream/Confluent vendor smoke, AMQP/RabbitMQ, Redis Streams/PubSub, RabbitMQ management, and NATS/JetStream coverage are implemented and documented. |
-| Cross-platform release | `.github/workflows/release.yml`, `scripts/package-release.sh`, `scripts/package-npm.mjs`, `scripts/package-python-wheel.py`, and `dist/mise/README.md` all list Linux musl, macOS, and Windows targets for x64 and arm64. |
+| Selected release target | `.github/workflows/release.yml` builds and runs only `aarch64-apple-darwin` on a native GitHub macOS ARM64 runner; `scripts/package-macos-arm64.sh` reproduces the single archive locally. |
 | Single binary artifact | Release archives contain `dbtool` or `dbtool.exe`; `scripts/smoke-binary.sh` and `scripts/smoke-release-artifacts.sh` validate packaged binaries. |
-| Completion and manpage artifacts | `dbtool generate-artifacts` emits bash/zsh/fish completions and `dbtool.1` from clap metadata; release, npm, and Python package scripts include those files. |
-| npm / pip / uv / mise install paths | `dist/npm`, `scripts/package-npm.mjs`, `dist/python`, `scripts/package-python-wheel.py`, and `dist/mise/README.md` provide wrapper packages and mise/ubi metadata. |
+| Completion and manpage artifacts | `dbtool generate-artifacts` emits bash/zsh/fish completions and `dbtool.1` from clap metadata; the official macOS ARM64 archive includes those files. |
+| Optional package generators | `dist/npm`, `scripts/package-npm.mjs`, `dist/python`, `scripts/package-python-wheel.py`, and `dist/mise/README.md` remain available without expanding the official single-asset release. |
 | Environment connections | `ConnectionResolver` handles raw DSNs, named config, and `DBTOOL_CONN_*`; `docs/connections.example.toml` documents named connection config. |
 | Read-only default | CLI tests cover write refusal before connection for search and time-series writes; SQL safety tests cover read/write/destructive classification. |
 | Destructive confirmation | `SafetyGuard` issues target-bound confirm tokens for destructive SQL; CLI JSON tests cover two-step confirmation. |

@@ -1,11 +1,12 @@
 # Release Feature And Packaging Evidence
 
-Result: LOCAL_HOST_FINAL_PASS_WITH_STRICT_CROSS_TARGET_BOUNDARY
+Result: MACOS_ARM64_SINGLE_ASSET_PASS
 
-Run at (UTC): 2026-07-16T13:46:46Z
+Run at: 2026-07-17 Asia/Shanghai
 
 Host: macOS arm64; workspace version `0.1.0`; verified source commit
-`687967f` (the following evidence-only commit changes no Rust or packaging code)
+base `914e46e` plus the release-scope workflow/script/docs patch; no Rust source
+changed after that base.
 
 ## Final local gate
 
@@ -14,9 +15,10 @@ Host: macOS arm64; workspace version `0.1.0`; verified source commit
 | `./scripts/verify.sh` | PASS: fmt, workspace check, strict workspace Clippy, all workspace unit/integration/doctests, SQLite core smoke, 27-task DB manifest, eight TiDB HA drill manifests, final-goal validator |
 | `RUSTFLAGS='-D deprecated' cargo check --workspace --lib --bins` | PASS: no unapproved first-party production legacy API call |
 | `./scripts/validate-feature-matrix.sh` | PASS: minimal/default/portable/full/full-native CLI and TUI composition plus pure/native Kafka exclusivity |
-| `cargo build --release -p dbtool-cli --no-default-features --features portable` | PASS in 1m15s |
-| archive + npm + Python package generation and archive smoke | PASS for the selected native `aarch64-apple-darwin` target |
-| isolated npm offline install and Python `--no-index` venv install | both returned exact `dbtool 0.1.0` |
+| `./scripts/package-macos-arm64.sh` | PASS in 2m16s target build plus packaging/smoke |
+| Mach-O identity | `file` and `lipo -archs` both proved 64-bit `arm64` only |
+| archive content/runtime | binary, bash/zsh/fish completions and manpage present; extracted binary returned exact `dbtool 0.1.0` and passed SQLite core flow |
+| checksum | generated `.tar.gz.sha256`; `shasum -a 256 -c` PASS |
 | `./scripts/smoke-docker-image.sh` | PASS: cold Docker build, image `sha256:88e54b25e32f25ae44f0bbf9b14a4641792cf6d6450b7508f9d5f1860fcea6b6`, non-root runtime SQLite core smoke |
 
 The first sandboxed `verify.sh` attempt could not bind the AMQP fixture's local
@@ -45,10 +47,11 @@ The feature matrix was rerun after IF-T75 and IF-T78 closed.
 | `dbtool --format invalid ...` | Clap non-zero rejection before connection PASS |
 | release `dbtool --version` | exact `dbtool 0.1.0` PASS |
 
-## Target identity and failure paths
+## Selected target and identity boundary
 
-All four entry points now default to all six release targets and resolve only
-one of these target-specific layouts:
+The official release scope is exactly `aarch64-apple-darwin`. Both
+`.github/workflows/release.yml` and `scripts/package-macos-arm64.sh` set the
+target explicitly and resolve only one of these target-specific layouts:
 
 ```text
 artifacts/dbtool-bin-<target>/dbtool[.exe]
@@ -56,9 +59,9 @@ artifacts/<target>/dbtool[.exe]
 ```
 
 The former generic `artifacts/dbtool[.exe]` fallback is not accepted for package
-payloads. Before removing or creating output, npm/Python packaging resolves every
-selected binary; release archive packaging likewise preflights the complete
-selection.
+payloads. The release archive preflights the selected native binary before it
+writes output. Generic archive/npm/Python tools retain their strict multi-target
+support for manual use but are not attached by the official release workflow.
 
 | Negative check | Result |
 | --- | --- |
@@ -68,23 +71,22 @@ selection.
 | Default six-target npm/Python packaging with only host artifact | rejected before output reset/generation PASS |
 | Default six-target archive smoke with only host archive | rejected PASS |
 
-`DBTOOL_PACKAGE_TARGETS` is an explicit local-test filter. Unknown targets, empty
-list entries, and duplicates are rejected; the GitHub release workflow does not
-set it and therefore continues to require all six targets.
+`DBTOOL_PACKAGE_TARGETS` still rejects unknown targets, empty list entries, and
+duplicates. The official workflow now fixes it to `aarch64-apple-darwin`, so a
+tag creates one archive instead of waiting for five unwanted platform binaries.
 
 ## Host release build and package installation
 
-Command: `cargo build --release -p dbtool-cli --no-default-features --features portable`
+Command: `./scripts/package-macos-arm64.sh`
 
 | Artifact path | Generate | Permission/content | Install and execute |
 | --- | --- | --- | --- |
 | macOS arm64 release binary | PASS | 34 portable schemes; version exact PASS | direct `--version` PASS |
-| npm macOS arm64 platform package + main wrapper | PASS | copied target-specific binary is mode 0755; completions/manpage present | both local `.tgz` files installed offline with isolated npm cache; wrapper returned exact `dbtool 0.1.0` |
-| Python macOS arm64 wheel | PASS | target-specific binary embedded as mode 0755; completions/manpage present | installed into a fresh venv with `--no-index`; console entry returned exact `dbtool 0.1.0` |
-| release workflow assets | YAML PASS | archives, `.tgz`, and `.whl` all feed GitHub Release; npm and musllinux jobs contain install/run gates | executable only on a tag runner |
+| `dbtool-v0.1.0-aarch64-apple-darwin.tar.gz` | PASS, 11 MiB | executable + completions + manpage | extracted runtime and SQLite core smoke PASS |
+| checksum sidecar | PASS | SHA-256 stored beside local archive | independent `shasum -a 256 -c` PASS |
+| official release workflow | YAML/validator PASS | native `macos-latest` ARM64 build, one archive and its SHA-256 sidecar | tag run remains the publication event |
 
-Cross-target boundary: this host built, packaged, installed, and executed only
-the native macOS arm64 binary. No package or manifest was generated for the
-other five targets. Their real binaries and install gates remain the
-responsibility of the six-target GitHub Actions matrix and must not be reported
-as locally executed.
+Release boundary: the current product decision intentionally publishes only
+Apple Silicon macOS. Linux, Windows, Intel Mac, npm, and Python generators remain
+available as optional tooling, but their absence from the official Release is
+intentional and no longer an incomplete release claim.

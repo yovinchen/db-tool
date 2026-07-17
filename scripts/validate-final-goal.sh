@@ -32,7 +32,9 @@ require_no_pattern() {
   fi
 }
 
-targets=(
+release_target="aarch64-apple-darwin"
+
+package_targets=(
   x86_64-unknown-linux-musl
   aarch64-unknown-linux-musl
   x86_64-apple-darwin
@@ -54,6 +56,7 @@ require_file "dist/mise/README.md"
 require_file "crates/dbtool-registry/tests/embedded_library.rs"
 
 require_executable "scripts/package-release.sh"
+require_executable "scripts/package-macos-arm64.sh"
 require_executable "scripts/generate-cli-artifacts.sh"
 require_executable "scripts/smoke-binary.sh"
 require_executable "scripts/smoke-release-artifacts.sh"
@@ -70,8 +73,16 @@ require_executable "scripts/integration-mq-test.sh"
 require_executable "scripts/integration-mq-native-test.sh"
 require_executable "scripts/integration-mq-tls-test.sh"
 
-for target in "${targets[@]}"; do
-  require_pattern ".github/workflows/release.yml" "$target"
+require_pattern ".github/workflows/release.yml" "$release_target"
+require_pattern ".github/workflows/release.yml" "build-macos-arm64"
+require_pattern ".github/workflows/release.yml" "DBTOOL_PACKAGE_TARGETS"
+require_no_pattern ".github/workflows/release.yml" "package-npm:"
+require_no_pattern ".github/workflows/release.yml" "package-python:"
+
+for target in "${package_targets[@]}"; do
+  if [[ "$target" != "$release_target" ]]; then
+    require_no_pattern ".github/workflows/release.yml" "$target"
+  fi
   require_pattern "scripts/package-release.sh" "$target"
   require_pattern "scripts/package-npm.mjs" "$target"
   require_pattern "scripts/package-python-wheel.py" "$target"

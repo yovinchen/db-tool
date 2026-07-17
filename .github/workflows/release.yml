@@ -18,76 +18,40 @@ jobs:
       - name: Require tag to match workspace version
         run: scripts/validate-release-version.sh "${{ github.ref_name }}"
 
-  build-matrix:
-    name: Build ${{ matrix.target }}
+  build-macos-arm64:
+    name: Build macOS ARM64
     needs: validate-release
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            use_cross: true
-            suffix: ""
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-latest
-            use_cross: true
-            suffix: ""
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            use_cross: false
-            suffix: ""
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            use_cross: false
-            suffix: ""
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            use_cross: false
-            suffix: ".exe"
-          - target: aarch64-pc-windows-msvc
-            runner: windows-latest
-            use_cross: false
-            suffix: ".exe"
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross
-        if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+          targets: aarch64-apple-darwin
 
       - name: Build
-        shell: bash
-        run: |
-          ${{ matrix.use_cross && 'cross' || 'cargo' }} build --release \
-            --target ${{ matrix.target }} -p dbtool-cli \
-            --no-default-features --features portable
+        run: cargo build --release --target aarch64-apple-darwin -p dbtool-cli --no-default-features --features portable
 
       - name: Prepare binary artifact
-        shell: bash
         run: |
-          BIN=target/${{ matrix.target }}/release/dbtool${{ matrix.suffix }}
-          mkdir -p dist-bin/${{ matrix.target }}
-          cp "$BIN" dist-bin/${{ matrix.target }}/dbtool${{ matrix.suffix }}
-          chmod +x dist-bin/${{ matrix.target }}/dbtool${{ matrix.suffix }}
+          mkdir -p dist-bin/aarch64-apple-darwin
+          cp target/aarch64-apple-darwin/release/dbtool dist-bin/aarch64-apple-darwin/dbtool
+          chmod +x dist-bin/aarch64-apple-darwin/dbtool
 
       - name: Smoke binary artifact
-        shell: bash
-        run: scripts/smoke-binary.sh ${{ matrix.target }} dist-bin/${{ matrix.target }}/dbtool${{ matrix.suffix }}
+        run: scripts/smoke-binary.sh aarch64-apple-darwin dist-bin/aarch64-apple-darwin/dbtool
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dbtool-bin-${{ matrix.target }}
-          path: dist-bin/${{ matrix.target }}/dbtool${{ matrix.suffix }}
+          name: dbtool-bin-aarch64-apple-darwin
+          path: dist-bin/aarch64-apple-darwin/dbtool
 
   package-release:
-    name: Package release archives
-    needs: build-matrix
-    runs-on: ubuntu-latest
+    name: Package macOS ARM64 release
+    needs: build-macos-arm64
+    runs-on: macos-latest
+    env:
+      DBTOOL_PACKAGE_TARGETS: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v6.0.3
 
@@ -101,84 +65,21 @@ jobs:
       - name: Smoke packaged archives
         run: scripts/smoke-release-artifacts.sh release-dist
 
+      - name: Generate SHA-256 checksum
+        working-directory: release-dist
+        run: shasum -a 256 dbtool-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz > dbtool-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz.sha256
+
       - name: Upload release archives
         uses: actions/upload-artifact@v4
         with:
           name: dbtool-release-archives
-          path: release-dist/*.tar.gz
-
-  package-npm:
-    name: Package npm wrappers
-    needs: build-matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6.0.3
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Package npm tarballs
-        run: node scripts/package-npm.mjs artifacts npm-dist ${{ github.ref_name }}
-
-      - name: Install and run npm package
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          work="$(mktemp -d)"
-          cd "$work"
-          export npm_config_cache="$work/.npm-cache"
-          npm init -y >/dev/null
-          npm install \
-            "$GITHUB_WORKSPACE/npm-dist/yovinchen-dbtool-linux-x64-${version}.tgz" \
-            --offline --no-audit --no-fund
-          npm install \
-            "$GITHUB_WORKSPACE/npm-dist/yovinchen-dbtool-${version}.tgz" \
-            --omit=optional --offline --no-audit --no-fund
-          ./node_modules/.bin/dbtool --version | grep -F "$version"
-
-      - name: Upload npm packages
-        uses: actions/upload-artifact@v4
-        with:
-          name: dbtool-npm-packages
-          path: npm-dist/*.tgz
-
-  package-python:
-    name: Package pip/uv wheels
-    needs: build-matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6.0.3
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Package wheels
-        run: python3 scripts/package-python-wheel.py artifacts python-dist ${{ github.ref_name }}
-
-      - name: Install and run Python wheel
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          docker run --rm \
-            -e DBTOOL_EXPECTED_VERSION="$version" \
-            -v "$PWD/python-dist:/dist:ro" \
-            python:3.12-alpine \
-            sh -ceu 'pip install --no-index /dist/dbtool_bin-*-musllinux_1_2_x86_64.whl; dbtool --version | grep -F "$DBTOOL_EXPECTED_VERSION"'
-
-      - name: Upload Python wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: dbtool-python-wheels
-          path: python-dist/*.whl
+          path: |
+            release-dist/*.tar.gz
+            release-dist/*.sha256
 
   release:
     name: Create GitHub Release
-    needs:
-      - package-release
-      - package-npm
-      - package-python
+    needs: package-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -186,21 +87,10 @@ jobs:
           name: dbtool-release-archives
           path: release-dist
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: dbtool-npm-packages
-          path: npm-dist
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: dbtool-python-wheels
-          path: python-dist
-
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             release-dist/*.tar.gz
-            npm-dist/*.tgz
-            python-dist/*.whl
+            release-dist/*.sha256
           generate_release_notes: true

@@ -19,7 +19,7 @@ usable.
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`, then apply CLI overrides such as `--rate`, `--request-timeout`, and `--deadline`; CLI execution uses the one-shot path so writes are not replayed. Message-produce execution timeout is conservatively non-retryable `OUTCOME_INDETERMINATE`, while pre-execution admission errors keep their ordinary codes. |
 | Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, observability, OpenSearch security-plugin TLS, and product-native Elasticsearch profiles are available. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; feature-matrix gates prove minimal/default/portable/full/full-native composition and pure/native Kafka exclusivity; live Docker jobs are manual workflow inputs. |
-| Release artifacts | Implemented | Tags must equal the Cargo workspace version. Six-platform `portable` binaries contain every self-contained adapter while excluding host-ODBC Db2 and native Kafka; archive/npm/wheel packaging accepts only target-specific binaries, preflights every selected target before writing output, includes generated completions/manpage, enforces executable permissions, install-smokes the host package, and attaches all artifacts to GitHub Release. |
+| Release artifacts | Implemented | Tags must equal the Cargo workspace version. The official workflow builds one native `aarch64-apple-darwin` `portable` binary on a GitHub macOS ARM64 runner, executes it, packages binary/completions/manpage into one archive, and attaches that archive plus its SHA-256 sidecar to GitHub Release. `scripts/package-macos-arm64.sh` provides the same checked local path. Generic multi-target/npm/wheel generators remain optional tooling, not official release assets. |
 | TUI | Implemented | Connection picker, exact-operation command dispatch, finite read and mutation envelopes, AST-based SQL write classification, readonly/one-shot confirmation, command history, per-capability forms, and RAII terminal restoration are covered by smoke and failure-path tests. |
 
 ## Usable Database And Protocol Matrix
@@ -138,10 +138,10 @@ local configuration, and all 20 non-messaging mutation input envelopes are
 closed. The 64-method legacy API lifecycle is also closed: every first-party
 production target passes a workspace compile with deprecated calls denied.
 Cross-platform artifact replacement is implemented but still awaits the
-current-SHA Windows x64 runtime and arm64 compile/link evidence. IF-T51's final
-macOS arm64 compile/test/package/Docker gate is recorded as PASS and remains
-open only until the six-platform CI matrix succeeds; IF-T52 remains an
-external-product gate.
+current-SHA Windows x64 runtime and arm64 compile/link evidence. IF-T51 is
+complete for the selected single macOS ARM64 release target; IF-T52 remains an
+external-product gate. Windows evidence under IF-T68 no longer blocks the
+official macOS-only release.
 
 Real-product completeness is tracked separately in
 `docs/db-completeness-tasks.md`. A connector or test script being present does

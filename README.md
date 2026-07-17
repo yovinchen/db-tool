@@ -449,17 +449,20 @@ dbtool --dsn elasticsearch+https://elastic.example.com:9200 search search logs '
 
 ## Distribution
 
-Release builds compile each target once, upload raw binary artifacts, and reuse those artifacts for GitHub Release archives plus npm and pip/uv wrappers.
+The official release builds one native Apple Silicon artifact on GitHub's
+macOS ARM64 runner and publishes one archive that can be uploaded or installed
+directly.
 
-The six-platform binary uses the `portable` feature bundle: SQL, SQL Server,
+The macOS ARM64 binary uses the `portable` feature bundle: SQL, SQL Server,
 Cassandra/ScyllaDB, Redis, MongoDB, search, Prometheus, AMQP, NATS, and pure
 Kafka are included. Db2 stays available through `--features full` because it
 requires a host ODBC runtime; native Kafka stays behind `full-native`.
 
-- GitHub Release assets: `dbtool-<tag>-<target>.tar.gz`
-- npm wrapper: `@yovinchen/dbtool`
-- pip/uv wrapper: `dbtool-bin`
-- mise/ubi: consumes the GitHub Release asset names documented in [dist/mise/README.md](dist/mise/README.md)
+- GitHub Release asset: `dbtool-<tag>-aarch64-apple-darwin.tar.gz`
+- SHA-256 sidecar: `dbtool-<tag>-aarch64-apple-darwin.tar.gz.sha256`
+- Local one-command package: `./scripts/package-macos-arm64.sh`
+- The generic npm, Python, and multi-target package generators remain available
+  for manual use, but they are not attached by the official release workflow.
 
 ## Implementation Status
 
@@ -477,7 +480,7 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
   read limits, AST-based SQL write classification, readonly protection,
   one-shot write confirmation, history, and failure-safe terminal restoration
   are implemented.
-- Release packaging: tag/version validation, target-specific preflight for portable six-platform archives, npm and pip/uv install smokes, GitHub Release attachment, and mise/ubi metadata are wired; a host binary cannot be reused as another target, while signing/notarization is still future work.
+- Release packaging: tag/version validation, native macOS ARM64 build and runtime smoke, target-specific archive preflight, completions/manpage inclusion, checksum generation for local packages, and single-asset GitHub Release attachment are wired; signing/notarization is still future work.
 
 The detailed current matrix is in
 [docs/implementation-status.md](docs/implementation-status.md). The Chinese
