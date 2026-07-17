@@ -38,6 +38,31 @@ fn cassandra_enabled() -> bool {
     env::var("DBTOOL_RUN_CASSANDRA_INTEGRATION").as_deref() == Ok("1")
 }
 
+fn scylla_enabled() -> bool {
+    env::var("DBTOOL_RUN_SCYLLA_INTEGRATION").as_deref() == Ok("1")
+}
+
+fn cql_live_target() -> Option<(String, String, &'static str, &'static str)> {
+    if scylla_enabled() {
+        return Some((
+            dsn("DBTOOL_IT_SCYLLA_DSN")?,
+            env::var("DBTOOL_IT_SCYLLA_KEYSPACE").unwrap_or_else(|_| "dbtool_it_scylla".to_owned()),
+            "scylla",
+            "cassandra",
+        ));
+    }
+    if cassandra_enabled() {
+        return Some((
+            dsn("DBTOOL_IT_CASSANDRA_DSN")?,
+            env::var("DBTOOL_IT_CASSANDRA_KEYSPACE")
+                .unwrap_or_else(|_| "dbtool_it_cassandra".to_owned()),
+            "cassandra",
+            "scylla",
+        ));
+    }
+    None
+}
+
 fn redshift_enabled() -> bool {
     env::var("DBTOOL_RUN_REDSHIFT_INTEGRATION").as_deref() == Ok("1")
 }
@@ -1241,20 +1266,15 @@ fn sqlserver_live_sql_lifecycle_and_typed_values() {
 }
 
 #[test]
-fn cassandra_live_cql_lifecycle_and_typed_values() {
-    if !cassandra_enabled() {
-        return;
-    }
-    let Some(dsn) = dsn("DBTOOL_IT_CASSANDRA_DSN") else {
+fn cql_live_cql_lifecycle_and_typed_values() {
+    let Some((dsn, keyspace, expected_kind, alias_kind)) = cql_live_target() else {
         return;
     };
-    let keyspace = env::var("DBTOOL_IT_CASSANDRA_KEYSPACE")
-        .unwrap_or_else(|_| "dbtool_it_cassandra".to_owned());
-    let table = unique_name("dbtool_it_cassandra_users");
+    let table = unique_name(&format!("dbtool_it_{expected_kind}_users"));
     let qualified_table = format!("{keyspace}.{table}");
 
-    cassandra_cql_probe(&dsn, "cassandra");
-    cassandra_cql_probe(&dsn_with_scheme(&dsn, "scylla"), "scylla");
+    cassandra_cql_probe(&dsn, expected_kind);
+    cassandra_cql_probe(&dsn_with_scheme(&dsn, alias_kind), alias_kind);
 
     setup_sql_exec(
         &dsn,
@@ -1272,10 +1292,10 @@ fn cassandra_live_cql_lifecycle_and_typed_values() {
     cql_lifecycle(
         &dsn,
         &keyspace,
-        &unique_name("dbtool_it_cassandra_cql_users"),
+        &unique_name(&format!("dbtool_it_{expected_kind}_cql_users")),
     );
 
-    let typed_table_name = unique_name("dbtool_it_cassandra_typed");
+    let typed_table_name = unique_name(&format!("dbtool_it_{expected_kind}_typed"));
     let typed_table = format!("{keyspace}.{typed_table_name}");
     eprintln!("dbtool test resource: cql typed table={typed_table}");
     cql_exec(

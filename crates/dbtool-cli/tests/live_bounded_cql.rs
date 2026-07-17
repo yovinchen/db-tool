@@ -1,8 +1,18 @@
 use serde_json::Value;
 use std::{env, process::Command, time::SystemTime};
 
-fn enabled() -> bool {
-    env::var("DBTOOL_RUN_CASSANDRA_INTEGRATION").as_deref() == Ok("1")
+fn integration_dsn() -> Option<String> {
+    if env::var("DBTOOL_RUN_SCYLLA_INTEGRATION").as_deref() == Ok("1") {
+        return env::var("DBTOOL_IT_SCYLLA_DSN")
+            .ok()
+            .filter(|value| !value.is_empty());
+    }
+    if env::var("DBTOOL_RUN_CASSANDRA_INTEGRATION").as_deref() == Ok("1") {
+        return env::var("DBTOOL_IT_CASSANDRA_DSN")
+            .ok()
+            .filter(|value| !value.is_empty());
+    }
+    None
 }
 
 fn dbtool(args: &[&str]) -> std::process::Output {
@@ -64,18 +74,12 @@ fn unique_suffix() -> String {
 }
 
 #[test]
-fn cassandra_catalogs_are_bounded_before_cli_rendering() {
-    if !enabled() {
-        return;
-    }
-    let Some(dsn) = env::var("DBTOOL_IT_CASSANDRA_DSN")
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
+fn cql_catalogs_are_bounded_before_cli_rendering() {
+    let Some(dsn) = integration_dsn() else {
         return;
     };
     let suffix = unique_suffix();
-    let keyspace = format!("dbt_bnd_{suffix}");
+    let keyspace = format!("dbtool_it_bnd_{suffix}");
     let tables = [
         format!("a_{suffix}"),
         format!("b_{suffix}"),

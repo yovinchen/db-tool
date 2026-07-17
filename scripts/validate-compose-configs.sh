@@ -17,6 +17,7 @@ run_config "compat" --profile compat --profile compat-extra
 run_config "pg-compat" --profile pg-compat
 run_config "sqlserver" --profile sqlserver
 run_config "cassandra" --profile cassandra
+run_config "scylla" --profile scylla
 run_config "db2" --profile db2
 run_config "tidb" --profile tidb
 run_config "tidb-secure" --profile tidb-secure

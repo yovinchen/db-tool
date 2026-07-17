@@ -181,6 +181,37 @@ services:
     cpus: ${DBTOOL_IT_CASSANDRA_CPUS:-1.00}
     mem_limit: ${DBTOOL_IT_CASSANDRA_MEMORY:-2g}
 
+  scylla:
+    profiles: ["scylla"]
+    image: scylladb/scylla:${DBTOOL_IT_SCYLLA_VERSION:-2026.1.8}
+    container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-scylla
+    hostname: dbtool-it-scylla
+    command:
+      [
+        "--smp",
+        "1",
+        "--memory",
+        "${DBTOOL_IT_SCYLLA_DB_MEMORY:-384M}",
+        "--overprovisioned",
+        "1",
+        "--developer-mode",
+        "1",
+      ]
+    ports:
+      - "${DBTOOL_IT_SCYLLA_PORT:-29042}:9042"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cqlsh dbtool-it-scylla 9042 -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+      start_period: 30s
+    cpus: ${DBTOOL_IT_SCYLLA_CPUS:-1.00}
+    mem_limit: ${DBTOOL_IT_SCYLLA_MEMORY:-2g}
+
   tidb-pd:
     profiles: ["tidb"]
     image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}

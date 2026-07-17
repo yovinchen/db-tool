@@ -10,8 +10,14 @@ fn integration_enabled() -> bool {
     env::var("DBTOOL_RUN_INTEGRATION").as_deref() == Ok("1")
 }
 
-fn cassandra_integration_enabled() -> bool {
-    env::var("DBTOOL_RUN_CASSANDRA_INTEGRATION").as_deref() == Ok("1")
+fn cql_integration_dsn() -> Option<String> {
+    if env::var("DBTOOL_RUN_SCYLLA_INTEGRATION").as_deref() == Ok("1") {
+        return integration_dsn("DBTOOL_IT_SCYLLA_DSN");
+    }
+    if env::var("DBTOOL_RUN_CASSANDRA_INTEGRATION").as_deref() == Ok("1") {
+        return integration_dsn("DBTOOL_IT_CASSANDRA_DSN");
+    }
+    None
 }
 
 fn integration_dsn(name: &str) -> Option<String> {
@@ -164,11 +170,8 @@ fn mysql_live_streams_one_probe_row_for_large_results() {
 }
 
 #[test]
-fn cassandra_live_streams_one_probe_row_for_paged_results() {
-    if !cassandra_integration_enabled() {
-        return;
-    }
-    let Some(dsn) = integration_dsn("DBTOOL_IT_CASSANDRA_DSN") else {
+fn cql_live_streams_one_probe_row_for_paged_results() {
+    let Some(dsn) = cql_integration_dsn() else {
         return;
     };
 

@@ -36,6 +36,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_live_scylla:
+        description: "Run Docker-backed product-native ScyllaDB/CQL integration tests"
+        required: false
+        type: boolean
+        default: false
       run_live_tidb:
         description: "Run Docker-backed TiDB compatibility integration tests"
         required: false
@@ -358,6 +363,21 @@ jobs:
 
       - name: Run Cassandra/CQL integration tests
         run: ./scripts/integration-cassandra-test.sh
+
+  integration-scylla:
+    name: Live product-native ScyllaDB/CQL integration
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_scylla
+    runs-on: ubuntu-latest
+    env:
+      DBTOOL_IT_PROJECT: dbtool-it-ci-scylla
+      DBTOOL_IT_SCYLLA_PORT: 49042
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run product-native ScyllaDB/CQL integration tests
+        run: ./scripts/integration-scylla-test.sh
 
   integration-tidb:
     name: Live TiDB compatibility integration

@@ -15,6 +15,7 @@ docker compose \
   --profile pg-compat \
   --profile sqlserver \
   --profile cassandra \
+  --profile scylla \
   --profile db2 \
   --profile tidb \
   --profile tidb-secure \
