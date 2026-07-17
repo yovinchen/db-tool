@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies the retained 0.1.x item-only catalog contract.
+    #[allow(deprecated)] // Verifies the retained 1.x item-only catalog contract.
     async fn mysql_live_bounded_catalog_distinguishes_n_from_n_plus_one() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MYSQL_DSN") else {
             return;
@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies the retained 0.1.x atomic-insert contract.
+    #[allow(deprecated)] // Verifies the retained 1.x atomic-insert contract.
     async fn mysql_live_atomic_insert_rolls_back_typed_rows_and_rejects_myisam() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_MYSQL_DSN") else {
             return;

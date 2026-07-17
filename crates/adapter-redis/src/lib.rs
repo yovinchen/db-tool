@@ -1253,7 +1253,7 @@ impl AdminInspect for RedisAdapter {
                 needed: CapabilityOperation::MessageAdminConsumerLag.as_str(),
             });
         }
-        // Preserve the 0.1.x complete-result contract without routing through
+        // Preserve the 1.x complete-result contract without routing through
         // the deprecated public catalog method. The exact sibling below owns
         // its separate work and response envelopes.
         let streams = self.scan_stream_topics(None).await?;
@@ -4462,7 +4462,7 @@ mod tests {
             vec!["RPOP".to_owned(), list.clone()],
             vec!["SPOP".to_owned(), set.clone()],
         ] {
-            // 0.1.x compatibility: the legacy escape hatch must continue to
+            // 1.x compatibility: the legacy escape hatch must continue to
             // reject mutation commands whose return value cannot be modeled.
             #[allow(deprecated)]
             let result = kv.raw_command(&args).await;
@@ -5119,7 +5119,7 @@ mod tests {
             .operations()
             .contains(&CapabilityOperation::MessageProduceBudgeted));
         let producer = connector.as_producer().unwrap();
-        // 0.1.x compatibility: empty legacy batches remain validated no-ops.
+        // 1.x compatibility: empty legacy batches remain validated no-ops.
         #[allow(deprecated)]
         let legacy_empty = producer.produce(&rejected_stream, vec![]).await;
         let legacy_empty = legacy_empty.expect("legacy empty produce should remain a no-op");

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-amqp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-cassandra"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "dbtool-core",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-db2"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "dbtool-core",
@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-kafka"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-mongo"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "dbtool-core",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-nats"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-redis"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-search"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "dbtool-core",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-sql"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-sqlserver"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "dbtool-core",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-timeseries"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "dbtool-core",
@@ -1238,7 +1238,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "dbtool-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1254,7 +1254,7 @@ dependencies = [
 
 [[package]]
 name = "dbtool-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "dbtool-registry"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "adapter-amqp",
  "adapter-cassandra",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "dbtool-tui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

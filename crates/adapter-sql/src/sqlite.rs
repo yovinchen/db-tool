@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies the retained 0.1.x atomic-insert contract.
+    #[allow(deprecated)] // Verifies the retained 1.x atomic-insert contract.
     async fn sqlite_atomic_insert_binds_injection_text_and_rolls_back_every_row() {
         let connector = memory_sqlite().await;
         assert!(connector
@@ -1569,7 +1569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies the retained 0.1.x row-only query contract.
+    #[allow(deprecated)] // Verifies the retained 1.x row-only query contract.
     async fn sqlite_bounded_query_streams_one_probe_row_and_preserves_params() {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
@@ -1624,7 +1624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies validation order on the 0.1.x row-only query contract.
+    #[allow(deprecated)] // Verifies validation order on the 1.x row-only query contract.
     async fn sqlite_bounded_query_rejects_invalid_limits_before_sql() {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();
@@ -1760,7 +1760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies the retained 0.1.x item-only catalog contract.
+    #[allow(deprecated)] // Verifies the retained 1.x item-only catalog contract.
     async fn sqlite_bounded_catalogs_distinguish_exact_n_from_probe_rows() {
         let connector = memory_sqlite().await;
         assert!(connector
@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies validation order on 0.1.x item-only catalog contracts.
+    #[allow(deprecated)] // Verifies validation order on 1.x item-only catalog contracts.
     async fn sqlite_bounded_catalogs_reject_limits_before_schema_or_sql_access() {
         let connector = memory_sqlite().await;
         let sql = connector.as_sql().unwrap();

@@ -94,3 +94,4 @@ jobs:
             release-dist/*.tar.gz
             release-dist/*.sha256
           generate_release_notes: true
+          prerelease: true

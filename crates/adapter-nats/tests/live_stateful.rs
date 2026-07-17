@@ -86,7 +86,7 @@ async fn delete_stream(connector: &dyn dbtool_core::port::connector::Connector, 
 }
 
 #[tokio::test]
-// This assertion intentionally locks the retained 0.1.x empty-batch no-op.
+// This assertion intentionally locks the retained 1.x empty-batch no-op.
 #[allow(deprecated)]
 async fn budgeted_core_nats_publish_rejects_before_jetstream_write_then_round_trips() {
     let Some(dsn) = live_dsn() else {
@@ -203,7 +203,7 @@ async fn budgeted_core_nats_publish_rejects_before_jetstream_write_then_round_tr
 }
 
 #[tokio::test]
-// This test retains one explicit 0.1.x consumer-lag compatibility probe.
+// This test retains one explicit 1.x consumer-lag compatibility probe.
 #[allow(deprecated)]
 async fn core_queue_groups_and_jetstream_durables_are_stateful_only_where_supported() {
     let Some(dsn) = live_dsn() else {

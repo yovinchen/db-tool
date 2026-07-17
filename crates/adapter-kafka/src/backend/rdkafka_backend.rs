@@ -1497,7 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    // This test retains one explicit 0.1.x consumer-lag compatibility probe.
+    // This test retains one explicit 1.x consumer-lag compatibility probe.
     #[allow(deprecated)]
     async fn live_consumer_lag_reads_a_real_committed_group_offset() {
         if std::env::var("DBTOOL_RUN_KAFKA_NATIVE_LIVE").as_deref() != Ok("1") {

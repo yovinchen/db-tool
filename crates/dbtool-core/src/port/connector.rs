@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    // This test intentionally proves the retained 0.1.x compatibility default.
+    // This test intentionally proves the retained 1.x compatibility default.
     #[allow(deprecated)]
     async fn legacy_kv_connectors_neither_claim_nor_inherit_optional_read_operations() {
         let connector = MockKvConnector::default();
@@ -1228,7 +1228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    // This test intentionally exercises capability negotiation for a 0.1.x legacy writer.
+    // This test intentionally exercises capability negotiation for a 1.x legacy writer.
     #[allow(deprecated)]
     async fn embedded_callers_can_negotiate_before_downcasting_and_invoking() {
         let connector = MockKvConnector::default();
@@ -1253,7 +1253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    // This test intentionally locks the retained 0.1.x key-value write contract.
+    // This test intentionally locks the retained 1.x key-value write contract.
     #[allow(deprecated)]
     async fn key_value_contract_round_trips_scans_and_deletes() {
         let connector = MockKvConnector::default();

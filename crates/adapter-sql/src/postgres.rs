@@ -1314,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies the retained 0.1.x item-only catalog contract.
+    #[allow(deprecated)] // Verifies the retained 1.x item-only catalog contract.
     async fn postgres_live_bounded_catalog_is_schema_scoped_and_exact() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_POSTGRES_DSN") else {
             return;
@@ -1431,7 +1431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)] // Verifies the retained 0.1.x atomic-insert contract.
+    #[allow(deprecated)] // Verifies the retained 1.x atomic-insert contract.
     async fn postgres_live_atomic_insert_rolls_back_and_preserves_typed_values() {
         let Ok(raw_dsn) = std::env::var("DBTOOL_IT_POSTGRES_DSN") else {
             return;

@@ -4,9 +4,9 @@ Result: MACOS_ARM64_SINGLE_ASSET_PASS
 
 Run at: 2026-07-17 Asia/Shanghai
 
-Host: macOS arm64; workspace version `0.1.0`; verified source commit
-base `914e46e` plus the release-scope workflow/script/docs patch; no Rust source
-changed after that base.
+Host: macOS arm64; workspace version `1.0.0`; the verified source tree is the
+`v1.0.0` release candidate. The release only extends the deprecated API
+compatibility window; no public interface was removed.
 
 ## Final local gate
 
@@ -17,7 +17,7 @@ changed after that base.
 | `./scripts/validate-feature-matrix.sh` | PASS: minimal/default/portable/full/full-native CLI and TUI composition plus pure/native Kafka exclusivity |
 | `./scripts/package-macos-arm64.sh` | PASS in 2m16s target build plus packaging/smoke |
 | Mach-O identity | `file` and `lipo -archs` both proved 64-bit `arm64` only |
-| archive content/runtime | binary, bash/zsh/fish completions and manpage present; extracted binary returned exact `dbtool 0.1.0` and passed SQLite core flow |
+| archive content/runtime | binary, bash/zsh/fish completions and manpage present; extracted binary returned exact `dbtool 1.0.0` and passed SQLite core flow |
 | checksum | generated `.tar.gz.sha256`; `shasum -a 256 -c` PASS |
 | `./scripts/smoke-docker-image.sh` | PASS: cold Docker build, image `sha256:88e54b25e32f25ae44f0bbf9b14a4641792cf6d6450b7508f9d5f1860fcea6b6`, non-root runtime SQLite core smoke |
 
@@ -42,10 +42,10 @@ The feature matrix was rerun after IF-T75 and IF-T78 closed.
 
 | Check | Result |
 | --- | --- |
-| `validate-release-version.sh v0.1.0` | PASS |
-| `validate-release-version.sh v0.1.1` | expected rejection PASS |
+| `validate-release-version.sh v1.0.0` | PASS |
+| `validate-release-version.sh v1.0.1` | expected rejection PASS |
 | `dbtool --format invalid ...` | Clap non-zero rejection before connection PASS |
-| release `dbtool --version` | exact `dbtool 0.1.0` PASS |
+| release `dbtool --version` | exact `dbtool 1.0.0` PASS |
 
 ## Selected target and identity boundary
 
@@ -82,8 +82,8 @@ Command: `./scripts/package-macos-arm64.sh`
 | Artifact path | Generate | Permission/content | Install and execute |
 | --- | --- | --- | --- |
 | macOS arm64 release binary | PASS | 34 portable schemes; version exact PASS | direct `--version` PASS |
-| `dbtool-v0.1.0-aarch64-apple-darwin.tar.gz` | PASS, 11 MiB | executable + completions + manpage | extracted runtime and SQLite core smoke PASS |
-| checksum sidecar | PASS | SHA-256 stored beside local archive | independent `shasum -a 256 -c` PASS |
+| `dbtool-v1.0.0-aarch64-apple-darwin.tar.gz` | PASS, 11,117,865 bytes | executable + completions + manpage | extracted runtime and SQLite core smoke PASS |
+| checksum sidecar | PASS | SHA-256 `e70dd45a6465a5ce3dad9c60ca1ab2594c4dbff9267ebe74b9c9f9bbe3b27447` | independent `shasum -a 256 -c` PASS |
 | official release workflow | YAML/validator PASS | native `macos-latest` ARM64 build, one archive and its SHA-256 sidecar | tag run remains the publication event |
 
 Release boundary: the current product decision intentionally publishes only

@@ -17,7 +17,7 @@ use std::{
 };
 
 #[tokio::test]
-// This test retains one explicit 0.1.x producer/catalog compatibility probe.
+// This test retains one explicit 1.x producer/catalog compatibility probe.
 #[allow(deprecated)]
 async fn pure_kafka_detail_and_delete_stay_on_capped_admin_clients() {
     if std::env::var("DBTOOL_RUN_MQ_INTEGRATION").as_deref() != Ok("1") {

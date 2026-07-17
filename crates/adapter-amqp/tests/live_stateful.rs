@@ -45,7 +45,7 @@ fn produce_message(payload: &'static [u8]) -> Message {
 }
 
 #[tokio::test]
-// This assertion intentionally locks the retained 0.1.x empty-batch no-op.
+// This assertion intentionally locks the retained 1.x empty-batch no-op.
 #[allow(deprecated)]
 async fn budgeted_amqp_produce_rejects_before_queue_creation_then_round_trips() {
     let Some(dsn) = integration_dsn() else {
