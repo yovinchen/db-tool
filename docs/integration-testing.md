@@ -752,6 +752,13 @@ Live integration jobs are opt-in from the GitHub Actions **Run workflow** button
 - `run_live_opensearch_security` runs `./scripts/integration-opensearch-security-test.sh` for real OpenSearch security-plugin HTTPS/basic-auth coverage.
 - `run_live_elasticsearch` runs `./scripts/integration-elasticsearch-test.sh` for product-native Elasticsearch coverage.
 
+The external Redshift and Kafka-vendor workflow jobs set
+`DBTOOL_IT_REQUIRE_EXTERNAL=1`. Selecting one of those jobs without its
+repository secret is therefore a hard configuration failure, not a green
+skip. Direct local scripts remain convenient: without a DSN they print
+`SKIP`, while `integration-db-suite.sh` records the phase under an explicit
+skipped summary instead of reporting it as passed.
+
 The CI jobs use separate Compose project names and host ports so the database,
 fixture-image, compatibility, TiDB, messaging, and observability suites can run
 in parallel.

@@ -68,6 +68,7 @@ require_executable "scripts/integration-opensearch-security-up.sh"
 require_executable "scripts/integration-opensearch-security-test.sh"
 require_executable "scripts/integration-kafka-vendor-test.sh"
 require_executable "scripts/integration-redshift-test.sh"
+require_executable "scripts/integration-external-requirement-test.sh"
 require_executable "scripts/integration-db2-test.sh"
 require_executable "scripts/integration-scylla-up.sh"
 require_executable "scripts/integration-scylla-test.sh"
@@ -173,13 +174,15 @@ require_pattern "scripts/integration-db-suite.sh" "messaging)"
 require_pattern "scripts/integration-db-suite.sh" "messaging-native)"
 require_pattern "scripts/integration-db-suite.sh" "messaging-tls)"
 require_pattern ".github/workflows/ci.yml" "run_live_redshift"
+require_pattern ".github/workflows/ci.yml" "DBTOOL_IT_REQUIRE_EXTERNAL"
+require_pattern "scripts/verify.sh" "integration-external-requirement-test.sh"
 require_pattern "crates/dbtool-cli/tests/live_services.rs" "redshift_external_sql_lifecycle_and_typed_values"
 require_pattern "crates/dbtool-registry/tests/embedded_library.rs" "ConnectionManager"
 require_pattern "crates/dbtool-registry/tests/embedded_library.rs" "FlowControl"
 require_pattern "crates/dbtool-tui/src/state.rs" "CommandFormState"
 require_pattern "crates/dbtool-tui/src/app.rs" "pending_write"
 
-if grep -Ev '^\| IF-T43–IF-T80 Interface completion campaign ' "$ROOT/docs/tasks.md" \
+if grep -Ev '^\| IF-T43–IF-T81 Interface completion campaign ' "$ROOT/docs/tasks.md" \
   | grep -Eq 'Pending|In progress|Deferred|\[ \]'; then
   fail "docs/tasks.md still contains an unfinished implementation task marker"
 fi
@@ -204,7 +207,7 @@ require_pattern "docs/final-goal-audit.md" "The repo satisfies the original dbto
 require_pattern "docs/final-goal-audit.md" "Product-specific production-readiness exercises remain explicit boundaries"
 require_pattern "docs/final-goal-audit.md" "Active Interface Completion Campaign"
 require_pattern "docs/final-goal-audit.md" "23 tasks are"
-require_pattern "docs/tasks.md" "IF-T43–IF-T80 Interface completion campaign"
+require_pattern "docs/tasks.md" "IF-T43–IF-T81 Interface completion campaign"
 require_pattern "docs/interface-completion-tasks.zh-CN.md" "IF-T43 SQL 参数绑定"
 require_pattern "docs/interface-completion-tasks.zh-CN.md" "IF-T55 CLI/发布严格性"
 require_pattern "docs/implementation-status.md" "export sql"

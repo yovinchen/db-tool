@@ -210,6 +210,33 @@ run_phase() {
   esac
 }
 
+phase_skip_reason() {
+  local phase="$1"
+
+  if [[ "${DBTOOL_IT_REQUIRE_EXTERNAL:-0}" == "1" ]]; then
+    return 1
+  fi
+
+  case "$phase" in
+    redshift)
+      if [[ -z "${DBTOOL_IT_REDSHIFT_DSN:-}" ]]; then
+        echo "DBTOOL_IT_REDSHIFT_DSN is not supplied"
+        return 0
+      fi
+      ;;
+    kafka-vendors)
+      if [[ -z "${DBTOOL_IT_AUTOMQ_DSN:-}" \
+        && -z "${DBTOOL_IT_WARPSTREAM_DSN:-}" \
+        && -z "${DBTOOL_IT_CONFLUENT_DSN:-}" ]]; then
+        echo "no AutoMQ, WarpStream, or Confluent DSN is supplied"
+        return 0
+      fi
+      ;;
+  esac
+
+  return 1
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
@@ -244,8 +271,14 @@ if [[ "${DBTOOL_IT_DB_SUITE_DRY_RUN:-0}" == "1" ]]; then
 fi
 
 FAILED_PHASES=()
+SKIPPED_PHASES=()
 
 for phase in "${SELECTED_PHASES[@]}"; do
+  if skip_reason="$(phase_skip_reason "$phase")"; then
+    echo "db suite: $(timestamp) skipped $phase - $skip_reason"
+    SKIPPED_PHASES+=("$phase")
+    continue
+  fi
   echo "db suite: $(timestamp) starting $phase - $(phase_description "$phase")"
   if run_phase "$phase"; then
     echo "db suite: $(timestamp) passed $phase"
@@ -264,4 +297,9 @@ if ((${#FAILED_PHASES[@]} > 0)); then
   exit 1
 fi
 
-echo "db suite: all selected phases passed"
+if ((${#SKIPPED_PHASES[@]} > 0)); then
+  echo "db suite: skipped external phases: ${SKIPPED_PHASES[*]}"
+  echo "db suite: completed with explicit external skips"
+else
+  echo "db suite: all selected phases passed"
+fi

@@ -5,8 +5,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/integration-env.sh"
 
 if [[ -z "$DBTOOL_IT_AUTOMQ_DSN" && -z "$DBTOOL_IT_WARPSTREAM_DSN" && -z "$DBTOOL_IT_CONFLUENT_DSN" ]]; then
+  if [[ "${DBTOOL_IT_REQUIRE_EXTERNAL:-0}" == "1" ]]; then
+    echo "dbtool vendor Kafka smoke failed: at least one of DBTOOL_IT_AUTOMQ_DSN, DBTOOL_IT_WARPSTREAM_DSN, or DBTOOL_IT_CONFLUENT_DSN is required when DBTOOL_IT_REQUIRE_EXTERNAL=1." >&2
+    exit 2
+  fi
+
   cat <<'EOF'
-dbtool vendor Kafka smoke skipped.
+dbtool vendor Kafka smoke SKIP: no vendor DSN is set.
 
 Set one or more external broker DSNs to run it:
   DBTOOL_IT_AUTOMQ_DSN='automq://host:9092'

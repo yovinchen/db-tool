@@ -38,8 +38,8 @@ board is [interface-completion-tasks.zh-CN.md](interface-completion-tasks.zh-CN.
 It tracks declared-interface gaps, Cargo feature correctness, TUI safety, CLI
 strictness, packaging/install smoke, and explicit external boundaries.
 
-Current interface result: IF-T43–51, IF-T53–67, and IF-T69–80 are complete
-(36 tasks). The declared read, write, catalog, configuration, CLI/TUI, and
+Current interface result: IF-T43–51, IF-T53–67, and IF-T69–81 are complete
+(37 tasks). The declared read, write, catalog, configuration, CLI/TUI, and
 legacy-API contracts are implemented. The remaining two tasks are release or
 external evidence gates rather than hidden adapter fallbacks: IF-T52 requires
 unavailable product runtimes/DSNs; IF-T68 requires current-SHA Windows x64

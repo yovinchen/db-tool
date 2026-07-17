@@ -5,8 +5,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/integration-env.sh"
 
 if [[ -z "$DBTOOL_IT_REDSHIFT_DSN" ]]; then
+  if [[ "${DBTOOL_IT_REQUIRE_EXTERNAL:-0}" == "1" ]]; then
+    echo "dbtool Redshift smoke failed: DBTOOL_IT_REDSHIFT_DSN is required when DBTOOL_IT_REQUIRE_EXTERNAL=1." >&2
+    exit 2
+  fi
+
   cat <<'EOF'
-dbtool Redshift smoke skipped.
+dbtool Redshift smoke SKIP: DBTOOL_IT_REDSHIFT_DSN is not set.
 
 Set DBTOOL_IT_REDSHIFT_DSN to run it, for example:
   DBTOOL_IT_REDSHIFT_DSN='redshift://user:pass@host:5439/dev?sslmode=require'
