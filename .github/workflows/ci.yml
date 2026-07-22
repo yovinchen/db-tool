@@ -636,12 +636,13 @@ jobs:
           fi
           file -L "$driver"
           file -L "$driver" | grep -Eq 'ELF 64-bit.*x86-64'
+          export LD_LIBRARY_PATH="$driver_root/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           ldd "$driver"
           if ldd "$driver" | grep -q 'not found'; then
             ldd "$driver"
             exit 1
           fi
-          echo "LD_LIBRARY_PATH=$driver_root/lib64" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
           sudo tee -a /etc/odbcinst.ini >/dev/null <<EOF
           [IBM DB2 ODBC DRIVER]
           Description = IBM Db2 64-bit SQLLEN ODBC Driver
