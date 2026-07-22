@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${DBTOOL_COMPOSE_FILE:-$ROOT/docker-compose.integration.yml}"
 
+"$ROOT/scripts/validate-container-image-pins.sh" "$COMPOSE_FILE"
+
 run_config() {
   local name="$1"
   shift

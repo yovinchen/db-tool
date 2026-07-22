@@ -2,7 +2,7 @@ name: ${DBTOOL_IT_PROJECT:-dbtool-it}
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.14-alpine@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-postgres
     environment:
       POSTGRES_DB: ${DBTOOL_IT_POSTGRES_DB:-dbtool_it_pg}
@@ -23,7 +23,7 @@ services:
     mem_limit: ${DBTOOL_IT_POSTGRES_MEMORY:-512m}
 
   mysql:
-    image: mysql:8.4
+    image: mysql:8.4.9@sha256:c36050afdca850f23cef85703f84c7531a5ae155a11b5ee1c60acb09937c4084
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mysql
     environment:
       MYSQL_DATABASE: ${DBTOOL_IT_MYSQL_DB:-dbtool_it_mysql}
@@ -53,7 +53,7 @@ services:
 
   mariadb:
     profiles: ["compat"]
-    image: mariadb:11.4
+    image: mariadb:11.4.12@sha256:1b46b73d4b629022dfa29e6db3bb0d63b5df714fc3bfbe5057d63d76d8f6054b
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mariadb
     environment:
       MARIADB_DATABASE: ${DBTOOL_IT_MARIADB_DB:-dbtool_it_mariadb}
@@ -82,7 +82,7 @@ services:
 
   cockroach:
     profiles: ["pg-compat"]
-    image: cockroachdb/cockroach:${DBTOOL_IT_COCKROACH_VERSION:-v24.3.8}
+    image: cockroachdb/cockroach:${DBTOOL_IT_COCKROACH_VERSION:-v24.3.8@sha256:544c3dd37d13fcefc323d53f0b4ab8286af47846d56a117df6738b5c169d6d98}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-cockroach
     command:
       [
@@ -110,7 +110,7 @@ services:
 
   timescale:
     profiles: ["pg-compat"]
-    image: timescale/timescaledb:${DBTOOL_IT_TIMESCALE_VERSION:-2.17.2-pg16}
+    image: timescale/timescaledb:${DBTOOL_IT_TIMESCALE_VERSION:-2.17.2-pg16@sha256:4e459e217f00cbb09920c34d245501e63427e6767a495de57ce76823ff280f12}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-timescale
     environment:
       POSTGRES_DB: ${DBTOOL_IT_TIMESCALE_DB:-dbtool_it_timescale}
@@ -132,7 +132,7 @@ services:
 
   sqlserver:
     profiles: ["sqlserver"]
-    image: mcr.microsoft.com/mssql/server:${DBTOOL_IT_SQLSERVER_VERSION:-2022-CU26-ubuntu-22.04}
+    image: mcr.microsoft.com/mssql/server:${DBTOOL_IT_SQLSERVER_VERSION:-2022-CU26-ubuntu-22.04@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-sqlserver
     platform: ${DBTOOL_IT_SQLSERVER_PLATFORM:-linux/amd64}
     hostname: dbtool-it-sqlserver
@@ -157,7 +157,7 @@ services:
 
   cassandra:
     profiles: ["cassandra"]
-    image: cassandra:${DBTOOL_IT_CASSANDRA_VERSION:-5.0}
+    image: cassandra:${DBTOOL_IT_CASSANDRA_VERSION:-5.0.8@sha256:755db0086160b6898e890959343dec1544ff27e7fa8ecc955c2f4b28c40a2f1a}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-cassandra
     hostname: dbtool-it-cassandra
     environment:
@@ -183,7 +183,7 @@ services:
 
   scylla:
     profiles: ["scylla"]
-    image: scylladb/scylla:${DBTOOL_IT_SCYLLA_VERSION:-2026.1.8}
+    image: scylladb/scylla:${DBTOOL_IT_SCYLLA_VERSION:-2026.1.8@sha256:7f536795dde84c82fb625f496a9d043eed7674fbb2eb08c88998b51c414cd276}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-scylla
     hostname: dbtool-it-scylla
     command:
@@ -214,7 +214,7 @@ services:
 
   tidb-pd:
     profiles: ["tidb"]
-    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:c26dbbaaf95f2d5e15402f40f829f8dc26f5b2a39d8d90d74c30a9de7689521b}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-pd
     command:
       [
@@ -231,7 +231,7 @@ services:
 
   tidb-tikv:
     profiles: ["tidb"]
-    image: pingcap/tikv:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/tikv:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:73eb97fd9e8c0d645860c7a65fe80efb56c4f0f1cd3b364698294b6f15e65979}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-tikv
     command:
       [
@@ -252,7 +252,7 @@ services:
 
   tidb:
     profiles: ["tidb"]
-    image: pingcap/tidb:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/tidb:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:7124cad80d39ead55d76017635a9820d3c4d3cbd4b1f0824aaffe4b899fac677}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb
     command:
       [
@@ -283,7 +283,7 @@ services:
 
   tidb-secure-pd-1:
     profiles: ["tidb-secure"]
-    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:c26dbbaaf95f2d5e15402f40f829f8dc26f5b2a39d8d90d74c30a9de7689521b}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-pd-1
     command:
       [
@@ -305,7 +305,7 @@ services:
 
   tidb-secure-pd-2:
     profiles: ["tidb-secure"]
-    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:c26dbbaaf95f2d5e15402f40f829f8dc26f5b2a39d8d90d74c30a9de7689521b}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-pd-2
     command:
       [
@@ -327,7 +327,7 @@ services:
 
   tidb-secure-pd-3:
     profiles: ["tidb-secure"]
-    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/pd:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:c26dbbaaf95f2d5e15402f40f829f8dc26f5b2a39d8d90d74c30a9de7689521b}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-pd-3
     command:
       [
@@ -349,7 +349,7 @@ services:
 
   tidb-secure-tikv-1:
     profiles: ["tidb-secure"]
-    image: pingcap/tikv:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/tikv:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:73eb97fd9e8c0d645860c7a65fe80efb56c4f0f1cd3b364698294b6f15e65979}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-tikv-1
     command:
       [
@@ -375,7 +375,7 @@ services:
 
   tidb-secure-tikv-2:
     profiles: ["tidb-secure"]
-    image: pingcap/tikv:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/tikv:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:73eb97fd9e8c0d645860c7a65fe80efb56c4f0f1cd3b364698294b6f15e65979}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-tikv-2
     command:
       [
@@ -401,7 +401,7 @@ services:
 
   tidb-secure-1:
     profiles: ["tidb-secure"]
-    image: pingcap/tidb:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/tidb:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:7124cad80d39ead55d76017635a9820d3c4d3cbd4b1f0824aaffe4b899fac677}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-1
     command:
       [
@@ -429,7 +429,7 @@ services:
 
   tidb-secure-2:
     profiles: ["tidb-secure"]
-    image: pingcap/tidb:${DBTOOL_IT_TIDB_VERSION:-v8.5.6}
+    image: pingcap/tidb:${DBTOOL_IT_TIDB_VERSION:-v8.5.6@sha256:7124cad80d39ead55d76017635a9820d3c4d3cbd4b1f0824aaffe4b899fac677}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-2
     command:
       [
@@ -457,7 +457,7 @@ services:
 
   tidb-secure-tiproxy:
     profiles: ["tidb-tiproxy"]
-    image: pingcap/tiproxy:${DBTOOL_IT_TIDB_TIPROXY_VERSION:-v1.3.2}
+    image: pingcap/tiproxy:${DBTOOL_IT_TIDB_TIPROXY_VERSION:-v1.3.2@sha256:bfa0cad16ec1d37b01321ab6fa8ceb21b433585f8c84ed70d50212bc22b600d0}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-tidb-secure-tiproxy
     entrypoint: ["/bin/tiproxy"]
     command: ["--config=/tidb-secure/tiproxy.toml"]
@@ -478,7 +478,7 @@ services:
     mem_limit: ${DBTOOL_IT_TIDB_TIPROXY_MEMORY:-256m}
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-redis
     command:
       [
@@ -504,7 +504,7 @@ services:
 
   valkey:
     profiles: ["compat"]
-    image: valkey/valkey:8-alpine
+    image: valkey/valkey:8.1.8-alpine@sha256:77643d152547b446fc15cbafaff22004545663fcd40c6b28038ad283837baa75
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-valkey
     command:
       [
@@ -530,7 +530,7 @@ services:
 
   keydb:
     profiles: ["compat-extra"]
-    image: eqalpha/keydb:alpine
+    image: eqalpha/keydb:alpine@sha256:f1d60f12cb3c933b169886657333a17018580c0fdbde5c3b3717e652e7af3f0a
     platform: ${DBTOOL_IT_KEYDB_PLATFORM:-linux/amd64}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-keydb
     command:
@@ -557,7 +557,7 @@ services:
 
   dragonfly:
     profiles: ["compat-extra"]
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.39.0@sha256:0fa01a2b929e704c7a9300d23e7f52002ebd39e90996fb8bb63826aed92fa06f
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-dragonfly
     command:
       [
@@ -569,7 +569,7 @@ services:
     mem_limit: ${DBTOOL_IT_DRAGONFLY_MEMORY:-384m}
 
   mongo:
-    image: mongo:7
+    image: mongo:7.0.37@sha256:8ecb514b00bdcc0bde67ef4e6c330385377a9dc68e24ee94e28c07c891647348
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-mongo
     command: ["mongod", "--bind_ip", "0.0.0.0"]
     environment:
@@ -709,7 +709,7 @@ services:
 
   opensearch:
     profiles: ["observability"]
-    image: opensearchproject/opensearch:${DBTOOL_IT_OPENSEARCH_VERSION:-2.17.1}
+    image: opensearchproject/opensearch:${DBTOOL_IT_OPENSEARCH_VERSION:-2.17.1@sha256:1193b7c29c5d63028523728243cc4da047ac49f697a8f8105e5aeee2f89bcc4c}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-opensearch
     environment:
       discovery.type: single-node
@@ -737,7 +737,7 @@ services:
       context: .
       dockerfile: docker/search-tls/Dockerfile
       args:
-        PYTHON_VERSION: ${DBTOOL_IT_SEARCH_TLS_PYTHON_VERSION:-3.12-alpine}
+        PYTHON_VERSION: ${DBTOOL_IT_SEARCH_TLS_PYTHON_VERSION:-3.12-alpine@sha256:dbb1970cc04ce7d381c65efe8309c0c03d463e5b35c88f14d721796ad24cfbfd}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-opensearch-tls
     command:
       [
@@ -770,7 +770,7 @@ services:
 
   opensearch-security:
     profiles: ["opensearch-security"]
-    image: opensearchproject/opensearch:${DBTOOL_IT_OPENSEARCH_SECURITY_VERSION:-2.17.1}
+    image: opensearchproject/opensearch:${DBTOOL_IT_OPENSEARCH_SECURITY_VERSION:-2.17.1@sha256:1193b7c29c5d63028523728243cc4da047ac49f697a8f8105e5aeee2f89bcc4c}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-opensearch-security
     environment:
       discovery.type: single-node
@@ -804,7 +804,7 @@ services:
 
   prometheus:
     profiles: ["observability"]
-    image: prom/prometheus:${DBTOOL_IT_PROMETHEUS_VERSION:-v2.55.1}
+    image: prom/prometheus:${DBTOOL_IT_PROMETHEUS_VERSION:-v2.55.1@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-prometheus
     command:
       [
@@ -826,7 +826,7 @@ services:
 
   elasticsearch:
     profiles: ["elasticsearch"]
-    image: docker.elastic.co/elasticsearch/elasticsearch:${DBTOOL_IT_ELASTICSEARCH_VERSION:-8.15.5}
+    image: docker.elastic.co/elasticsearch/elasticsearch:${DBTOOL_IT_ELASTICSEARCH_VERSION:-8.15.5@sha256:8870d5b7b86235fa790c9112464f5fd3b693f89d73e757a630f8b5cda350f95b}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-elasticsearch
     environment:
       discovery.type: single-node
@@ -849,7 +849,7 @@ services:
 
   kafka:
     profiles: ["messaging"]
-    image: redpandadata/redpanda:v24.3.6
+    image: redpandadata/redpanda:v24.3.6@sha256:04baa40ed34edf86028396f762be802f3b6b0acaab65e9de696a3f15d54c550f
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-kafka
     command:
       [
@@ -883,7 +883,7 @@ services:
 
   rabbitmq:
     profiles: ["messaging"]
-    image: rabbitmq:3.13-management-alpine
+    image: rabbitmq:3.13.7-management-alpine@sha256:606d8c0d6b3c18d1da9afc53bc7cdb2a8d5486df91b5a9830e9e07626c9ae281
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: ${DBTOOL_IT_AMQP_USER:-dbtool}
@@ -906,7 +906,7 @@ services:
 
   nats:
     profiles: ["messaging"]
-    image: nats:2.10-alpine
+    image: nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-nats
     command: ["-js", "-m", "8222"]
     ports:
@@ -922,7 +922,7 @@ services:
 
   rabbitmq-tls:
     profiles: ["messaging-tls"]
-    image: rabbitmq:3.13-management-alpine
+    image: rabbitmq:3.13.7-management-alpine@sha256:606d8c0d6b3c18d1da9afc53bc7cdb2a8d5486df91b5a9830e9e07626c9ae281
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-rabbitmq-tls
     environment:
       RABBITMQ_DEFAULT_USER: ${DBTOOL_IT_AMQP_USER:-dbtool}
@@ -947,7 +947,7 @@ services:
 
   nats-tls:
     profiles: ["messaging-tls"]
-    image: nats:2.10-alpine
+    image: nats:2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-nats-tls
     command: ["-c", "/etc/nats/nats.conf"]
     volumes:
@@ -966,7 +966,7 @@ services:
 
   db2:
     profiles: ["db2"]
-    image: icr.io/db2_community/db2:${DBTOOL_IT_DB2_VERSION:-latest}
+    image: icr.io/db2_community/db2:${DBTOOL_IT_DB2_VERSION:-latest@sha256:2de8151713c261843868c5c3411b57be6ae79d99d70a5b3022337836776bfda6}
     container_name: ${DBTOOL_IT_PROJECT:-dbtool-it}-db2
     hostname: dbtool-it-db2
     privileged: true

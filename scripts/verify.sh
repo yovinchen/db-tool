@@ -6,6 +6,8 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ./scripts/smoke-core-flow.sh
+./scripts/validate-container-image-pins.sh
+./scripts/validate-container-image-pins-test.sh
 ./scripts/validate-db-completeness.sh
 ./scripts/validate-db-completeness-test.sh
 ./scripts/integration-external-requirement-test.sh
