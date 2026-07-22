@@ -1,6 +1,6 @@
 # dbtool Final Goal Audit
 
-Last updated: 2026-07-17
+Last updated: 2026-07-18
 
 This audit maps the final objective to current, repo-verifiable evidence. It is
 not a replacement for optional live Docker drills, but it proves the codebase has
@@ -26,9 +26,13 @@ Product-specific production-readiness exercises remain explicit boundaries in
 [implementation-status.md](implementation-status.md), not missing pieces of this
 objective.
 
-The real-product validation campaign is reported separately: 23 tasks are
-`COMPLETE`, 2 are `BLOCKED`, 2 are `EXTERNAL`, and none are `PARTIAL`.
-Those four non-complete tasks are not silently counted as passes.
+The existing `v1.0.0` prerelease is historical and points to commit `193d32e`.
+It does not contain the later hardening on `master`; publishing current source
+requires a new version/tag rather than moving or reusing `v1.0.0`.
+
+The real-product validation campaign is reported separately: 24 tasks are
+`COMPLETE`, 1 is `BLOCKED`, 2 are `EXTERNAL`, and none are `PARTIAL`.
+Those three non-complete tasks are not silently counted as passes.
 
 ## Active Interface Completion Campaign
 
@@ -38,13 +42,12 @@ board is [interface-completion-tasks.zh-CN.md](interface-completion-tasks.zh-CN.
 It tracks declared-interface gaps, Cargo feature correctness, TUI safety, CLI
 strictness, packaging/install smoke, and explicit external boundaries.
 
-Current interface result: IF-T43–51, IF-T53–67, and IF-T69–81 are complete
-(37 tasks). The declared read, write, catalog, configuration, CLI/TUI, and
-legacy-API contracts are implemented. The remaining two tasks are release or
-external evidence gates rather than hidden adapter fallbacks: IF-T52 requires
-unavailable product runtimes/DSNs; IF-T68 requires current-SHA Windows x64
-runtime plus arm64 compile/link evidence but does not block the macOS-only
-release.
+Current interface result: IF-T43–51 and IF-T53–81 are complete (38 tasks).
+The declared read, write, catalog, configuration, CLI/TUI, legacy-API, and
+cross-platform publication contracts are implemented. IF-T52 is the only
+non-complete interface task because it requires unavailable product
+runtimes/DSNs; it remains an explicit external gate rather than a hidden adapter
+fallback.
 
 ## Requirement Evidence
 
@@ -65,7 +68,7 @@ release.
 | Read-only default | CLI tests cover write refusal before connection for search and time-series writes; SQL safety tests cover read/write/destructive classification. |
 | Destructive confirmation | `SafetyGuard` issues target-bound confirm tokens for destructive SQL; CLI JSON tests cover two-step confirmation. |
 | Flow control / no hang | `FlowControl` covers concurrency, rate limiting, acquire timeout, request timeout, overall deadline, and retry budget; service-free and Docker-backed smoke scripts exercise bounded behavior. |
-| Local integration automation | `scripts/integration-db-suite.sh`, `scripts/validate-compose-configs.sh`, and the TiDB HA manifest validator keep the live verification matrix discoverable and bounded. |
+| Local integration automation | `scripts/integration-db-suite.sh`, content-addressed container defaults plus their mutation-tested pin validator, Compose validation, and the TiDB HA manifest validator keep the live verification matrix discoverable, bounded, and reproducible by default. |
 
 ## Repo-Level Completion Gate
 
@@ -81,3 +84,9 @@ package wrappers, safety evidence, protocol aliases, task status, and this audit
 remain synchronized. It reports the baseline result and the active interface
 campaign status separately instead of treating an active enhancement queue as a
 failure of the already-proven baseline.
+
+Known transitive dependency advisories and their constrained reachability are
+tracked separately in
+[dependency-security-audit.md](test-evidence/dependency-security-audit.md).
+The baseline and interface results above do not mean that those upstream
+advisories have been remediated.

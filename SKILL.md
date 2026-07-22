@@ -65,6 +65,12 @@ Default CLI output is JSON. The envelope is stable:
 
 On failure, read `error.code` before interpreting the message. Useful codes include `UNSUPPORTED_CAPABILITY`, `WRITE_NOT_ALLOWED`, and `CONFIRM_REQUIRED`. `error.needed` is diagnostic; use `caps.data.operations`, not message text, for machine negotiation.
 
+If the caller must parse command-line argument failures as well as runtime
+failures, add the global `--json-errors` flag. Invalid arguments then produce a
+single stderr JSON object with `error.code = "CLI_ARGUMENT_ERROR"` and exit code
+`2`. Do not parse the human `error.message`; Clap may change its wording.
+`--help` and `--version` intentionally remain text on stdout with exit code `0`.
+
 For human inspection or pipelines, request an alternate successful-output format:
 
 ```bash

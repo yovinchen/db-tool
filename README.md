@@ -6,10 +6,10 @@ dbtool is a Rust workspace for a unified data and message connection tool. The c
 
 The core, CLI, independent TUI, registered adapters, Docker integration paths,
 and macOS ARM64 release packaging are implemented. Method-level capability
-negotiation, nested metadata bounds, and bounded catalogs are complete. Current
-work is limited to current-SHA Windows ARM64 evidence, externally supplied
-product environments, and distribution targets beyond the selected macOS ARM64
-release.
+negotiation, nested metadata bounds, bounded catalogs, and Windows x64 runtime /
+ARM64 compile-link gates are complete. Remaining work is limited to externally
+supplied product environments, upstream dependency-advisory remediation, and
+distribution targets beyond the selected macOS ARM64 release.
 
 - `dbtool-core` owns stable models, ports, exact operation names, DSN/config,
   safety, limits, formatting, and connection management.
@@ -80,6 +80,19 @@ All CLI responses are JSON envelopes by default:
   }
 }
 ```
+
+Runtime failures already use that envelope. Automation that also needs Clap
+argument failures to be machine-readable can opt in with `--json-errors`:
+
+```bash
+dbtool --json-errors --format invalid --dsn sqlite::memory: ping
+```
+
+Argument failures then emit one JSON object to stderr with
+`error.code = "CLI_ARGUMENT_ERROR"` and retain exit code `2`. The default human
+error output is unchanged, and `--help` / `--version` remain normal stdout with
+exit code `0`. Callers should treat the code and exit status as stable; the
+human `error.message` remains Clap-owned text.
 
 Run `caps` before dispatch. Legacy booleans identify only a capability family;
 `data.operations` is the authoritative method contract. Every CLI/TUI data
@@ -225,10 +238,13 @@ flow-control flag overrides:
 ```
 
 Docker Compose profile validation checks every integration profile without
-starting containers:
+starting containers. Repository defaults are content-addressed as
+`tag@sha256`; explicit `DBTOOL_IT_*_VERSION` overrides are developer escape
+hatches and are not covered by the default reproducibility claim:
 
 ```bash
 ./scripts/validate-compose-configs.sh
+./scripts/validate-container-image-pins-test.sh
 ```
 
 The dbtool CLI can also be built as a container image and checked with the same
@@ -464,6 +480,13 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
 - Local one-command package: `./scripts/package-macos-arm64.sh`
 - The generic npm, Python, and multi-target package generators remain available
   for manual use, but they are not attached by the official release workflow.
+- The existing `v1.0.0` prerelease points to historical commit `193d32e` and
+  does not contain later main-branch hardening. A release from current `master`
+  must use a new version/tag; the old tag must not be moved or reused.
+- Five upstream dependency advisories remain open in legacy transitive TLS/TUI
+  slots. Their constrained reachability and required upgrade paths are recorded
+  in [the dependency security audit](docs/test-evidence/dependency-security-audit.md);
+  the project does not claim zero known advisories.
 
 ## Implementation Status
 
@@ -486,5 +509,5 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
 The detailed current matrix is in
 [docs/implementation-status.md](docs/implementation-status.md). The Chinese
 [interface task table](docs/interface-completion-tasks.zh-CN.md) distinguishes
-completed interface contracts from current-SHA cross-platform evidence and
-external runtime blockers.
+completed interface contracts from external runtime and upstream dependency
+blockers.

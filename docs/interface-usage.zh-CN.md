@@ -415,6 +415,17 @@ portable release、解包并执行核心 SQLite 流程。底层 archive/npm/Pyth
 `--format` 由 Clap 枚举解析，只接受 `json`、`table`、`ndjson`。未知值在连接
 数据库之前直接以非零状态退出，不再回退成 JSON。
 
+自动化调用方若还需要解析 Clap 参数错误，应显式增加全局 `--json-errors`：
+
+```bash
+dbtool --json-errors --format invalid --dsn sqlite::memory: ping
+```
+
+此时参数错误只向 stderr 写一个 JSON 对象，稳定字段为
+`ok=false`、`error.code="CLI_ARGUMENT_ERROR"`，退出码保持 `2`。默认模式仍使用
+Clap 人类文本；`--help` 和 `--version` 仍写 stdout 并返回 `0`。调用方只能依赖
+错误码、JSON 结构和退出码，不应解析可能随 Clap 文案变化的 `error.message`。
+
 ## SQL 参数绑定
 
 `sql query` 与 `sql exec` 都接受一个 JSON 数组：
