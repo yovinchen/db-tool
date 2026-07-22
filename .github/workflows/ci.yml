@@ -109,7 +109,10 @@ env:
 jobs:
   verify:
     name: Service-free verification
-    runs-on: ubuntu-latest
+    # IBM's 64-bit full-product libdb2o driver must be installed on the host;
+    # copying server-container libraries onto a generic hosted runner is not a
+    # supported client installation and fails SQLAllocHandle(HENV).
+    runs-on: [self-hosted, linux, x64, db2-client]
     steps:
       - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
@@ -599,87 +602,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install unixODBC (compile-time and driver-registration dependency)
-        run: sudo apt-get install -y libaio1t64 odbcinst unixodbc unixodbc-dev
+      - name: Verify the supported host-installed IBM ODBC client
+        run: |
+          command -v docker
+          command -v odbcinst
+          : "${DB2INSTANCE:?self-hosted runner must source the IBM db2profile}"
+          : "${LD_LIBRARY_PATH:?self-hosted runner must expose the IBM client libraries}"
+          odbcinst -q -d -n "IBM DB2 ODBC DRIVER"
 
       - name: Start the pinned IBM Db2 product
         run: ./scripts/integration-db2-up.sh
-
-      - name: Register the product's 64-bit IBM ODBC driver
-        # IBM's standalone clidriver archive exposes libdb2.so, whose legacy
-        # SQLLEN ABI is incompatible with unixODBC's 64-bit SQLBindCol
-        # indicators. The full x86_64 product contains libdb2o.so, so use the
-        # exact driver shipped with the product under test.
-        run: |
-          container="${DBTOOL_IT_PROJECT}-db2"
-          instance_home_in_container="/database/config/db2inst1"
-          driver_in_container="$instance_home_in_container/sqllib/lib/libdb2o.so"
-          if ! docker exec "$container" test -r "$driver_in_container"; then
-            docker exec "$container" sh -lc \
-              'find /database /opt -name "libdb2*.so*" -print 2>/dev/null | sort'
-            exit 1
-          fi
-          echo "IBM ODBC instance driver: $driver_in_container"
-          client_root="$RUNNER_TEMP/db2client"
-          mkdir -p "$client_root"
-          # The full-product driver is instance-scoped and needs the cfg, msg,
-          # security, and binary paths linked from sqllib. Dereference the
-          # pinned product's instance tree into one self-contained client root.
-          docker exec "$container" tar -C "$instance_home_in_container" -chf - sqllib \
-            | tar -C "$client_root" -xf -
-          driver="$client_root/sqllib/lib/libdb2o.so"
-          if [[ ! -r "$driver" ]]; then
-            find "$client_root" -maxdepth 4 -name 'libdb2o.so*' -ls
-            exit 1
-          fi
-          file -L "$driver"
-          file -L "$driver" | grep -Eq 'ELF 64-bit.*x86-64'
-          export DB2INSTANCE=db2inst1
-          export INSTHOME="$client_root"
-          export DB2DIR="$client_root/sqllib"
-          export DB2_HOME="$client_root/sqllib"
-          export IBM_DB_DIR="$client_root/sqllib"
-          export IBM_DB_LIB="$client_root/sqllib/lib"
-          export IBM_DB_INCLUDE="$client_root/sqllib/include"
-          export DB2LIB="$client_root/sqllib/lib"
-          export DB2_CLI_DRIVER_INSTALL_PATH="$client_root/sqllib"
-          export DB2_NET_CLIENT_PATH="$client_root/sqllib/cfg"
-          export DB2_APPL_DATA_PATH="$RUNNER_TEMP/db2-client-data"
-          export DB2_DIAGPATH="$DB2_APPL_DATA_PATH"
-          export NLSPATH="$client_root/sqllib/msg/%L/%N"
-          export PATH="$client_root/sqllib/bin:$PATH"
-          export LD_LIBRARY_PATH="$client_root/sqllib/lib:$client_root/sqllib/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          mkdir -p "$DB2_APPL_DATA_PATH"
-          ldd "$driver"
-          if ldd "$driver" | grep -q 'not found'; then
-            ldd "$driver"
-            exit 1
-          fi
-          {
-            echo "DB2INSTANCE=$DB2INSTANCE"
-            echo "INSTHOME=$INSTHOME"
-            echo "DB2DIR=$DB2DIR"
-            echo "DB2_HOME=$DB2_HOME"
-            echo "IBM_DB_DIR=$IBM_DB_DIR"
-            echo "IBM_DB_LIB=$IBM_DB_LIB"
-            echo "IBM_DB_INCLUDE=$IBM_DB_INCLUDE"
-            echo "DB2LIB=$DB2LIB"
-            echo "DB2_CLI_DRIVER_INSTALL_PATH=$DB2_CLI_DRIVER_INSTALL_PATH"
-            echo "DB2_NET_CLIENT_PATH=$DB2_NET_CLIENT_PATH"
-            echo "DB2_APPL_DATA_PATH=$DB2_APPL_DATA_PATH"
-            echo "DB2_DIAGPATH=$DB2_DIAGPATH"
-            echo "NLSPATH=$NLSPATH"
-            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
-          } >> "$GITHUB_ENV"
-          echo "$client_root/sqllib/bin" >> "$GITHUB_PATH"
-          sudo tee -a /etc/odbcinst.ini >/dev/null <<EOF
-          [IBM DB2 ODBC DRIVER]
-          Description = IBM Db2 64-bit SQLLEN ODBC Driver
-          Driver      = $driver
-          FileUsage   = 1
-          DontDLClose = 1
-          EOF
-          odbcinst -q -d -n "IBM DB2 ODBC DRIVER"
 
       - name: Run IBM Db2 integration tests
         run: ./scripts/integration-db2-test.sh
