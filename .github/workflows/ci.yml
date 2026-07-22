@@ -634,8 +634,8 @@ jobs:
             find "$driver_root/lib64" -maxdepth 2 -name 'libdb2o.so*' -ls
             exit 1
           fi
-          file "$driver"
-          file "$driver" | grep -Eq 'ELF 64-bit.*x86-64'
+          file -L "$driver"
+          file -L "$driver" | grep -Eq 'ELF 64-bit.*x86-64'
           ldd "$driver"
           if ldd "$driver" | grep -q 'not found'; then
             ldd "$driver"
