@@ -2157,8 +2157,8 @@ fn db2_live_sql_lifecycle_and_schema_inspection() {
     let create_sql = format!("CREATE TABLE {table} (id INTEGER NOT NULL, name VARCHAR(64))");
     let blocked = stderr_json(dbtool(&["--dsn", &dsn, "sql", "exec", &create_sql]));
     assert_eq!(
-        blocked["error"]["code"], "CONFIRM_REQUIRED",
-        "destructive DDL must require a confirmation token"
+        blocked["error"]["code"], "WRITE_NOT_ALLOWED",
+        "destructive DDL must require write permission before confirmation"
     );
 
     // create table
