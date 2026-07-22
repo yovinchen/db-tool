@@ -594,7 +594,6 @@ jobs:
     env:
       DBTOOL_IT_PROJECT: dbtool-it-ci-db2
       DBTOOL_IT_DB2_PORT: 50000
-      LD_LIBRARY_PATH: /opt/ibm/db2odbc/lib
     steps:
       - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
@@ -603,30 +602,42 @@ jobs:
       - name: Install unixODBC (compile-time and driver-registration dependency)
         run: sudo apt-get install -y libaio1t64 odbcinst unixodbc unixodbc-dev
 
-      - name: Install IBM Data Server Driver for ODBC and CLI
-        # Download the clidriver from IBM and register it with unixODBC.
-        # The community-edition image ships with the driver inside the container;
-        # the host build only needs the driver manager headers (unixodbc-dev)
-        # plus the shared library at runtime. On CI the test binary connects to
-        # localhost:50000 so a minimal ODBC driver setup is sufficient.
+      - name: Start the pinned IBM Db2 product
+        run: ./scripts/integration-db2-up.sh
+
+      - name: Register the product's 64-bit IBM ODBC driver
+        # IBM's standalone clidriver archive exposes libdb2.so, whose legacy
+        # SQLLEN ABI is incompatible with unixODBC's 64-bit SQLBindCol
+        # indicators. The full x86_64 product contains libdb2o.so, so use the
+        # exact driver shipped with the product under test.
         run: |
-          curl -fsSL "https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/v11.5.9/linuxx64_odbc_cli.tar.gz" \
-            -o /tmp/db2odbc.tar.gz
-          mkdir -p /opt/ibm/db2odbc
-          tar -xzf /tmp/db2odbc.tar.gz -C /opt/ibm/db2odbc --strip-components=1
-          test -r /opt/ibm/db2odbc/lib/libdb2.so
-          if ldd /opt/ibm/db2odbc/lib/libdb2.so | grep -q 'not found'; then
-            ldd /opt/ibm/db2odbc/lib/libdb2.so
+          container="${DBTOOL_IT_PROJECT}-db2"
+          driver_in_container="$(docker exec "$container" sh -lc \
+            'find /database /opt /home -name libdb2o.so -print -quit 2>/dev/null')"
+          test -n "$driver_in_container"
+          driver_dir="$(dirname "$driver_in_container")"
+          driver_root="$RUNNER_TEMP/db2odbc"
+          mkdir -p "$driver_root/lib64"
+          docker cp "$container:$driver_dir/." "$driver_root/lib64"
+          driver="$driver_root/lib64/libdb2o.so"
+          test -r "$driver"
+          file "$driver" | grep -Eq 'ELF 64-bit.*x86-64'
+          if ldd "$driver" | grep -q 'not found'; then
+            ldd "$driver"
             exit 1
           fi
-          # Register driver with the system ODBC driver manager
+          echo "LD_LIBRARY_PATH=$driver_root/lib64" >> "$GITHUB_ENV"
           sudo tee -a /etc/odbcinst.ini >/dev/null <<EOF
           [IBM DB2 ODBC DRIVER]
-          Description = IBM DB2 ODBC Driver
-          Driver      = /opt/ibm/db2odbc/lib/libdb2.so
+          Description = IBM Db2 64-bit SQLLEN ODBC Driver
+          Driver      = $driver
           FileUsage   = 1
           EOF
-          odbcinst -q -d
+          odbcinst -q -d -n "IBM DB2 ODBC DRIVER"
 
       - name: Run IBM Db2 integration tests
         run: ./scripts/integration-db2-test.sh
+
+      - name: Clean up IBM Db2 integration
+        if: always()
+        run: ./scripts/integration-down.sh
