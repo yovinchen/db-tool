@@ -480,6 +480,12 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
 - Local one-command package: `./scripts/package-macos-arm64.sh`
 - The generic npm, Python, and multi-target package generators remain available
   for manual use, but they are not attached by the official release workflow.
+  The npm generator now fails closed unless all six native targets are present,
+  emits six platform packages plus `@yovinchen/dbtool`, carries both repository
+  licenses, and passes offline-install plus seven-package publish dry-runs. See
+  the [Chinese npm publication task board](docs/npm-publication-tasks.zh-CN.md).
+  No package has been published: this checkout is not authenticated to npm and
+  the official release currently produces only the selected macOS ARM64 binary.
 - The existing `v1.0.0` prerelease points to historical commit `193d32e` and
   does not contain later main-branch hardening. A release from current `master`
   uses the `1.0.1` patch version and must use tag `v1.0.1`; the old tag must not

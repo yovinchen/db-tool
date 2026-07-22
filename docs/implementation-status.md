@@ -1,6 +1,6 @@
 # dbtool Implementation Status
 
-Last updated: 2026-07-18
+Last updated: 2026-07-22
 
 This document is the current implementation inventory for dbtool. It separates
 implemented behavior, compatibility that has been live-tested, compatibility
@@ -19,7 +19,7 @@ usable.
 | Flow control | Implemented | Core `FlowControl` covers per-process concurrency, optional token-bucket rate limiting, acquire timeout, request timeout, shared overall deadline, and retry budget. CLI data commands load `[defaults.limits]` and named-connection overrides from `connections.toml`, then apply CLI overrides such as `--rate`, `--request-timeout`, and `--deadline`; CLI execution uses the one-shot path so writes are not replayed. Message-produce execution timeout is conservatively non-retryable `OUTCOME_INDETERMINATE`, while pre-execution admission errors keep their ordinary codes. |
 | Docker integration | Implemented | Base databases, fixture-image databases, compatibility databases, SQL Server, Cassandra, TiDB, TiDB secure HA, messaging, messaging TLS, observability, OpenSearch security-plugin TLS, and product-native Elasticsearch profiles are available. Every repository-default remote image and Dockerfile base is content-addressed as `tag@sha256`; explicit version/build-argument overrides remain developer escape hatches. A Dockerfile-backed dbtool CLI runtime image can be smoke-tested with the same SQLite core flow. |
 | CI | Implemented | Service-free verification runs by default; feature-matrix gates prove minimal/default/portable/full/full-native composition and pure/native Kafka exclusivity; live Docker jobs are manual workflow inputs. |
-| Release artifacts | Implemented | Current workspace version is `1.0.1`; tags must equal that version and an existing tag must point at the current commit. The official workflow builds one native `aarch64-apple-darwin` `portable` binary on a GitHub macOS ARM64 runner, executes it, packages binary/completions/manpage into one archive, and attaches that archive plus its SHA-256 sidecar to GitHub Release. `scripts/package-macos-arm64.sh` provides the same locked checked path. Generic multi-target/npm/wheel generators remain optional tooling, not official release assets. |
+| Release artifacts | Implemented | Current workspace version is `1.0.1`; tags must equal that version and an existing tag must point at the current commit. The official workflow builds one native `aarch64-apple-darwin` `portable` binary on a GitHub macOS ARM64 runner, executes it, packages binary/completions/manpage into one archive, and attaches that archive plus its SHA-256 sidecar to GitHub Release. `scripts/package-macos-arm64.sh` provides the same locked checked path. The optional npm generator is publication-hardened and test-generates six native packages plus one wrapper, but public npm publication remains external until the complete real binary matrix and npm scope credentials exist. Generic multi-target/npm/wheel generators remain optional tooling, not official release assets. |
 | TUI | Implemented | Connection picker, exact-operation command dispatch, finite read and mutation envelopes, AST-based SQL write classification, readonly/one-shot confirmation, command history, per-capability forms, and RAII terminal restoration are covered by smoke and failure-path tests. |
 
 ## Usable Database And Protocol Matrix

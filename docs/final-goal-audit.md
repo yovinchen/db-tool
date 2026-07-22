@@ -1,6 +1,6 @@
 # dbtool Final Goal Audit
 
-Last updated: 2026-07-18
+Last updated: 2026-07-22
 
 This audit maps the final objective to current, repo-verifiable evidence. It is
 not a replacement for optional live Docker drills, but it proves the codebase has
@@ -64,7 +64,7 @@ fallback.
 | Selected release target | `.github/workflows/release.yml` builds and runs only `aarch64-apple-darwin` on a native GitHub macOS ARM64 runner; `scripts/package-macos-arm64.sh` reproduces the single archive locally. |
 | Single binary artifact | Release archives contain `dbtool` or `dbtool.exe`; `scripts/smoke-binary.sh` and `scripts/smoke-release-artifacts.sh` validate packaged binaries. |
 | Completion and manpage artifacts | `dbtool generate-artifacts` emits bash/zsh/fish completions and `dbtool.1` from clap metadata; the official macOS ARM64 archive includes those files. |
-| Optional package generators | `dist/npm`, `scripts/package-npm.mjs`, `dist/python`, `scripts/package-python-wheel.py`, and `dist/mise/README.md` remain available without expanding the official single-asset release. |
+| Optional package generators | `dist/npm`, `scripts/package-npm.mjs`, `dist/python`, `scripts/package-python-wheel.py`, and `dist/mise/README.md` remain available without expanding the official single-asset release. The npm path has a fail-closed six-native-plus-wrapper matrix test, license/registry metadata, offline install smoke, and seven dry-run publishes; actual registry publication is not claimed. |
 | Environment connections | `ConnectionResolver` handles raw DSNs, named config, and `DBTOOL_CONN_*`; `docs/connections.example.toml` documents named connection config. |
 | Read-only default | CLI tests cover write refusal before connection for search and time-series writes; SQL safety tests cover read/write/destructive classification. |
 | Destructive confirmation | `SafetyGuard` issues target-bound confirm tokens for destructive SQL; CLI JSON tests cover two-step confirmation. |
