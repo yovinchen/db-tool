@@ -38,8 +38,10 @@ envelope; the TUI does not expose CQL, Db2, or messaging detail/lag commands.
 | Redis Streams | fixed Lua detail/lag response and exact remaining+1 work |
 | NATS JetStream | server `INFO.max_payload` gate, bounded detail and lag API |
 
-SQL Server and Db2 were verified by compile/unit paths on this host; their real product live runs
-remain IF-T52 external prerequisites and are not represented as Docker PASS.
+SQL Server and Db2 were verified by compile/unit paths in this original slice.
+SQL Server later completed an x86_64 product CRUD/types/catalog/cleanup run in
+`sqlserver.md`; the exact nested N/N+1/byte edges here remain adapter-level.
+Db2 product live remains an IF-T52 prerequisite until its separate gate passes.
 
 Representative verification commands:
 

@@ -37,8 +37,10 @@ tests verified table absence before removing those files.
 Valkey, KeyDB, Dragonfly, MariaDB, TiDB, CockroachDB, TimescaleDB, TLS profiles,
 and fixture-image profiles were not restarted solely for this final inventory;
 their product-specific cleanup evidence remains in their existing evidence
-files. SQL Server, Db2, Redshift, and vendor Kafka endpoints keep
-their declared external/runtime boundaries.
+files. Db2, Redshift, and vendor Kafka endpoints keep their declared
+external/runtime boundaries. SQL Server subsequently completed its disposable
+x86_64 product lifecycle with exact table absence and container cleanup; see
+[`sqlserver.md`](sqlserver.md).
 
 ScyllaDB addendum (2026-07-17T16:31:05Z): the product-native ARM64 run created
 SQL-compatible, native CQL, typed-value, bounded-catalog, and exact-mutation

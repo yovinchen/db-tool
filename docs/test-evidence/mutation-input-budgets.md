@@ -43,7 +43,7 @@ without invoking a legacy method.
 | SQLite | service-free adapter lifecycle; PASS | N-1 CREATE left `sqlite_master` unchanged; exact CREATE, bound INSERT, UPDATE, two-row atomic insert, SELECT of all three rows, targeted DELETE; duplicate execute reported outcome-indeterminate | `exact_crud` absent after exact DROP |
 | PostgreSQL 16.14 | Docker exact lifecycle 1/1 PASS | N-1 CREATE produced zero catalog rows; exact CREATE/INSERT/UPDATE, late-row budget rejection left count 1, two-row atomic insert returned 2, SELECT returned all rows, targeted DELETE | unique `dbtool_exact_*` table absent after DROP |
 | MySQL 8.4.9 | Docker exact lifecycle 1/1 PASS | same SQL checklist using native placeholders and InnoDB; late-row rejection produced no partial batch | unique `dbtool_exact_*` table absent after DROP |
-| SQL Server | service-free 9/9 PASS | exact statement/parameter counting, N/N-1, NUL and 2,100-parameter ceiling, unsupported dynamic params rejected before client lock | live arm64 product run remains IF-T52 BLOCKED |
+| SQL Server | service-free 9/9 PASS | exact statement/parameter counting, N/N-1, NUL and 2,100-parameter ceiling, unsupported dynamic params rejected before client lock | exact input boundary remains service-free; later x86_64 product CRUD/types/catalog/cleanup LIVE_PASS is recorded in `sqlserver.md` |
 | IBM Db2 | service-free 23/23 PASS | exact statement/parameter counting, N/N-1, NUL and fixed Db2 ceilings, unsupported params rejected before ODBC connection | live run remains IF-T52 BLOCKED until host IBM ODBC exists |
 | Cassandra 5.0 | Docker exact lifecycle 1/1 PASS | N-1 CREATE did not create rejected keyspace; both native `execute_cql_budgeted` and SQL-compatible `execute_budgeted` use the canonical finite contract; exact keyspace/table CREATE, INSERT, UPDATE, SELECT of `(1,updated)`, targeted DELETE and empty readback, table DROP | unique `dbtool_it_input_*` keyspace absent after DROP KEYSPACE |
 | Redis 7.4.9 | Docker exact lifecycle 1/1 PASS | exact binary SET/readback, lifetime restore and NX condition, two-key DEL, allowlisted raw SET/readback; every N-1 request left target keys unchanged; one-byte response budget after raw SET returned outcome-indeterminate while the written value was observable | exact delete removed all test keys; prefix scan empty |
@@ -99,8 +99,9 @@ credentials.
   host cannot run the x86_64-only local image gate.
 - Db2 is implemented and service-free tested, but the host has no registered
   IBM Data Server ODBC driver.
-- Real ScyllaDB, Redshift, AutoMQ, WarpStream, and Confluent endpoints were not
-  supplied; compatibility aliases are not promoted to product-native passes.
+- Redshift, AutoMQ, WarpStream, and Confluent endpoints were not supplied;
+  compatibility aliases are not promoted to product-native passes. ScyllaDB was
+  subsequently verified as a named product in `scylladb.md`.
 - Elasticsearch product-native HTTPS was not rerun in this slice; its existing
   plain HTTP product test and shared TLS transport tests remain separate.
 

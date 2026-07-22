@@ -4,9 +4,10 @@ Result: MACOS_ARM64_SINGLE_ASSET_PASS
 
 Run at: 2026-07-17 Asia/Shanghai
 
-Host: macOS arm64; workspace version `1.0.0`; the verified source tree is the
-`v1.0.0` release candidate. The release only extends the deprecated API
-compatibility window; no public interface was removed.
+Host: macOS arm64; workspace version `1.0.0`; this historical evidence belongs
+to tag `v1.0.0` and source commit
+`193d32e5b38a4dfd6c11342809497d7df79d52fd`. Later main-branch hardening is not
+part of that tagged artifact and must use a new version/tag if released.
 
 ## Final local gate
 

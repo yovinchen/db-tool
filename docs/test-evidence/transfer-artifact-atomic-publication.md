@@ -1,10 +1,10 @@
 # Transfer Artifact Atomic Publication Evidence
 
-Result: IMPLEMENTATION_PASS_WINDOWS_RUN_PENDING
+Result: PASS
 
-Run at (UTC): 2026-07-16
+Run at (UTC): 2026-07-17
 
-Environment: macOS arm64 workspace; Windows semantics delegated to the checked-in PR gate
+Environment: macOS arm64 workspace plus GitHub Actions `windows-latest`
 
 ## Contract
 
@@ -40,6 +40,19 @@ Every pull request now runs the core atomic tests and the exact transfer replace
 - `x86_64-pc-windows-msvc`;
 - `aarch64-pc-windows-msvc`.
 
-This file does not claim those commands ran for the current unpushed SHA. Before changing IF-T68
-from pending evidence to fully verified, record the Windows Actions run URL and commit SHA here;
-x64 supplies runtime evidence, while arm64 is compile/link-only on the x64 runner.
+The gate passed for current implementation commit
+`9529b518804b9363b5fdea094cfe400dfa2c7594` in
+[workflow run 29599157939](https://github.com/yovinchen/db-tool/actions/runs/29599157939):
+
+- [Windows tests](https://github.com/yovinchen/db-tool/actions/runs/29599157939/job/87946815132)
+  ran the core atomic and exact transfer replacement tests successfully.
+- [Windows x64 portable gate](https://github.com/yovinchen/db-tool/actions/runs/29599157939/job/87946814998)
+  compiled and linked the release binary, then executed the portable SQLite core
+  smoke and expected rejected-write probe successfully.
+- [Windows ARM64 portable gate](https://github.com/yovinchen/db-tool/actions/runs/29599157939/job/87946815000)
+  compiled and linked the release binary. Runtime was correctly omitted because
+  GitHub's hosted Windows runner is x64.
+
+The x64 run provides runtime evidence; ARM64 is compile/link-only. This proves
+the checked-in Windows publication path without claiming ARM64 execution on an
+incompatible runner.

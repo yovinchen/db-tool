@@ -19,6 +19,10 @@ Command: `./scripts/integration-scylla-test.sh`
 
 Implementation commit: `336f4bd`
 
+GitHub x86_64 confirmation: [workflow run 29598991078, product-native ScyllaDB job](https://github.com/yovinchen/db-tool/actions/runs/29598991078/job/87946290242)
+at commit `1fd88e6`; the same four product gates and cleanup passed against the
+pinned image on a hosted Linux x86_64 runner.
+
 ## Executed gates
 
 | Gate | Result |

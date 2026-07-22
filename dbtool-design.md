@@ -623,7 +623,7 @@ core 不需要知道具体驱动。
 1. Db2 live test 需要宿主 IBM ODBC runtime；没有 runtime 时只能证明 service-free adapter 合同。
 2. Redshift、AutoMQ、WarpStream、Confluent 等外部产品需要真实端点和凭证，env-gated skip 不是通过。
 3. SQL Server 本机 arm64 Docker 不能代表 x86_64 服务路径；当前真实覆盖依赖 amd64 环境/CI。
-4. 真正 Scylla 产品、产品原生 Elasticsearch HTTPS 等仍需补外部证据，不能只用 Cassandra/OpenSearch-compatible harness 代替。
+4. 产品原生 Elasticsearch HTTPS 等仍需补外部证据；ScyllaDB 已通过命名产品原生 ARM64/x86_64 门禁，不能再用旧的 Cassandra alias-only 状态描述。
 5. TiDB 本地安全 HA、PD/SQL 节点演练、TiProxy 与证书冷重启不等于生产备份、升级、在线证书轮换和全量容灾认证。
 6. FlowControl 没有跨进程全局限流。
 7. AMQP 无可移植 queue list；RabbitMQ queue depth 不是 consumer-group lag。Redis Pub/Sub 与 NATS core 没有持久 catalog 语义。

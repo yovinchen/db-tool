@@ -2,7 +2,7 @@
 
 Task ID: IF-T66-SQLSERVER / IF-T74-SQLSERVER
 
-Result: COMPILE_PASS / EXTERNAL_BLOCKED
+Result: COMPILE_PASS / PRODUCT_LIFECYCLE_LIVE_PASS
 
 Run at (UTC): 2026-07-15T22:09:53Z
 
@@ -35,12 +35,12 @@ Result: 4/4 adapter tests PASS; Clippy PASS. Tests cover explicit operation
 declaration, N+1 conversion, zero/overflow rejection, identifier safety,
 connection config construction, and value decoding.
 
-The repository's existing `scripts/integration-sqlserver-test.sh` exercises
-the public SQL lifecycle and therefore the bounded schema/table commands when
-a SQL Server endpoint is supplied. A live run was not claimed here: the local
-macOS arm64 Docker environment has no supported SQL Server product image. This
-remains the explicit IF-T52 external-product blocker rather than being reported
-as a false LIVE_PASS.
+The original slice was service-free because the local macOS arm64 Docker
+environment has no supported SQL Server product image. A later hosted x86_64
+run completed the public SQL CRUD/types/catalog/guard/cleanup lifecycle against
+SQL Server 2022 CU26; see [`sqlserver.md`](sqlserver.md). The exact N/N+1 and
+byte boundary assertions in this file remain adapter-level evidence and are not
+retroactively relabeled as network product tests.
 
 ## IF-T74 scalar-byte extension（2026-07-16）
 
@@ -49,5 +49,5 @@ operations 广告。adapter 在建连/查询前验证 `ReadBudget`，用 `TOP (N
 再在 retention 前计费完整 schema String 或 TableInfo，最后校验完整 BoundedList envelope。
 
 当前 adapter 8/8 与 all-target Clippy PASS，包含 item N/N+1、byte N/N-1 和
-zero/overflow。macOS arm64 当前仍没有可运行的 SQL Server 产品容器；本项只记录
-COMPILE_PASS，真实产品 byte envelope 仍是 IF-T52 解除条件。
+zero/overflow。macOS arm64 当前仍没有可运行的 SQL Server 产品容器；精确 byte
+envelope 仍由 adapter 证据证明，后续 x86_64 产品目录生命周期已 LIVE_PASS。

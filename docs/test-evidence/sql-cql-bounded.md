@@ -18,7 +18,7 @@ Products: PostgreSQL 16.14; MySQL 8.4.9; Cassandra 5.0.8; SQLite in-memory
 | PostgreSQL / SQLx | `generate_series(1,10000)`, limit 3 | 3 rows with limit 3 | CLI overflow rejected before connection | LIVE_PASS |
 | MySQL / SQLx | recursive 1,000 rows, limit 3 | 3 rows with limit 3 | shared CLI validation | LIVE_PASS |
 | Cassandra / Scylla driver | multi-page `system_schema.columns`, limit 3 | server `LIMIT 3` with client limit 3 | adapter unit validation | LIVE_PASS |
-| SQL Server / Tiberius | first-result-set stream stops after probe | covered by implementation and compile checks | shared core validation | COMPILE_PASS; x86_64 live runner required |
+| SQL Server / Tiberius | first-result-set stream stops after probe | exact probe boundary covered by implementation/unit checks; later product lifecycle ran on x86_64 | shared core validation | COMPILE_PASS for exact probe boundary; product lifecycle LIVE_PASS in `sqlserver.md` |
 | Db2 / ODBC | one-row rowset stops after probe | covered by implementation and compile checks | shared core validation | COMPILE_PASS; Db2 ODBC runtime required |
 
 For every live path, a result larger than 3 returned exactly 3 rows with both

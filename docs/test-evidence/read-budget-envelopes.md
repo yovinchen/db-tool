@@ -28,7 +28,7 @@ row/item-only methods neither advertise nor implement these contracts.
 | PostgreSQL 16 Docker | adapter and CLI N/N+1 plus `--max-bytes 1` failure |
 | MySQL 8.4 Docker | adapter and CLI N/N+1 plus `--max-bytes 1` failure |
 | Cassandra 5.0 Docker | CLI paged N/N+1 plus `--max-bytes 1` failure |
-| SQL Server | unit/compile disposable TDS stream and recursive envelope; external live pending IF-T52 |
+| SQL Server | unit/compile disposable TDS stream and recursive envelope; later x86_64 product lifecycle LIVE_PASS in `sqlserver.md` (exact byte edge remains adapter-level) |
 | Db2 | unit/compile single-row ODBC rowset and truncation fail-closed; external live pending IF-T52 |
 | MongoDB 7 Docker | find and aggregate N/N+1, `--max-bytes 1`, exact operation report, drop cleanup |
 | CLI/TUI/export | default-feature regression; exact operation negotiation only; invalid budgets before DSN; SQL/Document artifact bounded by caller bytes |
