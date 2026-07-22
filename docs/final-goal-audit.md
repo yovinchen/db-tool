@@ -28,7 +28,8 @@ objective.
 
 The existing `v1.0.0` prerelease is historical and points to commit `193d32e`.
 It does not contain the later hardening on `master`; publishing current source
-requires a new version/tag rather than moving or reusing `v1.0.0`.
+uses workspace version `1.0.1` and requires tag `v1.0.1` rather than moving or
+reusing `v1.0.0`.
 
 The real-product validation campaign is reported separately: 24 tasks are
 `COMPLETE`, 1 is `BLOCKED`, 2 are `EXTERNAL`, and none are `PARTIAL`.

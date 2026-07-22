@@ -14,7 +14,7 @@ fi
 
 "$ROOT/scripts/validate-release-version.sh" "$REF_NAME"
 
-cargo build --release \
+cargo build --locked --release \
   --target "$TARGET" \
   -p dbtool-cli \
   --no-default-features \

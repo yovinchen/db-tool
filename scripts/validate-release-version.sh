@@ -33,4 +33,13 @@ if [[ "$REF_NAME" != "$expected" ]]; then
   exit 1
 fi
 
+if tag_commit="$(git -C "$ROOT" rev-list -n 1 "$REF_NAME" 2>/dev/null)" \
+  && [[ -n "$tag_commit" ]]; then
+  head_commit="$(git -C "$ROOT" rev-parse HEAD)"
+  if [[ "$tag_commit" != "$head_commit" ]]; then
+    echo "release version validation failed: existing tag $REF_NAME points to $tag_commit, not current commit $head_commit" >&2
+    exit 1
+  fi
+fi
+
 echo "release version validation passed ($expected)"

@@ -482,7 +482,8 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
   for manual use, but they are not attached by the official release workflow.
 - The existing `v1.0.0` prerelease points to historical commit `193d32e` and
   does not contain later main-branch hardening. A release from current `master`
-  must use a new version/tag; the old tag must not be moved or reused.
+  uses the `1.0.1` patch version and must use tag `v1.0.1`; the old tag must not
+  be moved or reused.
 - Five upstream dependency advisories remain open in legacy transitive TLS/TUI
   slots. Their constrained reachability and required upgrade paths are recorded
   in [the dependency security audit](docs/test-evidence/dependency-security-audit.md);
