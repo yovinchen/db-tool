@@ -159,18 +159,24 @@ function packPlatformPackage(target) {
         version,
         description: `dbtool binary for ${target.target}`,
         license: "MIT OR Apache-2.0",
+        publishConfig: {
+          access: "public",
+          registry: "https://registry.npmjs.org/",
+        },
+        preferUnplugged: true,
         repository: {
           type: "git",
-          url: "git+https://github.com/YoVinchen/db-tool.git",
+          url: "git+https://github.com/yovinchen/db-tool.git",
         },
         os: [target.os],
         cpu: [target.cpu],
-        files: ["bin", "completions", "man"],
+        files: ["bin", "completions", "man", "LICENSE-MIT", "LICENSE-APACHE-2.0"],
       },
       null,
       2,
     )}\n`,
   );
+  copyLicenses(dir);
   npmPack(dir);
 }
 
@@ -181,6 +187,7 @@ function packMainPackage(optionalDependencies) {
   copyFileSync(join(src, "bin", "dbtool.js"), join(dir, "bin", "dbtool.js"));
   copyFileSync(join(src, "README.md"), join(dir, "README.md"));
   copyCliArtifacts(dir);
+  copyLicenses(dir);
 
   const packageJson = JSON.parse(readFileSync(join(src, "package.json"), "utf8"));
   packageJson.version = version;
@@ -203,6 +210,12 @@ function generateCliArtifacts() {
 function copyCliArtifacts(dir) {
   cpSync(join(cliArtifactsDir, "completions"), join(dir, "completions"), { recursive: true });
   cpSync(join(cliArtifactsDir, "man"), join(dir, "man"), { recursive: true });
+}
+
+function copyLicenses(dir) {
+  for (const name of ["LICENSE-MIT", "LICENSE-APACHE-2.0"]) {
+    copyFileSync(join(repoRoot, name), join(dir, name));
+  }
 }
 
 function npmPack(dir) {

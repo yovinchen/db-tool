@@ -32,15 +32,20 @@ const platforms = {
   },
 };
 
-const binary = resolveBinary();
-const result = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });
+try {
+  const binary = resolveBinary();
+  const result = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });
 
-if (result.error) {
-  console.error(result.error.message);
+  if (result.error) {
+    throw result.error;
+  }
+
+  process.exit(result.status ?? 1);
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`dbtool: ${message}`);
   process.exit(1);
 }
-
-process.exit(result.status ?? 1);
 
 function resolveBinary() {
   if (process.env.DBTOOL_BINARY) {
@@ -60,7 +65,7 @@ function resolveBinary() {
       return vendored;
     }
     throw new Error(
-      `missing optional package ${platform.packageName}; reinstall @yovinchen/dbtool or set DBTOOL_BINARY`,
+      `missing ${platform.packageName}; reinstall @yovinchen/dbtool, or set DBTOOL_BINARY=/path/to/dbtool`,
     );
   }
 }

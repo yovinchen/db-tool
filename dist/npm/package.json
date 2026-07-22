@@ -3,9 +3,14 @@
   "version": "0.0.0-development",
   "description": "Unified data and message connection CLI",
   "license": "MIT OR Apache-2.0",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "preferUnplugged": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YoVinchen/db-tool.git"
+    "url": "git+https://github.com/yovinchen/db-tool.git"
   },
   "bin": {
     "dbtool": "bin/dbtool.js"
@@ -14,7 +19,9 @@
     "bin",
     "completions",
     "man",
-    "README.md"
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE-2.0"
   ],
   "engines": {
     "node": ">=18"
