@@ -622,7 +622,11 @@ jobs:
           driver_dir="$(dirname "$driver_in_container")"
           driver_root="$RUNNER_TEMP/db2odbc"
           mkdir -p "$driver_root/lib64"
-          docker cp "$container:$driver_dir/." "$driver_root/lib64"
+          # docker cp rejects IBM's intentionally cross-directory libtsm.a
+          # symlink. Stream the pinned product directory through tar instead;
+          # the driver dependency check below still fails closed.
+          docker exec "$container" tar -C "$driver_dir" -cf - . \
+            | tar -C "$driver_root/lib64" -xf -
           driver="$driver_root/lib64/libdb2o.so"
           test -r "$driver"
           file "$driver" | grep -Eq 'ELF 64-bit.*x86-64'
