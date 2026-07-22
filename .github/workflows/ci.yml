@@ -109,10 +109,7 @@ env:
 jobs:
   verify:
     name: Service-free verification
-    # IBM's 64-bit full-product libdb2o driver must be installed on the host;
-    # copying server-container libraries onto a generic hosted runner is not a
-    # supported client installation and fails SQLAllocHandle(HENV).
-    runs-on: [self-hosted, linux, x64, db2-client]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@stable
@@ -593,7 +590,10 @@ jobs:
   integration-db2:
     name: Live IBM Db2 integration
     if: github.event_name == 'workflow_dispatch' && inputs.run_live_db2
-    runs-on: ubuntu-latest
+    # IBM's 64-bit full-product libdb2o driver must be installed on the host;
+    # copying server-container libraries onto a generic hosted runner is not a
+    # supported client installation and fails SQLAllocHandle(HENV).
+    runs-on: [self-hosted, linux, x64, db2-client]
     env:
       DBTOOL_IT_PROJECT: dbtool-it-ci-db2
       DBTOOL_IT_DB2_PORT: 50000
