@@ -613,8 +613,12 @@ jobs:
         run: |
           container="${DBTOOL_IT_PROJECT}-db2"
           driver_in_container="$(docker exec "$container" sh -lc \
-            'find /database /opt /home -name libdb2o.so -print -quit 2>/dev/null')"
-          test -n "$driver_in_container"
+            'find /database /opt -name libdb2o.so -print -quit 2>/dev/null')"
+          if [[ -z "$driver_in_container" ]]; then
+            docker exec "$container" sh -lc \
+              'find /database /opt -name "libdb2*.so*" -print 2>/dev/null | sort'
+            exit 1
+          fi
           driver_dir="$(dirname "$driver_in_container")"
           driver_root="$RUNNER_TEMP/db2odbc"
           mkdir -p "$driver_root/lib64"
@@ -632,6 +636,7 @@ jobs:
           Description = IBM Db2 64-bit SQLLEN ODBC Driver
           Driver      = $driver
           FileUsage   = 1
+          DontDLClose = 1
           EOF
           odbcinst -q -d -n "IBM DB2 ODBC DRIVER"
 
