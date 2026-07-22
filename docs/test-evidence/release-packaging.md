@@ -110,3 +110,28 @@ The published assets were downloaded again from GitHub and verified independentl
 | executable identity | Mach-O 64-bit `arm64` only; `lipo -archs` returned `arm64` |
 | executable version | exact `dbtool 1.0.0` PASS |
 | downloaded runtime | extracted archive passed the SQLite core flow |
+
+## Current v1.0.1 local release candidate
+
+Result: LOCAL_CANDIDATE_PASS
+
+Run at: 2026-07-22 Asia/Shanghai
+
+Source: version/packaging commit `8121487`; the following `e1f845b` changes only
+the hosted Db2 workflow and does not alter the packaged Rust source. This local
+candidate is not a claim that tag `v1.0.1` or its GitHub prerelease already
+exists.
+
+| Candidate check | Result |
+| --- | --- |
+| locked build/package | `./scripts/package-macos-arm64.sh v1.0.1` PASS |
+| archive | `release-dist/macos-arm64/dbtool-v1.0.1-aarch64-apple-darwin.tar.gz`, 11,119,794 bytes |
+| SHA-256 | `4832835e0d0a6255722ab6bc05a44c5dab8ae8d33574b19390151bb2516b35a8`; sidecar verification PASS |
+| payload | binary, bash/zsh/fish completions, and `dbtool.1` manpage PASS |
+| executable identity | Mach-O 64-bit thin `arm64`; `lipo -archs` returned `arm64` |
+| executable version/runtime | exact `dbtool 1.0.1`; packaged SQLite core smoke PASS |
+
+The candidate is linker-signed ad hoc (`Signature=adhoc`, no TeamIdentifier),
+not Developer ID signed, notarized, or stapled. It is technically usable for
+manual/test distribution on Apple Silicon, but those Apple trust-chain steps
+remain required before describing it as a polished public macOS download.
