@@ -613,12 +613,14 @@ jobs:
         run: |
           container="${DBTOOL_IT_PROJECT}-db2"
           driver_in_container="$(docker exec "$container" sh -lc \
-            'find /database /opt -name libdb2o.so -print -quit 2>/dev/null')"
+            'candidate="$(find /opt /database -name libdb2o.so -print -quit 2>/dev/null)"; \
+             test -n "$candidate" && readlink -f "$candidate"')"
           if [[ -z "$driver_in_container" ]]; then
             docker exec "$container" sh -lc \
               'find /database /opt -name "libdb2*.so*" -print 2>/dev/null | sort'
             exit 1
           fi
+          echo "Resolved IBM ODBC driver: $driver_in_container"
           driver_dir="$(dirname "$driver_in_container")"
           driver_root="$RUNNER_TEMP/db2odbc"
           mkdir -p "$driver_root/lib64"
@@ -628,8 +630,13 @@ jobs:
           docker exec "$container" tar -C "$driver_dir" -cf - . \
             | tar -C "$driver_root/lib64" -xf -
           driver="$driver_root/lib64/libdb2o.so"
-          test -r "$driver"
+          if [[ ! -r "$driver" ]]; then
+            find "$driver_root/lib64" -maxdepth 2 -name 'libdb2o.so*' -ls
+            exit 1
+          fi
+          file "$driver"
           file "$driver" | grep -Eq 'ELF 64-bit.*x86-64'
+          ldd "$driver"
           if ldd "$driver" | grep -q 'not found'; then
             ldd "$driver"
             exit 1
