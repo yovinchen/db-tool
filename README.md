@@ -486,10 +486,11 @@ requires a host ODBC runtime; native Kafka stays behind `full-native`.
   the [Chinese npm publication task board](docs/npm-publication-tasks.zh-CN.md).
   No package has been published: this checkout is not authenticated to npm and
   the official release currently produces only the selected macOS ARM64 binary.
-- The existing `v1.0.0` prerelease points to historical commit `193d32e` and
-  does not contain later main-branch hardening. A release from current `master`
-  uses the `1.0.1` patch version and must use tag `v1.0.1`; the old tag must not
-  be moved or reused.
+- The current Apple Silicon prerelease is
+  [`v1.0.1`](https://github.com/yovinchen/db-tool/releases/tag/v1.0.1), built
+  from commit `6794f1b` after the full hosted CI gate passed. The historical
+  `v1.0.0` tag remains unchanged at commit `193d32e` and must not be moved or
+  reused.
 - Five upstream dependency advisories remain open in legacy transitive TLS/TUI
   slots. Their constrained reachability and required upgrade paths are recorded
   in [the dependency security audit](docs/test-evidence/dependency-security-audit.md);

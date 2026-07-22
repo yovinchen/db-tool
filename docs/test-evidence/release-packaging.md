@@ -111,27 +111,47 @@ The published assets were downloaded again from GitHub and verified independentl
 | executable version | exact `dbtool 1.0.0` PASS |
 | downloaded runtime | extracted archive passed the SQLite core flow |
 
-## Current v1.0.1 local release candidate
+## Current v1.0.1 release
 
-Result: LOCAL_CANDIDATE_PASS
+Result: PUBLISHED_PRERELEASE_PASS
 
 Run at: 2026-07-22 Asia/Shanghai
 
-Source: version/packaging commit `8121487`; the following `e1f845b` changes only
-the hosted Db2 workflow and does not alter the packaged Rust source. This local
-candidate is not a claim that tag `v1.0.1` or its GitHub prerelease already
-exists.
+Source and immutable tag: `v1.0.1` at
+`6794f1bf3dddd3a1662adaecee0e5c0be0e71e46`. Required hosted CI
+[`29905316297`](https://github.com/yovinchen/db-tool/actions/runs/29905316297)
+passed before the tag was created. Release workflow
+[`29906000948`](https://github.com/yovinchen/db-tool/actions/runs/29906000948)
+then passed tag/version validation, native ARM64 build and runtime smoke,
+archive smoke, checksum generation, and prerelease publication.
 
-| Candidate check | Result |
+| Local final-source check | Result |
 | --- | --- |
 | locked build/package | `./scripts/package-macos-arm64.sh v1.0.1` PASS |
-| archive | `release-dist/macos-arm64/dbtool-v1.0.1-aarch64-apple-darwin.tar.gz`, 11,119,794 bytes |
-| SHA-256 | `4832835e0d0a6255722ab6bc05a44c5dab8ae8d33574b19390151bb2516b35a8`; sidecar verification PASS |
+| archive | `release-dist/macos-arm64/dbtool-v1.0.1-aarch64-apple-darwin.tar.gz`, 11,119,793 bytes |
+| SHA-256 | `b561a563fe49e5b9721831249f1afe19cb535c3a14496a6f30775922ec938d03`; sidecar verification PASS |
 | payload | binary, bash/zsh/fish completions, and `dbtool.1` manpage PASS |
 | executable identity | Mach-O 64-bit thin `arm64`; `lipo -archs` returned `arm64` |
 | executable version/runtime | exact `dbtool 1.0.1`; packaged SQLite core smoke PASS |
 
-The candidate is linker-signed ad hoc (`Signature=adhoc`, no TeamIdentifier),
-not Developer ID signed, notarized, or stapled. It is technically usable for
-manual/test distribution on Apple Silicon, but those Apple trust-chain steps
-remain required before describing it as a polished public macOS download.
+The published GitHub assets were downloaded into a new temporary directory and
+verified independently rather than trusting the workflow workspace:
+
+| Published asset check | Result |
+| --- | --- |
+| release identity | GitHub Pre-release [`v1.0.1`](https://github.com/yovinchen/db-tool/releases/tag/v1.0.1), not a draft; published 2026-07-22 |
+| attached asset set | exactly `dbtool-v1.0.1-aarch64-apple-darwin.tar.gz` and its `.sha256` sidecar |
+| archive size/digest | 10,913,598 bytes; SHA-256 `82df8e0727ef9ce94dfc797e5a81890707c52dfbc6f8e6be90a63b231aac104b` |
+| sidecar verification | `shasum -a 256 -c` PASS against the downloaded archive |
+| payload | binary, bash/zsh/fish completions, and `dbtool.1` manpage PASS |
+| executable identity | Mach-O 64-bit thin `arm64`; `lipo -archs` returned `arm64` |
+| executable version/runtime | exact `dbtool 1.0.1`; downloaded SQLite core smoke PASS |
+
+The local and GitHub-built archives are expected to have different byte-level
+digests because they contain independently built binaries and archive metadata;
+the published asset digest above is the authoritative download checksum.
+
+The published binary is linker-signed ad hoc (`Signature=adhoc`, no
+TeamIdentifier), not Developer ID signed, notarized, or stapled. It is usable
+for direct/manual distribution on Apple Silicon, while those Apple trust-chain
+steps remain required before describing it as a fully polished macOS installer.
